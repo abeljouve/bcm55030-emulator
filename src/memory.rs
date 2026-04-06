@@ -224,15 +224,27 @@ impl Memory {
         Ok(())
     }
 
-    /// Apply pending DMA writes from the PBC to DCCM
+    /// Apply pending DMA transfers from the PBC
     fn apply_pending_dma(&mut self) {
         if let Some(ref mmio) = self.mmio {
+            // Apply flash -> DCCM reads
             let writes = mmio.borrow_mut().pbc.take_pending_dma();
             for dma_write in writes {
                 let start = dma_write.dccm_addr as usize;
                 let end = start + dma_write.data.len();
                 if end <= self.data.len() {
                     self.data[start..end].copy_from_slice(&dma_write.data);
+                }
+            }
+
+            // Apply DCCM -> flash writes
+            let flash_writes = mmio.borrow_mut().pbc.take_pending_flash_writes();
+            for fw in flash_writes {
+                let start = fw.dccm_addr as usize;
+                let end = start + fw.length;
+                if end <= self.data.len() {
+                    let data = self.data[start..end].to_vec();
+                    mmio.borrow_mut().pbc.complete_flash_write(fw.flash_addr, &data);
                 }
             }
         }

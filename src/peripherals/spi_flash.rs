@@ -170,13 +170,16 @@ impl SpiFlash {
         result
     }
 
-    /// Write flash data from DMA transfer
+    /// Write flash data from DMA transfer (page program semantics)
+    /// After a write operation, WEL is automatically cleared (like real hardware).
     pub fn dma_write(&mut self, addr: u32, data: &[u8]) {
         let start = (addr as usize) % FLASH_SIZE;
         for (i, &byte) in data.iter().enumerate() {
             let flash_addr = (start + i) % FLASH_SIZE;
-            self.data[flash_addr] &= byte; // page program semantics
+            self.data[flash_addr] &= byte; // page program: can only clear bits
         }
+        // Clear WEL after write completes (per SPI NOR flash spec)
+        self.status &= !SR_WEL;
     }
 
     fn extract_addr(tx: &[u8]) -> u32 {

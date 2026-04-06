@@ -224,6 +224,28 @@ fn main() {
             );
         }
 
+        // Patch ICCM to skip FDS bank registration/scanning calls in func_0x0364.
+        // The FDS subsystem iterates through flash banks causing infinite loops
+        // even with empty bank headers. We NOP out FDS bank calls but keep
+        // boot_fds_config_load (0x0370) which initializes the UART.
+        {
+            let nop4: [u8; 4] = [0x78, 0xE0, 0x78, 0xE0]; // 2x NOP_S = 4 bytes
+            let fds_calls: &[(u32, &str)] = &[
+                // (0x0370, "boot_fds_config_load"), // KEEP: initializes UART enable flag
+                (0x03A8, "fds_register_bank(0)"),
+                (0x03B8, "fds_register_bank(1)"),
+                (0x03C8, "fds_register_bank(2)"),
+                (0x03CC, "fds_scan_banks"),
+                (0x03D0, "fds_init_banks"),
+                (0x03D4, "fds_init"),
+                (0x03D8, "fds_read_records"),
+            ];
+            for &(addr, name) in fds_calls {
+                cpu.mem.load_iccm(addr, &nop4);
+                eprintln!("[SoC] Patched ICCM: 0x{:04X} BL {} -> NOP_S; NOP_S", addr, name);
+            }
+        }
+
         cpu
     } else {
         let mem_size = cfg.mem_size_kb * 1024;
@@ -261,6 +283,30 @@ fn main() {
             let copy_len = binary.len().min(mmio.pbc.flash.data.len());
             mmio.pbc.flash.data[..copy_len].copy_from_slice(&binary[..copy_len]);
             eprintln!("[SoC] SPI flash: loaded firmware binary ({} bytes) at offset 0", copy_len);
+        }
+    }
+
+    // Pre-initialize FDS (Flash Data Store) bank headers in SPI flash.
+    // The bootloader expects 4 FDS banks at 0x2A0000-0x2D0000 (64KB each).
+    // Each bank has 2 sectors of 32KB for wear-leveling. Sector header: 4 bytes
+    // where byte 0 = active sector index (0 or 1), bytes 1-3 = 0x00.
+    // Without valid headers (all 0xFF = erased), the FDS scan processes garbage
+    // entries and corrupts the stack via memcpy. Writing 00 00 00 00 at sector 0
+    // marks each bank as valid-but-empty (no records after the header).
+    if cfg.soc_mode {
+        const FDS_BANK_ADDRS: [usize; 4] = [0x2A0000, 0x2B0000, 0x2C0000, 0x2D0000];
+        if let Some(mut mmio) = cpu.mem.mmio() {
+            for &bank_addr in &FDS_BANK_ADDRS {
+                // Only initialize if the bank is erased (first 4 bytes = 0xFF)
+                if bank_addr + 3 < mmio.pbc.flash.data.len()
+                    && mmio.pbc.flash.data[bank_addr..bank_addr + 4].iter().all(|&b| b == 0xFF)
+                {
+                    // Write sector 0 header: active_sector=0, padding=0
+                    mmio.pbc.flash.data[bank_addr..bank_addr + 4].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                    // Sector 1 (at bank_addr + 0x8000) stays 0xFF = erased/inactive
+                    eprintln!("[SoC] FDS bank at 0x{:06X}: initialized as empty", bank_addr);
+                }
+            }
         }
     }
 

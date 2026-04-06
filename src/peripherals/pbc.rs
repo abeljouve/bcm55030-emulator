@@ -20,10 +20,17 @@ const REG_DMA_CTRL: u32 = 0x38;        // RW: bit 0 = busy/enable; W: triggers D
 const REG_DMA_ADDR: u32 = 0x3C;        // W: flash address for DMA
 const REG_DMA_DATA_ADDR: u32 = 0x40;   // W: memory address for DMA
 
-/// Pending DMA write to DCCM
+/// Pending DMA transfer to DCCM (flash -> mem)
 pub struct DmaWrite {
     pub dccm_addr: u32,
     pub data: Vec<u8>,
+}
+
+/// Pending DMA transfer from DCCM to flash (mem -> flash)
+pub struct DmaFlashWrite {
+    pub dccm_addr: u32,
+    pub flash_addr: u32,
+    pub length: usize,
 }
 
 pub struct PeripheralBusController {
@@ -41,8 +48,10 @@ pub struct PeripheralBusController {
     dma_flash_addr: u32,
     dma_data_addr: u32,
 
-    // Pending DMA writes to be applied to DCCM
+    // Pending DMA transfers: flash -> DCCM
     pending_dma: Vec<DmaWrite>,
+    // Pending DMA transfers: DCCM -> flash
+    pending_flash_writes: Vec<DmaFlashWrite>,
 }
 
 impl PeripheralBusController {
@@ -58,6 +67,7 @@ impl PeripheralBusController {
             dma_flash_addr: 0,
             dma_data_addr: 0,
             pending_dma: Vec::new(),
+            pending_flash_writes: Vec::new(),
         }
     }
 
@@ -128,9 +138,25 @@ impl PeripheralBusController {
         }
     }
 
-    /// Drain pending DMA writes (to be applied to DCCM by the memory subsystem)
+    /// Drain pending DMA reads (flash -> DCCM, to be applied by the memory subsystem)
     pub fn take_pending_dma(&mut self) -> Vec<DmaWrite> {
         std::mem::take(&mut self.pending_dma)
+    }
+
+    /// Drain pending DMA writes (DCCM -> flash, memory subsystem provides the data)
+    pub fn take_pending_flash_writes(&mut self) -> Vec<DmaFlashWrite> {
+        std::mem::take(&mut self.pending_flash_writes)
+    }
+
+    /// Complete a DCCM -> flash DMA write with actual DCCM data
+    pub fn complete_flash_write(&mut self, flash_addr: u32, data: &[u8]) {
+        if self.trace {
+            eprintln!(
+                "[PBC] SPI DMA WRITE: {} bytes to flash 0x{:06X} data={:02X?}",
+                data.len(), flash_addr, &data[..data.len().min(16)]
+            );
+        }
+        self.flash.dma_write(flash_addr, data);
     }
 
     /// Execute a FIFO-based SPI command
@@ -180,38 +206,63 @@ impl PeripheralBusController {
         }
     }
 
-    /// Execute a DMA transfer (always reads from flash to memory)
+    /// Execute a DMA transfer
+    /// bit 0 = enable, bit 1 = direction (0=flash->mem, 1=mem->flash), bits [15:4] = length
     fn execute_dma(&mut self, ctrl: u32) {
         let length = ((ctrl >> 4) & 0xFFF) as usize;
         let flash_addr = self.dma_flash_addr;
         let mem_addr = self.dma_data_addr;
-
-        if self.trace {
-            eprintln!(
-                "[PBC] SPI DMA: READ flash=0x{:06X} → mem=0x{:08X} len={}",
-                flash_addr, mem_addr, length
-            );
-        }
-
-        let data = self.flash.dma_read(flash_addr, length);
+        let write_to_flash = (ctrl & 0x2) != 0; // bit 1 = direction
 
         // Translate DMA address to DCCM offset
-        if mem_addr >= DMA_DCCM_BASE && mem_addr.wrapping_sub(DMA_DCCM_BASE) < DMA_DCCM_SIZE {
-            let dccm_addr = mem_addr - DMA_DCCM_BASE;
-            self.pending_dma.push(DmaWrite {
-                dccm_addr,
-                data,
-            });
+        let dccm_addr = if mem_addr >= DMA_DCCM_BASE && mem_addr.wrapping_sub(DMA_DCCM_BASE) < DMA_DCCM_SIZE {
+            Some(mem_addr - DMA_DCCM_BASE)
         } else if (mem_addr as usize) < 0x80000 {
-            self.pending_dma.push(DmaWrite {
-                dccm_addr: mem_addr,
-                data,
-            });
-        } else if self.trace {
-            eprintln!(
-                "[PBC] DMA: unmapped target address 0x{:08X}",
-                mem_addr
-            );
+            Some(mem_addr)
+        } else {
+            None
+        };
+
+        if write_to_flash {
+            // DMA WRITE: DCCM -> flash
+            if self.trace {
+                eprintln!(
+                    "[PBC] SPI DMA WRITE: ctrl=0x{:08X} mem=0x{:08X} → flash=0x{:06X} len={}",
+                    ctrl, mem_addr, flash_addr, length
+                );
+            }
+            if let Some(dccm_addr) = dccm_addr {
+                self.pending_flash_writes.push(DmaFlashWrite {
+                    dccm_addr,
+                    flash_addr,
+                    length,
+                });
+            } else if self.trace {
+                eprintln!(
+                    "[PBC] DMA WRITE: unmapped source address 0x{:08X}",
+                    mem_addr
+                );
+            }
+        } else {
+            // DMA READ: flash -> DCCM
+            if self.trace {
+                eprintln!(
+                    "[PBC] SPI DMA READ: ctrl=0x{:08X} flash=0x{:06X} → mem=0x{:08X} len={}",
+                    ctrl, flash_addr, mem_addr, length
+                );
+            }
+            let data = self.flash.dma_read(flash_addr, length);
+            if let Some(dccm_addr) = dccm_addr {
+                self.pending_dma.push(DmaWrite {
+                    dccm_addr,
+                    data,
+                });
+            } else if self.trace {
+                eprintln!(
+                    "[PBC] DMA READ: unmapped target address 0x{:08X}",
+                    mem_addr
+                );
+            }
         }
     }
 }

@@ -40,6 +40,22 @@ impl Cpu {
             return Ok(());
         }
 
+        // BCM55030 UART intercept: the bootloader's UART is interrupt-driven
+        // (ring buffer + TX interrupt handler). Since we don't deliver interrupts,
+        // the buffer fills and uart_send_byte_blocking loops forever.
+        // Intercept: write character directly to stdout and return immediately.
+        if self.mem.is_harvard() && self.state.pc == 0x42F4 {
+            // uart_send_byte_blocking(char): r0 = character, blink = return addr
+            let ch = self.state.core_regs[0] as u8;
+            use std::io::Write;
+            let _ = std::io::stdout().lock().write_all(&[ch]);
+            let _ = std::io::stdout().lock().flush();
+            // Simulate return: PC = blink (r31)
+            self.state.pc = self.state.core_regs[REG_BLINK as usize];
+            self.state.instruction_count += 1;
+            return Ok(());
+        }
+
         // Save and clear delay state
         let delay_info = match self.state.delay_state {
             DelayState::DelaySlot { target, is_link } => {
