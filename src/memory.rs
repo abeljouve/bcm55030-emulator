@@ -1,0 +1,356 @@
+use std::cell::RefCell;
+
+use crate::cpu::exception::Exception;
+use crate::peripherals::MmioController;
+
+/// BCM55030 DCCM size: 512 KB
+pub const DCCM_SIZE: usize = 512 * 1024;
+/// BCM55030 ICCM size: 512 KB
+pub const ICCM_SIZE: usize = 512 * 1024;
+
+pub struct Memory {
+    /// Primary data store.
+    /// - Flat mode: single unified memory (for tests).
+    /// - Harvard mode: DCCM (data closely coupled memory).
+    data: Vec<u8>,
+
+    /// Instruction memory (Harvard mode only).
+    /// When present, `fetch_half`/`fetch_word` read from here.
+    iccm: Option<Vec<u8>>,
+
+    /// MMIO peripheral controller (Harvard mode only).
+    /// Uses RefCell for interior mutability: reads may have side effects
+    /// (e.g. UART status register clears on read).
+    mmio: Option<RefCell<MmioController>>,
+}
+
+impl Memory {
+    /// Create a flat memory (single address space, for tests).
+    pub fn new(size: usize) -> Self {
+        Self {
+            data: vec![0u8; size],
+            iccm: None,
+            mmio: None,
+        }
+    }
+
+    /// Create a Harvard-architecture memory with separate ICCM, DCCM, and MMIO.
+    pub fn new_harvard(iccm_size: usize, dccm_size: usize) -> Self {
+        Self {
+            data: vec![0u8; dccm_size],
+            iccm: Some(vec![0u8; iccm_size]),
+            mmio: Some(RefCell::new(MmioController::new())),
+        }
+    }
+
+    pub fn is_harvard(&self) -> bool {
+        self.iccm.is_some()
+    }
+
+    pub fn dccm_size(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Load a binary blob into the primary data store (flat) or DCCM (Harvard).
+    pub fn load_binary(&mut self, addr: u32, binary: &[u8]) {
+        let start = addr as usize;
+        let end = start + binary.len();
+        assert!(end <= self.data.len(), "binary exceeds memory size");
+        self.data[start..end].copy_from_slice(binary);
+    }
+
+    /// Load a binary blob into ICCM (Harvard mode).
+    /// In flat mode, falls back to load_binary.
+    pub fn load_iccm(&mut self, addr: u32, binary: &[u8]) {
+        if let Some(ref mut iccm) = self.iccm {
+            let start = addr as usize;
+            let end = start + binary.len();
+            assert!(end <= iccm.len(), "binary exceeds ICCM size");
+            iccm[start..end].copy_from_slice(binary);
+        } else {
+            self.load_binary(addr, binary);
+        }
+    }
+
+    /// Access the MMIO controller (Harvard mode only).
+    pub fn mmio(&self) -> Option<std::cell::RefMut<'_, MmioController>> {
+        self.mmio.as_ref().map(|rc| rc.borrow_mut())
+    }
+
+    // ========== Flat mode bounds check ==========
+
+    fn check_bounds(&self, addr: u32, size: u32) -> Result<(), Exception> {
+        let end = (addr as u64) + (size as u64);
+        if end > self.data.len() as u64 {
+            return Err(Exception::MemoryError {
+                address: addr,
+                is_write: false,
+            });
+        }
+        Ok(())
+    }
+
+    // ========== Data reads (DCCM in Harvard, flat otherwise) ==========
+
+    pub fn read_byte(&self, addr: u32) -> Result<u8, Exception> {
+        if self.iccm.is_some() {
+            // Harvard mode: route by address
+            if (addr as usize) < self.data.len() {
+                return Ok(self.data[addr as usize]);
+            }
+            // MMIO
+            if let Some(ref mmio) = self.mmio {
+                return mmio.borrow_mut().read_byte(addr);
+            }
+            return Err(Exception::MemoryError { address: addr, is_write: false });
+        }
+        // Flat mode
+        self.check_bounds(addr, 1)?;
+        Ok(self.data[addr as usize])
+    }
+
+    pub fn read_half(&self, addr: u32) -> Result<u16, Exception> {
+        if addr & 1 != 0 {
+            return Err(Exception::MisalignedAccess { address: addr });
+        }
+        if self.iccm.is_some() {
+            if (addr as usize + 1) < self.data.len() {
+                let a = addr as usize;
+                return Ok(((self.data[a] as u16) << 8) | (self.data[a + 1] as u16));
+            }
+            if let Some(ref mmio) = self.mmio {
+                return mmio.borrow_mut().read_half(addr);
+            }
+            return Err(Exception::MemoryError { address: addr, is_write: false });
+        }
+        self.check_bounds(addr, 2)?;
+        let a = addr as usize;
+        Ok(((self.data[a] as u16) << 8) | (self.data[a + 1] as u16))
+    }
+
+    pub fn read_word(&self, addr: u32) -> Result<u32, Exception> {
+        if addr & 3 != 0 {
+            return Err(Exception::MisalignedAccess { address: addr });
+        }
+        if self.iccm.is_some() {
+            if (addr as usize + 3) < self.data.len() {
+                let a = addr as usize;
+                return Ok(((self.data[a] as u32) << 24)
+                    | ((self.data[a + 1] as u32) << 16)
+                    | ((self.data[a + 2] as u32) << 8)
+                    | (self.data[a + 3] as u32));
+            }
+            if let Some(ref mmio) = self.mmio {
+                return mmio.borrow_mut().read_word(addr);
+            }
+            return Err(Exception::MemoryError { address: addr, is_write: false });
+        }
+        self.check_bounds(addr, 4)?;
+        let a = addr as usize;
+        Ok(((self.data[a] as u32) << 24)
+            | ((self.data[a + 1] as u32) << 16)
+            | ((self.data[a + 2] as u32) << 8)
+            | (self.data[a + 3] as u32))
+    }
+
+    // ========== Data writes (DCCM in Harvard, flat otherwise) ==========
+
+    pub fn write_byte(&mut self, addr: u32, val: u8) -> Result<(), Exception> {
+        if self.iccm.is_some() {
+            if (addr as usize) < self.data.len() {
+                self.data[addr as usize] = val;
+                return Ok(());
+            }
+            if let Some(ref mmio) = self.mmio {
+                return mmio.borrow_mut().write_byte(addr, val);
+            }
+            return Err(Exception::MemoryError { address: addr, is_write: true });
+        }
+        self.check_bounds(addr, 1)?;
+        self.data[addr as usize] = val;
+        Ok(())
+    }
+
+    pub fn write_half(&mut self, addr: u32, val: u16) -> Result<(), Exception> {
+        if addr & 1 != 0 {
+            return Err(Exception::MisalignedAccess { address: addr });
+        }
+        if self.iccm.is_some() {
+            if (addr as usize + 1) < self.data.len() {
+                let a = addr as usize;
+                self.data[a] = (val >> 8) as u8;
+                self.data[a + 1] = val as u8;
+                return Ok(());
+            }
+            if let Some(ref mmio) = self.mmio {
+                return mmio.borrow_mut().write_half(addr, val);
+            }
+            return Err(Exception::MemoryError { address: addr, is_write: true });
+        }
+        self.check_bounds(addr, 2)?;
+        let a = addr as usize;
+        self.data[a] = (val >> 8) as u8;
+        self.data[a + 1] = val as u8;
+        Ok(())
+    }
+
+    pub fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
+        if addr & 3 != 0 {
+            return Err(Exception::MisalignedAccess { address: addr });
+        }
+        if self.iccm.is_some() {
+            if (addr as usize + 3) < self.data.len() {
+                let a = addr as usize;
+                self.data[a] = (val >> 24) as u8;
+                self.data[a + 1] = (val >> 16) as u8;
+                self.data[a + 2] = (val >> 8) as u8;
+                self.data[a + 3] = val as u8;
+                return Ok(());
+            }
+            if let Some(ref mmio) = self.mmio {
+                mmio.borrow_mut().write_word(addr, val)?;
+                // Apply any pending DMA writes to DCCM
+                self.apply_pending_dma();
+                return Ok(());
+            }
+            return Err(Exception::MemoryError { address: addr, is_write: true });
+        }
+        self.check_bounds(addr, 4)?;
+        let a = addr as usize;
+        self.data[a] = (val >> 24) as u8;
+        self.data[a + 1] = (val >> 16) as u8;
+        self.data[a + 2] = (val >> 8) as u8;
+        self.data[a + 3] = val as u8;
+        Ok(())
+    }
+
+    /// Apply pending DMA writes from the PBC to DCCM
+    fn apply_pending_dma(&mut self) {
+        if let Some(ref mmio) = self.mmio {
+            let writes = mmio.borrow_mut().pbc.take_pending_dma();
+            for dma_write in writes {
+                let start = dma_write.dccm_addr as usize;
+                let end = start + dma_write.data.len();
+                if end <= self.data.len() {
+                    self.data[start..end].copy_from_slice(&dma_write.data);
+                }
+            }
+        }
+    }
+
+    // ========== Instruction fetch (ICCM in Harvard, flat otherwise) ==========
+
+    pub fn fetch_half(&self, addr: u32) -> Result<u16, Exception> {
+        if addr & 1 != 0 {
+            return Err(Exception::MisalignedAccess { address: addr });
+        }
+        if let Some(ref iccm) = self.iccm {
+            let a = addr as usize;
+            if a + 1 >= iccm.len() {
+                return Err(Exception::MemoryError { address: addr, is_write: false });
+            }
+            return Ok(((iccm[a] as u16) << 8) | (iccm[a + 1] as u16));
+        }
+        self.check_bounds(addr, 2)?;
+        let a = addr as usize;
+        Ok(((self.data[a] as u16) << 8) | (self.data[a + 1] as u16))
+    }
+
+    pub fn fetch_word(&self, addr: u32) -> Result<u32, Exception> {
+        if addr & 1 != 0 {
+            return Err(Exception::MisalignedAccess { address: addr });
+        }
+        if let Some(ref iccm) = self.iccm {
+            let a = addr as usize;
+            if a + 3 >= iccm.len() {
+                return Err(Exception::MemoryError { address: addr, is_write: false });
+            }
+            return Ok(((iccm[a] as u32) << 24)
+                | ((iccm[a + 1] as u32) << 16)
+                | ((iccm[a + 2] as u32) << 8)
+                | (iccm[a + 3] as u32));
+        }
+        self.check_bounds(addr, 4)?;
+        let a = addr as usize;
+        Ok(((self.data[a] as u32) << 24)
+            | ((self.data[a + 1] as u32) << 16)
+            | ((self.data[a + 2] as u32) << 8)
+            | (self.data[a + 3] as u32))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_big_endian_word() {
+        let mut mem = Memory::new(16);
+        mem.write_word(0, 0xDEADBEEF).unwrap();
+        assert_eq!(mem.data[0], 0xDE);
+        assert_eq!(mem.data[1], 0xAD);
+        assert_eq!(mem.data[2], 0xBE);
+        assert_eq!(mem.data[3], 0xEF);
+        assert_eq!(mem.read_word(0).unwrap(), 0xDEADBEEF);
+    }
+
+    #[test]
+    fn test_big_endian_half() {
+        let mut mem = Memory::new(16);
+        mem.write_half(0, 0xCAFE).unwrap();
+        assert_eq!(mem.data[0], 0xCA);
+        assert_eq!(mem.data[1], 0xFE);
+        assert_eq!(mem.read_half(0).unwrap(), 0xCAFE);
+    }
+
+    #[test]
+    fn test_byte() {
+        let mut mem = Memory::new(16);
+        mem.write_byte(5, 0x42).unwrap();
+        assert_eq!(mem.read_byte(5).unwrap(), 0x42);
+    }
+
+    #[test]
+    fn test_misaligned_word() {
+        let mem = Memory::new(16);
+        assert!(mem.read_word(1).is_err());
+        assert!(mem.read_word(2).is_err());
+        assert!(mem.read_word(3).is_err());
+    }
+
+    #[test]
+    fn test_misaligned_half() {
+        let mem = Memory::new(16);
+        assert!(mem.read_half(1).is_err());
+    }
+
+    #[test]
+    fn test_load_binary() {
+        let mut mem = Memory::new(16);
+        mem.load_binary(0, &[0x20, 0x00, 0x08, 0x00]);
+        assert_eq!(mem.read_word(0).unwrap(), 0x20000800);
+    }
+
+    #[test]
+    fn test_harvard_separate_buses() {
+        let mut mem = Memory::new_harvard(1024, 1024);
+        // Write to ICCM
+        mem.load_iccm(0, &[0xAA, 0xBB, 0xCC, 0xDD]);
+        // Write to DCCM at same address
+        mem.load_binary(0, &[0x11, 0x22, 0x33, 0x44]);
+        // Fetch reads ICCM
+        assert_eq!(mem.fetch_half(0).unwrap(), 0xAABB);
+        assert_eq!(mem.fetch_word(0).unwrap(), 0xAABBCCDD);
+        // Data reads DCCM
+        assert_eq!(mem.read_half(0).unwrap(), 0x1122);
+        assert_eq!(mem.read_word(0).unwrap(), 0x11223344);
+    }
+
+    #[test]
+    fn test_harvard_mmio_stub() {
+        let mem = Memory::new_harvard(1024, 1024);
+        // MMIO reads return 0 for unstubbed addresses
+        assert_eq!(mem.read_byte(0x00FC0000).unwrap(), 0);
+        assert_eq!(mem.read_word(0xDE000000).unwrap(), 0);
+    }
+}

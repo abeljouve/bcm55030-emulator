@@ -1,0 +1,5 @@
+[package]
+name = "arc700-emulator"
+version = "0.1.0"
+edition = "2021"
+description = "ARC 700 ARCompact big-endian CPU emulator"
