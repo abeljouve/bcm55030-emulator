@@ -294,37 +294,22 @@ fn main() {
     cpu.state.flag_e1 = true;
     cpu.state.flag_e2 = true;
 
-    // 5. Patch ICCM: NOP out FDS and TKF calls that cause infinite loops
+    // 5. Patch ICCM: NOP out calls that cause issues
+    // - fds_init (0x03D4): causes stack corruption via memcpy at 0x6D44 overwriting
+    //   saved r13 at 0x1079C during FDS sector scanning. The other 6 FDS calls
+    //   (register_bank ×3, scan_banks, init_banks, read_records) work correctly.
+    // - TKF app validation (0x03E6, 0x03EA): tries to load firmware apps from flash.
+    //   Without a valid app, the return chain corrupts r31→0 causing a reset loop.
     {
         let nop4: [u8; 4] = [0x78, 0xE0, 0x78, 0xE0]; // 2x NOP_S
         let patches: &[(u32, &str)] = &[
-            (0x03A8, "fds_register_bank(0)"),
-            (0x03B8, "fds_register_bank(1)"),
-            (0x03C8, "fds_register_bank(2)"),
-            (0x03CC, "fds_scan_banks"),
-            (0x03D0, "fds_init_banks"),
-            (0x03D4, "fds_init"),
-            (0x03D8, "fds_read_records"),
-            (0x03E6, "tkf_try_load_app"),
+            (0x03D4, "fds_init (stack corruption via memcpy at 0x6D44)"),
+            (0x03E6, "tkf_try_load_app (jumps to 0x0000 without valid app)"),
             (0x03EA, "tkf_wait_retry_load"),
         ];
         for &(addr, name) in patches {
             cpu.mem.load_iccm(addr, &nop4);
             eprintln!("[BCM55030] Patched: 0x{:04X} {} -> NOP", addr, name);
-        }
-    }
-
-    // 6. Pre-initialize FDS bank headers (empty banks prevent scan loops)
-    {
-        let mut mmio = cpu.mem.mmio().unwrap();
-        const FDS_BANKS: [usize; 4] = [0x2A0000, 0x2B0000, 0x2C0000, 0x2D0000];
-        for &addr in &FDS_BANKS {
-            if addr + 3 < mmio.pbc.flash.data.len()
-                && mmio.pbc.flash.data[addr..addr + 4].iter().all(|&b| b == 0xFF)
-            {
-                mmio.pbc.flash.data[addr..addr + 4].copy_from_slice(&[0x00; 4]);
-                eprintln!("[BCM55030] FDS bank 0x{:06X}: initialized empty", addr);
-            }
         }
     }
 
