@@ -14,6 +14,10 @@ const UART_SIZE: u32 = 0x40; // +0x00 through +0x3F
 const PBC_BASE: u32 = 0x010001F0;
 const PBC_SIZE: u32 = 0x50; // +0x00 through +0x4F
 
+/// BCM55030 System Registers (Chip ID, revision, config)
+const SYSREG_BASE: u32 = 0x01000000;
+const SYSREG_SIZE: u32 = 0x28; // +0x00 through +0x27
+
 /// SerDes lane status registers (firmware scans these at startup)
 const SERDES_BASE: u32 = 0x224A0000;
 const SERDES_SIZE: u32 = 0x0800; // 256 lanes × 8 bytes
@@ -45,6 +49,20 @@ impl MmioController {
     }
 
     #[inline]
+    fn is_sysreg(addr: u32) -> bool {
+        addr >= SYSREG_BASE && addr < SYSREG_BASE + SYSREG_SIZE
+    }
+
+    /// BCM55030 system register reads
+    fn sysreg_read_word(&self, offset: u32) -> u32 {
+        match offset {
+            0x00 => 0x47010203, // CHIP_ID (BCM4701)
+            0x04 => 0xB2110816, // CHIP_REV / bond options
+            _ => 0,
+        }
+    }
+
+    #[inline]
     fn is_serdes(addr: u32) -> bool {
         addr >= SERDES_BASE && addr < SERDES_BASE + SERDES_SIZE
     }
@@ -61,6 +79,13 @@ impl MmioController {
             let byte_idx = offset & 3;
             let word = self.pbc.read_word(word_offset);
             // Big-endian: byte 0 is MSB
+            return Ok((word >> (24 - byte_idx * 8)) as u8);
+        }
+        if Self::is_sysreg(addr) {
+            let offset = addr - SYSREG_BASE;
+            let word_offset = offset & !3;
+            let byte_idx = offset & 3;
+            let word = self.sysreg_read_word(word_offset);
             return Ok((word >> (24 - byte_idx * 8)) as u8);
         }
         if Self::is_serdes(addr) {
@@ -92,6 +117,13 @@ impl MmioController {
             let hi = self.uart.read_byte(addr - UART_BASE)? as u16;
             let lo = self.uart.read_byte(addr + 1 - UART_BASE)? as u16;
             return Ok((hi << 8) | lo);
+        }
+        if Self::is_sysreg(addr) {
+            let offset = addr - SYSREG_BASE;
+            let word_offset = offset & !3;
+            let half_idx = (offset >> 1) & 1;
+            let word = self.sysreg_read_word(word_offset);
+            return Ok((word >> (16 - half_idx * 16)) as u16);
         }
         if Self::is_serdes(addr) {
             if self.trace {
@@ -131,6 +163,14 @@ impl MmioController {
             }
             return Ok(val);
         }
+        if Self::is_sysreg(addr) {
+            let offset = addr - SYSREG_BASE;
+            let val = self.sysreg_read_word(offset);
+            if self.trace {
+                eprintln!("[MMIO] read  word  0x{:08X} → 0x{:08X} (sysreg+0x{:02X})", addr, val, offset);
+            }
+            return Ok(val);
+        }
         if Self::is_serdes(addr) {
             if self.trace {
                 eprintln!("[MMIO] read  word  0x{:08X} → 0x00000001 (serdes)", addr);
@@ -153,6 +193,12 @@ impl MmioController {
                 eprintln!("[MMIO] write word  0x{:08X} = 0x{:08X} (pbc+0x{:02X})", addr, val, offset);
             }
             self.pbc.write_word(offset, val);
+            return Ok(());
+        }
+        if Self::is_sysreg(addr) {
+            if self.trace {
+                eprintln!("[MMIO] write word  0x{:08X} = 0x{:08X} (sysreg+0x{:02X})", addr, val, addr - SYSREG_BASE);
+            }
             return Ok(());
         }
         if self.trace {

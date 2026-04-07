@@ -1,6 +1,6 @@
 use crate::cpu::condition::ConditionCode;
 use crate::cpu::exception::Exception;
-use crate::cpu::registers::CpuState;
+use crate::cpu::registers::{CpuState, REG_ILINK1, REG_ILINK2};
 use crate::decoder::instruction::*;
 
 use super::resolve_value;
@@ -25,17 +25,23 @@ pub fn execute_zero_op(zop: &ZeroOp, state: &mut CpuState) -> Result<(), Excepti
                 });
             }
             if state.flag_ae {
-                // Return from level 2 exception
+                // Return from exception (highest priority)
+                state.set_status32(state.aux_erstatus);
+                state.pc = state.aux_eret;
+                state.pc_written = true;
+                state.aux_bta = state.aux_erbta;
+            } else if state.flag_a2 {
+                // Return from level 2 interrupt
                 let saved = state.aux_status32_l2;
                 state.set_status32(saved);
-                state.pc = state.aux_eret;
+                state.pc = state.core_regs[REG_ILINK2 as usize];
                 state.pc_written = true;
                 state.aux_bta = state.aux_bta_l2;
             } else {
-                // Return from level 1 exception
+                // Return from level 1 interrupt
                 let saved = state.aux_status32_l1;
                 state.set_status32(saved);
-                state.pc = state.aux_eret;
+                state.pc = state.core_regs[REG_ILINK1 as usize];
                 state.pc_written = true;
                 state.aux_bta = state.aux_bta_l1;
             }

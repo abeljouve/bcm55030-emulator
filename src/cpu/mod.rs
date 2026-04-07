@@ -2,8 +2,10 @@ pub mod condition;
 pub mod exception;
 pub mod registers;
 
+use std::collections::VecDeque;
+
 use exception::Exception;
-use registers::{CpuState, DelayState, REG_BLINK, REG_LP_COUNT};
+use registers::{CpuState, DelayState, REG_BLINK, REG_ILINK1, REG_ILINK2, REG_LP_COUNT};
 
 use crate::decoder;
 use crate::executor;
@@ -14,6 +16,8 @@ pub struct Cpu {
     pub mem: Memory,
     /// Log every instruction to stderr
     pub trace: bool,
+    /// Pending RX characters from stdin (for UART RX intercept)
+    pub rx_queue: VecDeque<u8>,
 }
 
 impl Cpu {
@@ -23,6 +27,7 @@ impl Cpu {
             state: CpuState::new(),
             mem: Memory::new(mem_size),
             trace: false,
+            rx_queue: VecDeque::new(),
         }
     }
 
@@ -32,28 +37,80 @@ impl Cpu {
             state: CpuState::new(),
             mem: Memory::new_harvard(ICCM_SIZE, DCCM_SIZE),
             trace: false,
+            rx_queue: VecDeque::new(),
         }
     }
 
     pub fn step(&mut self) -> Result<(), Exception> {
-        if self.state.halted || self.state.sleeping {
+        if self.state.halted {
             return Ok(());
         }
 
-        // BCM55030 UART intercept: the bootloader's UART is interrupt-driven
-        // (ring buffer + TX interrupt handler). Since we don't deliver interrupts,
-        // the buffer fills and uart_send_byte_blocking loops forever.
-        // Intercept: write character directly to stdout and return immediately.
-        if self.mem.is_harvard() && self.state.pc == 0x42F4 {
-            // uart_send_byte_blocking(char): r0 = character, blink = return addr
-            let ch = self.state.core_regs[0] as u8;
-            use std::io::Write;
-            let _ = std::io::stdout().lock().write_all(&[ch]);
-            let _ = std::io::stdout().lock().flush();
-            // Simulate return: PC = blink (r31)
-            self.state.pc = self.state.core_regs[REG_BLINK as usize];
-            self.state.instruction_count += 1;
+        // When sleeping, only tick timers and check interrupts.
+        // An interrupt wakes the CPU from SLEEP.
+        if self.state.sleeping {
+            self.tick_timers();
+            if self.check_interrupts() {
+                self.state.sleeping = false;
+                // PC was set to interrupt vector by check_interrupts
+            }
             return Ok(());
+        }
+
+        if self.mem.is_harvard() {
+            match self.state.pc {
+                // BCM55030 UART intercept: the bootloader's UART is interrupt-driven
+                // (ring buffer + TX interrupt handler). Since we don't deliver interrupts,
+                // the buffer fills and uart_send_byte_blocking loops forever.
+                // Intercept: write character directly to stdout and return immediately.
+                0x42F4 => {
+                    // uart_send_byte_blocking(char): r0 = character, blink = return addr
+                    let ch = self.state.core_regs[0] as u8;
+                    use std::io::Write;
+                    let _ = std::io::stdout().lock().write_all(&[ch]);
+                    let _ = std::io::stdout().lock().flush();
+                    self.state.pc = self.state.core_regs[REG_BLINK as usize];
+                    self.state.instruction_count += 1;
+                    return Ok(());
+                }
+                // timer1_get_current_value: returns a software timer counter
+                // that is normally incremented by the Timer1 ISR. Since we don't
+                // deliver interrupts yet, simulate by returning instruction_count
+                // divided by a prescaler to approximate real timer tick rate.
+                0x45E4 => {
+                    // Return value based on instruction count (scaled down)
+                    // The bootloader expects ~100 ticks between timer1_set calls
+                    self.state.core_regs[0] =
+                        (self.state.instruction_count / 64) as u32 & 0xFFFF;
+                    self.state.pc = self.state.core_regs[REG_BLINK as usize];
+                    self.state.instruction_count += 1;
+                    return Ok(());
+                }
+                // uart_tx_putchar: puts a character in the TX ring buffer.
+                // Since the TX ISR doesn't run (no interrupts), we output
+                // directly to stdout. Returns 0 in r0 (success).
+                0x427C => {
+                    let ch = self.state.core_regs[0] as u8;
+                    use std::io::Write;
+                    let _ = std::io::stdout().lock().write_all(&[ch]);
+                    let _ = std::io::stdout().lock().flush();
+                    self.state.core_regs[0] = 0;
+                    self.state.pc = self.state.core_regs[REG_BLINK as usize];
+                    self.state.instruction_count += 1;
+                    return Ok(());
+                }
+                // uart_rx_getchar: reads from UART RX ring buffer.
+                // Intercept to return characters from stdin queue.
+                // Returns: r0 = character byte, or 0 if no data available.
+                0x4218 => {
+                    let ch = self.rx_queue.pop_front().unwrap_or(0);
+                    self.state.core_regs[0] = ch as u32;
+                    self.state.pc = self.state.core_regs[REG_BLINK as usize];
+                    self.state.instruction_count += 1;
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
 
         // Save and clear delay state
@@ -121,6 +178,9 @@ impl Cpu {
         // Timer tick (simple: increment once per instruction)
         self.tick_timers();
 
+        // Check for pending interrupts
+        self.check_interrupts();
+
         Ok(())
     }
 
@@ -135,29 +195,112 @@ impl Cpu {
     }
 
     /// Advance timers by one tick.
+    /// ARC 700 timers always count (no start/stop bit).
+    /// BCM55030 timer CONTROL: bit 0 = IE (interrupt enable when count reaches limit),
+    /// bit 1 = NH (not halted), bit 3 = IP (interrupt pending, write-1-to-clear).
+    /// Note: the bootloader writes CONTROL1 = 4 (bit 2), so we treat bit 2 as IE
+    /// for BCM55030 compatibility (non-standard).
     fn tick_timers(&mut self) {
-        // Timer 0
-        if self.state.aux_control0 & 1 != 0 {
-            // Timer enabled (bit 0 of CONTROL)
-            self.state.aux_count0 = self.state.aux_count0.wrapping_add(1);
-            if self.state.aux_limit0 != 0 && self.state.aux_count0 >= self.state.aux_limit0 {
-                // Set interrupt pending (bit 3 of CONTROL = IP)
-                self.state.aux_control0 |= 0x08;
-                // Auto-reload if not halted mode (bit 1 of CONTROL = NH)
-                if self.state.aux_control0 & 0x02 == 0 {
-                    self.state.aux_count0 = 0;
-                }
+        // Timer 0 (IRQ 3)
+        self.state.aux_count0 = self.state.aux_count0.wrapping_add(1);
+        if self.state.aux_limit0 != 0 && self.state.aux_count0 >= self.state.aux_limit0 {
+            self.state.aux_control0 |= 0x08; // IP bit
+            if self.state.aux_control0 & 0x05 != 0 {
+                // IE: bit 0 (standard) or bit 2 (BCM55030)
+                self.state.aux_irq_pending |= 1 << 3;
+            }
+            if self.state.aux_control0 & 0x02 == 0 {
+                self.state.aux_count0 = 0;
             }
         }
-        // Timer 1
-        if self.state.aux_control1 & 1 != 0 {
-            self.state.aux_count1 = self.state.aux_count1.wrapping_add(1);
-            if self.state.aux_limit1 != 0 && self.state.aux_count1 >= self.state.aux_limit1 {
-                self.state.aux_control1 |= 0x08;
-                if self.state.aux_control1 & 0x02 == 0 {
-                    self.state.aux_count1 = 0;
-                }
+        // Timer 1 (IRQ 4)
+        self.state.aux_count1 = self.state.aux_count1.wrapping_add(1);
+        if self.state.aux_limit1 != 0 && self.state.aux_count1 >= self.state.aux_limit1 {
+            self.state.aux_control1 |= 0x08; // IP bit
+            if self.state.aux_control1 & 0x05 != 0 {
+                // IE: bit 0 (standard) or bit 2 (BCM55030)
+                self.state.aux_irq_pending |= 1 << 4;
+            }
+            if self.state.aux_control1 & 0x02 == 0 {
+                self.state.aux_count1 = 0;
             }
         }
+    }
+
+    /// Check and take pending interrupts.
+    /// Returns true if an interrupt was taken (PC changed to vector).
+    fn check_interrupts(&mut self) -> bool {
+        // Don't take interrupts during delay slots
+        if self.state.delay_state != DelayState::None {
+            return false;
+        }
+
+        // Combine hardware pending with software hint
+        let pending = self.state.aux_irq_pending & self.state.aux_ienable;
+        if pending == 0 {
+            return false;
+        }
+
+        // Find highest priority (lowest numbered) pending interrupt
+        let irq = pending.trailing_zeros();
+        if irq >= 32 {
+            return false;
+        }
+
+        // Determine interrupt level from AUX_IRQ_LEV (bit set = level 2, clear = level 1)
+        let is_level2 = (self.state.aux_irq_lev >> irq) & 1 != 0;
+
+        if is_level2 {
+            // Level 2: check E2 enabled and not already in level 2
+            if !self.state.flag_e2 || self.state.flag_a2 {
+                return false;
+            }
+            // Save state
+            self.state.aux_status32_l2 = self.state.status32();
+            self.state.aux_bta_l2 = self.state.aux_bta;
+            self.state.core_regs[REG_ILINK2 as usize] = self.state.pc;
+            self.state.aux_icause2 = irq;
+            // Update STATUS32
+            self.state.flag_e2 = false;
+            self.state.flag_a2 = true;
+            self.state.flag_de = false;
+            self.state.flag_u = false;
+        } else {
+            // Level 1: check E1 enabled and not already in level 1
+            if !self.state.flag_e1 || self.state.flag_a1 {
+                return false;
+            }
+            // Save state
+            self.state.aux_status32_l1 = self.state.status32();
+            self.state.aux_bta_l1 = self.state.aux_bta;
+            self.state.core_regs[REG_ILINK1 as usize] = self.state.pc;
+            self.state.aux_icause1 = irq;
+            // Update STATUS32
+            self.state.flag_e1 = false;
+            self.state.flag_e2 = false;
+            self.state.flag_a1 = true;
+            self.state.flag_de = false;
+            self.state.flag_u = false;
+        }
+
+        // Clear pending bit (edge-triggered)
+        self.state.aux_irq_pending &= !(1 << irq);
+
+        // Jump to interrupt vector: base + vector_number * 8
+        // IRQ N uses vector (16 + N) for ARC 700
+        let vector = 16 + irq;
+        self.state.pc = self.state.aux_int_vector_base + vector * 8;
+        self.state.pc_written = true;
+
+        if self.trace {
+            eprintln!(
+                "[IRQ] Took level {} interrupt IRQ {} → vector 0x{:08X}",
+                if is_level2 { 2 } else { 1 },
+                irq,
+                self.state.pc
+            );
+        }
+
+        true
     }
 }

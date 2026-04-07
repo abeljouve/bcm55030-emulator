@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::os::unix::io::AsRawFd;
 use std::process;
 
 use bcm55030_emulator::cpu::Cpu;
@@ -51,7 +52,7 @@ fn parse_args() -> Config {
         soc_mode: false,
         load_firmware: false,
         entry_point: 0,
-        max_cycles: 1_000_000,
+        max_cycles: u64::MAX,
         trace: false,
         trace_mmio: false,
         breakpoint: None,
@@ -170,6 +171,95 @@ fn parse_args() -> Config {
     cfg
 }
 
+/// Set up terminal in raw mode for interactive CLI.
+/// Returns the original termios settings for restoration.
+fn setup_raw_terminal() -> Option<libc::termios> {
+    unsafe {
+        let fd = std::io::stdin().as_raw_fd();
+        let mut orig: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut orig) != 0 {
+            eprintln!("[SoC] Warning: could not get terminal attributes");
+            return None;
+        }
+        let mut raw = orig;
+        libc::cfmakeraw(&mut raw);
+        // Non-blocking: no minimum chars, no timeout
+        raw.c_cc[libc::VMIN] = 0;
+        raw.c_cc[libc::VTIME] = 0;
+        if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
+            eprintln!("[SoC] Warning: could not set raw terminal mode");
+            return None;
+        }
+        // Also set O_NONBLOCK on stdin
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        eprintln!("[SoC] Terminal: raw mode enabled (Ctrl-C to exit)");
+        Some(orig)
+    }
+}
+
+/// Restore terminal to original settings.
+fn restore_terminal(orig: &libc::termios) {
+    unsafe {
+        let fd = std::io::stdin().as_raw_fd();
+        // Remove O_NONBLOCK
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        libc::tcsetattr(fd, libc::TCSANOW, orig);
+    }
+}
+
+/// Try to read one byte from stdin (non-blocking).
+fn try_read_stdin() -> Option<u8> {
+    unsafe {
+        let mut buf = [0u8; 1];
+        let n = libc::read(
+            std::io::stdin().as_raw_fd(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            1,
+        );
+        if n == 1 { Some(buf[0]) } else { None }
+    }
+}
+
+/// Main emulation loop with stdin polling for SoC mode.
+fn run_emulator(
+    cpu: &mut bcm55030_emulator::cpu::Cpu,
+    cfg: &Config,
+) -> Result<(), bcm55030_emulator::cpu::exception::Exception> {
+    let interactive = cfg.soc_mode;
+
+    for step in 0..cfg.max_cycles {
+        if cpu.state.halted {
+            break;
+        }
+
+        // In SoC mode, poll stdin and feed to UART RX queue.
+        // Check every 1024 steps to avoid syscall overhead.
+        if interactive && step % 1024 == 0 {
+            while let Some(byte) = try_read_stdin() {
+                if byte == 3 {
+                    // Ctrl-C: exit emulator
+                    eprintln!("\n[SoC] Ctrl-C received, stopping");
+                    cpu.state.halted = true;
+                    return Ok(());
+                }
+                cpu.rx_queue.push_back(byte);
+            }
+        }
+
+        if let Some(bp) = cfg.breakpoint {
+            if cpu.state.pc == bp {
+                eprintln!("[BREAK] Hit breakpoint at 0x{:08X}", bp);
+                break;
+            }
+        }
+
+        cpu.step()?;
+    }
+    Ok(())
+}
+
 fn main() {
     let cfg = parse_args();
 
@@ -193,6 +283,13 @@ fn main() {
         cpu.mem.load_binary(0, &binary);
         // Set initial stack pointer (SP = r28) to top of DCCM stack area
         cpu.state.core_regs[28] = 0x10800;
+
+        // Boot ROM emulation: enable interrupts.
+        // The on-chip boot ROM sets these before jumping to the bootloader.
+        // The bootloader never writes IENABLE itself.
+        cpu.state.aux_ienable = 0xFFFFFFFF; // All IRQs enabled
+        cpu.state.flag_e1 = true; // Level 1 interrupts enabled
+        cpu.state.flag_e2 = true; // Level 2 interrupts enabled
 
         // BCM55030 boot ROM emulation.
         // The on-chip mask ROM normally runs before the bootloader:
@@ -239,6 +336,8 @@ fn main() {
                 (0x03D0, "fds_init_banks"),
                 (0x03D4, "fds_init"),
                 (0x03D8, "fds_read_records"),
+                (0x03E6, "tkf_try_load_app"),
+                (0x03EA, "tkf_wait_retry_load"),
             ];
             for &(addr, name) in fds_calls {
                 cpu.mem.load_iccm(addr, &nop4);
@@ -317,37 +416,26 @@ fn main() {
         );
     }
 
-    // Run with optional breakpoint
-    if let Some(bp) = cfg.breakpoint {
-        for _ in 0..cfg.max_cycles {
-            if cpu.state.halted || cpu.state.sleeping {
-                break;
-            }
-            if cpu.state.pc == bp {
-                eprintln!("[BREAK] Hit breakpoint at 0x{:08X}", bp);
-                break;
-            }
-            match cpu.step() {
-                Ok(()) => {}
-                Err(e) => {
-                    eprintln!(
-                        "Exception at PC=0x{:08X}: {:?}",
-                        cpu.state.pc, e
-                    );
-                    break;
-                }
-            }
-        }
+    // Set up raw terminal for interactive SoC mode
+    let orig_termios = if cfg.soc_mode {
+        setup_raw_terminal()
     } else {
-        match cpu.run(cfg.max_cycles) {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!(
-                    "Exception at PC=0x{:08X}: {:?}",
-                    cpu.state.pc, e
-                );
-            }
-        }
+        None
+    };
+
+    // Run
+    let run_result = run_emulator(&mut cpu, &cfg);
+
+    // Restore terminal before printing final state
+    if let Some(ref orig) = orig_termios {
+        restore_terminal(orig);
+    }
+
+    if let Err(e) = run_result {
+        eprintln!(
+            "Exception at PC=0x{:08X}: {:?}",
+            cpu.state.pc, e
+        );
     }
 
     // Print final state
