@@ -14,6 +14,14 @@ use crate::memory::{Memory, DCCM_SIZE, ICCM_SIZE};
 /// so the UART IRQ must be level 1.
 const UART_IRQ: u32 = 5;
 
+/// UART IRQ prescaler: check every N instructions.
+/// On real hardware, the UART is baud-rate limited (~5760 bytes/sec at 57600 baud).
+/// Without throttling, the ISR drains the TX ring buffer instantly, causing the
+/// bootloader's tx_idle flush check (FUN_0x4428) to see an already-empty buffer
+/// and loop forever. A prescaler of 256 provides enough delay for the software
+/// to observe tx_idle=0 before the ISR finishes draining.
+const UART_PRESCALER: u64 = 256;
+
 pub struct Cpu {
     pub state: CpuState,
     pub mem: Memory,
@@ -49,7 +57,15 @@ impl Cpu {
         // An interrupt wakes the CPU from SLEEP.
         if self.state.sleeping {
             self.tick_timers();
-            self.check_uart_irq();
+            // No prescaler during SLEEP — check every step for wakeup
+            let uart_pending = if let Some(mmio) = self.mem.mmio() {
+                mmio.uart.irq_pending()
+            } else {
+                false
+            };
+            if uart_pending {
+                self.state.aux_irq_pending |= 1 << UART_IRQ;
+            }
             if self.check_interrupts() {
                 self.state.sleeping = false;
                 // PC was set to interrupt vector by check_interrupts
@@ -191,7 +207,11 @@ impl Cpu {
     }
 
     /// Set UART IRQ pending bit if the UART peripheral needs service.
+    /// Throttled by UART_PRESCALER to simulate baud-rate limited TX.
     fn check_uart_irq(&mut self) {
+        if self.state.instruction_count % UART_PRESCALER != 0 {
+            return;
+        }
         let pending = if let Some(mmio) = self.mem.mmio() {
             mmio.uart.irq_pending()
         } else {
