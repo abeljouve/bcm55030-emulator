@@ -4,38 +4,32 @@ use std::os::unix::io::AsRawFd;
 use std::process;
 
 use bcm55030_emulator::cpu::Cpu;
+use bcm55030_emulator::memory::ICCM_SIZE;
 
 fn usage(prog: &str) {
-    eprintln!("Usage: {} [OPTIONS] <binary>", prog);
+    eprintln!("BCM55030 ARC 700 Emulator");
     eprintln!();
-    eprintln!("Modes:");
-    eprintln!("  <binary>                    Load raw binary at address 0 (flat mode)");
-    eprintln!("  --soc <binary>              BCM55030 SoC mode (Harvard ICCM/DCCM)");
-    eprintln!("  --load-firmware <binary>        Load firmware firmware, entry at 0x0150");
+    eprintln!("Usage: {} [OPTIONS] <flash.bin>", prog);
+    eprintln!();
+    eprintln!("  <flash.bin>                 SPI flash image (bootloader or full 4MB dump)");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --entry <ADDR>              Entry point (hex, default: 0x0000)");
-    eprintln!("  --max-cycles <N>            Maximum instructions (default: 1000000)");
+    eprintln!("  --max-cycles <N>            Maximum instructions (default: unlimited)");
     eprintln!("  --trace                     Log each instruction to stderr");
     eprintln!("  --trace-mmio                Log MMIO accesses to stderr");
     eprintln!("  --break <ADDR>              Stop at address (hex)");
     eprintln!("  --dccm-dump <FILE>          Dump DCCM to file on exit");
-    eprintln!("  --mem-size <KB>             Flat mode memory size (default: 1024)");
-    eprintln!("  --flash <FILE>              Load SPI flash image (4MB, SoC mode)");
 }
 
 struct Config {
-    binary_path: String,
-    soc_mode: bool,
-    load_firmware: bool,
+    flash_path: String,
     entry_point: u32,
     max_cycles: u64,
     trace: bool,
     trace_mmio: bool,
     breakpoint: Option<u32>,
     dccm_dump: Option<String>,
-    mem_size_kb: usize,
-    flash_path: Option<String>,
 }
 
 fn parse_hex(s: &str) -> Option<u32> {
@@ -48,42 +42,18 @@ fn parse_args() -> Config {
     let prog = &args[0];
 
     let mut cfg = Config {
-        binary_path: String::new(),
-        soc_mode: false,
-        load_firmware: false,
+        flash_path: String::new(),
         entry_point: 0,
         max_cycles: u64::MAX,
         trace: false,
         trace_mmio: false,
         breakpoint: None,
         dccm_dump: None,
-        mem_size_kb: 1024,
-        flash_path: None,
     };
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--soc" => {
-                cfg.soc_mode = true;
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("Error: --soc requires a binary path");
-                    process::exit(1);
-                }
-                cfg.binary_path = args[i].clone();
-            }
-            "--load-firmware" => {
-                cfg.soc_mode = true;
-                cfg.load_firmware = true;
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("Error: --load-firmware requires a binary path");
-                    process::exit(1);
-                }
-                cfg.binary_path = args[i].clone();
-                cfg.entry_point = 0x0150;
-            }
             "--entry" => {
                 i += 1;
                 if i >= args.len() {
@@ -127,25 +97,6 @@ fn parse_args() -> Config {
                 }
                 cfg.dccm_dump = Some(args[i].clone());
             }
-            "--mem-size" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("Error: --mem-size requires a number");
-                    process::exit(1);
-                }
-                cfg.mem_size_kb = args[i].parse().unwrap_or_else(|_| {
-                    eprintln!("Error: invalid number: {}", args[i]);
-                    process::exit(1);
-                });
-            }
-            "--flash" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("Error: --flash requires a file path");
-                    process::exit(1);
-                }
-                cfg.flash_path = Some(args[i].clone());
-            }
             "--help" | "-h" => {
                 usage(prog);
                 process::exit(0);
@@ -156,14 +107,14 @@ fn parse_args() -> Config {
                     usage(prog);
                     process::exit(1);
                 }
-                cfg.binary_path = args[i].clone();
+                cfg.flash_path = args[i].clone();
             }
         }
         i += 1;
     }
 
-    if cfg.binary_path.is_empty() {
-        eprintln!("Error: no binary specified");
+    if cfg.flash_path.is_empty() {
+        eprintln!("Error: no flash image specified");
         usage(prog);
         process::exit(1);
     }
@@ -171,45 +122,55 @@ fn parse_args() -> Config {
     cfg
 }
 
+/// Detect the bootloader code size in a flash image.
+/// Scans from offset 0 for the first 256-byte aligned block that is all 0xFF (erased).
+/// Returns the offset of that block (= end of bootloader code region).
+fn detect_bootloader_size(flash: &[u8]) -> usize {
+    let block_size = 256;
+    let max_scan = flash.len().min(ICCM_SIZE);
+    let mut offset = 0;
+    while offset < max_scan {
+        let end = (offset + block_size).min(max_scan);
+        let block = &flash[offset..end];
+        if block.iter().all(|&b| b == 0xFF) {
+            return offset;
+        }
+        offset += block_size;
+    }
+    max_scan
+}
+
 /// Set up terminal in raw mode for interactive CLI.
-/// Returns the original termios settings for restoration.
 fn setup_raw_terminal() -> Option<libc::termios> {
     unsafe {
         let fd = std::io::stdin().as_raw_fd();
         let mut orig: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(fd, &mut orig) != 0 {
-            eprintln!("[SoC] Warning: could not get terminal attributes");
             return None;
         }
         let mut raw = orig;
         libc::cfmakeraw(&mut raw);
-        // Non-blocking: no minimum chars, no timeout
         raw.c_cc[libc::VMIN] = 0;
         raw.c_cc[libc::VTIME] = 0;
         if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
-            eprintln!("[SoC] Warning: could not set raw terminal mode");
             return None;
         }
-        // Also set O_NONBLOCK on stdin
         let flags = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        eprintln!("[SoC] Terminal: raw mode enabled (Ctrl-C to exit)");
+        eprintln!("[BCM55030] Terminal: raw mode (Ctrl-C to exit)");
         Some(orig)
     }
 }
 
-/// Restore terminal to original settings.
 fn restore_terminal(orig: &libc::termios) {
     unsafe {
         let fd = std::io::stdin().as_raw_fd();
-        // Remove O_NONBLOCK
         let flags = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
         libc::tcsetattr(fd, libc::TCSANOW, orig);
     }
 }
 
-/// Try to read one byte from stdin (non-blocking).
 fn try_read_stdin() -> Option<u8> {
     unsafe {
         let mut buf = [0u8; 1];
@@ -222,25 +183,20 @@ fn try_read_stdin() -> Option<u8> {
     }
 }
 
-/// Main emulation loop with stdin polling for SoC mode.
 fn run_emulator(
-    cpu: &mut bcm55030_emulator::cpu::Cpu,
+    cpu: &mut Cpu,
     cfg: &Config,
 ) -> Result<(), bcm55030_emulator::cpu::exception::Exception> {
-    let interactive = cfg.soc_mode;
-
     for step in 0..cfg.max_cycles {
         if cpu.state.halted {
             break;
         }
 
-        // In SoC mode, poll stdin and feed to UART RX queue.
-        // Check every 1024 steps to avoid syscall overhead.
-        if interactive && step % 1024 == 0 {
+        // Poll stdin every 1024 steps
+        if step % 1024 == 0 {
             while let Some(byte) = try_read_stdin() {
                 if byte == 3 {
-                    // Ctrl-C: exit emulator
-                    eprintln!("\n[SoC] Ctrl-C received, stopping");
+                    eprintln!("\n[BCM55030] Ctrl-C, stopping");
                     cpu.state.halted = true;
                     return Ok(());
                 }
@@ -263,100 +219,119 @@ fn run_emulator(
 fn main() {
     let cfg = parse_args();
 
-    let binary = match fs::read(&cfg.binary_path) {
+    // Read flash image
+    let flash_data = match fs::read(&cfg.flash_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("Error reading {}: {}", cfg.binary_path, e);
+            eprintln!("Error reading {}: {}", cfg.flash_path, e);
             process::exit(1);
         }
     };
 
-    let mut cpu = if cfg.soc_mode {
-        eprintln!(
-            "[SoC] BCM55030 mode: ICCM=512KB DCCM=512KB, loading {} ({} bytes)",
-            cfg.binary_path,
-            binary.len()
-        );
-        let mut cpu = Cpu::new_bcm55030();
-        // Load firmware into ICCM (code) and DCCM (data/literal pools)
-        cpu.mem.load_iccm(0, &binary);
-        cpu.mem.load_binary(0, &binary);
-        // Set initial stack pointer (SP = r28) to top of DCCM stack area
-        cpu.state.core_regs[28] = 0x10800;
+    eprintln!(
+        "[BCM55030] Flash image: {} ({} bytes)",
+        cfg.flash_path,
+        flash_data.len()
+    );
 
-        // Boot ROM emulation: enable interrupts.
-        // The on-chip boot ROM sets these before jumping to the bootloader.
-        // The bootloader never writes IENABLE itself.
-        cpu.state.aux_ienable = 0xFFFFFFFF; // All IRQs enabled
-        cpu.state.flag_e1 = true; // Level 1 interrupts enabled
-        cpu.state.flag_e2 = true; // Level 2 interrupts enabled
+    // --- Create BCM55030 CPU (always Harvard: ICCM + DCCM + MMIO) ---
+    let mut cpu = Cpu::new_bcm55030();
 
-        // BCM55030 boot ROM emulation.
-        // The on-chip mask ROM normally runs before the bootloader:
-        // it loads firmware into ICCM/DCCM, writes callback pointers
-        // to specific DCCM addresses, then jumps to the entry point.
-        //
-        // Fill unloaded ICCM with J_S [blink] (0x7EE0) so that any call
-        // to code beyond the loaded binary returns immediately. This handles
-        // boot ROM helper functions and tail-calls to code that only exists
-        // in the full firmware image.
-        {
-            let bin_len = binary.len();
-            // Round up to 16-bit alignment
-            let fill_start = (bin_len + 1) & !1;
-            let iccm_size = 512 * 1024;
-            if fill_start < iccm_size {
-                let mut fill = vec![0u8; iccm_size - fill_start];
-                // Fill with J_S [blink] = 0x7E 0xE0 (return to caller)
-                for chunk in fill.chunks_exact_mut(2) {
-                    chunk[0] = 0x7E;
-                    chunk[1] = 0xE0;
-                }
-                cpu.mem.load_iccm(fill_start as u32, &fill);
-            }
+    // --- Load flash image into SPI flash peripheral ---
+    {
+        let mut mmio = cpu.mem.mmio().expect("BCM55030 must have MMIO");
+        let flash_size = mmio.pbc.flash.data.len();
+        let copy_len = flash_data.len().min(flash_size);
+        mmio.pbc.flash.data[..copy_len].copy_from_slice(&flash_data[..copy_len]);
+        eprintln!("[BCM55030] SPI flash: {} bytes loaded", copy_len);
+    }
 
-            eprintln!(
-                "[SoC] Boot ROM: ICCM fill from 0x{:05X} with J_S [blink]",
-                fill_start
-            );
-        }
+    // --- Boot ROM emulation ---
+    // The on-chip mask ROM reads the bootloader from SPI flash and copies
+    // it into ICCM (code) and DCCM (data/literal pools), then jumps to
+    // the entry point.
 
-        // Patch ICCM to skip FDS bank registration/scanning calls in func_0x0364.
-        // The FDS subsystem iterates through flash banks causing infinite loops
-        // even with empty bank headers. We NOP out FDS bank calls but keep
-        // boot_fds_config_load (0x0370) which initializes the UART.
-        {
-            let nop4: [u8; 4] = [0x78, 0xE0, 0x78, 0xE0]; // 2x NOP_S = 4 bytes
-            let fds_calls: &[(u32, &str)] = &[
-                // (0x0370, "boot_fds_config_load"), // KEEP: initializes UART enable flag
-                (0x03A8, "fds_register_bank(0)"),
-                (0x03B8, "fds_register_bank(1)"),
-                (0x03C8, "fds_register_bank(2)"),
-                (0x03CC, "fds_scan_banks"),
-                (0x03D0, "fds_init_banks"),
-                (0x03D4, "fds_init"),
-                (0x03D8, "fds_read_records"),
-                (0x03E6, "tkf_try_load_app"),
-                (0x03EA, "tkf_wait_retry_load"),
-            ];
-            for &(addr, name) in fds_calls {
-                cpu.mem.load_iccm(addr, &nop4);
-                eprintln!("[SoC] Patched ICCM: 0x{:04X} BL {} -> NOP_S; NOP_S", addr, name);
-            }
-        }
-
-        cpu
-    } else {
-        let mem_size = cfg.mem_size_kb * 1024;
-        let mut cpu = Cpu::new(mem_size);
-        cpu.mem.load_binary(0, &binary);
-        cpu
+    // 1. Detect bootloader size in flash (scan for first erased block)
+    let boot_size = {
+        let mmio = cpu.mem.mmio().unwrap();
+        detect_bootloader_size(&mmio.pbc.flash.data)
     };
+    eprintln!("[BCM55030] Boot ROM: bootloader detected, {} bytes (0x{:X})", boot_size, boot_size);
 
+    // 2. Copy bootloader from flash to ICCM and DCCM
+    {
+        // Copy from flash data to a local buffer first to avoid borrow conflict
+        let code = {
+            let mmio = cpu.mem.mmio().unwrap();
+            mmio.pbc.flash.data[..boot_size].to_vec()
+        };
+        cpu.mem.load_iccm(0, &code);
+        cpu.mem.load_binary(0, &code);
+    }
+
+    // 3. Fill remaining ICCM with J_S [blink] (0x7EE0)
+    // Any call beyond the bootloader returns immediately — emulates
+    // boot ROM helper stubs that exist only in the mask ROM.
+    {
+        let fill_start = (boot_size + 1) & !1; // 16-bit aligned
+        if fill_start < ICCM_SIZE {
+            let mut fill = vec![0u8; ICCM_SIZE - fill_start];
+            for chunk in fill.chunks_exact_mut(2) {
+                chunk[0] = 0x7E;
+                chunk[1] = 0xE0;
+            }
+            cpu.mem.load_iccm(fill_start as u32, &fill);
+        }
+        eprintln!(
+            "[BCM55030] Boot ROM: ICCM filled from 0x{:05X} with J_S [blink]",
+            fill_start
+        );
+    }
+
+    // 4. Boot ROM initial state
+    cpu.state.core_regs[28] = 0x10800; // SP = top of DCCM stack area
+    cpu.state.aux_ienable = 0xFFFFFFFF; // All IRQs enabled
+    cpu.state.flag_e1 = true;
+    cpu.state.flag_e2 = true;
+
+    // 5. Patch ICCM: NOP out FDS and TKF calls that cause infinite loops
+    {
+        let nop4: [u8; 4] = [0x78, 0xE0, 0x78, 0xE0]; // 2x NOP_S
+        let patches: &[(u32, &str)] = &[
+            (0x03A8, "fds_register_bank(0)"),
+            (0x03B8, "fds_register_bank(1)"),
+            (0x03C8, "fds_register_bank(2)"),
+            (0x03CC, "fds_scan_banks"),
+            (0x03D0, "fds_init_banks"),
+            (0x03D4, "fds_init"),
+            (0x03D8, "fds_read_records"),
+            (0x03E6, "tkf_try_load_app"),
+            (0x03EA, "tkf_wait_retry_load"),
+        ];
+        for &(addr, name) in patches {
+            cpu.mem.load_iccm(addr, &nop4);
+            eprintln!("[BCM55030] Patched: 0x{:04X} {} -> NOP", addr, name);
+        }
+    }
+
+    // 6. Pre-initialize FDS bank headers (empty banks prevent scan loops)
+    {
+        let mut mmio = cpu.mem.mmio().unwrap();
+        const FDS_BANKS: [usize; 4] = [0x2A0000, 0x2B0000, 0x2C0000, 0x2D0000];
+        for &addr in &FDS_BANKS {
+            if addr + 3 < mmio.pbc.flash.data.len()
+                && mmio.pbc.flash.data[addr..addr + 4].iter().all(|&b| b == 0xFF)
+            {
+                mmio.pbc.flash.data[addr..addr + 4].copy_from_slice(&[0x00; 4]);
+                eprintln!("[BCM55030] FDS bank 0x{:06X}: initialized empty", addr);
+            }
+        }
+    }
+
+    // --- Configure and run ---
     cpu.state.pc = cfg.entry_point;
     cpu.trace = cfg.trace;
 
-    // Configure MMIO trace
     if cfg.trace_mmio {
         if let Some(mut mmio) = cpu.mem.mmio() {
             mmio.trace = true;
@@ -364,88 +339,28 @@ fn main() {
         }
     }
 
-    // Load SPI flash image if provided
-    if let Some(ref flash_path) = cfg.flash_path {
-        let flash_data = fs::read(flash_path).unwrap_or_else(|e| {
-            eprintln!("Error reading flash image {}: {}", flash_path, e);
-            process::exit(1);
-        });
-        if let Some(mut mmio) = cpu.mem.mmio() {
-            let flash_size = mmio.pbc.flash.data.len();
-            let copy_len = flash_data.len().min(flash_size);
-            mmio.pbc.flash.data[..copy_len].copy_from_slice(&flash_data[..copy_len]);
-            eprintln!("[SoC] SPI flash: loaded {} bytes from {}", copy_len, flash_path);
-        }
-    } else if cfg.soc_mode {
-        // In SoC mode without explicit flash, load the binary into flash at offset 0
-        if let Some(mut mmio) = cpu.mem.mmio() {
-            let copy_len = binary.len().min(mmio.pbc.flash.data.len());
-            mmio.pbc.flash.data[..copy_len].copy_from_slice(&binary[..copy_len]);
-            eprintln!("[SoC] SPI flash: loaded firmware binary ({} bytes) at offset 0", copy_len);
-        }
-    }
+    eprintln!(
+        "[BCM55030] Entry: 0x{:08X}, ICCM=512KB, DCCM=512KB",
+        cfg.entry_point
+    );
 
-    // Pre-initialize FDS (Flash Data Store) bank headers in SPI flash.
-    // The bootloader expects 4 FDS banks at 0x2A0000-0x2D0000 (64KB each).
-    // Each bank has 2 sectors of 32KB for wear-leveling. Sector header: 4 bytes
-    // where byte 0 = active sector index (0 or 1), bytes 1-3 = 0x00.
-    // Without valid headers (all 0xFF = erased), the FDS scan processes garbage
-    // entries and corrupts the stack via memcpy. Writing 00 00 00 00 at sector 0
-    // marks each bank as valid-but-empty (no records after the header).
-    if cfg.soc_mode {
-        const FDS_BANK_ADDRS: [usize; 4] = [0x2A0000, 0x2B0000, 0x2C0000, 0x2D0000];
-        if let Some(mut mmio) = cpu.mem.mmio() {
-            for &bank_addr in &FDS_BANK_ADDRS {
-                // Only initialize if the bank is erased (first 4 bytes = 0xFF)
-                if bank_addr + 3 < mmio.pbc.flash.data.len()
-                    && mmio.pbc.flash.data[bank_addr..bank_addr + 4].iter().all(|&b| b == 0xFF)
-                {
-                    // Write sector 0 header: active_sector=0, padding=0
-                    mmio.pbc.flash.data[bank_addr..bank_addr + 4].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-                    // Sector 1 (at bank_addr + 0x8000) stays 0xFF = erased/inactive
-                    eprintln!("[SoC] FDS bank at 0x{:06X}: initialized as empty", bank_addr);
-                }
-            }
-        }
-    }
+    let orig_termios = setup_raw_terminal();
 
-    if cfg.soc_mode {
-        eprintln!(
-            "[SoC] Entry point: 0x{:08X}, max cycles: {}",
-            cfg.entry_point, cfg.max_cycles
-        );
-    }
-
-    // Set up raw terminal for interactive SoC mode
-    let orig_termios = if cfg.soc_mode {
-        setup_raw_terminal()
-    } else {
-        None
-    };
-
-    // Run
     let run_result = run_emulator(&mut cpu, &cfg);
 
-    // Restore terminal before printing final state
     if let Some(ref orig) = orig_termios {
         restore_terminal(orig);
     }
 
     if let Err(e) = run_result {
-        eprintln!(
-            "Exception at PC=0x{:08X}: {:?}",
-            cpu.state.pc, e
-        );
+        eprintln!("Exception at PC=0x{:08X}: {:?}", cpu.state.pc, e);
     }
 
-    // Print final state
+    // Final state
     eprintln!();
     eprintln!("=== Final State ===");
     eprintln!("PC: 0x{:08X}", cpu.state.pc);
-    eprintln!(
-        "Instructions executed: {}",
-        cpu.state.instruction_count
-    );
+    eprintln!("Instructions: {}", cpu.state.instruction_count);
     eprintln!(
         "Flags: Z={} N={} C={} V={}",
         cpu.state.flag_z as u8,
@@ -454,11 +369,11 @@ fn main() {
         cpu.state.flag_v as u8
     );
     eprintln!(
-        "STATUS32: 0x{:04X} (U={} E1={} E2={})",
+        "STATUS32: 0x{:04X} (E1={} E2={} U={})",
         cpu.state.status32(),
-        cpu.state.flag_u as u8,
         cpu.state.flag_e1 as u8,
-        cpu.state.flag_e2 as u8
+        cpu.state.flag_e2 as u8,
+        cpu.state.flag_u as u8
     );
 
     for i in 0..32 {
@@ -479,17 +394,14 @@ fn main() {
 
     // DCCM dump
     if let Some(ref path) = cfg.dccm_dump {
-        if cpu.mem.is_harvard() {
-            eprintln!("[SoC] Dumping DCCM to {}", path);
-            // Read DCCM byte by byte into a buffer
-            let size = cpu.mem.dccm_size();
-            let mut buf = Vec::with_capacity(size);
-            for addr in 0..size {
-                buf.push(cpu.mem.read_byte(addr as u32).unwrap_or(0));
-            }
-            if let Err(e) = fs::write(path, &buf) {
-                eprintln!("Error writing DCCM dump: {}", e);
-            }
+        eprintln!("[BCM55030] Dumping DCCM to {}", path);
+        let size = cpu.mem.dccm_size();
+        let mut buf = Vec::with_capacity(size);
+        for addr in 0..size {
+            buf.push(cpu.mem.read_byte(addr as u32).unwrap_or(0));
+        }
+        if let Err(e) = fs::write(path, &buf) {
+            eprintln!("Error writing DCCM dump: {}", e);
         }
     }
 }
