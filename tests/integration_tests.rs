@@ -197,7 +197,7 @@ fn test_sub_produces_zero() {
     assert_eq!(cpu.state.core_regs[0], 0);
     assert!(cpu.state.flag_z);   // result is 0
     assert!(!cpu.state.flag_n);  // not negative
-    assert!(cpu.state.flag_c);   // no borrow (42 >= 42)
+    assert!(!cpu.state.flag_c);  // ARC: C=borrow, no borrow here (42 >= 42)
     assert!(!cpu.state.flag_v);  // no overflow
 }
 
@@ -213,7 +213,7 @@ fn test_sub_u6_underflow() {
     assert_eq!(cpu.state.core_regs[0], 0xFFFFFFFF);
     assert!(!cpu.state.flag_z);
     assert!(cpu.state.flag_n);   // bit 31 set
-    assert!(!cpu.state.flag_c);  // borrow occurred
+    assert!(cpu.state.flag_c);   // ARC: C=borrow, borrow occurred (0 < 1)
 }
 
 #[test]
@@ -227,7 +227,7 @@ fn test_cmp_equal() {
         .run(10);
 
     assert!(cpu.state.flag_z);
-    assert!(cpu.state.flag_c);   // no borrow (5 >= 5)
+    assert!(!cpu.state.flag_c);  // ARC: C=borrow, no borrow (5 >= 5)
     // r0 should be unchanged (CMP doesn't write dst)
     assert_eq!(cpu.state.core_regs[0], 5);
 }
@@ -243,7 +243,7 @@ fn test_cmp_less_than() {
         .run(10);
 
     assert!(!cpu.state.flag_z);
-    assert!(!cpu.state.flag_c);  // borrow (3 < 10)
+    assert!(cpu.state.flag_c);   // ARC: C=borrow, borrow occurred (3 < 10)
     assert!(cpu.state.flag_n);   // result is negative
 }
 
@@ -385,7 +385,7 @@ fn test_zero_overhead_loop() {
     // ADD r0, r0, #1    (loop body, 4 bytes)
     // BRK_S             (at LP_END address)
     let mov_lp_count = alu32(0x0A, 60, 5, 0, 0b01, false); // MOV r60, #5
-    let lp = lp32(8);                                         // LP 8
+    let lp = lp32(4);                                         // LP u6=4 → offset=8 (shifted <<1 for 16-bit alignment)
     let add_r0_1 = alu32(0x00, 0, 1, 0, 0b01, false);       // ADD r0, r0, #1
 
     let cpu = Program::new()

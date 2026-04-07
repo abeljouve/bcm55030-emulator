@@ -14,9 +14,10 @@ const UART_SIZE: u32 = 0x40; // +0x00 through +0x3F
 const PBC_BASE: u32 = 0x010001F0;
 const PBC_SIZE: u32 = 0x50; // +0x00 through +0x4F
 
-/// BCM55030 System Registers (Chip ID, revision, config)
+/// BCM55030 EPON MAC register block (includes Chip ID, revision, EPON regs)
+/// The `reg N` CLI command reads offset N*4 from this base.
 const SYSREG_BASE: u32 = 0x01000000;
-const SYSREG_SIZE: u32 = 0x28; // +0x00 through +0x27
+const SYSREG_SIZE: u32 = 0x1F0; // +0x000 through +0x1EF (up to PBC_BASE)
 
 /// SerDes lane status registers (firmware scans these at startup)
 const SERDES_BASE: u32 = 0x224A0000;
@@ -53,11 +54,16 @@ impl MmioController {
         addr >= SYSREG_BASE && addr < SYSREG_BASE + SYSREG_SIZE
     }
 
-    /// BCM55030 system register reads
+    /// BCM55030 EPON MAC / system register reads.
+    /// The `reg N` CLI command reads at offset N*4 from base 0x01000000.
     fn sysreg_read_word(&self, offset: u32) -> u32 {
         match offset {
-            0x00 => 0x47010203, // CHIP_ID (BCM4701)
-            0x04 => 0xB2110816, // CHIP_REV / bond options
+            0x000 => 0x47010203, // reg 0x00: CHIP_ID (BCM4701)
+            0x004 => 0xB2110816, // reg 0x01: CHIP_REV / bond options
+            0x00C => 0x0114B820, // reg 0x03: LLID_CAPTURE_MASK
+            0x018 => 0x00000006, // reg 0x06: LLID_ACTIVE_BITMAP
+            0x030 => 0x0000FFFF, // reg 0x0C: RX_GRANT_MASK
+            0x1E0 => 0x45504F4E, // reg 0x78: EPON signature ("EPON")
             _ => 0,
         }
     }

@@ -58,16 +58,19 @@ fn compute_alu(op: AluOp, a: u32, b: u32, carry_in: bool) -> (u32, Option<bool>,
             (result, Some(carry), Some(overflow))
         }
         AluOp::Sub | AluOp::Cmp => {
+            // ARC convention: C = borrow (C=1 when A < B unsigned)
             let (result, borrow) = a.overflowing_sub(b);
-            let carry = !borrow;
+            let carry = borrow;
             let overflow = ((a ^ b) & (a ^ result)) >> 31 != 0;
             (result, Some(carry), Some(overflow))
         }
         AluOp::Sbc => {
-            let borrow_in = (!carry_in) as u32;
+            // SBC: A - B - C (subtract with carry/borrow)
+            // ARC convention: C = borrow, so borrow_in = carry_in
+            let borrow_in = carry_in as u32;
             let (r1, b1) = a.overflowing_sub(b);
             let (result, b2) = r1.overflowing_sub(borrow_in);
-            let carry = !(b1 || b2);
+            let carry = b1 || b2;
             let overflow = ((a ^ b) & (a ^ result)) >> 31 != 0;
             (result, Some(carry), Some(overflow))
         }
@@ -91,14 +94,16 @@ fn compute_alu(op: AluOp, a: u32, b: u32, carry_in: bool) -> (u32, Option<bool>,
         }
         AluOp::Mov => (b, None, None),
         AluOp::Rcmp => {
+            // ARC convention: C = borrow
             let (result, borrow) = b.overflowing_sub(a);
-            let carry = !borrow;
+            let carry = borrow;
             let overflow = ((b ^ a) & (b ^ result)) >> 31 != 0;
             (result, Some(carry), Some(overflow))
         }
         AluOp::Rsub => {
+            // ARC convention: C = borrow
             let (result, borrow) = b.overflowing_sub(a);
-            let carry = !borrow;
+            let carry = borrow;
             let overflow = ((b ^ a) & (b ^ result)) >> 31 != 0;
             (result, Some(carry), Some(overflow))
         }
@@ -137,8 +142,9 @@ fn add_shifted(a: u32, b: u32, shift: u32) -> (u32, Option<bool>, Option<bool>) 
 
 fn sub_shifted(a: u32, b: u32, shift: u32) -> (u32, Option<bool>, Option<bool>) {
     let shifted = b << shift;
+    // ARC convention: C = borrow
     let (result, borrow) = a.overflowing_sub(shifted);
-    let carry = !borrow;
+    let carry = borrow;
     let overflow = ((a ^ shifted) & (a ^ result)) >> 31 != 0;
     (result, Some(carry), Some(overflow))
 }

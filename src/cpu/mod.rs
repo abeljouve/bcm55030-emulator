@@ -59,6 +59,19 @@ impl Cpu {
 
         if self.mem.is_harvard() {
             match self.state.pc {
+                // BCM55030 LLID getter intercept: the bootloader reads the LLID
+                // from an FDS-populated structure at 0xF00C. Since FDS is NOP'd,
+                // the structure stays zeroed and the LLID returns 0 instead of 0xFFFF.
+                // This function is called with r0=index (0=LLID/TKID).
+                // On a real unregistered ONU, the default LLID is 0xFFFF.
+                0x0D70 => {
+                    if self.state.core_regs[0] == 0 {
+                        self.state.core_regs[0] = 0xFFFF;
+                        self.state.pc = self.state.core_regs[REG_BLINK as usize];
+                        self.state.instruction_count += 1;
+                        return Ok(());
+                    }
+                }
                 // BCM55030 UART intercept: the bootloader's UART is interrupt-driven
                 // (ring buffer + TX interrupt handler). Since we don't deliver interrupts,
                 // the buffer fills and uart_send_byte_blocking loops forever.

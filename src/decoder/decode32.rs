@@ -423,7 +423,20 @@ fn decode_alu_op(
             // REG_REG: A = B op C
             let c_reg = extract_c_reg(word);
             let a_reg = extract_a_reg(word);
-            let (limm_val, has_limm) = resolve_limm(b_reg, c_reg, pc, 4, mem)?;
+
+            // For MOV/test-only, B is destination-only (not source), so B=62 means
+            // LP_COUNT register, NOT LIMM. Only check C for LIMM in those cases.
+            let (limm_val, has_limm) = if op.is_mov() || op.is_test_only() {
+                let needs = c_reg == 62;
+                if needs {
+                    let limm = mem.fetch_word(pc + 4)?;
+                    (Some(limm), true)
+                } else {
+                    (None, false)
+                }
+            } else {
+                resolve_limm(b_reg, c_reg, pc, 4, mem)?
+            };
             let src1 = resolve_operand(b_reg, limm_val);
             let src2 = resolve_operand(c_reg, limm_val);
             let _dst_unused = if op.is_test_only() {
@@ -534,7 +547,18 @@ fn decode_alu_op(
             if m == 0 {
                 // COND_REG: B = B op C
                 let c_reg = extract_c_reg(word);
-                let (limm_val, has_limm) = resolve_limm(b_reg, c_reg, pc, 4, mem)?;
+                // For MOV/test-only, B is dest-only, B=62 means LP_COUNT not LIMM
+                let (limm_val, has_limm) = if op.is_mov() || op.is_test_only() {
+                    let needs = c_reg == 62;
+                    if needs {
+                        let limm = mem.fetch_word(pc + 4)?;
+                        (Some(limm), true)
+                    } else {
+                        (None, false)
+                    }
+                } else {
+                    resolve_limm(b_reg, c_reg, pc, 4, mem)?
+                };
 
                 let (dst, src1, src2) = if op.is_mov() {
                     (Operand::Reg(b_reg), Operand::None, resolve_operand(c_reg, limm_val))
@@ -917,22 +941,22 @@ fn decode_loop(word: u32, pc: u32) -> Result<DecodedInstruction, Exception> {
 
     let (offset, cc) = match p {
         0b01 => {
-            // U6 immediate offset
+            // U6 immediate offset -> U7 (shifted left by 1 for 16-bit alignment)
             let u6 = extract_u6(word);
-            (u6, None)
+            (u6 << 1, None)
         }
         0b10 => {
-            // S12 immediate offset
+            // S12 immediate offset -> S13 (shifted left by 1 for 16-bit alignment)
             let s12 = extract_s12(word) as u32;
-            (s12, None)
+            (s12 << 1, None)
         }
         0b11 => {
-            // Conditional with U6
+            // Conditional with U6 -> U7 (shifted left by 1 for 16-bit alignment)
             let u6 = extract_u6(word);
             let q = extract_condition_q(word);
             let cc = ConditionCode::from_u8(q)
                 .ok_or(Exception::InstructionError { address: pc })?;
-            (u6, Some(cc))
+            (u6 << 1, Some(cc))
         }
         _ => return Err(Exception::InstructionError { address: pc }),
     };

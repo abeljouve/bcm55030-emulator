@@ -107,15 +107,17 @@ mod tests {
 
     #[test]
     fn test_unsigned_comparisons() {
-        // HI: !C AND !Z
-        assert!(ConditionCode::HI.evaluate(false, false, false, false));
-        assert!(!ConditionCode::HI.evaluate(true, false, false, false)); // Z
-        assert!(!ConditionCode::HI.evaluate(false, false, true, false)); // C
+        // ARC convention: C = borrow for subtraction
+        // After CMP A, B (A - B): C=1 if A < B (borrow), C=0 if A >= B (no borrow)
+        // HI: /C AND /Z (no borrow AND not zero = A > B unsigned)
+        assert!(ConditionCode::HI.evaluate(false, false, false, false)); // C=0, Z=0 (A > B)
+        assert!(!ConditionCode::HI.evaluate(true, false, false, false)); // Z=1 (A == B)
+        assert!(!ConditionCode::HI.evaluate(false, false, true, false)); // C=1 (A < B)
 
-        // LS: C OR Z
-        assert!(ConditionCode::LS.evaluate(true, false, false, false));
-        assert!(ConditionCode::LS.evaluate(false, false, true, false));
-        assert!(!ConditionCode::LS.evaluate(false, false, false, false));
+        // LS: C OR Z (borrow OR zero = A <= B unsigned)
+        assert!(ConditionCode::LS.evaluate(true, false, false, false)); // Z=1 (A == B)
+        assert!(ConditionCode::LS.evaluate(false, false, true, false)); // C=1 (A < B)
+        assert!(!ConditionCode::LS.evaluate(false, false, false, false)); // C=0, Z=0 (A > B)
     }
 
     #[test]
