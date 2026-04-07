@@ -53,6 +53,15 @@ impl Cpu {
             return Ok(());
         }
 
+        // Boot ROM "start app" intercept at ICCM address 0x32000.
+        // The bootloader computes this address (0x31FB4 + 0x4C) and calls JL [r0].
+        // On real hardware, the boot ROM has code here. We intercept and load firmware.
+        if self.mem.is_harvard() && self.state.pc == self.mem.iccm_base + 0x32000 {
+            if self.boot_rom_start_app() {
+                return Ok(());
+            }
+        }
+
         // When sleeping, only tick timers and check interrupts.
         // An interrupt wakes the CPU from SLEEP.
         if self.state.sleeping {
@@ -145,6 +154,124 @@ impl Cpu {
         self.check_interrupts();
 
         Ok(())
+    }
+
+    /// Boot ROM "start app" function: the bootloader has already staged firmware
+    /// code in DCCM (copied from flash). We detect this by checking if DCCM
+    /// contains non-zero data at the app staging area, copy it to ICCM,
+    /// reconfigure memory bases to 0x20000000, and jump to the entry point.
+    /// Returns true if app was loaded, false if not a start_app scenario.
+    fn boot_rom_start_app(&mut self) -> bool {
+        // The bootloader stages firmware in DCCM at offset 0x32000 (copied from flash).
+        // Detect it by matching the first 4 bytes with the firmware IVT signature.
+        let staging: usize = 0x32000;
+        let firmware_signature: [u8; 4] = [0x21, 0x4A, 0x00, 0x00];
+        {
+            let b0 = self.mem.read_byte(self.mem.dccm_base + staging as u32).unwrap_or(0);
+            let b1 = self.mem.read_byte(self.mem.dccm_base + staging as u32 + 1).unwrap_or(0);
+            let b2 = self.mem.read_byte(self.mem.dccm_base + staging as u32 + 2).unwrap_or(0);
+            let b3 = self.mem.read_byte(self.mem.dccm_base + staging as u32 + 3).unwrap_or(0);
+            if [b0, b1, b2, b3] != firmware_signature {
+                return false;
+            }
+        }
+
+        // Determine firmware size by finding it in the SPI flash.
+        // The bootloader copies from flash at offset (staging + 0x27) with a TKF header.
+        // We match the DCCM data signature against known flash locations.
+        let app_size = {
+            let mmio = match self.mem.mmio() {
+                Some(m) => m,
+                None => return false,
+            };
+            let flash = &mmio.pbc.flash.data;
+
+            // Search flash for the firmware signature at known TKF offsets
+            let mut found_size = 0usize;
+            for &header_off in &[0x120000usize, 0x1A0000, 0x270000] {
+                let code_off = header_off + 0x27;
+                if code_off + 4 > flash.len() { continue; }
+                if flash[code_off..code_off + 4] == firmware_signature {
+                    // Detect size: scan for first 256-byte erased block in flash
+                    let max_size = flash.len() - code_off;
+                    let mut size = 0;
+                    while size < max_size {
+                        let block_end = (size + 256).min(max_size);
+                        if flash[code_off + size..code_off + block_end].iter().all(|&b| b == 0xFF) {
+                            break;
+                        }
+                        size += 256;
+                    }
+                    if size > found_size {
+                        found_size = size;
+                    }
+                    break;
+                }
+            }
+            found_size
+        };
+
+        if app_size == 0 {
+            eprintln!("[Boot ROM] Firmware signature found in DCCM but not in flash");
+            return false;
+        }
+
+        eprintln!(
+            "[Boot ROM] Firmware detected in DCCM at 0x{:05X}, {} bytes from flash",
+            staging, app_size
+        );
+
+        // Copy firmware from DCCM staging area to a buffer
+        let mut app_code = vec![0u8; app_size];
+        for i in 0..app_size {
+            app_code[i] = self.mem.read_byte(self.mem.dccm_base + (staging + i) as u32).unwrap_or(0);
+        }
+
+        eprintln!(
+            "[Boot ROM] Loading firmware: DCCM 0x{:05X}, {} bytes (0x{:X})",
+            staging, app_size, app_size
+        );
+
+        // Load firmware into ICCM (overwriting bootloader)
+        self.mem.load_iccm(0, &app_code);
+
+        // If firmware was staged at a non-zero offset, also copy it to DCCM at offset 0
+        if staging != 0 {
+            self.mem.load_binary(0, &app_code);
+        }
+
+        // Fill remaining ICCM with J_S [blink] (0x7EE0)
+        let fill_start = (app_size + 1) & !1;
+        if fill_start < ICCM_SIZE {
+            let mut fill = vec![0u8; ICCM_SIZE - fill_start];
+            for chunk in fill.chunks_exact_mut(2) {
+                chunk[0] = 0x7E;
+                chunk[1] = 0xE0;
+            }
+            self.mem.load_iccm(fill_start as u32, &fill);
+        }
+
+        // Firmware runs with ICCM/DCCM at base 0 (same as bootloader).
+        // The Ghidra base 0x20000000 is just an analysis offset.
+        // The flash binary uses absolute addresses in the 0x00000000 range.
+        self.mem.iccm_base = 0;
+        self.mem.dccm_base = 0;
+
+        // Reset CPU state for firmware
+        self.state = CpuState::new();
+        self.state.core_regs[28] = 0x10800; // SP = top of stack
+        self.state.aux_ienable = 0xFFFFFFFF;
+        self.state.flag_e1 = true;
+        self.state.flag_e2 = true;
+
+        // Jump to firmware entry point (address 0 = first instruction in ICCM)
+        self.state.pc = 0;
+        eprintln!(
+            "[Boot ROM] ICCM/DCCM base=0, firmware {} bytes, entry=0x00000000",
+            app_size
+        );
+
+        true
     }
 
     pub fn run(&mut self, max_steps: u64) -> Result<(), Exception> {

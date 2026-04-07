@@ -22,6 +22,16 @@ pub struct Memory {
     /// Uses RefCell for interior mutability: reads may have side effects
     /// (e.g. UART status register clears on read).
     mmio: Option<RefCell<MmioController>>,
+
+    /// ICCM base address (Harvard mode). Instruction fetch at PC in
+    /// [iccm_base, iccm_base + iccm_size) reads from ICCM.
+    /// Default 0 for bootloader, 0x20000000 for firmware.
+    pub iccm_base: u32,
+
+    /// DCCM base address (Harvard mode). Data access at addr in
+    /// [dccm_base, dccm_base + dccm_size) reads/writes DCCM.
+    /// Default 0 for bootloader, 0x20000000 for firmware.
+    pub dccm_base: u32,
 }
 
 impl Memory {
@@ -31,6 +41,8 @@ impl Memory {
             data: vec![0u8; size],
             iccm: None,
             mmio: None,
+            iccm_base: 0,
+            dccm_base: 0,
         }
     }
 
@@ -40,6 +52,8 @@ impl Memory {
             data: vec![0u8; dccm_size],
             iccm: Some(vec![0u8; iccm_size]),
             mmio: Some(RefCell::new(MmioController::new())),
+            iccm_base: 0,
+            dccm_base: 0,
         }
     }
 
@@ -92,11 +106,23 @@ impl Memory {
 
     // ========== Data reads (DCCM in Harvard, flat otherwise) ==========
 
+    /// Check if an address falls in the DCCM range and return the offset.
+    #[inline]
+    fn dccm_offset(&self, addr: u32) -> Option<usize> {
+        if addr >= self.dccm_base {
+            let off = (addr - self.dccm_base) as usize;
+            if off < self.data.len() {
+                return Some(off);
+            }
+        }
+        None
+    }
+
     pub fn read_byte(&self, addr: u32) -> Result<u8, Exception> {
         if self.iccm.is_some() {
             // Harvard mode: route by address
-            if (addr as usize) < self.data.len() {
-                return Ok(self.data[addr as usize]);
+            if let Some(off) = self.dccm_offset(addr) {
+                return Ok(self.data[off]);
             }
             // MMIO
             if let Some(ref mmio) = self.mmio {
@@ -114,9 +140,10 @@ impl Memory {
             return Err(Exception::MisalignedAccess { address: addr });
         }
         if self.iccm.is_some() {
-            if (addr as usize + 1) < self.data.len() {
-                let a = addr as usize;
-                return Ok(((self.data[a] as u16) << 8) | (self.data[a + 1] as u16));
+            if let Some(off) = self.dccm_offset(addr) {
+                if off + 1 < self.data.len() {
+                    return Ok(((self.data[off] as u16) << 8) | (self.data[off + 1] as u16));
+                }
             }
             if let Some(ref mmio) = self.mmio {
                 return mmio.borrow_mut().read_half(addr);
@@ -133,12 +160,13 @@ impl Memory {
             return Err(Exception::MisalignedAccess { address: addr });
         }
         if self.iccm.is_some() {
-            if (addr as usize + 3) < self.data.len() {
-                let a = addr as usize;
-                return Ok(((self.data[a] as u32) << 24)
-                    | ((self.data[a + 1] as u32) << 16)
-                    | ((self.data[a + 2] as u32) << 8)
-                    | (self.data[a + 3] as u32));
+            if let Some(off) = self.dccm_offset(addr) {
+                if off + 3 < self.data.len() {
+                    return Ok(((self.data[off] as u32) << 24)
+                        | ((self.data[off + 1] as u32) << 16)
+                        | ((self.data[off + 2] as u32) << 8)
+                        | (self.data[off + 3] as u32));
+                }
             }
             if let Some(ref mmio) = self.mmio {
                 return mmio.borrow_mut().read_word(addr);
@@ -157,8 +185,8 @@ impl Memory {
 
     pub fn write_byte(&mut self, addr: u32, val: u8) -> Result<(), Exception> {
         if self.iccm.is_some() {
-            if (addr as usize) < self.data.len() {
-                self.data[addr as usize] = val;
+            if let Some(off) = self.dccm_offset(addr) {
+                self.data[off] = val;
                 return Ok(());
             }
             if let Some(ref mmio) = self.mmio {
@@ -176,11 +204,12 @@ impl Memory {
             return Err(Exception::MisalignedAccess { address: addr });
         }
         if self.iccm.is_some() {
-            if (addr as usize + 1) < self.data.len() {
-                let a = addr as usize;
-                self.data[a] = (val >> 8) as u8;
-                self.data[a + 1] = val as u8;
-                return Ok(());
+            if let Some(off) = self.dccm_offset(addr) {
+                if off + 1 < self.data.len() {
+                    self.data[off] = (val >> 8) as u8;
+                    self.data[off + 1] = val as u8;
+                    return Ok(());
+                }
             }
             if let Some(ref mmio) = self.mmio {
                 return mmio.borrow_mut().write_half(addr, val);
@@ -199,13 +228,14 @@ impl Memory {
             return Err(Exception::MisalignedAccess { address: addr });
         }
         if self.iccm.is_some() {
-            if (addr as usize + 3) < self.data.len() {
-                let a = addr as usize;
-                self.data[a] = (val >> 24) as u8;
-                self.data[a + 1] = (val >> 16) as u8;
-                self.data[a + 2] = (val >> 8) as u8;
-                self.data[a + 3] = val as u8;
-                return Ok(());
+            if let Some(off) = self.dccm_offset(addr) {
+                if off + 3 < self.data.len() {
+                    self.data[off] = (val >> 24) as u8;
+                    self.data[off + 1] = (val >> 16) as u8;
+                    self.data[off + 2] = (val >> 8) as u8;
+                    self.data[off + 3] = val as u8;
+                    return Ok(());
+                }
             }
             if let Some(ref mmio) = self.mmio {
                 mmio.borrow_mut().write_word(addr, val)?;
@@ -252,16 +282,31 @@ impl Memory {
 
     // ========== Instruction fetch (ICCM in Harvard, flat otherwise) ==========
 
+    /// Check if an address falls in the ICCM range and return the offset.
+    #[inline]
+    fn iccm_offset(&self, addr: u32) -> Option<usize> {
+        if let Some(ref iccm) = self.iccm {
+            if addr >= self.iccm_base {
+                let off = (addr - self.iccm_base) as usize;
+                if off < iccm.len() {
+                    return Some(off);
+                }
+            }
+        }
+        None
+    }
+
     pub fn fetch_half(&self, addr: u32) -> Result<u16, Exception> {
         if addr & 1 != 0 {
             return Err(Exception::MisalignedAccess { address: addr });
         }
         if let Some(ref iccm) = self.iccm {
-            let a = addr as usize;
-            if a + 1 >= iccm.len() {
-                return Err(Exception::MemoryError { address: addr, is_write: false });
+            if let Some(a) = self.iccm_offset(addr) {
+                if a + 1 < iccm.len() {
+                    return Ok(((iccm[a] as u16) << 8) | (iccm[a + 1] as u16));
+                }
             }
-            return Ok(((iccm[a] as u16) << 8) | (iccm[a + 1] as u16));
+            return Err(Exception::MemoryError { address: addr, is_write: false });
         }
         self.check_bounds(addr, 2)?;
         let a = addr as usize;
@@ -273,14 +318,15 @@ impl Memory {
             return Err(Exception::MisalignedAccess { address: addr });
         }
         if let Some(ref iccm) = self.iccm {
-            let a = addr as usize;
-            if a + 3 >= iccm.len() {
-                return Err(Exception::MemoryError { address: addr, is_write: false });
+            if let Some(a) = self.iccm_offset(addr) {
+                if a + 3 < iccm.len() {
+                    return Ok(((iccm[a] as u32) << 24)
+                        | ((iccm[a + 1] as u32) << 16)
+                        | ((iccm[a + 2] as u32) << 8)
+                        | (iccm[a + 3] as u32));
+                }
             }
-            return Ok(((iccm[a] as u32) << 24)
-                | ((iccm[a + 1] as u32) << 16)
-                | ((iccm[a + 2] as u32) << 8)
-                | (iccm[a + 3] as u32));
+            return Err(Exception::MemoryError { address: addr, is_write: false });
         }
         self.check_bounds(addr, 4)?;
         let a = addr as usize;
