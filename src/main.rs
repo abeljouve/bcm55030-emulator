@@ -294,8 +294,43 @@ fn main() {
     cpu.state.flag_e1 = true;
     cpu.state.flag_e2 = true;
 
-    // 5. No ICCM patches needed — all FDS and TKF calls work natively after
-    //    the LPcc (conditional zero-overhead loop) fix.
+    // 5. Boot ROM: install IRQ handlers in the IVT
+    // The bootloader's IVT entries for IRQs (0x80-0xFF) contain halt handlers.
+    // The real boot ROM installs proper IRQ dispatchers. We write a small
+    // handler at 0xA800 (in the J_S[blink] fill area) that saves blink,
+    // calls the bootloader's callback dispatcher (0x8C80), restores blink,
+    // and returns via RTIE.
+    {
+        // IRQ handler at 0xA800 (20 bytes):
+        //   st.aw blink,[sp,-4]   = 0x1CFCB7C8
+        //   jl 0x8C80             = 0x20220F80 00008C80
+        //   ld.ab blink,[sp,4]    = 0x1404341F
+        //   rtie                  = 0x246F003F
+        let irq_handler: [u8; 20] = [
+            0x1C, 0xFC, 0xB7, 0xC8, // st.aw blink,[sp,-4]
+            0x20, 0x22, 0x0F, 0x80, // jl (first half)
+            0x00, 0x00, 0x8C, 0x80, // jl 0x8C80 (second half)
+            0x14, 0x04, 0x34, 0x1F, // ld.ab blink,[sp,4]
+            0x24, 0x6F, 0x00, 0x3F, // rtie
+        ];
+        let handler_addr: u32 = 0xA800;
+        cpu.mem.load_iccm(handler_addr, &irq_handler);
+
+        // Install J 0xA800 at all IRQ vector entries (IRQ 0-15 at offsets 0x80-0xF8)
+        // J 0xA800 = 0x20200F80 0000A800
+        let j_handler: [u8; 8] = [
+            0x20, 0x20, 0x0F, 0x80, // j (first half)
+            0x00, 0x00, 0xA8, 0x00, // j 0xA800 (second half)
+        ];
+        for irq in 0..16u32 {
+            let vector_offset = (16 + irq) * 8; // IVT: vectors 16-31 are IRQs
+            cpu.mem.load_iccm(vector_offset, &j_handler);
+        }
+        eprintln!(
+            "[BCM55030] Boot ROM: IRQ handler at 0x{:04X}, IVT vectors 0x80-0xF8 installed",
+            handler_addr
+        );
+    }
 
     // --- Configure and run ---
     cpu.state.pc = cfg.entry_point;

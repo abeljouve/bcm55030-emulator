@@ -59,19 +59,6 @@ impl Cpu {
 
         if self.mem.is_harvard() {
             match self.state.pc {
-                // BCM55030 LLID getter intercept: the bootloader reads the LLID
-                // from an FDS-populated structure at 0xF00C. Since FDS is NOP'd,
-                // the structure stays zeroed and the LLID returns 0 instead of 0xFFFF.
-                // This function is called with r0=index (0=LLID/TKID).
-                // On a real unregistered ONU, the default LLID is 0xFFFF.
-                0x0D70 => {
-                    if self.state.core_regs[0] == 0 {
-                        self.state.core_regs[0] = 0xFFFF;
-                        self.state.pc = self.state.core_regs[REG_BLINK as usize];
-                        self.state.instruction_count += 1;
-                        return Ok(());
-                    }
-                }
                 // BCM55030 UART intercept: the bootloader's UART is interrupt-driven
                 // (ring buffer + TX interrupt handler). Since we don't deliver interrupts,
                 // the buffer fills and uart_send_byte_blocking loops forever.
@@ -82,19 +69,6 @@ impl Cpu {
                     use std::io::Write;
                     let _ = std::io::stdout().lock().write_all(&[ch]);
                     let _ = std::io::stdout().lock().flush();
-                    self.state.pc = self.state.core_regs[REG_BLINK as usize];
-                    self.state.instruction_count += 1;
-                    return Ok(());
-                }
-                // timer1_get_current_value: returns a software timer counter
-                // that is normally incremented by the Timer1 ISR. Since we don't
-                // deliver interrupts yet, simulate by returning instruction_count
-                // divided by a prescaler to approximate real timer tick rate.
-                0x45E4 => {
-                    // Return value based on instruction count (scaled down)
-                    // The bootloader expects ~100 ticks between timer1_set calls
-                    self.state.core_regs[0] =
-                        (self.state.instruction_count / 64) as u32 & 0xFFFF;
                     self.state.pc = self.state.core_regs[REG_BLINK as usize];
                     self.state.instruction_count += 1;
                     return Ok(());
@@ -207,13 +181,29 @@ impl Cpu {
         Ok(())
     }
 
-    /// Advance timers by one tick.
+    /// Advance timers by one tick (called every TIMER_PRESCALER instructions).
     /// ARC 700 timers always count (no start/stop bit).
     /// BCM55030 timer CONTROL: bit 0 = IE (interrupt enable when count reaches limit),
     /// bit 1 = NH (not halted), bit 3 = IP (interrupt pending, write-1-to-clear).
     /// Note: the bootloader writes CONTROL1 = 4 (bit 2), so we treat bit 2 as IE
     /// for BCM55030 compatibility (non-standard).
     fn tick_timers(&mut self) {
+        // BCM55030 EPON MAC free-running timer at SYSREG+0x050.
+        // This is independent of the ARC Timer1 — it's a hardware counter
+        // read by timer1_get_current_value (0x45E4) for delay loops.
+        const HW_TIMER_PRESCALER: u64 = 64;
+        if self.state.instruction_count % HW_TIMER_PRESCALER == 0 {
+            if let Some(mut mmio) = self.mem.mmio() {
+                mmio.timer_counter = mmio.timer_counter.wrapping_add(1);
+            }
+        }
+
+        // ARC timer prescaler: on real BCM55030, the timer clock is slower than the CPU.
+        const TIMER_PRESCALER: u64 = 128;
+        if self.state.instruction_count % TIMER_PRESCALER != 0 {
+            return;
+        }
+
         // Timer 0 (IRQ 3)
         self.state.aux_count0 = self.state.aux_count0.wrapping_add(1);
         if self.state.aux_limit0 != 0 && self.state.aux_count0 >= self.state.aux_limit0 {

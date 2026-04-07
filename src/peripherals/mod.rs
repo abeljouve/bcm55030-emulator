@@ -28,6 +28,10 @@ pub struct MmioController {
     pub uart: SimpleUart,
     pub pbc: PeripheralBusController,
     pub trace: bool,
+    /// BCM55030 EPON MAC timer counter at SYSREG+0x050.
+    /// Read by timer1_get_current_value (0x45E4) as a 16-bit hardware counter.
+    /// Incremented each time Timer1 interrupt fires.
+    pub timer_counter: u16,
 }
 
 impl MmioController {
@@ -36,6 +40,7 @@ impl MmioController {
             uart: SimpleUart::new(),
             pbc: PeripheralBusController::new(),
             trace: false,
+            timer_counter: 0,
         }
     }
 
@@ -63,6 +68,7 @@ impl MmioController {
             0x00C => 0x0114B820, // reg 0x03: LLID_CAPTURE_MASK
             0x018 => 0x00000006, // reg 0x06: LLID_ACTIVE_BITMAP
             0x030 => 0x0000FFFF, // reg 0x0C: RX_GRANT_MASK
+            0x050 => self.timer_counter as u32, // Timer counter (read by timer1_get_current_value)
             0x1E0 => 0x45504F4E, // reg 0x78: EPON signature ("EPON")
             _ => 0,
         }
