@@ -62,6 +62,21 @@ impl Cpu {
             }
         }
 
+        // Boot ROM function intercepts for firmware.
+        // The BCM55030 mask ROM (burned in silicon, not readable) provides functions
+        // called by firmware's startup stub at 0x00-0xD8. The ICCM is filled with
+        // J_S [blink] (0x7EE0) after the app binary, so these addresses already
+        // return immediately. We intercept them explicitly to:
+        // - Document what the real boot ROM does at each address
+        // - Implement the one critical function (0x74B60) that must NOT return
+        if self.state.pc >= 0x4E000 {
+            if self.mem.is_harvard() {
+                if self.boot_rom_intercept() {
+                    return Ok(());
+                }
+            }
+        }
+
         // When sleeping, only tick timers and check interrupts.
         // An interrupt wakes the CPU from SLEEP.
         if self.state.sleeping {
@@ -272,6 +287,86 @@ impl Cpu {
         );
 
         true
+    }
+
+    /// Boot ROM function intercepts for firmware.
+    ///
+    /// The BCM55030 mask ROM provides C runtime and hardware init functions that
+    /// firmware's startup stub calls via JL with LIMM operands. These 4 functions
+    /// were identified by searching the firmware binary for all JL instructions
+    /// targeting addresses >= 0x4E000 (beyond the 319KB firmware code).
+    ///
+    /// On real hardware, these live in the mask ROM burned into silicon.
+    /// The boot ROM is not readable from the data bus (Harvard architecture:
+    /// ICCM = instruction bus only, mem/rf reads the data bus).
+    ///
+    /// Note: the addresses below are the POST-RELOCATION values. The bootloader
+    /// patches the LIMM operands during app loading (flash values differ from
+    /// runtime values, e.g. flash 0x79450 → runtime 0x79190).
+    ///
+    /// Returns true if the PC matched a boot ROM address and was handled.
+    fn boot_rom_intercept(&mut self) -> bool {
+        match self.state.pc {
+            // 0x79190 — boot_rom_hw_init
+            // Called from firmware startup at PC=0x68, before SP/GP are set (all regs = 0).
+            // On real hardware: early hardware initialization (PLL, clocks, pin mux,
+            // SerDes lanes, memory controller). Sets up the chip before the C runtime.
+            // Safe to stub as no-op: the emulator doesn't need PLL/clock configuration.
+            0x79190 => {
+                eprintln!("[Boot ROM] 0x79190: boot_rom_hw_init — early HW init (stub, return to 0x{:05X})",
+                    self.state.core_regs[REG_BLINK as usize]);
+                // Return to caller (blink was set by JL)
+                self.state.pc = self.state.core_regs[REG_BLINK as usize];
+                true
+            }
+
+            // 0x74B60 — boot_rom_crt_main (CRITICAL — must NOT return)
+            // Called from firmware startup at PC=0x90, after SP=0x32000, GP=0x7E500, FP=0.
+            // On real hardware: the boot ROM's C runtime startup function. It:
+            //   1. Copies .data section from flash to DCCM (initialized globals)
+            //   2. Clears the .bss section in DCCM (zero-initialized globals)
+            //   3. Initializes the heap (sbrk base pointer)
+            //   4. Calls the app's main function: firmware_main_loop() at 0x20C
+            // This function NEVER returns; if it did, the startup stub halts (FLAG 1).
+            // We skip .data/.bss init (firmware_main_loop's init functions handle it)
+            // and jump directly to firmware_main_loop.
+            0x74B60 => {
+                eprintln!("[Boot ROM] 0x74B60: boot_rom_crt_main — C runtime init, jumping to firmware_main_loop (0x20C)");
+                self.state.pc = 0x20C; // firmware_main_loop entry point
+                true
+            }
+
+            // 0x78F54 — boot_rom_exception_handler_1
+            // Called from exception wrapper at PC=0xB4 (push blink, JL, pop blink, ret).
+            // On real hardware: handles a specific CPU exception type (likely memory
+            // error or machine check). The wrapper at 0xB4 is a default handler that
+            // the boot ROM installs in the IVT before the app starts.
+            // Firmware replaces exception vectors via hw_auxreg_init_exception_vectors()
+            // with its own handlers at 0x33BD0/0x33BD4 during init, so this handler
+            // is only active during the brief startup period.
+            // Safe to stub as no-op: no exceptions should occur during startup.
+            0x78F54 => {
+                eprintln!("[Boot ROM] 0x78F54: boot_rom_exception_handler_1 (stub, return to 0x{:05X})",
+                    self.state.core_regs[REG_BLINK as usize]);
+                self.state.pc = self.state.core_regs[REG_BLINK as usize];
+                true
+            }
+
+            // 0x78F78 — boot_rom_exception_handler_2
+            // Called from exception wrapper at PC=0xC8 (same pattern as 0xB4).
+            // On real hardware: handles a second CPU exception type (likely privilege
+            // violation or instruction error). Same lifecycle as handler_1 — active
+            // only during startup, replaced by firmware's own handlers at init.
+            // Safe to stub as no-op.
+            0x78F78 => {
+                eprintln!("[Boot ROM] 0x78F78: boot_rom_exception_handler_2 (stub, return to 0x{:05X})",
+                    self.state.core_regs[REG_BLINK as usize]);
+                self.state.pc = self.state.core_regs[REG_BLINK as usize];
+                true
+            }
+
+            _ => false,
+        }
     }
 
     pub fn run(&mut self, max_steps: u64) -> Result<(), Exception> {

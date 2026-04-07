@@ -71,6 +71,20 @@ impl PeripheralBusController {
         }
     }
 
+    /// Reset all PBC state except flash contents.
+    /// Called on CPU reboot — SPI flash is non-volatile but registers are not.
+    pub fn reset_state(&mut self) {
+        self.spi_control = 0;
+        self.spi_config = 0;
+        self.spi_fifo = [0; 2];
+        self.spi_rx = [0; 2];
+        self.dma_ctrl = 0;
+        self.dma_flash_addr = 0;
+        self.dma_data_addr = 0;
+        self.pending_dma.clear();
+        self.pending_flash_writes.clear();
+    }
+
     pub fn read_word(&mut self, offset: u32) -> u32 {
         match offset {
             REG_SPI_CONTROL => self.spi_control,

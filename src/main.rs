@@ -20,6 +20,7 @@ fn usage(prog: &str) {
     eprintln!("  --trace-mmio                Log MMIO accesses to stderr");
     eprintln!("  --break <ADDR>              Stop at address (hex)");
     eprintln!("  --dccm-dump <FILE>          Dump DCCM to file on exit");
+    eprintln!("  --persist-flash             Save modified flash to <flash.bin>.persist on exit");
 }
 
 struct Config {
@@ -30,6 +31,7 @@ struct Config {
     trace_mmio: bool,
     breakpoint: Option<u32>,
     dccm_dump: Option<String>,
+    persist_flash: bool,
 }
 
 fn parse_hex(s: &str) -> Option<u32> {
@@ -49,6 +51,7 @@ fn parse_args() -> Config {
         trace_mmio: false,
         breakpoint: None,
         dccm_dump: None,
+        persist_flash: false,
     };
 
     let mut i = 1;
@@ -97,6 +100,7 @@ fn parse_args() -> Config {
                 }
                 cfg.dccm_dump = Some(args[i].clone());
             }
+            "--persist-flash" => cfg.persist_flash = true,
             "--help" | "-h" => {
                 usage(prog);
                 process::exit(0);
@@ -183,13 +187,24 @@ fn try_read_stdin() -> Option<u8> {
     }
 }
 
-fn run_emulator(
-    cpu: &mut Cpu,
-    cfg: &Config,
-) -> Result<(), bcm55030_emulator::cpu::exception::Exception> {
+/// Result of run_emulator: tells the caller what to do next.
+enum RunResult {
+    /// CPU halted (FLAG 1) — treat as hardware reset, reboot from flash
+    Reboot,
+    /// User requested exit (Ctrl-C) — stop completely
+    UserExit,
+    /// Breakpoint hit — stop for debugging
+    Breakpoint,
+    /// CPU exception — stop with error
+    Exception(bcm55030_emulator::cpu::exception::Exception),
+    /// Max cycles reached
+    MaxCycles,
+}
+
+fn run_emulator(cpu: &mut Cpu, cfg: &Config) -> RunResult {
     for step in 0..cfg.max_cycles {
         if cpu.state.halted {
-            break;
+            return RunResult::Reboot;
         }
 
         // Poll stdin every 1024 steps — feed into UART RX queue
@@ -198,7 +213,7 @@ fn run_emulator(
                 if byte == 3 {
                     eprintln!("\n[BCM55030] Ctrl-C, stopping");
                     cpu.state.halted = true;
-                    return Ok(());
+                    return RunResult::UserExit;
                 }
                 if let Some(mut mmio) = cpu.mem.mmio() {
                     mmio.uart.rx_queue.push_back(byte);
@@ -209,51 +224,22 @@ fn run_emulator(
         if let Some(bp) = cfg.breakpoint {
             if cpu.state.pc == bp {
                 eprintln!("[BREAK] Hit breakpoint at 0x{:08X}", bp);
-                break;
+                return RunResult::Breakpoint;
             }
         }
 
-        cpu.step()?;
+        if let Err(e) = cpu.step() {
+            return RunResult::Exception(e);
+        }
     }
-    Ok(())
+    RunResult::MaxCycles
 }
 
-fn main() {
-    let cfg = parse_args();
-
-    // Read flash image
-    let flash_data = match fs::read(&cfg.flash_path) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("Error reading {}: {}", cfg.flash_path, e);
-            process::exit(1);
-        }
-    };
-
-    eprintln!(
-        "[BCM55030] Flash image: {} ({} bytes)",
-        cfg.flash_path,
-        flash_data.len()
-    );
-
-    // --- Create BCM55030 CPU (always Harvard: ICCM + DCCM + MMIO) ---
-    let mut cpu = Cpu::new_bcm55030();
-
-    // --- Load flash image into SPI flash peripheral ---
-    {
-        let mut mmio = cpu.mem.mmio().expect("BCM55030 must have MMIO");
-        let flash_size = mmio.pbc.flash.data.len();
-        let copy_len = flash_data.len().min(flash_size);
-        mmio.pbc.flash.data[..copy_len].copy_from_slice(&flash_data[..copy_len]);
-        eprintln!("[BCM55030] SPI flash: {} bytes loaded", copy_len);
-    }
-
-    // --- Boot ROM emulation ---
-    // The on-chip mask ROM reads the bootloader from SPI flash and copies
-    // it into ICCM (code) and DCCM (data/literal pools), then jumps to
-    // the entry point.
-
-    // 1. Detect bootloader size in flash (scan for first erased block)
+/// Boot ROM emulation: load bootloader from SPI flash into ICCM/DCCM,
+/// fill unused ICCM with J_S [blink] stubs, install IRQ vectors,
+/// and configure initial CPU state.
+fn boot_from_flash(cpu: &mut Cpu, entry_point: u32) {
+    // 1. Detect bootloader size in flash
     let boot_size = {
         let mmio = cpu.mem.mmio().unwrap();
         detect_bootloader_size(&mmio.pbc.flash.data)
@@ -262,7 +248,6 @@ fn main() {
 
     // 2. Copy bootloader from flash to ICCM and DCCM
     {
-        // Copy from flash data to a local buffer first to avoid borrow conflict
         let code = {
             let mmio = cpu.mem.mmio().unwrap();
             mmio.pbc.flash.data[..boot_size].to_vec()
@@ -272,10 +257,8 @@ fn main() {
     }
 
     // 3. Fill remaining ICCM with J_S [blink] (0x7EE0)
-    // Any call beyond the bootloader returns immediately — emulates
-    // boot ROM helper stubs that exist only in the mask ROM.
     {
-        let fill_start = (boot_size + 1) & !1; // 16-bit aligned
+        let fill_start = (boot_size + 1) & !1;
         if fill_start < ICCM_SIZE {
             let mut fill = vec![0u8; ICCM_SIZE - fill_start];
             for chunk in fill.chunks_exact_mut(2) {
@@ -292,16 +275,11 @@ fn main() {
 
     // 4. Boot ROM initial state
     cpu.state.core_regs[28] = 0x10800; // SP = top of DCCM stack area
-    cpu.state.aux_ienable = 0xFFFFFFFF; // All IRQs enabled
+    cpu.state.aux_ienable = 0xFFFFFFFF;
     cpu.state.flag_e1 = true;
     cpu.state.flag_e2 = true;
 
-    // 5. Boot ROM: install IRQ handlers in the IVT
-    // The bootloader's IVT entries for IRQs (0x80-0xFF) contain halt handlers.
-    // The real boot ROM installs proper IRQ dispatchers. We write a small
-    // handler at 0xA800 (in the J_S[blink] fill area) that saves blink,
-    // calls the bootloader's callback dispatcher (0x8C80), restores blink,
-    // and returns via RTIE.
+    // 5. Install IRQ handlers in the IVT
     {
         // IRQ handler at 0xA800 (20 bytes):
         //   st.aw blink,[sp,-4]   = 0x1CFCB7C8
@@ -309,23 +287,22 @@ fn main() {
         //   ld.ab blink,[sp,4]    = 0x1404341F
         //   rtie                  = 0x246F003F
         let irq_handler: [u8; 20] = [
-            0x1C, 0xFC, 0xB7, 0xC8, // st.aw blink,[sp,-4]
-            0x20, 0x22, 0x0F, 0x80, // jl (first half)
-            0x00, 0x00, 0x8C, 0x80, // jl 0x8C80 (second half)
-            0x14, 0x04, 0x34, 0x1F, // ld.ab blink,[sp,4]
-            0x24, 0x6F, 0x00, 0x3F, // rtie
+            0x1C, 0xFC, 0xB7, 0xC8,
+            0x20, 0x22, 0x0F, 0x80,
+            0x00, 0x00, 0x8C, 0x80,
+            0x14, 0x04, 0x34, 0x1F,
+            0x24, 0x6F, 0x00, 0x3F,
         ];
         let handler_addr: u32 = 0xA800;
         cpu.mem.load_iccm(handler_addr, &irq_handler);
 
         // Install J 0xA800 at all IRQ vector entries (IRQ 0-15 at offsets 0x80-0xF8)
-        // J 0xA800 = 0x20200F80 0000A800
         let j_handler: [u8; 8] = [
-            0x20, 0x20, 0x0F, 0x80, // j (first half)
-            0x00, 0x00, 0xA8, 0x00, // j 0xA800 (second half)
+            0x20, 0x20, 0x0F, 0x80,
+            0x00, 0x00, 0xA8, 0x00,
         ];
         for irq in 0..16u32 {
-            let vector_offset = (16 + irq) * 8; // IVT: vectors 16-31 are IRQs
+            let vector_offset = (16 + irq) * 8;
             cpu.mem.load_iccm(vector_offset, &j_handler);
         }
         eprintln!(
@@ -333,14 +310,12 @@ fn main() {
             handler_addr
         );
 
-        // UART IRQ 5 (level 1): point IVT vector directly to the bootloader's
-        // native UART ISR at 0x4348. The ISR saves/restores its own registers
-        // (r0-r3, r13-r14) and ends with J.F [ILINK1] (level 1 RTIE).
+        // UART IRQ 5 (level 1): direct to bootloader's native UART ISR at 0x4348
         let j_uart_isr: [u8; 8] = [
-            0x20, 0x20, 0x0F, 0x80, // j (first half)
-            0x00, 0x00, 0x43, 0x48, // j 0x4348 (LIMM)
+            0x20, 0x20, 0x0F, 0x80,
+            0x00, 0x00, 0x43, 0x48,
         ];
-        let uart_vector = (16 + 5) * 8; // IRQ 5 → vector 21
+        let uart_vector = (16 + 5) * 8;
         cpu.mem.load_iccm(uart_vector, &j_uart_isr);
         eprintln!(
             "[BCM55030] Boot ROM: UART ISR at 0x4348, vector 0x{:02X} (IRQ 5, level 1)",
@@ -348,10 +323,91 @@ fn main() {
         );
     }
 
-    // --- Configure and run ---
-    cpu.state.pc = cfg.entry_point;
-    cpu.trace = cfg.trace;
+    // 6. Set entry point
+    cpu.state.pc = entry_point;
+    eprintln!(
+        "[BCM55030] Entry: 0x{:08X}, ICCM=512KB, DCCM=512KB",
+        entry_point
+    );
+}
 
+/// Reset the CPU and DCCM for a fresh boot, preserving SPI flash state.
+/// This emulates a hardware reset: all volatile state (registers, DCCM)
+/// is cleared, but the SPI flash retains its contents.
+fn reset_cpu_for_reboot(cpu: &mut Cpu) {
+    use bcm55030_emulator::cpu::registers::CpuState;
+
+    // Reset CPU state (all registers, flags, aux regs)
+    cpu.state = CpuState::new();
+
+    // Clear DCCM (volatile RAM)
+    let dccm_size = cpu.mem.dccm_size();
+    let zeros = vec![0u8; dccm_size];
+    cpu.mem.load_binary(0, &zeros);
+
+    // Reset peripheral state but NOT flash data (non-volatile)
+    if let Some(mut mmio) = cpu.mem.mmio() {
+        mmio.uart.rx_queue.clear();
+        mmio.pbc.reset_state();
+    }
+}
+
+fn main() {
+    let cfg = parse_args();
+
+    // Read flash image (or persisted version if available)
+    let persist_path = format!("{}.persist", cfg.flash_path);
+    let (flash_data, using_persisted) = if cfg.persist_flash {
+        match fs::read(&persist_path) {
+            Ok(b) => {
+                eprintln!("[BCM55030] Loading persisted flash: {}", persist_path);
+                (b, true)
+            }
+            Err(_) => {
+                let data = match fs::read(&cfg.flash_path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("Error reading {}: {}", cfg.flash_path, e);
+                        process::exit(1);
+                    }
+                };
+                (data, false)
+            }
+        }
+    } else {
+        let data = match fs::read(&cfg.flash_path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Error reading {}: {}", cfg.flash_path, e);
+                process::exit(1);
+            }
+        };
+        (data, false)
+    };
+
+    eprintln!(
+        "[BCM55030] Flash image: {} ({} bytes{})",
+        cfg.flash_path,
+        flash_data.len(),
+        if using_persisted { ", persisted state" } else { "" }
+    );
+
+    // --- Create BCM55030 CPU ---
+    let mut cpu = Cpu::new_bcm55030();
+
+    // --- Load flash image into SPI flash peripheral ---
+    {
+        let mut mmio = cpu.mem.mmio().expect("BCM55030 must have MMIO");
+        let flash_size = mmio.pbc.flash.data.len();
+        let copy_len = flash_data.len().min(flash_size);
+        mmio.pbc.flash.data[..copy_len].copy_from_slice(&flash_data[..copy_len]);
+        eprintln!("[BCM55030] SPI flash: {} bytes loaded", copy_len);
+    }
+
+    // --- Initial boot from flash ---
+    boot_from_flash(&mut cpu, cfg.entry_point);
+
+    cpu.trace = cfg.trace;
     if cfg.trace_mmio {
         if let Some(mut mmio) = cpu.mem.mmio() {
             mmio.trace = true;
@@ -359,20 +415,57 @@ fn main() {
         }
     }
 
-    eprintln!(
-        "[BCM55030] Entry: 0x{:08X}, ICCM=512KB, DCCM=512KB",
-        cfg.entry_point
-    );
-
     let orig_termios = setup_raw_terminal();
 
-    let run_result = run_emulator(&mut cpu, &cfg);
+    // --- Main execution loop with reboot support ---
+    // On real BCM55030 hardware, FLAG 1 (halt) triggers a chip reset which
+    // reboots from SPI flash. The flash is non-volatile and retains any
+    // modifications made during the previous boot cycle. This is critical
+    // for the bootloader's recovery mechanism: first boot writes FDS flags
+    // to flash, resets, and the second boot reads the updated flags.
+    const MAX_REBOOTS: u32 = 5;
+    let mut reboot_count: u32 = 0;
+    let final_result;
+
+    loop {
+        let result = run_emulator(&mut cpu, &cfg);
+        match result {
+            RunResult::Reboot => {
+                reboot_count += 1;
+                if reboot_count > MAX_REBOOTS {
+                    eprintln!("[BCM55030] Max reboots ({}) reached, stopping", MAX_REBOOTS);
+                    final_result = result;
+                    break;
+                }
+                eprintln!(
+                    "\n[BCM55030] === REBOOT #{} (FLAG 1 = hardware reset) ===\n",
+                    reboot_count
+                );
+                // Reset CPU and DCCM, keep flash state
+                reset_cpu_for_reboot(&mut cpu);
+                // Re-run boot ROM sequence from (possibly modified) flash
+                boot_from_flash(&mut cpu, cfg.entry_point);
+                cpu.trace = cfg.trace;
+                if cfg.trace_mmio {
+                    if let Some(mut mmio) = cpu.mem.mmio() {
+                        mmio.trace = true;
+                        mmio.pbc.trace = true;
+                    }
+                }
+                // Continue execution loop
+            }
+            _ => {
+                final_result = result;
+                break;
+            }
+        }
+    }
 
     if let Some(ref orig) = orig_termios {
         restore_terminal(orig);
     }
 
-    if let Err(e) = run_result {
+    if let RunResult::Exception(ref e) = final_result {
         eprintln!("Exception at PC=0x{:08X}: {:?}", cpu.state.pc, e);
     }
 
@@ -411,6 +504,7 @@ fn main() {
     if cpu.state.sleeping {
         eprintln!("CPU: SLEEPING");
     }
+    eprintln!("Reboots: {}", reboot_count);
 
     // DCCM dump
     if let Some(ref path) = cfg.dccm_dump {
@@ -422,6 +516,20 @@ fn main() {
         }
         if let Err(e) = fs::write(path, &buf) {
             eprintln!("Error writing DCCM dump: {}", e);
+        }
+    }
+
+    // Persist flash if requested and modified
+    if cfg.persist_flash {
+        let is_dirty = cpu.mem.mmio().map_or(false, |mmio| mmio.pbc.flash.dirty);
+        if is_dirty {
+            let flash_data: Vec<u8> = cpu.mem.mmio().unwrap().pbc.flash.data.clone();
+            match fs::write(&persist_path, &flash_data) {
+                Ok(_) => eprintln!("[BCM55030] Flash persisted to {} ({} bytes)", persist_path, flash_data.len()),
+                Err(e) => eprintln!("Error persisting flash: {}", e),
+            }
+        } else {
+            eprintln!("[BCM55030] Flash not modified, nothing to persist");
         }
     }
 }

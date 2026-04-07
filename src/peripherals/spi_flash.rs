@@ -31,6 +31,9 @@ const DEVICE_ID: u8 = 0x15;
 pub struct SpiFlash {
     pub data: Vec<u8>,
     status: u8,
+    /// Set when flash contents are modified (PP, SE, BE, CE, DMA write).
+    /// Used to decide whether to persist flash to disk on exit.
+    pub dirty: bool,
 }
 
 impl SpiFlash {
@@ -38,6 +41,7 @@ impl SpiFlash {
         Self {
             data: vec![0xFF; FLASH_SIZE],
             status: 0x00, // not busy, write disabled
+            dirty: false,
         }
     }
 
@@ -109,47 +113,49 @@ impl SpiFlash {
             CMD_PP => {
                 if self.status & SR_WEL != 0 && tx.len() >= 4 {
                     let addr = Self::extract_addr(tx);
-                    // Page program: can only change 1→0 within a 256-byte page
                     for i in 4..tx.len() {
                         let flash_addr = (addr as usize + (i - 4)) % FLASH_SIZE;
-                        self.data[flash_addr] &= tx[i]; // can only clear bits
+                        self.data[flash_addr] &= tx[i];
                     }
+                    self.dirty = true;
                 }
                 self.status &= !SR_WEL;
             }
             CMD_SE => {
                 if self.status & SR_WEL != 0 && tx.len() >= 4 {
                     let addr = Self::extract_addr(tx) as usize;
-                    let sector_base = addr & !0xFFF; // 4KB aligned
+                    let sector_base = addr & !0xFFF;
                     let end = (sector_base + 4096).min(FLASH_SIZE);
                     self.data[sector_base..end].fill(0xFF);
+                    self.dirty = true;
                 }
                 self.status &= !SR_WEL;
             }
             CMD_BE => {
                 if self.status & SR_WEL != 0 && tx.len() >= 4 {
                     let addr = Self::extract_addr(tx) as usize;
-                    let block_base = addr & !0xFFFF; // 64KB aligned
+                    let block_base = addr & !0xFFFF;
                     let end = (block_base + 65536).min(FLASH_SIZE);
                     self.data[block_base..end].fill(0xFF);
+                    self.dirty = true;
                 }
                 self.status &= !SR_WEL;
             }
             CMD_CE => {
                 if self.status & SR_WEL != 0 {
                     self.data.fill(0xFF);
+                    self.dirty = true;
                 }
                 self.status &= !SR_WEL;
             }
             CMD_CP => {
-                // Continuously Program mode — handled at higher level
-                // For FIFO, treat as page program with 2-byte data
                 if self.status & SR_WEL != 0 && tx.len() >= 4 {
                     let addr = Self::extract_addr(tx);
                     for i in 4..tx.len() {
                         let flash_addr = (addr as usize + (i - 4)) % FLASH_SIZE;
                         self.data[flash_addr] &= tx[i];
                     }
+                    self.dirty = true;
                 }
             }
             _ => {
@@ -176,10 +182,10 @@ impl SpiFlash {
         let start = (addr as usize) % FLASH_SIZE;
         for (i, &byte) in data.iter().enumerate() {
             let flash_addr = (start + i) % FLASH_SIZE;
-            self.data[flash_addr] &= byte; // page program: can only clear bits
+            self.data[flash_addr] &= byte;
         }
-        // Clear WEL after write completes (per SPI NOR flash spec)
         self.status &= !SR_WEL;
+        self.dirty = true;
     }
 
     fn extract_addr(tx: &[u8]) -> u32 {
