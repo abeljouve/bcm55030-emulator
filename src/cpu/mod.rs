@@ -2,8 +2,6 @@ pub mod condition;
 pub mod exception;
 pub mod registers;
 
-use std::collections::VecDeque;
-
 use exception::Exception;
 use registers::{CpuState, DelayState, REG_BLINK, REG_ILINK1, REG_ILINK2, REG_LP_COUNT};
 
@@ -11,13 +9,16 @@ use crate::decoder;
 use crate::executor;
 use crate::memory::{Memory, DCCM_SIZE, ICCM_SIZE};
 
+/// UART interrupt number (IRQ 5, level 1 per aux_irq_lev = 0xD7 bit 5 = 0).
+/// The bootloader's UART ISR at 0x4348 ends with J.F [ILINK1] (level 1 RTIE),
+/// so the UART IRQ must be level 1.
+const UART_IRQ: u32 = 5;
+
 pub struct Cpu {
     pub state: CpuState,
     pub mem: Memory,
     /// Log every instruction to stderr
     pub trace: bool,
-    /// Pending RX characters from stdin (for UART RX intercept)
-    pub rx_queue: VecDeque<u8>,
 }
 
 impl Cpu {
@@ -27,7 +28,6 @@ impl Cpu {
             state: CpuState::new(),
             mem: Memory::new(mem_size),
             trace: false,
-            rx_queue: VecDeque::new(),
         }
     }
 
@@ -37,7 +37,6 @@ impl Cpu {
             state: CpuState::new(),
             mem: Memory::new_harvard(ICCM_SIZE, DCCM_SIZE),
             trace: false,
-            rx_queue: VecDeque::new(),
         }
     }
 
@@ -50,54 +49,12 @@ impl Cpu {
         // An interrupt wakes the CPU from SLEEP.
         if self.state.sleeping {
             self.tick_timers();
+            self.check_uart_irq();
             if self.check_interrupts() {
                 self.state.sleeping = false;
                 // PC was set to interrupt vector by check_interrupts
             }
             return Ok(());
-        }
-
-        if self.mem.is_harvard() {
-            match self.state.pc {
-                // BCM55030 UART intercept: the bootloader's UART is interrupt-driven
-                // (ring buffer + TX interrupt handler). Since we don't deliver interrupts,
-                // the buffer fills and uart_send_byte_blocking loops forever.
-                // Intercept: write character directly to stdout and return immediately.
-                0x42F4 => {
-                    // uart_send_byte_blocking(char): r0 = character, blink = return addr
-                    let ch = self.state.core_regs[0] as u8;
-                    use std::io::Write;
-                    let _ = std::io::stdout().lock().write_all(&[ch]);
-                    let _ = std::io::stdout().lock().flush();
-                    self.state.pc = self.state.core_regs[REG_BLINK as usize];
-                    self.state.instruction_count += 1;
-                    return Ok(());
-                }
-                // uart_tx_putchar: puts a character in the TX ring buffer.
-                // Since the TX ISR doesn't run (no interrupts), we output
-                // directly to stdout. Returns 0 in r0 (success).
-                0x427C => {
-                    let ch = self.state.core_regs[0] as u8;
-                    use std::io::Write;
-                    let _ = std::io::stdout().lock().write_all(&[ch]);
-                    let _ = std::io::stdout().lock().flush();
-                    self.state.core_regs[0] = 0;
-                    self.state.pc = self.state.core_regs[REG_BLINK as usize];
-                    self.state.instruction_count += 1;
-                    return Ok(());
-                }
-                // uart_rx_getchar: reads from UART RX ring buffer.
-                // Intercept to return characters from stdin queue.
-                // Returns: r0 = character byte, or 0 if no data available.
-                0x4218 => {
-                    let ch = self.rx_queue.pop_front().unwrap_or(0);
-                    self.state.core_regs[0] = ch as u32;
-                    self.state.pc = self.state.core_regs[REG_BLINK as usize];
-                    self.state.instruction_count += 1;
-                    return Ok(());
-                }
-                _ => {}
-            }
         }
 
         // Save and clear delay state
@@ -165,6 +122,9 @@ impl Cpu {
         // Timer tick (simple: increment once per instruction)
         self.tick_timers();
 
+        // UART peripheral IRQ
+        self.check_uart_irq();
+
         // Check for pending interrupts
         self.check_interrupts();
 
@@ -227,6 +187,18 @@ impl Cpu {
             if self.state.aux_control1 & 0x02 == 0 {
                 self.state.aux_count1 = 0;
             }
+        }
+    }
+
+    /// Set UART IRQ pending bit if the UART peripheral needs service.
+    fn check_uart_irq(&mut self) {
+        let pending = if let Some(mmio) = self.mem.mmio() {
+            mmio.uart.irq_pending()
+        } else {
+            false
+        };
+        if pending {
+            self.state.aux_irq_pending |= 1 << UART_IRQ;
         }
     }
 

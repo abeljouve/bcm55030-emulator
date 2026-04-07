@@ -192,7 +192,7 @@ fn run_emulator(
             break;
         }
 
-        // Poll stdin every 1024 steps
+        // Poll stdin every 1024 steps — feed into UART RX queue
         if step % 1024 == 0 {
             while let Some(byte) = try_read_stdin() {
                 if byte == 3 {
@@ -200,7 +200,9 @@ fn run_emulator(
                     cpu.state.halted = true;
                     return Ok(());
                 }
-                cpu.rx_queue.push_back(byte);
+                if let Some(mut mmio) = cpu.mem.mmio() {
+                    mmio.uart.rx_queue.push_back(byte);
+                }
             }
         }
 
@@ -329,6 +331,20 @@ fn main() {
         eprintln!(
             "[BCM55030] Boot ROM: IRQ handler at 0x{:04X}, IVT vectors 0x80-0xF8 installed",
             handler_addr
+        );
+
+        // UART IRQ 5 (level 1): point IVT vector directly to the bootloader's
+        // native UART ISR at 0x4348. The ISR saves/restores its own registers
+        // (r0-r3, r13-r14) and ends with J.F [ILINK1] (level 1 RTIE).
+        let j_uart_isr: [u8; 8] = [
+            0x20, 0x20, 0x0F, 0x80, // j (first half)
+            0x00, 0x00, 0x43, 0x48, // j 0x4348 (LIMM)
+        ];
+        let uart_vector = (16 + 5) * 8; // IRQ 5 → vector 21
+        cpu.mem.load_iccm(uart_vector, &j_uart_isr);
+        eprintln!(
+            "[BCM55030] Boot ROM: UART ISR at 0x4348, vector 0x{:02X} (IRQ 5, level 1)",
+            uart_vector
         );
     }
 

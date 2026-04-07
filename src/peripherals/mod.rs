@@ -6,9 +6,10 @@ use crate::cpu::exception::Exception;
 use uart::SimpleUart;
 use pbc::PeripheralBusController;
 
-/// UART base address in the SoC MMIO space
-const UART_BASE: u32 = 0x00FC1014;
-const UART_SIZE: u32 = 0x40; // +0x00 through +0x3F
+/// UART base address in the SoC MMIO space.
+/// Hardware base pointer is 0x00FC0FE8; data register at +0x28, IER at +0x2C.
+const UART_BASE: u32 = 0x00FC1010;
+const UART_SIZE: u32 = 0x10; // +0x00 through +0x0F (data, IER, baud_lo, baud_hi)
 
 /// Peripheral Bus Controller (SPI + MDIO) base address
 const PBC_BASE: u32 = 0x010001F0;
