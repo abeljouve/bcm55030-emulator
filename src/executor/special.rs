@@ -59,6 +59,11 @@ pub fn execute_loop(
 ) -> Result<(), Exception> {
     if let Some(cc) = cc {
         if !cc.evaluate(state.flag_z, state.flag_n, state.flag_c, state.flag_v) {
+            // Condition not met: skip the loop body by jumping to lp_end.
+            // ARC 700 ISA: "If the condition is not satisfied, no loop is
+            // set up and a branch is made to the target of the LP instruction"
+            state.pc = decoded.pc.wrapping_add(offset);
+            state.pc_written = true;
             return Ok(());
         }
     }

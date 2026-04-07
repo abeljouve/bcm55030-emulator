@@ -294,24 +294,8 @@ fn main() {
     cpu.state.flag_e1 = true;
     cpu.state.flag_e2 = true;
 
-    // 5. Patch ICCM: NOP out calls that cause issues
-    // - fds_init (0x03D4): causes stack corruption via memcpy at 0x6D44 overwriting
-    //   saved r13 at 0x1079C during FDS sector scanning. The other 6 FDS calls
-    //   (register_bank ×3, scan_banks, init_banks, read_records) work correctly.
-    // - TKF app validation (0x03E6, 0x03EA): tries to load firmware apps from flash.
-    //   Without a valid app, the return chain corrupts r31→0 causing a reset loop.
-    {
-        let nop4: [u8; 4] = [0x78, 0xE0, 0x78, 0xE0]; // 2x NOP_S
-        let patches: &[(u32, &str)] = &[
-            (0x03D4, "fds_init (stack corruption via memcpy at 0x6D44)"),
-            (0x03E6, "tkf_try_load_app (jumps to 0x0000 without valid app)"),
-            (0x03EA, "tkf_wait_retry_load"),
-        ];
-        for &(addr, name) in patches {
-            cpu.mem.load_iccm(addr, &nop4);
-            eprintln!("[BCM55030] Patched: 0x{:04X} {} -> NOP", addr, name);
-        }
-    }
+    // 5. No ICCM patches needed — all FDS and TKF calls work natively after
+    //    the LPcc (conditional zero-overhead loop) fix.
 
     // --- Configure and run ---
     cpu.state.pc = cfg.entry_point;
