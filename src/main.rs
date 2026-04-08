@@ -32,6 +32,7 @@ struct Config {
     breakpoint: Option<u32>,
     dccm_dump: Option<String>,
     persist_flash: bool,
+    watch_dccm: Option<u32>,
 }
 
 fn parse_hex(s: &str) -> Option<u32> {
@@ -52,6 +53,7 @@ fn parse_args() -> Config {
         breakpoint: None,
         dccm_dump: None,
         persist_flash: false,
+        watch_dccm: None,
     };
 
     let mut i = 1;
@@ -101,6 +103,17 @@ fn parse_args() -> Config {
                 cfg.dccm_dump = Some(args[i].clone());
             }
             "--persist-flash" => cfg.persist_flash = true,
+            "--watch-dccm" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --watch-dccm requires an address");
+                    process::exit(1);
+                }
+                cfg.watch_dccm = Some(parse_hex(&args[i]).unwrap_or_else(|| {
+                    eprintln!("Error: invalid hex address: {}", args[i]);
+                    process::exit(1);
+                }));
+            }
             "--help" | "-h" => {
                 usage(prog);
                 process::exit(0);
@@ -411,6 +424,7 @@ fn main() {
     boot_from_flash(&mut cpu, cfg.entry_point);
 
     cpu.trace = cfg.trace;
+    cpu.mem.dccm_watchpoint = cfg.watch_dccm;
     if cfg.trace_mmio {
         if let Some(mut mmio) = cpu.mem.mmio() {
             mmio.trace = true;

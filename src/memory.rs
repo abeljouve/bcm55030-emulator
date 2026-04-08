@@ -57,6 +57,10 @@ pub struct Memory {
     /// Set to app_size after firmware binary is loaded. 0 = protection disabled.
     firmware_code_protect_end: usize,
 
+    /// DCCM write watchpoint address (temporary diagnostic).
+    /// When set, logs the first write to this word-aligned address with full context.
+    pub dccm_watchpoint: Option<u32>,
+
     /// COW tracking for the firmware code section.
     /// On ARC 700 with overlapping ICCM/DCCM, data reads go to DCCM while
     /// instruction fetch goes to ICCM. Both are initialized with the same binary.
@@ -84,6 +88,7 @@ impl Memory {
             dccm_base: 0,
             app_size: None,
             firmware_code_protect_end: 0,
+            dccm_watchpoint: None,
             code_section_written: HashSet::new(),
         }
     }
@@ -98,7 +103,26 @@ impl Memory {
             dccm_base: 0,
             app_size: None,
             firmware_code_protect_end: 0,
+            dccm_watchpoint: None,
             code_section_written: HashSet::new(),
+        }
+    }
+
+    /// Check DCCM write watchpoint. Logs writes that overlap with the watched word.
+    fn check_watchpoint(&self, off: usize, size: usize) {
+        if let Some(wp) = self.dccm_watchpoint {
+            let wp_off = wp as usize;
+            if off < wp_off + 4 && off + size > wp_off {
+                let old = if wp_off + 3 < self.data.len() {
+                    ((self.data[wp_off] as u32) << 24) | ((self.data[wp_off+1] as u32) << 16)
+                    | ((self.data[wp_off+2] as u32) << 8) | (self.data[wp_off+3] as u32)
+                } else { 0 };
+                let pc = self.mmio.as_ref().map(|m| m.borrow().current_pc).unwrap_or(0);
+                eprintln!(
+                    "[WATCHPOINT] DCCM 0x{:05X} ({}B) hits watch 0x{:05X}, old=0x{:08X}, PC=0x{:05X}",
+                    off, size, wp_off, old, pc
+                );
+            }
         }
     }
 
@@ -275,9 +299,13 @@ impl Memory {
     pub fn write_byte(&mut self, addr: u32, val: u8) -> Result<(), Exception> {
         if self.iccm.is_some() {
             if let Some(off) = self.dccm_offset(addr) {
-                if off < self.firmware_code_protect_end {
-                    self.code_section_written.insert(off & !3);
-                }
+                self.check_watchpoint(off, 1);
+                // NOTE: byte writes do NOT mark the word as dirty in the COW set.
+                // This is critical: epon_counter_table_reset_all and similar functions
+                // write bytes to counter entries that physically overlap with PCL-relative
+                // literal pools. By not marking dirty, word reads (used by LD [PCL,offset])
+                // return the pristine ICCM value, while byte reads (used by counter code)
+                // return the DCCM value. This solves the literal pool corruption at 0xE1E0.
                 self.data[off] = val;
                 return Ok(());
             }
@@ -299,6 +327,7 @@ impl Memory {
             // handler fixes up the access. We emulate this directly.
             if let Some(off) = self.dccm_offset(addr) {
                 if off + 1 < self.data.len() {
+                    self.check_watchpoint(off, 2);
                     // Protect firmware code section: suppress zero-writes to non-zero halfwords.
                     // This preserves PCL-relative literal pool constants that overlap
                     // with event counter table entries.
@@ -341,6 +370,7 @@ impl Memory {
                 // Misaligned DCCM writes: perform byte-wise fixup
                 if let Some(off) = self.dccm_offset(addr) {
                     if off + 3 < self.data.len() {
+                        self.check_watchpoint(off, 4);
                         if off < self.firmware_code_protect_end {
                             self.code_section_written.insert(off & !3);
                         }
@@ -355,6 +385,7 @@ impl Memory {
             }
             if let Some(off) = self.dccm_offset(addr) {
                 if off + 3 < self.data.len() {
+                    self.check_watchpoint(off, 4);
                     if off < self.firmware_code_protect_end {
                         self.code_section_written.insert(off & !3);
                     }
