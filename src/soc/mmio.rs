@@ -11,10 +11,12 @@ const UART_SIZE: u32 = 0x10; // +0x00 through +0x0F (data, IER, baud_lo, baud_hi
 const PBC_BASE: u32 = 0x010001F0;
 const PBC_SIZE: u32 = 0x50; // +0x00 through +0x4F
 
-/// BCM55030 EPON MAC register block (includes Chip ID, revision, EPON regs)
-/// The `reg N` CLI command reads offset N*4 from this base.
+/// BCM55030 EPON MAC / SoC register block.
+/// Covers all MMIO registers from CHIP_ID through Channel Config Register.
+/// Resolved from 85 hwregs base pointers: the full MMIO space spans
+/// 0x01000000 to 0x010037B4. We round up to 0x3800.
 const SYSREG_BASE: u32 = 0x01000000;
-const SYSREG_SIZE: u32 = 0x1F0; // +0x000 through +0x1EF (up to PBC_BASE)
+const SYSREG_SIZE: u32 = 0x3800;
 
 /// SerDes lane status registers (firmware scans these at startup)
 const SERDES_BASE: u32 = 0x224A0000;
@@ -29,14 +31,15 @@ pub struct MmioController {
     /// Read by timer1_get_current_value (0x45E4) as a 16-bit hardware counter.
     /// Incremented each time Timer1 interrupt fires.
     pub timer_counter: u16,
-    /// BCM55030 EPON MAC / system register storage for read-write registers.
-    /// The bootloader writes config values (e.g., FDS recovery bitmap at +0x24)
-    /// and reads them back later. Uninitialized entries default to 0.
-    sysreg_store: [u32; SYSREG_SIZE as usize / 4],
+    /// BCM55030 SoC register storage for read-write registers.
+    /// Covers the full MMIO space (0x01000000-0x010037FF). Uninitialized
+    /// entries default to 0. PBC addresses (0x1F0-0x23F) are handled
+    /// separately by the PBC dispatcher (checked first).
+    sysreg_store: Vec<u32>,
     /// Bits pending auto-clear: when the firmware writes command bits (27-31) to a
     /// register, the hardware clears them after processing. We clear them on the next
     /// read (simulating instant completion).
-    sysreg_pending_clear: [u32; SYSREG_SIZE as usize / 4],
+    sysreg_pending_clear: Vec<u32>,
     /// I2C bit-bang state for SFP EEPROM bus (SYSREG+0x48/0x4C).
     /// Counts clock toggles to simulate NAK (no SFP module present).
     i2c_clock_toggles: u32,
@@ -44,13 +47,14 @@ pub struct MmioController {
 
 impl MmioController {
     pub fn new() -> Self {
+        let num_entries = SYSREG_SIZE as usize / 4;
         Self {
             uart: SimpleUart::new(),
             pbc: PeripheralBusController::new(),
             trace: false,
             timer_counter: 0,
-            sysreg_store: [0; SYSREG_SIZE as usize / 4],
-            sysreg_pending_clear: [0; SYSREG_SIZE as usize / 4],
+            sysreg_store: vec![0u32; num_entries],
+            sysreg_pending_clear: vec![0u32; num_entries],
             i2c_clock_toggles: 0,
         }
     }
@@ -70,33 +74,33 @@ impl MmioController {
         addr >= SYSREG_BASE && addr < SYSREG_BASE + SYSREG_SIZE
     }
 
-    /// BCM55030 EPON MAC / system register reads.
-    /// Hardware-defined registers return fixed values; all others return
-    /// the last value written (read-write storage for firmware config).
+    /// BCM55030 SoC register reads.
+    ///
+    /// Hardware-defined registers return fixed/computed values. All others use a
+    /// read-write store with auto-clear for command bits (27-31), simulating
+    /// instant hardware completion of write-triggered operations.
+    ///
+    /// The full register map was resolved from 85 hwregs base pointers via Ghidra.
+    /// Major clusters:
+    ///   0x000-0x1EF  EPON MAC core (CHIP_ID, timers, I2C, link lock, EPON sig)
+    ///   0x1F0-0x23F  PBC (handled separately, checked before sysreg)
+    ///   0x240-0xFFF  SerDes Speed/PHY, MACsec, MPCP LLID, misc
+    ///   0xFF8-0x13FF EPON MAC extended (timing, grants, slots, counters, LLIDs)
+    ///   0x13DC-0x15FF DMA/IRQ controller, channel drain, mailbox, counters
+    ///   0x2100-0x27FF DMA status, Lane HW, Fatal Error, MDIO, SerDes MDIO
+    ///   0x2B00-0x37FF MACsec Control, VLAN, Filter, Lane IRQ, Channel Config
     fn sysreg_read_word(&mut self, offset: u32) -> u32 {
         match offset {
-            0x000 => 0x47010203, // reg 0x00: CHIP_ID (BCM4701)
-            0x004 => 0xB2110816, // reg 0x01: CHIP_REV / bond options
-            0x00C => 0x0114B820, // reg 0x03: LLID_CAPTURE_MASK
-            0x018 => 0x00000006, // reg 0x06: LLID_ACTIVE_BITMAP
-            0x030 => 0x0000FFFF, // reg 0x0C: RX_GRANT_MASK
-            0x050 => self.timer_counter as u32, // Timer counter
-            0x194 | 0x1D4 => {
-                // SerDes lane link lock status registers.
-                // Bits 1,3 = link lock indicators for sub-lanes.
-                // Return "all locked" to prevent infinite polling loops.
-                let base = self.sysreg_store[(offset / 4) as usize];
-                base | 0x0A
-            }
-            0x1E0 => 0x45504F4E, // reg 0x78: EPON signature ("EPON")
+            // ── EPON MAC core (0x000-0x1EF) ──────────────────────────────
+            0x000 => 0x47010203, // CHIP_ID (BCM4701)
+            0x004 => 0xB2110816, // CHIP_REV / bond options
+            0x00C => 0x0114B820, // LLID_CAPTURE_MASK
+            0x018 => 0x00000006, // LLID_ACTIVE_BITMAP
+            0x030 => 0x0000FFFF, // RX_GRANT_MASK
+            0x050 => self.timer_counter as u32, // Free-running timer counter
             0x048 => {
                 // I2C status register for SFP EEPROM bit-bang bus.
                 // Bit 31 = SDA input line. Bit 4 = ACK enable (set by firmware).
-                // The firmware sets bit 4 before checking for ACK (bit 31=0),
-                // then clears it and waits for SDA high (bit 31=1).
-                // We simulate an always-ACKing SFP EEPROM:
-                // - When bit 4 is set: return bit 31=0 (ACK from slave)
-                // - When bit 4 is clear: return bit 31=1 (SDA released high)
                 let base = self.sysreg_store[0x048 / 4];
                 if base & 0x10 != 0 {
                     base & !0x80000000 // bit 4 set → ACK: SDA low
@@ -106,31 +110,53 @@ impl MmioController {
             }
             0x04C => {
                 // I2C clock/data register. Bit 0 = SCL, bit 31 = SDA (data in).
-                // For data reads, return SDA=1 (all 0xFF EEPROM data = blank SFP).
                 let base = self.sysreg_store[0x04C / 4];
                 base | 0x80000000 // SDA high = data bit 1 (0xFF bytes)
             }
-            _ => {
-                // Read-write storage for firmware-configured registers
-                let idx = (offset / 4) as usize;
-                if idx < self.sysreg_store.len() {
-                    let val = self.sysreg_store[idx];
-                    // Apply pending auto-clear: bits that were written as command triggers
-                    // are cleared on the next read (simulating hardware command completion).
-                    let clear_mask = self.sysreg_pending_clear[idx];
-                    if clear_mask != 0 {
-                        self.sysreg_store[idx] = val & !clear_mask;
-                        self.sysreg_pending_clear[idx] = 0;
-                    }
-                    val
-                } else {
-                    0
-                }
+            0x194 | 0x1D4 => {
+                // SerDes lane link lock status registers.
+                // Bits 1,3 = link lock indicators for sub-lanes.
+                // Return "all locked" to prevent infinite polling loops.
+                let base = self.sysreg_store[(offset / 4) as usize];
+                base | 0x0A
             }
+            0x1E0 => 0x45504F4E, // EPON signature ("EPON")
+
+            // ── DMA/IRQ cluster (0x13DC-0x15FF) ─────────────────────────
+            // DMA Channel Queue Drain Register: base 0x143C, stride 0x200.
+            // epon_rx_queue_wait_drain_done polls bit 8 (0x100) until set.
+            o @ 0x1400..=0x3FFF if (o.wrapping_sub(0x143C)) % 0x200 == 0 => {
+                self.store_read(offset) | 0x100 // bit 8 = drain complete
+            }
+
+            // ── Fatal Error Status (0x2804) ──────────────────────────────
+            // hw_check_fatal_error_status reads base 0x010027B8 + 0x4C = offset 0x2804.
+            // Write side (error mask) shares the same address. Return 0 = no errors.
+            0x2804 => 0,
+
+            // ── Default: read-write store with auto-clear ────────────────
+            _ => self.store_read(offset),
         }
     }
 
-    /// BCM55030 EPON MAC / system register writes.
+    /// Read from the read-write store with auto-clear for command bits (27-31).
+    #[inline]
+    fn store_read(&mut self, offset: u32) -> u32 {
+        let idx = (offset / 4) as usize;
+        if idx < self.sysreg_store.len() {
+            let val = self.sysreg_store[idx];
+            let clear_mask = self.sysreg_pending_clear[idx];
+            if clear_mask != 0 {
+                self.sysreg_store[idx] = val & !clear_mask;
+                self.sysreg_pending_clear[idx] = 0;
+            }
+            val
+        } else {
+            0
+        }
+    }
+
+    /// BCM55030 SoC register writes.
     fn sysreg_write_word(&mut self, offset: u32, val: u32) {
         // Track I2C clock toggles on bit 0 of register 0x4C
         if offset == 0x04C {
@@ -176,7 +202,6 @@ impl MmioController {
             let word_offset = offset & !3;
             let byte_idx = offset & 3;
             let word = self.pbc.read_word(word_offset);
-            // Big-endian: byte 0 is MSB
             return Ok((word >> (24 - byte_idx * 8)) as u8);
         }
         if Self::is_sysreg(addr) {
@@ -201,6 +226,19 @@ impl MmioController {
     pub fn write_byte(&mut self, addr: u32, val: u8) -> Result<(), Exception> {
         if Self::is_uart(addr) {
             return self.uart.write_byte(addr - UART_BASE, val);
+        }
+        if Self::is_sysreg(addr) {
+            // Byte write to sysreg: read-modify-write the containing word
+            let offset = addr - SYSREG_BASE;
+            let word_offset = offset & !3;
+            let byte_idx = offset & 3;
+            let idx = (word_offset / 4) as usize;
+            if idx < self.sysreg_store.len() {
+                let shift = 24 - byte_idx * 8;
+                let mask = !(0xFFu32 << shift);
+                self.sysreg_store[idx] = (self.sysreg_store[idx] & mask) | ((val as u32) << shift);
+            }
+            return Ok(());
         }
         if self.trace {
             eprintln!("[MMIO] write byte  0x{:08X} = 0x{:02X}", addr, val);
@@ -241,6 +279,19 @@ impl MmioController {
             self.uart.write_byte(addr + 1 - UART_BASE, val as u8)?;
             return Ok(());
         }
+        if Self::is_sysreg(addr) {
+            // Halfword write to sysreg: read-modify-write the containing word
+            let offset = addr - SYSREG_BASE;
+            let word_offset = offset & !3;
+            let half_idx = (offset >> 1) & 1;
+            let idx = (word_offset / 4) as usize;
+            if idx < self.sysreg_store.len() {
+                let shift = 16 - half_idx * 16;
+                let mask = !(0xFFFFu32 << shift);
+                self.sysreg_store[idx] = (self.sysreg_store[idx] & mask) | ((val as u32) << shift);
+            }
+            return Ok(());
+        }
         if self.trace {
             eprintln!("[MMIO] write half  0x{:08X} = 0x{:04X}", addr, val);
         }
@@ -265,7 +316,7 @@ impl MmioController {
             let offset = addr - SYSREG_BASE;
             let val = self.sysreg_read_word(offset);
             if self.trace {
-                eprintln!("[MMIO] read  word  0x{:08X} → 0x{:08X} (sysreg+0x{:02X})", addr, val, offset);
+                eprintln!("[MMIO] read  word  0x{:08X} → 0x{:08X} (sysreg+0x{:04X})", addr, val, offset);
             }
             return Ok(val);
         }
@@ -274,21 +325,6 @@ impl MmioController {
                 eprintln!("[MMIO] read  word  0x{:08X} → 0x00000001 (serdes)", addr);
             }
             return Ok(1);
-        }
-        // Extended EPON MAC registers: targeted handlers for known polling registers.
-        // Default for unknown addresses remains 0 (via the fallthrough below).
-        if addr >= SYSREG_BASE + SYSREG_SIZE && addr < SYSREG_BASE + 0x10000 {
-            let offset = addr - SYSREG_BASE;
-            let val = match offset {
-                // RX queue drain status: base 0x143C, stride 0x200 per channel.
-                // epon_rx_queue_wait_drain_done polls bit 8 (0x100) until set.
-                o if o >= 0x1400 && o <= 0x4000 && (o.wrapping_sub(0x143C)) % 0x200 == 0 => 0x100u32,
-                _ => 0,
-            };
-            if self.trace {
-                eprintln!("[MMIO] read  word  0x{:08X} → 0x{:08X} (epon-ext+0x{:04X})", addr, val, offset);
-            }
-            return Ok(val);
         }
         if self.trace {
             eprintln!("[MMIO] read  word  0x{:08X} → 0x00000000", addr);
@@ -312,7 +348,7 @@ impl MmioController {
             let offset = addr - SYSREG_BASE;
             self.sysreg_write_word(offset, val);
             if self.trace {
-                eprintln!("[MMIO] write word  0x{:08X} = 0x{:08X} (sysreg+0x{:02X})", addr, val, offset);
+                eprintln!("[MMIO] write word  0x{:08X} = 0x{:08X} (sysreg+0x{:04X})", addr, val, offset);
             }
             return Ok(());
         }
