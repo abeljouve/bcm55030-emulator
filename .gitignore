@@ -2,3 +2,4 @@ target/
 .idea/
 firmwares/
 knowledge/
+unhandled_mmio.json
