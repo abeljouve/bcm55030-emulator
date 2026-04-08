@@ -50,11 +50,12 @@ pub fn register_hooks(hooks: &mut HookTable) {
     // Previously had a restart_guard here, but it intercepted Timer 0 interrupts
     // and caused firmware_main_loop to restart instead of handling the timer ISR.
 
-    // irq_set_pending_bit_and_call_handler (0x33A50): stub during firmware init.
-    // The event dispatch calls handler table addresses (e.g., 0x3B740) as function
-    // pointers, but these addresses land 4 bytes past the actual function entry
-    // (skipping the FP save in the prologue). This causes FP corruption → SP=0 → crash.
-    // Stubbing the dispatch prevents premature event handling during init.
+    // irq_set_pending_bit_and_call_handler (0x33A50): the event dispatch calls handler
+    // table addresses (e.g., 0x3B740) that are intentionally +4 past the function entry
+    // (the binary stores these addresses in ICCM literal pools). Calling at +4 skips
+    // the FP prologue (st.a fp,[sp,-4]), and the shared epilogue (ld.ab fp,[sp,4])
+    // pops the caller's local variable into FP → SP corruption.
+    // This appears to be a boot ROM trampoline mechanism that we don't emulate.
     hooks.insert(0x33A50, Hook::Custom(event_dispatch_stub));
 
     // serdes_reg_read_byte — return 0xFF for non-SPI bus types.
@@ -107,16 +108,14 @@ pub fn register_hooks(hooks: &mut HookTable) {
 
 // ── Hook implementations ─────────────────────────────────────────────────
 
-
-
-/// Event dispatch stub — skip handler calls during firmware init.
-/// The firmware's event system calls handler table addresses as function pointers,
-/// but those addresses are +4 past the real function entry (missing the FP prologue).
+/// Event dispatch stub — skip handler calls during firmware execution.
+/// The firmware's event system stores handler table addresses (from ICCM literal pools)
+/// that are +4 past the actual function entry, skipping the FP save prologue.
+/// On real hardware, the boot ROM likely installs trampolines at these addresses.
 fn event_dispatch_stub(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
     if mem.app_size.is_none() {
         return Ok(HookAction::Continue);
     }
-    // Return immediately without dispatching the event handler
     state.pc = state.core_regs[31]; // blink
     state.instruction_count += 1;
     Ok(HookAction::Skip)
