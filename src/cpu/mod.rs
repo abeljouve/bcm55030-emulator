@@ -125,6 +125,11 @@ impl Cpu {
             self.state.write_core_reg(REG_BLINK, next_pc)?;
         }
 
+        // Update MMIO PC context for unhandled register logging
+        if let Some(mut mmio) = self.mem.mmio() {
+            mmio.current_pc = self.state.pc;
+        }
+
         // Execute
         self.state.pc_written = false;
         executor::execute(&decoded, &mut self.state, &mut self.mem)?;

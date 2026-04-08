@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::cpu::exception::Exception;
 use super::uart::SimpleUart;
 use super::pbc::PeripheralBusController;
@@ -27,6 +29,9 @@ pub struct MmioController {
     pub uart: SimpleUart,
     pub pbc: PeripheralBusController,
     pub trace: bool,
+    /// Current CPU PC — set by the CPU step loop before MMIO access.
+    /// Used to provide context in unhandled register warnings.
+    pub current_pc: u32,
     /// BCM55030 EPON MAC timer counter at SYSREG+0x050.
     /// Read by timer1_get_current_value (0x45E4) as a 16-bit hardware counter.
     /// Incremented each time Timer1 interrupt fires.
@@ -43,6 +48,9 @@ pub struct MmioController {
     /// I2C bit-bang state for SFP EEPROM bus (SYSREG+0x48/0x4C).
     /// Counts clock toggles to simulate NAK (no SFP module present).
     i2c_clock_toggles: u32,
+    /// Track which unhandled SYSREG offsets have been logged (first-access only).
+    /// Prevents flooding from polling loops while showing every unique register.
+    unhandled_logged: HashSet<u32>,
 }
 
 impl MmioController {
@@ -52,10 +60,12 @@ impl MmioController {
             uart: SimpleUart::new(),
             pbc: PeripheralBusController::new(),
             trace: false,
+            current_pc: 0,
             timer_counter: 0,
             sysreg_store: vec![0u32; num_entries],
             sysreg_pending_clear: vec![0u32; num_entries],
             i2c_clock_toggles: 0,
+            unhandled_logged: HashSet::new(),
         }
     }
 
@@ -135,7 +145,10 @@ impl MmioController {
             0x2804 => 0,
 
             // ── Default: read-write store with auto-clear ────────────────
-            _ => self.store_read(offset),
+            _ => {
+                self.log_unhandled_read(offset);
+                self.store_read(offset)
+            }
         }
     }
 
@@ -156,8 +169,42 @@ impl MmioController {
         }
     }
 
+    /// Log the first read from an unhandled SYSREG offset.
+    /// Shows PC context for Ghidra reverse engineering.
+    fn log_unhandled_read(&mut self, offset: u32) {
+        let aligned = offset & !3;
+        if self.unhandled_logged.insert(aligned) {
+            let idx = (aligned / 4) as usize;
+            let val = if idx < self.sysreg_store.len() { self.sysreg_store[idx] } else { 0 };
+            eprintln!(
+                "[MMIO] UNHANDLED READ  sysreg+0x{:04X} (0x{:08X}) → 0x{:08X}  at PC=0x{:05X}",
+                aligned, SYSREG_BASE + aligned, val, self.current_pc
+            );
+        }
+    }
+
+    /// Log the first write to an unhandled SYSREG offset.
+    fn log_unhandled_write(&mut self, offset: u32, val: u32) {
+        // Use offset | 0x80000000 to distinguish write logs from read logs in the set
+        let key = (offset & !3) | 0x80000000;
+        if self.unhandled_logged.insert(key) {
+            eprintln!(
+                "[MMIO] UNHANDLED WRITE sysreg+0x{:04X} (0x{:08X}) = 0x{:08X}  at PC=0x{:05X}",
+                offset & !3, SYSREG_BASE + (offset & !3), val, self.current_pc
+            );
+        }
+    }
+
     /// BCM55030 SoC register writes.
     fn sysreg_write_word(&mut self, offset: u32, val: u32) {
+        // Log unhandled writes (offsets without explicit read handlers)
+        match offset {
+            0x000 | 0x004 | 0x00C | 0x018 | 0x030 | 0x050 |
+            0x040 | 0x048 | 0x04C | 0x194 | 0x1D4 | 0x1E0 | 0x2804 => {}
+            o if (0x1400..=0x3FFF).contains(&o) && (o.wrapping_sub(0x143C)) % 0x200 == 0 => {}
+            _ => self.log_unhandled_write(offset, val),
+        }
+
         // Track I2C clock toggles on bit 0 of register 0x4C
         if offset == 0x04C {
             let old = self.sysreg_store[0x04C / 4];
