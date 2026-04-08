@@ -349,6 +349,22 @@ impl Memory {
                     self.data[off + 1] = (val >> 16) as u8;
                     self.data[off + 2] = (val >> 8) as u8;
                     self.data[off + 3] = val as u8;
+                    // Mirror to ICCM for the IVT area (0x00-0xFF): firmware installs
+                    // interrupt handlers via hw_auxreg_write_entry data writes.
+                    // On real BCM55030, these writes update ICCM (dual-ported for
+                    // the vector table). Only the IVT area is mirrored to avoid
+                    // corrupting code when BSS/bzero writes hit the code section.
+                    if addr < 0x100 {
+                        if let Some(ref mut iccm) = self.iccm {
+                            let iccm_off = (addr.wrapping_sub(self.iccm_base)) as usize;
+                            if iccm_off + 3 < iccm.len() {
+                                iccm[iccm_off] = (val >> 24) as u8;
+                                iccm[iccm_off + 1] = (val >> 16) as u8;
+                                iccm[iccm_off + 2] = (val >> 8) as u8;
+                                iccm[iccm_off + 3] = val as u8;
+                            }
+                        }
+                    }
                     return Ok(());
                 }
             }
