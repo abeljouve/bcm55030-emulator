@@ -66,6 +66,9 @@ pub fn execute_loop(
         }
     }
 
+    // ISA: LP clears the L bit (re-enables zero-overhead loops)
+    state.flag_l = false;
+
     let next_pc = decoded.pc + decoded.total_size();
     state.aux_lp_start = next_pc;
     state.aux_lp_end = decoded.pc.wrapping_add(offset);

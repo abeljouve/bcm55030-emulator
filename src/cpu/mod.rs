@@ -189,7 +189,7 @@ impl Cpu {
         self.state.aux_count0 = self.state.aux_count0.wrapping_add(1);
         if self.state.aux_limit0 != 0 && self.state.aux_count0 >= self.state.aux_limit0 {
             self.state.aux_control0 |= 0x08; // IP bit
-            if self.state.aux_control0 & 0x05 != 0 {
+            if self.state.aux_control0 & 0x01 != 0 {
                 self.state.aux_irq_pending |= 1 << 3;
             }
             if self.state.aux_control0 & 0x02 == 0 {
@@ -200,7 +200,7 @@ impl Cpu {
         self.state.aux_count1 = self.state.aux_count1.wrapping_add(1);
         if self.state.aux_limit1 != 0 && self.state.aux_count1 >= self.state.aux_limit1 {
             self.state.aux_control1 |= 0x08; // IP bit
-            if self.state.aux_control1 & 0x05 != 0 {
+            if self.state.aux_control1 & 0x01 != 0 {
                 self.state.aux_irq_pending |= 1 << 4;
             }
             if self.state.aux_control1 & 0x02 == 0 {
@@ -255,6 +255,7 @@ impl Cpu {
             self.state.flag_a2 = true;
             self.state.flag_de = false;
             self.state.flag_u = false;
+            self.state.flag_l = true; // ISA: disable ZOL on interrupt entry
         } else {
             if !self.state.flag_e1 || self.state.flag_a1 {
                 return false;
@@ -268,6 +269,7 @@ impl Cpu {
             self.state.flag_a1 = true;
             self.state.flag_de = false;
             self.state.flag_u = false;
+            self.state.flag_l = true; // ISA: disable ZOL on interrupt entry
         }
 
         self.state.aux_irq_pending &= !(1 << irq);

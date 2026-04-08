@@ -58,11 +58,12 @@ pub fn execute_ext_arith(
             ((rh as u32) << 16) | (rl as u32)
         }
         ExtArithOp::Divaw => {
-            // Division assist: if src1 >= 0 then (src1<<1) - src2 else (src1<<1) + src2
-            if (a as i32) >= 0 {
-                (a << 1).wrapping_sub(b)
+            // Division assist (ISA): B_TEMP = B<<1; if B_TEMP >= C then (B_TEMP-C)+1 else B
+            let b_temp = a << 1;
+            if b_temp >= b {
+                b_temp.wrapping_sub(b).wrapping_add(1)
             } else {
-                (a << 1).wrapping_add(b)
+                a
             }
         }
         ExtArithOp::Asls => {
@@ -108,19 +109,20 @@ pub fn execute_ext_arith(
             } else if v < -0x8000 {
                 0xFFFF8000u32
             } else {
-                a & 0xFFFF
+                v as u32
             }
         }
         ExtArithOp::Rnd16 => {
-            let sum = (a as i32 as i64) + 0x8000;
-            let shifted = (sum >> 16) as i32;
-            if shifted > 0x7FFF {
-                0x7FFF
-            } else if shifted < -0x8000 {
-                0xFFFF8000u32
+            // ISA: B <- SAT32(C + 0x00008000) & 0xFFFF0000
+            let sum = (a as i32 as i64) + 0x8000i64;
+            let sat = if sum > i32::MAX as i64 {
+                i32::MAX
+            } else if sum < i32::MIN as i64 {
+                i32::MIN
             } else {
-                shifted as u32
-            }
+                sum as i32
+            };
+            (sat as u32) & 0xFFFF0000
         }
         ExtArithOp::Abss => {
             let v = a as i32;
@@ -153,7 +155,7 @@ pub fn execute_ext_arith(
             if neg > i16::MAX as i32 {
                 i16::MAX as u32
             } else {
-                neg as u16 as u32
+                neg as i16 as i32 as u32
             }
         }
         ExtArithOp::Norm => {
