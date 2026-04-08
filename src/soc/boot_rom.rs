@@ -136,13 +136,22 @@ pub fn boot_rom_start_app(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
     mem.iccm_base = 0;
     mem.dccm_base = 0;
 
+    // Install generic IRQ handlers at IVT entries 16-31 (external IRQs at offsets 0x80-0xF8).
+    // The firmware's hw_irq_and_exception_init installs exception handlers (entries 1-15)
+    // via hw_auxreg_write_entry → ICCM mirror. But external IRQ entries (16+) are NOT
+    // written by the firmware — the boot ROM installs them before firmware starts.
+    // The handler at 0x33BD0 is the firmware's generic exception/IRQ dispatch function
+    // (read from literal pool at 0x1C04 by hw_auxreg_write_entry).
+    // NOTE: IRQ vector stubs are installed in boot_rom_crt_main (not here) because
+    // the firmware startup code at 0x60-0x98 overlaps the IVT IRQ entries (0x80-0x98).
+    // The startup code must execute first before we overwrite those addresses.
+
     // Protect PCL-relative literal pool constants
     mem.protect_firmware_literals();
 
     // Reset CPU state for firmware.
-    // Interrupts start DISABLED — the firmware's IVT area (0x80-0xF8) contains
-    // startup code, not interrupt handlers. The firmware installs proper handlers
-    // via irq_setup_vector_and_enable() later in the init sequence.
+    // Interrupts start DISABLED — the firmware enables them via
+    // irq_setup_vector_and_enable() after installing exception handlers.
     *state = CpuState::new();
     state.core_regs[28] = 0x10800; // SP
     state.pc = 0;
@@ -217,8 +226,22 @@ pub fn boot_rom_crt_main(state: &mut CpuState, mem: &mut Memory) -> Result<HookA
         mem.load_binary(app_size, &zeros);
     }
 
+    // Install RTIE stubs at IVT entries 16-31 (external IRQs at offsets 0x80-0xF8).
+    // Done HERE (not in boot_rom_start_app) because the firmware startup code at
+    // 0x60-0x98 overlaps IVT entries 16-19 and must execute first.
+    // RTIE = immediate return from interrupt, preventing crashes from unhandled IRQs.
+    // The firmware's hw_irq_and_exception_init installs exception handlers (entries 1-15)
+    // via hw_auxreg_write_entry → ICCM mirror writes.
+    {
+        let rtie_stub: [u8; 8] = [0x24, 0x6F, 0x00, 0x3F, 0x78, 0xE0, 0x78, 0xE0];
+        for irq in 0..16u32 {
+            let vector_offset = (16 + irq) * 8;
+            mem.load_iccm(vector_offset, &rtie_stub);
+        }
+    }
+
     eprintln!(
-        "[Boot ROM] 0x{:05X}: boot_rom_crt_main — BSS cleared 0x{:X}-0x{:X} ({} bytes), jumping to firmware_main_loop (0x20C)",
+        "[Boot ROM] 0x{:05X}: boot_rom_crt_main — BSS cleared 0x{:X}-0x{:X} ({} bytes), IRQ RTIE stubs installed, jumping to firmware_main_loop (0x20C)",
         state.pc, app_size, bss_end, bss_end - app_size
     );
 
