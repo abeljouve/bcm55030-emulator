@@ -146,7 +146,7 @@ impl Cpu {
 
         // Execute
         self.state.pc_written = false;
-        // (debug removed)
+        // (no debug)
         executor::execute(&decoded, &mut self.state, &mut self.mem)?;
 
         // PC update logic
@@ -320,29 +320,27 @@ impl Cpu {
     /// Returns true if the PC matched a boot ROM address and was handled.
     fn boot_rom_intercept(&mut self) -> bool {
         match self.state.pc {
-            // 0x79190 — boot_rom_hw_init
-            // Called from firmware startup at PC=0x68, before SP/GP are set (all regs = 0).
-            // On real hardware: early hardware initialization (PLL, clocks, pin mux,
-            // SerDes lanes, memory controller). Sets up the chip before the C runtime.
+            // boot_rom_hw_init — early hardware initialization
+            // Called from app startup at PC=0x68, before SP/GP are set (all regs = 0).
+            // Pre-relocation LIMM: 0x79450 (Firmware), 0x79190 (Diag)
+            // Post-relocation: 0x79190 (if bootloader LIMM patching ran)
+            // On real hardware: PLL, clocks, pin mux, SerDes lanes, memory controller.
             // Safe to stub as no-op: the emulator doesn't need PLL/clock configuration.
-            0x79190 => {
-                eprintln!("[Boot ROM] 0x79190: boot_rom_hw_init — early HW init (stub, return to 0x{:05X})",
-                    self.state.core_regs[REG_BLINK as usize]);
-                // Return to caller (blink was set by JL)
+            0x79190 | 0x79450 => {
+                eprintln!("[Boot ROM] 0x{:05X}: boot_rom_hw_init — early HW init (stub, return to 0x{:05X})",
+                    self.state.pc, self.state.core_regs[REG_BLINK as usize]);
                 self.state.pc = self.state.core_regs[REG_BLINK as usize];
                 true
             }
 
-            // 0x74B60 — boot_rom_crt_main (CRITICAL — must NOT return)
-            // Called from firmware startup at PC=0x90, after SP=0x32000, GP=0x7E500, FP=0.
-            // On real hardware: the boot ROM's C runtime startup function. It:
-            //   1. Copies .data section from flash to DCCM (initialized globals)
-            //   2. Clears the .bss section in DCCM (zero-initialized globals)
-            //   3. Initializes the heap (sbrk base pointer)
-            //   4. Calls the app's main function: firmware_main_loop() at 0x20C
+            // boot_rom_crt_main (CRITICAL — must NOT return)
+            // Called from app startup at PC=0x90, after SP=0x32000, GP=0x7E400, FP=0.
+            // Pre-relocation LIMM: 0x74E24 (Firmware), 0x74B60 (Diag)
+            // Post-relocation: 0x74B60 (if bootloader LIMM patching ran)
+            // On real hardware: C runtime init (.data copy, .bss clear, heap, call main).
             // .data is already in DCCM (loaded by boot_rom_start_app).
             // We clear .bss (from end of binary to end of DCCM) and jump to main.
-            0x74B60 => {
+            0x74B60 | 0x74E24 => {
                 // Clear .bss: from end of loaded binary to end of DCCM
                 let bss_start = self.mem.app_size.unwrap_or(0) as u32;
                 let bss_end = DCCM_SIZE as u32;
@@ -350,11 +348,11 @@ impl Cpu {
                     let zeros = vec![0u8; (bss_end - bss_start) as usize];
                     self.mem.load_binary(bss_start, &zeros);
                     eprintln!(
-                        "[Boot ROM] 0x74B60: boot_rom_crt_main — BSS cleared 0x{:X}-0x{:X} ({} bytes), jumping to firmware_main_loop (0x20C)",
-                        bss_start, bss_end, bss_end - bss_start
+                        "[Boot ROM] 0x{:05X}: boot_rom_crt_main — BSS cleared 0x{:X}-0x{:X} ({} bytes), jumping to firmware_main_loop (0x20C)",
+                        self.state.pc, bss_start, bss_end, bss_end - bss_start
                     );
                 } else {
-                    eprintln!("[Boot ROM] 0x74B60: boot_rom_crt_main — jumping to firmware_main_loop (0x20C)");
+                    eprintln!("[Boot ROM] 0x{:05X}: boot_rom_crt_main — jumping to firmware_main_loop (0x20C)", self.state.pc);
                 }
                 self.state.pc = 0x20C; // firmware_main_loop entry point
                 true
@@ -369,22 +367,24 @@ impl Cpu {
             // with its own handlers at 0x33BD0/0x33BD4 during init, so this handler
             // is only active during the brief startup period.
             // Safe to stub as no-op: no exceptions should occur during startup.
-            0x78F54 => {
-                eprintln!("[Boot ROM] 0x78F54: boot_rom_exception_handler_1 (stub, return to 0x{:05X})",
-                    self.state.core_regs[REG_BLINK as usize]);
+            // Pre-relocation: 0x79214 (Firmware), 0x78F54 (Diag)
+            0x78F54 | 0x79214 => {
+                eprintln!("[Boot ROM] 0x{:05X}: boot_rom_exception_handler_1 (stub, return to 0x{:05X})",
+                    self.state.pc, self.state.core_regs[REG_BLINK as usize]);
                 self.state.pc = self.state.core_regs[REG_BLINK as usize];
                 true
             }
 
-            // 0x78F78 — boot_rom_exception_handler_2
+            // boot_rom_exception_handler_2
             // Called from exception wrapper at PC=0xC8 (same pattern as 0xB4).
             // On real hardware: handles a second CPU exception type (likely privilege
             // violation or instruction error). Same lifecycle as handler_1 — active
             // only during startup, replaced by firmware's own handlers at init.
             // Safe to stub as no-op.
-            0x78F78 => {
-                eprintln!("[Boot ROM] 0x78F78: boot_rom_exception_handler_2 (stub, return to 0x{:05X})",
-                    self.state.core_regs[REG_BLINK as usize]);
+            // Pre-relocation: 0x79238 (Firmware), 0x78F78 (Diag)
+            0x78F78 | 0x79238 => {
+                eprintln!("[Boot ROM] 0x{:05X}: boot_rom_exception_handler_2 (stub, return to 0x{:05X})",
+                    self.state.pc, self.state.core_regs[REG_BLINK as usize]);
                 self.state.pc = self.state.core_regs[REG_BLINK as usize];
                 true
             }
