@@ -37,6 +37,10 @@ pub struct MmioController {
     /// The bootloader writes config values (e.g., FDS recovery bitmap at +0x24)
     /// and reads them back later. Uninitialized entries default to 0.
     sysreg_store: [u32; SYSREG_SIZE as usize / 4],
+    /// Bits pending auto-clear: when the firmware writes command bits (27-31) to a
+    /// register, the hardware clears them after processing. We clear them on the next
+    /// read (simulating instant completion).
+    sysreg_pending_clear: [u32; SYSREG_SIZE as usize / 4],
     /// I2C bit-bang state for SFP EEPROM bus (SYSREG+0x48/0x4C).
     /// Counts clock toggles to simulate NAK (no SFP module present).
     i2c_clock_toggles: u32,
@@ -50,6 +54,7 @@ impl MmioController {
             trace: false,
             timer_counter: 0,
             sysreg_store: [0; SYSREG_SIZE as usize / 4],
+            sysreg_pending_clear: [0; SYSREG_SIZE as usize / 4],
             i2c_clock_toggles: 0,
         }
     }
@@ -72,7 +77,7 @@ impl MmioController {
     /// BCM55030 EPON MAC / system register reads.
     /// Hardware-defined registers return fixed values; all others return
     /// the last value written (read-write storage for firmware config).
-    fn sysreg_read_word(&self, offset: u32) -> u32 {
+    fn sysreg_read_word(&mut self, offset: u32) -> u32 {
         match offset {
             0x000 => 0x47010203, // reg 0x00: CHIP_ID (BCM4701)
             0x004 => 0xB2110816, // reg 0x01: CHIP_REV / bond options
@@ -80,6 +85,13 @@ impl MmioController {
             0x018 => 0x00000006, // reg 0x06: LLID_ACTIVE_BITMAP
             0x030 => 0x0000FFFF, // reg 0x0C: RX_GRANT_MASK
             0x050 => self.timer_counter as u32, // Timer counter
+            0x194 | 0x1D4 => {
+                // SerDes lane link lock status registers.
+                // Bits 1,3 = link lock indicators for sub-lanes.
+                // Return "all locked" to prevent infinite polling loops.
+                let base = self.sysreg_store[(offset / 4) as usize];
+                base | 0x0A
+            }
             0x1E0 => 0x45504F4E, // reg 0x78: EPON signature ("EPON")
             0x048 => {
                 // I2C status register for SFP EEPROM bit-bang bus.
@@ -106,7 +118,15 @@ impl MmioController {
                 // Read-write storage for firmware-configured registers
                 let idx = (offset / 4) as usize;
                 if idx < self.sysreg_store.len() {
-                    self.sysreg_store[idx]
+                    let val = self.sysreg_store[idx];
+                    // Apply pending auto-clear: bits that were written as command triggers
+                    // are cleared on the next read (simulating hardware command completion).
+                    let clear_mask = self.sysreg_pending_clear[idx];
+                    if clear_mask != 0 {
+                        self.sysreg_store[idx] = val & !clear_mask;
+                        self.sysreg_pending_clear[idx] = 0;
+                    }
+                    val
                 } else {
                     0
                 }
@@ -133,12 +153,14 @@ impl MmioController {
 
         let idx = (offset / 4) as usize;
         if idx < self.sysreg_store.len() {
-            // Auto-clear command/busy bits (27-31) on write.
-            // Many EPON MAC registers use upper bits as write-1-to-trigger commands
-            // that the hardware clears after processing. The firmware polls these bits
-            // and expects them to be cleared. We simulate instant completion.
-            let stored = val & 0x07FFFFFF; // clear bits 27-31 for reads
-            self.sysreg_store[idx] = stored;
+            self.sysreg_store[idx] = val;
+            // Mark bits 27-31 for auto-clear on next read.
+            // Hardware command registers use these bits as write-1-to-trigger that
+            // the hardware clears after processing. The firmware polls until cleared.
+            let cmd_bits = val & 0xF8000000;
+            if cmd_bits != 0 {
+                self.sysreg_pending_clear[idx] = cmd_bits;
+            }
         }
     }
 

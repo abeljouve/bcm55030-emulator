@@ -124,7 +124,78 @@ impl Cpu {
             }
         }
 
+        // Prevent firmware_main_loop from "returning" to the startup code.
+        // The function has do{}while(true) and should never return. But on the
+        // emulator, some init error path causes it to exit. The startup code at
+        // 0x98 would branch to halt_loop, then restart via stack corruption.
+        // We redirect back to firmware_main_loop to retry the init.
+        if self.mem.app_size.is_some() && self.state.pc == 0x98 {
+            // Just re-enter firmware_main_loop
+            self.state.pc = 0x20C;
+            return Ok(());
+        }
 
+        // SerDes register read intercept: hw_peripheral_read_dispatch returns 0 for
+        // bus types it doesn't handle (type 0x00 = direct SerDes access, not SPI).
+        // On real hardware, the BCM55030 has dedicated SerDes register buses.
+        // We return 0xFF (all flags set) to satisfy calibration/ready checks.
+        if self.mem.app_size.is_some() && self.state.pc == 0x12CA4 {
+            let bus_type = (self.state.core_regs[0] >> 8) & 0xFF;
+            if bus_type != 0x06 { // not SPI → unhandled bus type
+                self.state.core_regs[0] = 0xFF;
+                self.state.pc = self.state.core_regs[REG_BLINK as usize];
+                self.state.instruction_count += 1;
+                return Ok(());
+            }
+        }
+        // Intercept serdes_hw_ready_flag (0x1E6C) — always return 1 (ready).
+        // On real hardware, the boot ROM hw_init sets this flag. The emulator stubs
+        // that function, so the flag never gets set.
+        if self.mem.app_size.is_some() && self.state.pc == 0x1E6C {
+            self.state.core_regs[0] = 1;
+            self.state.pc = self.state.core_regs[REG_BLINK as usize];
+            self.state.instruction_count += 1;
+            return Ok(());
+        }
+        // Also intercept serdes_reg_write (0x12CD8) for non-SPI bus types — just skip
+        if self.mem.app_size.is_some() && self.state.pc == 0x12CD8 {
+            let bus_type = (self.state.core_regs[0] >> 8) & 0xFF;
+            if bus_type != 0x06 {
+                self.state.pc = self.state.core_regs[REG_BLINK as usize];
+                self.state.instruction_count += 1;
+                return Ok(());
+            }
+        }
+
+        // Firmware init progress milestones — lightweight, always active in Harvard mode
+        if self.mem.is_harvard() && self.mem.app_size.is_some() {
+            match self.state.pc {
+                0x0020C => eprintln!("[Firmware Init] ★ firmware_main_loop ENTRY at insn {} (caller blink=0x{:05X})",
+                    self.state.instruction_count, self.state.core_regs[REG_BLINK as usize]),
+                0x000F8 => eprintln!("[Firmware Init] → firmware_update_check_and_trigger at insn {}", self.state.instruction_count),
+                0x084FC => eprintln!("[Firmware Init] → firmware_update_trigger (REBOOT!) at insn {}", self.state.instruction_count),
+                0x33CF8 => eprintln!("[Firmware Init] → system_reboot_infinite_loop at insn {}", self.state.instruction_count),
+                0x3BB30 => eprintln!("[Firmware Init] → epon_link_init at insn {}", self.state.instruction_count),
+                0x01B98 => eprintln!("[Firmware Init] → serdes_hw_init_lanes_and_dma at insn {}", self.state.instruction_count),
+                0x16138 => eprintln!("[Firmware Init] → cli_uart_init at insn {}", self.state.instruction_count),
+                0x3C224 => eprintln!("[Firmware Init] → serdes_config_fds_init at insn {}", self.state.instruction_count),
+                0x128E8 => eprintln!("[Firmware Init] → serdes_load_config_and_reinit at insn {}", self.state.instruction_count),
+                0x1366C => eprintln!("[Firmware Init]   → serdes_init_all_lanes_hw at insn {}", self.state.instruction_count),
+                0x14AB0 => eprintln!("[Firmware Init]   → mpcp_send_RegisterReq_with_speed at insn {}", self.state.instruction_count),
+                0x13F94 => eprintln!("[Firmware Init]   → serdes_lane2_init_pon_rx at insn {}", self.state.instruction_count),
+                0x14670 => eprintln!("[Firmware Init]   → serdes_lane0_reinit_rate_change at insn {}", self.state.instruction_count),
+                0x046D0 => eprintln!("[Firmware Init] → sfp_serial_bus_read_and_configure at insn {}", self.state.instruction_count),
+                0x09834 => eprintln!("[Firmware Init] → epon_runtime_full_init at insn {}", self.state.instruction_count),
+                0x02750 => eprintln!("[Firmware Init] → irq_setup_vector_and_enable at insn {}", self.state.instruction_count),
+                0x16014 => {
+                    static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("[Firmware Init] → cli_poll_and_process_input (MAIN LOOP!) at insn {}", self.state.instruction_count);
+                    }
+                }
+                _ => {}
+            }
+        }
 
         // Fetch and decode
         let decoded = decoder::decode(self.state.pc, &self.mem)?;
@@ -361,6 +432,12 @@ impl Cpu {
                     eprintln!("[Boot ROM] 0x{:05X}: boot_rom_crt_main — jumping to firmware_main_loop (0x20C)", self.state.pc);
                 }
                 self.state.pc = 0x20C; // firmware_main_loop entry point
+
+                // Set hardware ready flags that the real boot ROM hw_init would set.
+                // These are checked by firmware init loops (serdes_hw_ready_flag at 0x1E6C).
+                // DCCM 0x7E207 = SerDes hardware ready flag (byte, non-zero = ready)
+                let _ = self.mem.write_byte(0x7E207, 1);
+
                 true
             }
 
