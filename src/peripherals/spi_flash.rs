@@ -125,9 +125,11 @@ impl SpiFlash {
                 if self.status & SR_WEL != 0 && tx.len() >= 4 {
                     let addr = Self::extract_addr(tx) as usize;
                     let sector_base = addr & !0xFFF;
-                    let end = (sector_base + 4096).min(FLASH_SIZE);
-                    self.data[sector_base..end].fill(0xFF);
-                    self.dirty = true;
+                    if sector_base < FLASH_SIZE {
+                        let end = (sector_base + 4096).min(FLASH_SIZE);
+                        self.data[sector_base..end].fill(0xFF);
+                        self.dirty = true;
+                    }
                 }
                 self.status &= !SR_WEL;
             }
@@ -135,9 +137,11 @@ impl SpiFlash {
                 if self.status & SR_WEL != 0 && tx.len() >= 4 {
                     let addr = Self::extract_addr(tx) as usize;
                     let block_base = addr & !0xFFFF;
-                    let end = (block_base + 65536).min(FLASH_SIZE);
-                    self.data[block_base..end].fill(0xFF);
-                    self.dirty = true;
+                    if block_base < FLASH_SIZE {
+                        let end = (block_base + 65536).min(FLASH_SIZE);
+                        self.data[block_base..end].fill(0xFF);
+                        self.dirty = true;
+                    }
                 }
                 self.status &= !SR_WEL;
             }

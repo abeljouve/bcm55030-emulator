@@ -221,9 +221,9 @@ impl PeripheralBusController {
     }
 
     /// Execute a DMA transfer
-    /// bit 0 = enable, bit 1 = direction (0=flash->mem, 1=mem->flash), bits [15:4] = length
+    /// bit 0 = enable, bit 1 = direction (0=flash->mem, 1=mem->flash), bits [21:4] = length (bytes)
     fn execute_dma(&mut self, ctrl: u32) {
-        let length = ((ctrl >> 4) & 0xFFF) as usize;
+        let length = ((ctrl >> 4) & 0x3FFFF) as usize;
         let flash_addr = self.dma_flash_addr;
         let mem_addr = self.dma_data_addr;
         let write_to_flash = (ctrl & 0x2) != 0; // bit 1 = direction

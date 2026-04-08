@@ -27,6 +27,8 @@ pub struct Cpu {
     pub mem: Memory,
     /// Log every instruction to stderr
     pub trace: bool,
+    /// Trace firmware init only (activated after firmware_main_loop entry)
+    pub trace_firmware_init: bool,
 }
 
 impl Cpu {
@@ -36,6 +38,7 @@ impl Cpu {
             state: CpuState::new(),
             mem: Memory::new(mem_size),
             trace: false,
+            trace_firmware_init: false,
         }
     }
 
@@ -45,6 +48,7 @@ impl Cpu {
             state: CpuState::new(),
             mem: Memory::new_harvard(ICCM_SIZE, DCCM_SIZE),
             trace: false,
+            trace_firmware_init: false,
         }
     }
 
@@ -124,7 +128,7 @@ impl Cpu {
         let decoded = decoder::decode(self.state.pc, &self.mem)?;
         let next_pc = self.state.pc + decoded.total_size();
 
-        if self.trace {
+        if self.trace || self.trace_firmware_init {
             eprintln!(
                 "[TRACE] PC=0x{:08X} size={} Z={} N={} C={} V={} {:?}",
                 self.state.pc, decoded.total_size(),
@@ -142,6 +146,7 @@ impl Cpu {
 
         // Execute
         self.state.pc_written = false;
+        // (no debug)
         executor::execute(&decoded, &mut self.state, &mut self.mem)?;
 
         // PC update logic
@@ -191,9 +196,10 @@ impl Cpu {
             }
         }
 
-        // Determine firmware size by finding it in the SPI flash.
-        // The bootloader copies from flash at offset (staging + 0x27) with a TKF header.
-        // We match the DCCM data signature against known flash locations.
+        // Determine app size by matching DCCM staging data against flash sections.
+        // Multiple TKF sections share the same IVT signature (0x214A0000), so we
+        // compare 64 bytes of DCCM content against each flash section to find the
+        // correct one (the one the bootloader actually DMA'd).
         let app_size = {
             let mmio = match self.mem.mmio() {
                 Some(m) => m,
@@ -201,13 +207,20 @@ impl Cpu {
             };
             let flash = &mmio.pbc.flash.data;
 
-            // Search flash for the firmware signature at known TKF offsets
+            // Read first 64 bytes from DCCM staging area for matching
+            let match_len = 64;
+            let mut staging_bytes = vec![0u8; match_len];
+            for i in 0..match_len {
+                staging_bytes[i] = self.mem.read_byte(self.mem.dccm_base + (staging + i) as u32).unwrap_or(0);
+            }
+
+            // Search flash for matching content at known TKF offsets
             let mut found_size = 0usize;
             for &header_off in &[0x120000usize, 0x1A0000, 0x270000] {
                 let code_off = header_off + 0x27;
-                if code_off + 4 > flash.len() { continue; }
-                if flash[code_off..code_off + 4] == firmware_signature {
-                    // Detect size: scan for first 256-byte erased block in flash
+                if code_off + match_len > flash.len() { continue; }
+                if flash[code_off..code_off + match_len] == staging_bytes[..] {
+                    // Found matching section — determine size by scanning for erased block
                     let max_size = flash.len() - code_off;
                     let mut size = 0;
                     while size < max_size {
@@ -217,9 +230,8 @@ impl Cpu {
                         }
                         size += 256;
                     }
-                    if size > found_size {
-                        found_size = size;
-                    }
+                    found_size = size;
+                    eprintln!("[Boot ROM] Matched flash section at 0x{:06X}, size {} bytes", header_off, size);
                     break;
                 }
             }
@@ -249,6 +261,7 @@ impl Cpu {
 
         // Load firmware into ICCM (overwriting bootloader)
         self.mem.load_iccm(0, &app_code);
+        self.mem.app_size = Some(app_size);
 
         // If firmware was staged at a non-zero offset, also copy it to DCCM at offset 0
         if staging != 0 {
@@ -327,11 +340,22 @@ impl Cpu {
             //   2. Clears the .bss section in DCCM (zero-initialized globals)
             //   3. Initializes the heap (sbrk base pointer)
             //   4. Calls the app's main function: firmware_main_loop() at 0x20C
-            // This function NEVER returns; if it did, the startup stub halts (FLAG 1).
-            // We skip .data/.bss init (firmware_main_loop's init functions handle it)
-            // and jump directly to firmware_main_loop.
+            // .data is already in DCCM (loaded by boot_rom_start_app).
+            // We clear .bss (from end of binary to end of DCCM) and jump to main.
             0x74B60 => {
-                eprintln!("[Boot ROM] 0x74B60: boot_rom_crt_main — C runtime init, jumping to firmware_main_loop (0x20C)");
+                // Clear .bss: from end of loaded binary to end of DCCM
+                let bss_start = self.mem.app_size.unwrap_or(0) as u32;
+                let bss_end = DCCM_SIZE as u32;
+                if bss_start < bss_end {
+                    let zeros = vec![0u8; (bss_end - bss_start) as usize];
+                    self.mem.load_binary(bss_start, &zeros);
+                    eprintln!(
+                        "[Boot ROM] 0x74B60: boot_rom_crt_main — BSS cleared 0x{:X}-0x{:X} ({} bytes), jumping to firmware_main_loop (0x20C)",
+                        bss_start, bss_end, bss_end - bss_start
+                    );
+                } else {
+                    eprintln!("[Boot ROM] 0x74B60: boot_rom_crt_main — jumping to firmware_main_loop (0x20C)");
+                }
                 self.state.pc = 0x20C; // firmware_main_loop entry point
                 true
             }

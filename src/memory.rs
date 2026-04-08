@@ -32,6 +32,9 @@ pub struct Memory {
     /// [dccm_base, dccm_base + dccm_size) reads/writes DCCM.
     /// Default 0 for bootloader, 0x20000000 for firmware.
     pub dccm_base: u32,
+
+    /// Size of the loaded app binary (used for BSS clearing in boot ROM CRT init)
+    pub app_size: Option<usize>,
 }
 
 impl Memory {
@@ -43,6 +46,7 @@ impl Memory {
             mmio: None,
             iccm_base: 0,
             dccm_base: 0,
+            app_size: None,
         }
     }
 
@@ -54,6 +58,7 @@ impl Memory {
             mmio: Some(RefCell::new(MmioController::new())),
             iccm_base: 0,
             dccm_base: 0,
+            app_size: None,
         }
     }
 
@@ -128,7 +133,8 @@ impl Memory {
             if let Some(ref mmio) = self.mmio {
                 return mmio.borrow_mut().read_byte(addr);
             }
-            return Err(Exception::MemoryError { address: addr, is_write: false });
+            // Unmapped address (boot ROM data, etc.) — return 0
+            return Ok(0);
         }
         // Flat mode
         self.check_bounds(addr, 1)?;
@@ -136,10 +142,16 @@ impl Memory {
     }
 
     pub fn read_half(&self, addr: u32) -> Result<u16, Exception> {
-        if addr & 1 != 0 {
-            return Err(Exception::MisalignedAccess { address: addr });
-        }
         if self.iccm.is_some() {
+            // Harvard mode: check DCCM first, then MMIO, then unmapped
+            if addr & 1 != 0 {
+                // Only enforce alignment for mapped memory
+                if self.dccm_offset(addr).is_some() {
+                    return Err(Exception::MisalignedAccess { address: addr });
+                }
+                // Unmapped misaligned — return 0
+                return Ok(0);
+            }
             if let Some(off) = self.dccm_offset(addr) {
                 if off + 1 < self.data.len() {
                     return Ok(((self.data[off] as u16) << 8) | (self.data[off + 1] as u16));
@@ -148,7 +160,11 @@ impl Memory {
             if let Some(ref mmio) = self.mmio {
                 return mmio.borrow_mut().read_half(addr);
             }
-            return Err(Exception::MemoryError { address: addr, is_write: false });
+            // Unmapped address — return 0
+            return Ok(0);
+        }
+        if addr & 1 != 0 {
+            return Err(Exception::MisalignedAccess { address: addr });
         }
         self.check_bounds(addr, 2)?;
         let a = addr as usize;
@@ -156,10 +172,14 @@ impl Memory {
     }
 
     pub fn read_word(&self, addr: u32) -> Result<u32, Exception> {
-        if addr & 3 != 0 {
-            return Err(Exception::MisalignedAccess { address: addr });
-        }
         if self.iccm.is_some() {
+            // Harvard mode: check DCCM first, then MMIO, then unmapped
+            if addr & 3 != 0 {
+                if self.dccm_offset(addr).is_some() {
+                    return Err(Exception::MisalignedAccess { address: addr });
+                }
+                return Ok(0);
+            }
             if let Some(off) = self.dccm_offset(addr) {
                 if off + 3 < self.data.len() {
                     return Ok(((self.data[off] as u32) << 24)
@@ -171,7 +191,11 @@ impl Memory {
             if let Some(ref mmio) = self.mmio {
                 return mmio.borrow_mut().read_word(addr);
             }
-            return Err(Exception::MemoryError { address: addr, is_write: false });
+            // Unmapped address — return 0
+            return Ok(0);
+        }
+        if addr & 3 != 0 {
+            return Err(Exception::MisalignedAccess { address: addr });
         }
         self.check_bounds(addr, 4)?;
         let a = addr as usize;
@@ -192,7 +216,8 @@ impl Memory {
             if let Some(ref mmio) = self.mmio {
                 return mmio.borrow_mut().write_byte(addr, val);
             }
-            return Err(Exception::MemoryError { address: addr, is_write: true });
+            // Unmapped write — absorb silently
+            return Ok(());
         }
         self.check_bounds(addr, 1)?;
         self.data[addr as usize] = val;
@@ -200,10 +225,13 @@ impl Memory {
     }
 
     pub fn write_half(&mut self, addr: u32, val: u16) -> Result<(), Exception> {
-        if addr & 1 != 0 {
-            return Err(Exception::MisalignedAccess { address: addr });
-        }
         if self.iccm.is_some() {
+            if addr & 1 != 0 {
+                if self.dccm_offset(addr).is_some() {
+                    return Err(Exception::MisalignedAccess { address: addr });
+                }
+                return Ok(()); // Unmapped misaligned write — absorb
+            }
             if let Some(off) = self.dccm_offset(addr) {
                 if off + 1 < self.data.len() {
                     self.data[off] = (val >> 8) as u8;
@@ -214,7 +242,11 @@ impl Memory {
             if let Some(ref mmio) = self.mmio {
                 return mmio.borrow_mut().write_half(addr, val);
             }
-            return Err(Exception::MemoryError { address: addr, is_write: true });
+            // Unmapped write — absorb silently
+            return Ok(());
+        }
+        if addr & 1 != 0 {
+            return Err(Exception::MisalignedAccess { address: addr });
         }
         self.check_bounds(addr, 2)?;
         let a = addr as usize;
@@ -224,10 +256,13 @@ impl Memory {
     }
 
     pub fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
-        if addr & 3 != 0 {
-            return Err(Exception::MisalignedAccess { address: addr });
-        }
         if self.iccm.is_some() {
+            if addr & 3 != 0 {
+                if self.dccm_offset(addr).is_some() {
+                    return Err(Exception::MisalignedAccess { address: addr });
+                }
+                return Ok(()); // Unmapped misaligned write — absorb
+            }
             if let Some(off) = self.dccm_offset(addr) {
                 if off + 3 < self.data.len() {
                     self.data[off] = (val >> 24) as u8;
@@ -239,11 +274,14 @@ impl Memory {
             }
             if let Some(ref mmio) = self.mmio {
                 mmio.borrow_mut().write_word(addr, val)?;
-                // Apply any pending DMA writes to DCCM
                 self.apply_pending_dma();
                 return Ok(());
             }
-            return Err(Exception::MemoryError { address: addr, is_write: true });
+            // Unmapped write — absorb silently
+            return Ok(());
+        }
+        if addr & 3 != 0 {
+            return Err(Exception::MisalignedAccess { address: addr });
         }
         self.check_bounds(addr, 4)?;
         let a = addr as usize;
