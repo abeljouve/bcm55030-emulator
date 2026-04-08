@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 
 use crate::cpu::exception::Exception;
-use crate::peripherals::MmioController;
+use crate::soc::mmio::MmioController;
 
 /// BCM55030 DCCM size: 512 KB
 pub const DCCM_SIZE: usize = 512 * 1024;

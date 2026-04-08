@@ -6,6 +6,10 @@
 /// of the BCM55030 — all SoC-specific behavior is injected via hooks.
 
 pub mod boot_rom;
+pub mod mmio;
+pub mod pbc;
+pub mod spi_flash;
+pub mod uart;
 
 use crate::cpu::exception::Exception;
 use crate::cpu::registers::CpuState;
