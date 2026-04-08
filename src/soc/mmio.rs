@@ -275,6 +275,21 @@ impl MmioController {
             }
             return Ok(1);
         }
+        // Extended EPON MAC registers: targeted handlers for known polling registers.
+        // Default for unknown addresses remains 0 (via the fallthrough below).
+        if addr >= SYSREG_BASE + SYSREG_SIZE && addr < SYSREG_BASE + 0x10000 {
+            let offset = addr - SYSREG_BASE;
+            let val = match offset {
+                // RX queue drain status: base 0x143C, stride 0x200 per channel.
+                // epon_rx_queue_wait_drain_done polls bit 8 (0x100) until set.
+                o if o >= 0x1400 && o <= 0x4000 && (o.wrapping_sub(0x143C)) % 0x200 == 0 => 0x100u32,
+                _ => 0,
+            };
+            if self.trace {
+                eprintln!("[MMIO] read  word  0x{:08X} → 0x{:08X} (epon-ext+0x{:04X})", addr, val, offset);
+            }
+            return Ok(val);
+        }
         if self.trace {
             eprintln!("[MMIO] read  word  0x{:08X} → 0x00000000", addr);
         }

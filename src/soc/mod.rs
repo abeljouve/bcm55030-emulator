@@ -46,9 +46,16 @@ pub fn register_hooks(hooks: &mut HookTable) {
     // These hooks handle hardware features not yet emulated. They are at
     // addresses within the firmware binary, so they only fire after firmware loads.
 
-    // Prevent firmware_main_loop from "returning" to startup code.
-    // The function should loop forever, but some init error causes it to exit.
-    hooks.insert(0x98, Hook::Custom(restart_guard));
+    // Note: 0x98 is the Timer 0 (IRQ 3) vector in the firmware IVT.
+    // Previously had a restart_guard here, but it intercepted Timer 0 interrupts
+    // and caused firmware_main_loop to restart instead of handling the timer ISR.
+
+    // irq_set_pending_bit_and_call_handler (0x33A50): stub during firmware init.
+    // The event dispatch calls handler table addresses (e.g., 0x3B740) as function
+    // pointers, but these addresses land 4 bytes past the actual function entry
+    // (skipping the FP save in the prologue). This causes FP corruption → SP=0 → crash.
+    // Stubbing the dispatch prevents premature event handling during init.
+    hooks.insert(0x33A50, Hook::Custom(event_dispatch_stub));
 
     // serdes_reg_read_byte — return 0xFF for non-SPI bus types.
     // The BCM55030 has dedicated SerDes register buses (type 0x00) that the
@@ -76,19 +83,42 @@ pub fn register_hooks(hooks: &mut HookTable) {
     hooks.insert(0x3BB30, Hook::Log("epon_link_init"));
     hooks.insert(0x046D0, Hook::Log("sfp_serial_bus_read_and_configure"));
     hooks.insert(0x09834, Hook::Log("epon_runtime_full_init"));
+    hooks.insert(0x3573C, Hook::Log("hw_check_fatal_error_status"));
+    hooks.insert(0x099CC, Hook::Log("system_shutdown_and_flush"));
+    hooks.insert(0x06680, Hook::Log("epon_rx_flag_clear_init"));
+    hooks.insert(0x1AE2C, Hook::Log("mpcp_slot_and_timing_init"));
+    hooks.insert(0x20FD4, Hook::Log("hw_config_load_and_reset_init"));
+    hooks.insert(0x3C4B4, Hook::Log("epon_llid_queue_table_init"));
+    hooks.insert(0x16014, Hook::Log("cli_poll_and_process_input"));
     hooks.insert(0x02750, Hook::Log("irq_setup_vector_and_enable"));
+    // Remaining init functions after irq_setup_vector_and_enable
+    hooks.insert(0x2F800, Hook::Log("stats_counter_reset_all_init"));
+    hooks.insert(0x07C1C, Hook::Log("mpcp_register_ack_init"));
+    hooks.insert(0x19D74, Hook::Log("system_load_hw_config_from_fds"));
+    hooks.insert(0x0BD14, Hook::Log("epon_llid_init_all_channels"));
+    hooks.insert(0x09AD8, Hook::Log("macsec_hw_session_init"));
+    hooks.insert(0x06B78, Hook::Log("epon_rx_and_mka_init"));
+    hooks.insert(0x010CC, Hook::Log("mpcp_slot_config_init_from_fds"));
+    hooks.insert(0x1C400, Hook::Log("dpoe_queue_config_init"));
+    hooks.insert(0x0A2C8, Hook::Log("serdes_apply_pending_speed_change"));
+    hooks.insert(0x01880, Hook::Log("llid_all_channels_init_and_deactivate"));
+    hooks.insert(0x04138, Hook::Log("fds_init_default_hw_record_if_missing"));
 }
 
 // ── Hook implementations ─────────────────────────────────────────────────
 
-/// Prevent firmware_main_loop from returning to startup code (0x98).
-/// Redirects back to firmware_main_loop (0x20C) to retry the init.
-fn restart_guard(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
-    // Only active when firmware is loaded
+
+
+/// Event dispatch stub — skip handler calls during firmware init.
+/// The firmware's event system calls handler table addresses as function pointers,
+/// but those addresses are +4 past the real function entry (missing the FP prologue).
+fn event_dispatch_stub(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
     if mem.app_size.is_none() {
         return Ok(HookAction::Continue);
     }
-    state.pc = 0x20C;
+    // Return immediately without dispatching the event handler
+    state.pc = state.core_regs[31]; // blink
+    state.instruction_count += 1;
     Ok(HookAction::Skip)
 }
 

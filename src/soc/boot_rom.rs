@@ -107,12 +107,12 @@ pub fn boot_rom_start_app(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
     // Protect PCL-relative literal pool constants
     mem.protect_firmware_literals();
 
-    // Reset CPU state for firmware
+    // Reset CPU state for firmware.
+    // Interrupts start DISABLED — the firmware's IVT area (0x80-0xF8) contains
+    // startup code, not interrupt handlers. The firmware installs proper handlers
+    // via irq_setup_vector_and_enable() later in the init sequence.
     *state = CpuState::new();
     state.core_regs[28] = 0x10800; // SP
-    state.aux_ienable = 0xFFFFFFFF;
-    state.flag_e1 = true;
-    state.flag_e2 = true;
     state.pc = 0;
 
     eprintln!("[Boot ROM] ICCM/DCCM base=0, firmware {} bytes, entry=0x00000000", app_size);

@@ -20,9 +20,7 @@ pub fn execute_zero_op(zop: &ZeroOp, state: &mut CpuState) -> Result<(), Excepti
         ZeroOp::Trap { param } => Err(Exception::Trap { param: *param }),
         ZeroOp::Rtie => {
             if state.flag_u {
-                return Err(Exception::PrivilegeViolation {
-                    address: state.pc,
-                });
+                return Err(Exception::PrivilegeViolation { address: state.pc });
             }
             if state.flag_ae {
                 // Return from exception (highest priority)
@@ -91,9 +89,7 @@ pub fn execute_flag(
     // Bit 0 = H (halt)
     if val & 1 != 0 {
         if state.flag_u {
-            return Err(Exception::PrivilegeViolation {
-                address: state.pc,
-            });
+            return Err(Exception::PrivilegeViolation { address: state.pc });
         }
         state.halted = true;
         state.set_status32(val);

@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 use crate::cpu::exception::Exception;
 use crate::soc::mmio::MmioController;
@@ -55,6 +56,21 @@ pub struct Memory {
     ///
     /// Set to app_size after firmware binary is loaded. 0 = protection disabled.
     firmware_code_protect_end: usize,
+
+    /// COW tracking for the firmware code section.
+    /// On ARC 700 with overlapping ICCM/DCCM, data reads go to DCCM while
+    /// instruction fetch goes to ICCM. Both are initialized with the same binary.
+    /// If the firmware (or a cascading MMIO bug) writes to a DCCM address in the
+    /// code section, the literal pool values at that address diverge from ICCM.
+    ///
+    /// This set tracks which word-aligned offsets in the code section have been
+    /// explicitly written. For reads:
+    /// - Written addresses → return DCCM value (firmware's intent)
+    /// - Unwritten addresses → return ICCM value (pristine literal pools)
+    ///
+    /// This makes PCL-relative literal pools resilient to accidental corruption
+    /// from overlapping data structures or wrong code paths due to incomplete MMIO.
+    code_section_written: HashSet<usize>,
 }
 
 impl Memory {
@@ -68,6 +84,7 @@ impl Memory {
             dccm_base: 0,
             app_size: None,
             firmware_code_protect_end: 0,
+            code_section_written: HashSet::new(),
         }
     }
 
@@ -81,6 +98,7 @@ impl Memory {
             dccm_base: 0,
             app_size: None,
             firmware_code_protect_end: 0,
+            code_section_written: HashSet::new(),
         }
     }
 
@@ -218,6 +236,17 @@ impl Memory {
             }
             if let Some(off) = self.dccm_offset(addr) {
                 if off + 3 < self.data.len() {
+                    // COW: for unwritten code section words, return ICCM (pristine literal pools)
+                    if off < self.firmware_code_protect_end && !self.code_section_written.contains(&(off & !3)) {
+                        if let Some(ref iccm) = self.iccm {
+                            if off + 3 < iccm.len() {
+                                return Ok(((iccm[off] as u32) << 24)
+                                    | ((iccm[off + 1] as u32) << 16)
+                                    | ((iccm[off + 2] as u32) << 8)
+                                    | (iccm[off + 3] as u32));
+                            }
+                        }
+                    }
                     return Ok(((self.data[off] as u32) << 24)
                         | ((self.data[off + 1] as u32) << 16)
                         | ((self.data[off + 2] as u32) << 8)
@@ -246,7 +275,9 @@ impl Memory {
     pub fn write_byte(&mut self, addr: u32, val: u8) -> Result<(), Exception> {
         if self.iccm.is_some() {
             if let Some(off) = self.dccm_offset(addr) {
-                // (no debug)
+                if off < self.firmware_code_protect_end {
+                    self.code_section_written.insert(off & !3);
+                }
                 self.data[off] = val;
                 return Ok(());
             }
@@ -276,6 +307,9 @@ impl Memory {
                         if existing != 0 {
                             return Ok(()); // Suppress: would zero a code-section constant
                         }
+                    }
+                    if off < self.firmware_code_protect_end {
+                        self.code_section_written.insert(off & !3);
                     }
                     self.data[off] = (val >> 8) as u8;
                     self.data[off + 1] = val as u8;
@@ -307,6 +341,9 @@ impl Memory {
                 // Misaligned DCCM writes: perform byte-wise fixup
                 if let Some(off) = self.dccm_offset(addr) {
                     if off + 3 < self.data.len() {
+                        if off < self.firmware_code_protect_end {
+                            self.code_section_written.insert(off & !3);
+                        }
                         self.data[off] = (val >> 24) as u8;
                         self.data[off + 1] = (val >> 16) as u8;
                         self.data[off + 2] = (val >> 8) as u8;
@@ -318,6 +355,9 @@ impl Memory {
             }
             if let Some(off) = self.dccm_offset(addr) {
                 if off + 3 < self.data.len() {
+                    if off < self.firmware_code_protect_end {
+                        self.code_section_written.insert(off & !3);
+                    }
                     self.data[off] = (val >> 24) as u8;
                     self.data[off + 1] = (val >> 16) as u8;
                     self.data[off + 2] = (val >> 8) as u8;

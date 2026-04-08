@@ -140,6 +140,7 @@ impl Cpu {
 
         self.state.instruction_count += 1;
 
+
         // Timer tick
         self.tick_timers();
 
