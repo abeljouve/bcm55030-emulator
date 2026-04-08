@@ -395,6 +395,9 @@ fn main() {
     // --- Create BCM55030 CPU ---
     let mut cpu = Cpu::new_bcm55030();
 
+    // --- Register BCM55030 SoC hooks ---
+    bcm55030_emulator::soc::register_hooks(&mut cpu.hooks);
+
     // --- Load flash image into SPI flash peripheral ---
     {
         let mut mmio = cpu.mem.mmio().expect("BCM55030 must have MMIO");
