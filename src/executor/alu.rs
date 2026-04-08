@@ -24,13 +24,16 @@ pub fn execute_alu(
     let a = resolve_value(src1, state)?;
     let b = resolve_value(src2, state)?;
 
-    let (result, carry, overflow) = compute_alu(op, a, b, state.flag_c);
+    let (result, carry, overflow, flag_result) = compute_alu(op, a, b, state.flag_c);
 
     write_dest(dst, result, state)?;
 
     if set_flags {
-        state.flag_z = result == 0;
-        state.flag_n = (result >> 31) != 0;
+        // For MAX/MIN, Z and N come from the internal comparison (a - b),
+        // not from the selected result. flag_result carries the comparison result.
+        let zn_val = flag_result.unwrap_or(result);
+        state.flag_z = zn_val == 0;
+        state.flag_n = (zn_val >> 31) != 0;
         if let Some(c) = carry {
             state.flag_c = c;
         }
@@ -42,12 +45,15 @@ pub fn execute_alu(
     Ok(())
 }
 
-fn compute_alu(op: AluOp, a: u32, b: u32, carry_in: bool) -> (u32, Option<bool>, Option<bool>) {
+// Returns (result, carry, overflow, flag_result)
+// flag_result: if Some, Z/N flags are computed from this value instead of result.
+// Used by MAX/MIN where flags come from the internal comparison, not the selected value.
+fn compute_alu(op: AluOp, a: u32, b: u32, carry_in: bool) -> (u32, Option<bool>, Option<bool>, Option<u32>) {
     match op {
         AluOp::Add => {
             let (result, carry) = a.overflowing_add(b);
             let overflow = ((a ^ result) & (b ^ result)) >> 31 != 0;
-            (result, Some(carry), Some(overflow))
+            (result, Some(carry), Some(overflow), None)
         }
         AluOp::Adc => {
             let c = carry_in as u32;
@@ -55,14 +61,14 @@ fn compute_alu(op: AluOp, a: u32, b: u32, carry_in: bool) -> (u32, Option<bool>,
             let (result, c2) = r1.overflowing_add(c);
             let carry = c1 || c2;
             let overflow = ((a ^ result) & (b ^ result)) >> 31 != 0;
-            (result, Some(carry), Some(overflow))
+            (result, Some(carry), Some(overflow), None)
         }
         AluOp::Sub | AluOp::Cmp => {
             // ARC convention: C = borrow (C=1 when A < B unsigned)
             let (result, borrow) = a.overflowing_sub(b);
             let carry = borrow;
             let overflow = ((a ^ b) & (a ^ result)) >> 31 != 0;
-            (result, Some(carry), Some(overflow))
+            (result, Some(carry), Some(overflow), None)
         }
         AluOp::Sbc => {
             // SBC: A - B - C (subtract with carry/borrow)
@@ -72,51 +78,45 @@ fn compute_alu(op: AluOp, a: u32, b: u32, carry_in: bool) -> (u32, Option<bool>,
             let (result, b2) = r1.overflowing_sub(borrow_in);
             let carry = b1 || b2;
             let overflow = ((a ^ b) & (a ^ result)) >> 31 != 0;
-            (result, Some(carry), Some(overflow))
+            (result, Some(carry), Some(overflow), None)
         }
-        AluOp::And | AluOp::Tst => (a & b, None, None),
-        AluOp::Or => (a | b, None, None),
-        AluOp::Bic => (a & !b, None, None),
-        AluOp::Xor => (a ^ b, None, None),
+        AluOp::And | AluOp::Tst => (a & b, None, None, None),
+        AluOp::Or => (a | b, None, None, None),
+        AluOp::Bic => (a & !b, None, None, None),
+        AluOp::Xor => (a ^ b, None, None, None),
         AluOp::Max => {
-            // Flags from internal comparison (a - b)
+            // Flags from internal comparison (a - b), including Z/N
             let (cmp_result, borrow) = a.overflowing_sub(b);
             let overflow = ((a ^ b) & (a ^ cmp_result)) >> 31 != 0;
-            if (a as i32) >= (b as i32) {
-                (a, Some(borrow), Some(overflow))
-            } else {
-                (b, Some(borrow), Some(overflow))
-            }
+            let selected = if (a as i32) >= (b as i32) { a } else { b };
+            (selected, Some(borrow), Some(overflow), Some(cmp_result))
         }
         AluOp::Min => {
-            // Flags from internal comparison (a - b)
+            // Flags from internal comparison (a - b), including Z/N
             let (cmp_result, borrow) = a.overflowing_sub(b);
             let overflow = ((a ^ b) & (a ^ cmp_result)) >> 31 != 0;
-            if (a as i32) <= (b as i32) {
-                (a, Some(borrow), Some(overflow))
-            } else {
-                (b, Some(borrow), Some(overflow))
-            }
+            let selected = if (a as i32) <= (b as i32) { a } else { b };
+            (selected, Some(borrow), Some(overflow), Some(cmp_result))
         }
-        AluOp::Mov => (b, None, None),
+        AluOp::Mov => (b, None, None, None),
         AluOp::Rcmp => {
             // ARC convention: C = borrow
             let (result, borrow) = b.overflowing_sub(a);
             let carry = borrow;
             let overflow = ((b ^ a) & (b ^ result)) >> 31 != 0;
-            (result, Some(carry), Some(overflow))
+            (result, Some(carry), Some(overflow), None)
         }
         AluOp::Rsub => {
             // ARC convention: C = borrow
             let (result, borrow) = b.overflowing_sub(a);
             let carry = borrow;
             let overflow = ((b ^ a) & (b ^ result)) >> 31 != 0;
-            (result, Some(carry), Some(overflow))
+            (result, Some(carry), Some(overflow), None)
         }
-        AluOp::Bset => (a | (1u32 << (b & 31)), None, None),
-        AluOp::Bclr => (a & !(1u32 << (b & 31)), None, None),
-        AluOp::Btst => (a & (1u32 << (b & 31)), None, None),
-        AluOp::Bxor => (a ^ (1u32 << (b & 31)), None, None),
+        AluOp::Bset => (a | (1u32 << (b & 31)), None, None, None),
+        AluOp::Bclr => (a & !(1u32 << (b & 31)), None, None, None),
+        AluOp::Btst => (a & (1u32 << (b & 31)), None, None, None),
+        AluOp::Bxor => (a ^ (1u32 << (b & 31)), None, None, None),
         AluOp::Bmsk => {
             let width = (b & 31) + 1;
             let mask = if width >= 32 {
@@ -124,18 +124,18 @@ fn compute_alu(op: AluOp, a: u32, b: u32, carry_in: bool) -> (u32, Option<bool>,
             } else {
                 (1u32 << width) - 1
             };
-            (a & mask, None, None)
+            (a & mask, None, None, None)
         }
-        AluOp::Add1 => add_shifted(a, b, 1),
-        AluOp::Add2 => add_shifted(a, b, 2),
-        AluOp::Add3 => add_shifted(a, b, 3),
-        AluOp::Sub1 => sub_shifted(a, b, 1),
-        AluOp::Sub2 => sub_shifted(a, b, 2),
-        AluOp::Sub3 => sub_shifted(a, b, 3),
-        AluOp::Mpy => (multiply::mpy(a, b), None, None),
-        AluOp::Mpyh => (multiply::mpyh(a, b), None, None),
-        AluOp::Mpyu => (multiply::mpyu(a, b), None, None),
-        AluOp::Mpyhu => (multiply::mpyhu(a, b), None, None),
+        AluOp::Add1 => { let r = add_shifted(a, b, 1); (r.0, r.1, r.2, None) }
+        AluOp::Add2 => { let r = add_shifted(a, b, 2); (r.0, r.1, r.2, None) }
+        AluOp::Add3 => { let r = add_shifted(a, b, 3); (r.0, r.1, r.2, None) }
+        AluOp::Sub1 => { let r = sub_shifted(a, b, 1); (r.0, r.1, r.2, None) }
+        AluOp::Sub2 => { let r = sub_shifted(a, b, 2); (r.0, r.1, r.2, None) }
+        AluOp::Sub3 => { let r = sub_shifted(a, b, 3); (r.0, r.1, r.2, None) }
+        AluOp::Mpy => (multiply::mpy(a, b), None, None, None),
+        AluOp::Mpyh => (multiply::mpyh(a, b), None, None, None),
+        AluOp::Mpyu => (multiply::mpyu(a, b), None, None, None),
+        AluOp::Mpyhu => (multiply::mpyhu(a, b), None, None, None),
     }
 }
 

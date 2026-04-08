@@ -1298,8 +1298,8 @@ fn decode_extension_ops(
         0x01 => ExtArithOp::Lsr,
         0x02 => ExtArithOp::Asr,
         0x03 => ExtArithOp::Ror,
-        0x04 => ExtArithOp::Mul64,
-        0x05 => ExtArithOp::Mulu64,
+        // 0x04 (MUL64) and 0x05 (MULU64) are not supported on ARC 700
+        0x04 | 0x05 => return Err(Exception::InstructionError { address: pc }),
         0x06 => ExtArithOp::Adds,
         0x07 => ExtArithOp::Subs,
         0x08 => ExtArithOp::Divaw,

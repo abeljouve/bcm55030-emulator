@@ -23,25 +23,6 @@ pub fn execute_ext_arith(
     let a = resolve_value(src1, state)?;
     let b = resolve_value(src2, state)?;
 
-    // MUL64/MULU64: result goes to r57(MLO)/r58(MMID)/r59(MHI), not dst
-    match op {
-        ExtArithOp::Mul64 => {
-            let result = (a as i32 as i64).wrapping_mul(b as i32 as i64) as u64;
-            state.core_regs[57] = result as u32;           // MLO: low 32
-            state.core_regs[58] = (result >> 16) as u32;   // MMID: middle 32
-            state.core_regs[59] = (result >> 32) as u32;   // MHI: high 32
-            return Ok(());
-        }
-        ExtArithOp::Mulu64 => {
-            let result = (a as u64).wrapping_mul(b as u64);
-            state.core_regs[57] = result as u32;           // MLO: low 32
-            state.core_regs[58] = (result >> 16) as u32;   // MMID: middle 32
-            state.core_regs[59] = (result >> 32) as u32;   // MHI: high 32
-            return Ok(());
-        }
-        _ => {}
-    }
-
     let mut carry: Option<bool> = None;
 
     let result = match op {
@@ -229,7 +210,6 @@ pub fn execute_ext_arith(
             }
         }
         ExtArithOp::Swap => ((a & 0xFFFF) << 16) | ((a >> 16) & 0xFFFF),
-        ExtArithOp::Mul64 | ExtArithOp::Mulu64 => unreachable!(),
     };
 
     write_dest(dst, result, state)?;

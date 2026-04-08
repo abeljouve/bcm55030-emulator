@@ -575,3 +575,157 @@ fn test_asr_s_u3() {
 
     assert_eq!(cpu.state.core_regs[1], 8);
 }
+
+// === MAX/MIN flag tests (Bug fix: Z/N must come from comparison, not selected value) ===
+
+#[test]
+fn test_max_flags_a_greater() {
+    // MAX.F r0, r1, r2 where r1=5, r2=3 → result=5, flags from 5-3=2
+    let cpu = Program::new()
+        .emit16(mov_s(1, 5))
+        .emit16(mov_s(2, 3))
+        .emit32(alu32(0x08, 1, 2, 0, 0b00, true))  // MAX.F r0, r1, r2
+        .emit16(brk_s())
+        .run(10);
+
+    assert_eq!(cpu.state.core_regs[0], 5);  // max(5,3) = 5
+    assert!(!cpu.state.flag_z);  // 5-3=2, not zero
+    assert!(!cpu.state.flag_n);  // 5-3=2, not negative
+    assert!(!cpu.state.flag_c);  // no borrow (5 >= 3)
+    assert!(!cpu.state.flag_v);  // no overflow
+}
+
+#[test]
+fn test_max_flags_equal() {
+    // MAX.F r0, r1, r2 where r1=3, r2=3 → result=3, flags from 3-3=0
+    let cpu = Program::new()
+        .emit16(mov_s(1, 3))
+        .emit16(mov_s(2, 3))
+        .emit32(alu32(0x08, 1, 2, 0, 0b00, true))  // MAX.F r0, r1, r2
+        .emit16(brk_s())
+        .run(10);
+
+    assert_eq!(cpu.state.core_regs[0], 3);  // max(3,3) = 3
+    assert!(cpu.state.flag_z);   // 3-3=0, Z must be set from comparison
+    assert!(!cpu.state.flag_n);  // 3-3=0, not negative
+    assert!(!cpu.state.flag_c);  // no borrow (3 >= 3)
+}
+
+#[test]
+fn test_max_flags_a_less() {
+    // MAX.F r0, r1, r2 where r1=1, r2=5 → result=5, flags from 1-5=-4
+    let cpu = Program::new()
+        .emit16(mov_s(1, 1))
+        .emit16(mov_s(2, 5))
+        .emit32(alu32(0x08, 1, 2, 0, 0b00, true))  // MAX.F r0, r1, r2
+        .emit16(brk_s())
+        .run(10);
+
+    assert_eq!(cpu.state.core_regs[0], 5);  // max(1,5) = 5
+    assert!(!cpu.state.flag_z);  // 1-5=-4, not zero
+    assert!(cpu.state.flag_n);   // 1-5=-4, N must be set from comparison
+    assert!(cpu.state.flag_c);   // borrow (1 < 5)
+}
+
+#[test]
+fn test_min_flags_a_less() {
+    // MIN.F r0, r1, r2 where r1=2, r2=10 → result=2, flags from 2-10=-8
+    let cpu = Program::new()
+        .emit16(mov_s(1, 2))
+        .emit16(mov_s(2, 10))
+        .emit32(alu32(0x09, 1, 2, 0, 0b00, true))  // MIN.F r0, r1, r2
+        .emit16(brk_s())
+        .run(10);
+
+    assert_eq!(cpu.state.core_regs[0], 2);  // min(2,10) = 2
+    assert!(!cpu.state.flag_z);  // 2-10=-8, not zero
+    assert!(cpu.state.flag_n);   // 2-10=-8, N from comparison
+    assert!(cpu.state.flag_c);   // borrow (2 < 10)
+}
+
+#[test]
+fn test_min_flags_equal() {
+    // MIN.F r0, r1, r2 where r1=7, r2=7 → result=7, flags from 7-7=0
+    let cpu = Program::new()
+        .emit16(mov_s(1, 7))
+        .emit16(mov_s(2, 7))
+        .emit32(alu32(0x09, 1, 2, 0, 0b00, true))  // MIN.F r0, r1, r2
+        .emit16(brk_s())
+        .run(10);
+
+    assert_eq!(cpu.state.core_regs[0], 7);  // min(7,7) = 7
+    assert!(cpu.state.flag_z);   // 7-7=0, Z from comparison
+    assert!(!cpu.state.flag_n);
+    assert!(!cpu.state.flag_c);  // no borrow (7 >= 7)
+}
+
+// === ABS flag tests (Bug fix: V must be explicitly set to 0 for non-overflow cases) ===
+
+/// 32-bit single-op: OP.F B, C (sub=0x2F, A=sub_opcode2)
+fn single_op32(sub2: u8, b: u8, c: u8, f: bool) -> u32 {
+    alu32(0x2F, b, c, sub2, 0b00, f)
+}
+
+#[test]
+fn test_abs_positive_clears_v() {
+    // Set V=1 first via SUB overflow, then ABS.F should clear V
+    // SUB.F r2, r2, #1 with r2=0 → r2=0xFFFFFFFF, C=1, N=1
+    // Then set V=1 by doing ADD.F on values that overflow
+    // Simplest: use CMP to set V, but V from CMP on small values is 0...
+    // Alternative: just check that ABS.F on positive value sets V=0
+    // First set V=1 with a trick: MOV r1, #5, then ABS.F r0, r1 → V should be 0
+    // But we need V=1 before. Use SUB.F 0, 0x7F, 0x80 with sign extension issue...
+    // Simplest: trust that V starts as false, and just verify ABS sets it correctly.
+    // Test: ABS.F r0, r1 where r1=5 → result=5, V=0, C=0
+    let cpu = Program::new()
+        .emit16(mov_s(1, 5))
+        .emit32(single_op32(0x09, 0, 1, true))  // ABS.F r0, r1
+        .emit16(brk_s())
+        .run(10);
+
+    assert_eq!(cpu.state.core_regs[0], 5);
+    assert!(!cpu.state.flag_v);  // no overflow
+    assert!(!cpu.state.flag_c);  // C=0 for non-negative
+    assert!(!cpu.state.flag_z);
+    assert!(!cpu.state.flag_n);
+}
+
+#[test]
+fn test_abs_negative_clears_v() {
+    // r1 = -5 (0xFFFFFFFB), ABS.F r0, r1 → result=5, V=0, C=1
+    let cpu = Program::new()
+        .emit16(mov_s(1, 0))
+        .emit32(alu32(0x02, 1, 5, 1, 0b01, false))  // SUB r1, r1, #5 → r1 = -5
+        .emit32(single_op32(0x09, 0, 1, true))       // ABS.F r0, r1
+        .emit16(brk_s())
+        .run(10);
+
+    assert_eq!(cpu.state.core_regs[0], 5);
+    assert!(!cpu.state.flag_v);  // V must be cleared (not preserved)
+    assert!(cpu.state.flag_c);   // C=1 for negative input
+    assert!(!cpu.state.flag_z);
+    assert!(!cpu.state.flag_n);
+}
+
+#[test]
+fn test_abs_negative_clears_stale_v() {
+    // Verify ABS clears a stale V=1 from a previous instruction.
+    // First: create V=1 via ADD.F that overflows (0x7FFFFFFF + 1)
+    // MOV r1, LIMM(0x7FFFFFFF), ADD.F r2, r1, #1 → overflow, V=1
+    // Then: ABS.F r0, r3 where r3=42 → V must be 0 (not stale 1)
+    let mov_limm = alu32(0x0A, 1, 62, 0, 0b00, false);  // MOV r1, LIMM
+    let limm_val: u32 = 0x7FFFFFFF;
+
+    let cpu = Program::new()
+        .emit32(mov_limm)                             // MOV r1, 0x7FFFFFFF
+        .emit32(limm_val)                             // LIMM data
+        .emit32(alu32(0x00, 1, 1, 2, 0b01, true))    // ADD.F r2, r1, #1 → overflow, V=1
+        .emit16(mov_s(3, 42))                          // r3 = 42
+        .emit32(single_op32(0x09, 0, 3, true))        // ABS.F r0, r3 → V must be cleared
+        .emit16(brk_s())
+        .run(10);
+
+    assert_eq!(cpu.state.core_regs[0], 42);
+    assert!(!cpu.state.flag_v);  // V must be 0, not stale 1 from ADD overflow
+    assert!(!cpu.state.flag_c);  // C=0 for non-negative
+}

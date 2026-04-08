@@ -160,8 +160,7 @@ pub enum ExtArithOp {
     Divaw,    // 0x08
     Asls,     // 0x0A - shift left with saturation
     Asrs,     // 0x0B - shift right with saturation
-    Mul64,    // 0x04 - 32x32 signed multiply → r57/r58/r59
-    Mulu64,   // 0x05 - 32x32 unsigned multiply → r57/r58/r59
+    // 0x04 (Mul64) and 0x05 (Mulu64) not supported on ARC 700
     Addsdw,   // 0x28
     Subsdw,   // 0x29
     // Single-operand extensions (sub 0x2F, a field = sub-opcode2)

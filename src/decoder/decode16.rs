@@ -192,13 +192,8 @@ fn decode_0f_general(half: u16, pc: u32) -> Result<DecodedInstruction, Exception
             op: AluOp::Tst, dst: Operand::None, src1: Operand::Reg(b),
             src2: Operand::Reg(c), set_flags: true, cc: None,
         },
-        0x0C => {
-            // MUL64_S: signed multiply, result goes to r57/r58/r59
-            Instruction::ExtArith {
-                op: ExtArithOp::Mul64, dst: Operand::None, src1: Operand::Reg(b),
-                src2: Operand::Reg(c), set_flags: false, cc: None,
-            }
-        }
+        // 0x0C: MUL64_S not supported on ARC 700
+        0x0C => return Err(Exception::InstructionError { address: pc }),
         0x0D => Instruction::SingleOp {
             op: SingleOp::Sexb, dst: Operand::Reg(b), src: Operand::Reg(c),
             set_flags: false, cc: None,

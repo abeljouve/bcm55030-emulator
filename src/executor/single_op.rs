@@ -68,8 +68,10 @@ pub fn execute_single_op(
                 overflow = Some(true);
                 (0x80000000u32, Some(true))
             } else if signed < 0 {
+                overflow = Some(false);
                 ((-signed) as u32, Some(true))
             } else {
+                overflow = Some(false);
                 (val, Some(false))
             }
         }
