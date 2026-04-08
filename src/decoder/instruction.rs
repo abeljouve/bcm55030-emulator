@@ -160,18 +160,20 @@ pub enum ExtArithOp {
     Divaw,    // 0x08
     Asls,     // 0x0A - shift left with saturation
     Asrs,     // 0x0B - shift right with saturation
+    Mul64,    // 0x04 - 32x32 signed multiply → r57/r58/r59
+    Mulu64,   // 0x05 - 32x32 unsigned multiply → r57/r58/r59
     Addsdw,   // 0x28
     Subsdw,   // 0x29
-    // Single-operand extensions (sub 0x2F)
+    // Single-operand extensions (sub 0x2F, a field = sub-opcode2)
+    Swap,     // a=0x00
+    Norm,     // a=0x01
     Sat16,    // a=0x02
     Rnd16,    // a=0x03
-    Abss,     // a=0x04
-    Abssw,    // a=0x01
-    Negs,     // a=0x07
+    Abssw,    // a=0x04
+    Abss,     // a=0x05
     Negsw,    // a=0x06
-    Norm,     // a=0x00
-    Normw,    // a=0x05
-    Swap,     // a=0x0D
+    Negs,     // a=0x07
+    Normw,    // a=0x08
 }
 
 /// Data sizes for load/store

@@ -8,7 +8,15 @@ use super::resolve_value;
 pub fn execute_zero_op(zop: &ZeroOp, state: &mut CpuState) -> Result<(), Exception> {
     match zop {
         ZeroOp::Nop => Ok(()),
-        ZeroOp::Sleep { .. } => {
+        ZeroOp::Sleep { u6 } => {
+            // SLEEP operand can selectively enable interrupt levels
+            // Bits[4:3] of u6 control E1/E2 enable during sleep
+            if *u6 != 0 {
+                let mask = *u6 as u32;
+                // Bit 3 = E1 enable, Bit 4 = E2 enable
+                state.flag_e1 = (mask >> 3) & 1 != 0;
+                state.flag_e2 = (mask >> 4) & 1 != 0;
+            }
             state.sleeping = true;
             Ok(())
         }

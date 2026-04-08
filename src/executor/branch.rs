@@ -24,6 +24,8 @@ pub fn execute_branch(
     let target = (pcl as i64 + offset as i64) as u32;
     let next_pc = decoded.pc + decoded.total_size();
 
+    state.aux_bta = target;
+
     match delay {
         DelayMode::Delay => {
             // For BL.D, blink is set later in step() when we know the delay slot size.
@@ -73,6 +75,8 @@ pub fn execute_branch_compare(
     let pcl = decoded.pc & !3;
     let target = (pcl as i64 + offset as i64) as u32;
 
+    state.aux_bta = target;
+
     match delay {
         DelayMode::Delay => {
             // BRcc never has link, is_link always false
@@ -105,15 +109,18 @@ pub fn execute_jump(
     let target = resolve_value(target_op, state)?;
     let next_pc = decoded.pc + decoded.total_size();
 
-    // J.F [ILINK1/2]: restore STATUS32 from saved level
+    state.aux_bta = target;
+
+    // J.F [ILINK1/2]: restore STATUS32 and BTA from saved level
     if flag_restore {
         if let Operand::Reg(r) = target_op {
-            let saved_status = if r == 29 {
-                state.aux_status32_l1
+            if r == 29 {
+                state.set_status32(state.aux_status32_l1);
+                state.aux_bta = state.aux_bta_l1;
             } else {
-                state.aux_status32_l2
-            };
-            state.set_status32(saved_status);
+                state.set_status32(state.aux_status32_l2);
+                state.aux_bta = state.aux_bta_l2;
+            }
         }
     }
 

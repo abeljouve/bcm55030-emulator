@@ -901,6 +901,7 @@ fn decode_jump(
             };
 
             // Check F bit with ILINK (only in REG mode, m=0)
+            // Using ILINK without F raises InstructionError
             let flag_restore = if f {
                 if m == 0 {
                     if let Operand::Reg(r) = target {
@@ -916,6 +917,14 @@ fn decode_jump(
                     return Err(Exception::InstructionError { address: pc });
                 }
             } else {
+                // ILINK used without F → InstructionError
+                if m == 0 {
+                    if let Operand::Reg(r) = target {
+                        if r == 29 || r == 30 {
+                            return Err(Exception::InstructionError { address: pc });
+                        }
+                    }
+                }
                 false
             };
 
@@ -1238,17 +1247,15 @@ fn decode_extension_ops(
     if sub == 0x2F {
         let a_field = extract_a_reg(word);
         let ext_sop = match a_field {
-            0x00 => ExtArithOp::Norm,
-            0x01 => ExtArithOp::Abssw,
+            0x00 => ExtArithOp::Swap,
+            0x01 => ExtArithOp::Norm,
             0x02 => ExtArithOp::Sat16,
             0x03 => ExtArithOp::Rnd16,
-            0x04 => ExtArithOp::Abss,
-            0x05 => ExtArithOp::Normw,
+            0x04 => ExtArithOp::Abssw,
+            0x05 => ExtArithOp::Abss,
             0x06 => ExtArithOp::Negsw,
             0x07 => ExtArithOp::Negs,
-            0x08 => ExtArithOp::Asls,
-            0x09 => ExtArithOp::Asrs,
-            0x0D => ExtArithOp::Swap,
+            0x08 => ExtArithOp::Normw,
             _ => return Err(Exception::InstructionError { address: pc }),
         };
 
@@ -1291,6 +1298,8 @@ fn decode_extension_ops(
         0x01 => ExtArithOp::Lsr,
         0x02 => ExtArithOp::Asr,
         0x03 => ExtArithOp::Ror,
+        0x04 => ExtArithOp::Mul64,
+        0x05 => ExtArithOp::Mulu64,
         0x06 => ExtArithOp::Adds,
         0x07 => ExtArithOp::Subs,
         0x08 => ExtArithOp::Divaw,

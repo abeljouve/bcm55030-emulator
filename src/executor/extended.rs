@@ -23,20 +23,71 @@ pub fn execute_ext_arith(
     let a = resolve_value(src1, state)?;
     let b = resolve_value(src2, state)?;
 
+    // MUL64/MULU64: result goes to r57(MLO)/r58(MMID)/r59(MHI), not dst
+    match op {
+        ExtArithOp::Mul64 => {
+            let result = (a as i32 as i64).wrapping_mul(b as i32 as i64) as u64;
+            state.core_regs[57] = result as u32;           // MLO: low 32
+            state.core_regs[58] = (result >> 16) as u32;   // MMID: middle 32
+            state.core_regs[59] = (result >> 32) as u32;   // MHI: high 32
+            return Ok(());
+        }
+        ExtArithOp::Mulu64 => {
+            let result = (a as u64).wrapping_mul(b as u64);
+            state.core_regs[57] = result as u32;           // MLO: low 32
+            state.core_regs[58] = (result >> 16) as u32;   // MMID: middle 32
+            state.core_regs[59] = (result >> 32) as u32;   // MHI: high 32
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let mut carry: Option<bool> = None;
+
     let result = match op {
         ExtArithOp::Asl => {
-            let shift = b & 31;
-            if shift == 0 { a } else { a << shift }
+            let shift = b & 0x1F;
+            if b >= 32 {
+                carry = if b == 32 { Some((a & 1) != 0) } else { Some(false) };
+                0
+            } else if shift == 0 {
+                a
+            } else {
+                carry = Some(((a >> (32 - shift)) & 1) != 0);
+                a << shift
+            }
         }
         ExtArithOp::Lsr => {
-            let shift = b & 31;
-            if shift == 0 { a } else { a >> shift }
+            let shift = b & 0x1F;
+            if b >= 32 {
+                carry = if b == 32 { Some((a >> 31) != 0) } else { Some(false) };
+                0
+            } else if shift == 0 {
+                a
+            } else {
+                carry = Some(((a >> (shift - 1)) & 1) != 0);
+                a >> shift
+            }
         }
         ExtArithOp::Asr => {
-            let shift = b & 31;
-            ((a as i32) >> shift) as u32
+            let shift = b & 0x1F;
+            if b >= 32 {
+                carry = Some((a >> 31) != 0);
+                ((a as i32) >> 31) as u32
+            } else if shift == 0 {
+                a
+            } else {
+                carry = Some(((a >> (shift - 1)) & 1) != 0);
+                ((a as i32) >> shift) as u32
+            }
         }
-        ExtArithOp::Ror => a.rotate_right(b & 31),
+        ExtArithOp::Ror => {
+            let shift = b & 0x1F;
+            if shift != 0 {
+                carry = Some(((a >> (shift - 1)) & 1) != 0);
+            }
+            a.rotate_right(b & 31)
+        }
         ExtArithOp::Adds => (a as i32).saturating_add(b as i32) as u32,
         ExtArithOp::Subs => (a as i32).saturating_sub(b as i32) as u32,
         ExtArithOp::Addsdw => {
@@ -178,6 +229,7 @@ pub fn execute_ext_arith(
             }
         }
         ExtArithOp::Swap => ((a & 0xFFFF) << 16) | ((a >> 16) & 0xFFFF),
+        ExtArithOp::Mul64 | ExtArithOp::Mulu64 => unreachable!(),
     };
 
     write_dest(dst, result, state)?;
@@ -185,6 +237,9 @@ pub fn execute_ext_arith(
     if set_flags {
         state.flag_z = result == 0;
         state.flag_n = (result >> 31) != 0;
+        if let Some(c) = carry {
+            state.flag_c = c;
+        }
     }
 
     Ok(())

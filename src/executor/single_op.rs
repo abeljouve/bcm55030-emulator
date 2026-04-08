@@ -34,6 +34,7 @@ pub fn execute_single_op(
 
     let val = resolve_value(src, state)?;
     let carry_in = state.flag_c;
+    let mut overflow: Option<bool> = None;
 
     let (result, carry) = match op {
         SingleOp::Asl => {
@@ -64,6 +65,7 @@ pub fn execute_single_op(
         SingleOp::Abs => {
             let signed = val as i32;
             if signed == i32::MIN {
+                overflow = Some(true);
                 (0x80000000u32, Some(true))
             } else if signed < 0 {
                 ((-signed) as u32, Some(true))
@@ -87,6 +89,9 @@ pub fn execute_single_op(
         state.flag_n = (result >> 31) != 0;
         if let Some(c) = carry {
             state.flag_c = c;
+        }
+        if let Some(v) = overflow {
+            state.flag_v = v;
         }
     }
 

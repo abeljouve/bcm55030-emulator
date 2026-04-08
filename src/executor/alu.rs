@@ -79,17 +79,23 @@ fn compute_alu(op: AluOp, a: u32, b: u32, carry_in: bool) -> (u32, Option<bool>,
         AluOp::Bic => (a & !b, None, None),
         AluOp::Xor => (a ^ b, None, None),
         AluOp::Max => {
+            // Flags from internal comparison (a - b)
+            let (cmp_result, borrow) = a.overflowing_sub(b);
+            let overflow = ((a ^ b) & (a ^ cmp_result)) >> 31 != 0;
             if (a as i32) >= (b as i32) {
-                (a, None, None)
+                (a, Some(borrow), Some(overflow))
             } else {
-                (b, None, None)
+                (b, Some(borrow), Some(overflow))
             }
         }
         AluOp::Min => {
+            // Flags from internal comparison (a - b)
+            let (cmp_result, borrow) = a.overflowing_sub(b);
+            let overflow = ((a ^ b) & (a ^ cmp_result)) >> 31 != 0;
             if (a as i32) <= (b as i32) {
-                (a, None, None)
+                (a, Some(borrow), Some(overflow))
             } else {
-                (b, None, None)
+                (b, Some(borrow), Some(overflow))
             }
         }
         AluOp::Mov => (b, None, None),

@@ -16,6 +16,13 @@ pub fn execute_load(
     state: &mut CpuState,
     mem: &Memory,
 ) -> Result<(), Exception> {
+    // ARC 700: LD to extension regs (r32-r59) or LP_COUNT (r60) raises InstructionError
+    if let Operand::Reg(r) = dst {
+        if r >= 32 && r <= 60 {
+            return Err(Exception::InstructionError { address: state.pc });
+        }
+    }
+
     let base_val = resolve_value(base, state)?;
     let offset_val = resolve_value(offset, state)?;
 

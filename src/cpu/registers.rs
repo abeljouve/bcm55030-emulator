@@ -428,8 +428,8 @@ impl CpuState {
                 Ok(())
             }
             AUX_STATUS32 => {
-                self.set_status32(val);
-                Ok(())
+                // STATUS32 is read-only via SR; use FLAG instruction to modify
+                Err(Exception::InstructionError { address: self.pc })
             }
             AUX_STATUS32_L1 => {
                 self.aux_status32_l1 = val;
@@ -444,7 +444,8 @@ impl CpuState {
                 Ok(())
             }
             AUX_CONTROL0 => {
-                self.aux_control0 = val;
+                // IP bit (bit 3) is read-only; preserve it
+                self.aux_control0 = (val & !0x08) | (self.aux_control0 & 0x08);
                 Ok(())
             }
             AUX_LIMIT0 => {
@@ -469,7 +470,8 @@ impl CpuState {
                 Ok(())
             }
             AUX_CONTROL1 => {
-                self.aux_control1 = val;
+                // IP bit (bit 3) is read-only; preserve it
+                self.aux_control1 = (val & !0x08) | (self.aux_control1 & 0x08);
                 Ok(())
             }
             AUX_LIMIT1 => {

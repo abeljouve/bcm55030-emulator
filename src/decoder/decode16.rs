@@ -193,9 +193,9 @@ fn decode_0f_general(half: u16, pc: u32) -> Result<DecodedInstruction, Exception
             src2: Operand::Reg(c), set_flags: true, cc: None,
         },
         0x0C => {
-            // MUL64_S: multiply result goes to special regs
-            Instruction::Alu {
-                op: AluOp::Mpy, dst: Operand::None, src1: Operand::Reg(b),
+            // MUL64_S: signed multiply, result goes to r57/r58/r59
+            Instruction::ExtArith {
+                op: ExtArithOp::Mul64, dst: Operand::None, src1: Operand::Reg(b),
                 src2: Operand::Reg(c), set_flags: false, cc: None,
             }
         }
@@ -665,7 +665,7 @@ fn decode_1c_add_cmp_imm(half: u16, pc: u32) -> Result<DecodedInstruction, Excep
     let inst = if i == 0 {
         Instruction::Alu {
             op: AluOp::Add, dst: Operand::Reg(b), src1: Operand::Reg(b),
-            src2: Operand::Imm(u7), set_flags: true, cc: None,
+            src2: Operand::Imm(u7), set_flags: false, cc: None,
         }
     } else {
         Instruction::Alu {
