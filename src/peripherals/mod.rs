@@ -33,6 +33,10 @@ pub struct MmioController {
     /// Read by timer1_get_current_value (0x45E4) as a 16-bit hardware counter.
     /// Incremented each time Timer1 interrupt fires.
     pub timer_counter: u16,
+    /// BCM55030 EPON MAC / system register storage for read-write registers.
+    /// The bootloader writes config values (e.g., FDS recovery bitmap at +0x24)
+    /// and reads them back later. Uninitialized entries default to 0.
+    sysreg_store: [u32; SYSREG_SIZE as usize / 4],
 }
 
 impl MmioController {
@@ -42,6 +46,7 @@ impl MmioController {
             pbc: PeripheralBusController::new(),
             trace: false,
             timer_counter: 0,
+            sysreg_store: [0; SYSREG_SIZE as usize / 4],
         }
     }
 
@@ -61,7 +66,8 @@ impl MmioController {
     }
 
     /// BCM55030 EPON MAC / system register reads.
-    /// The `reg N` CLI command reads at offset N*4 from base 0x01000000.
+    /// Hardware-defined registers return fixed values; all others return
+    /// the last value written (read-write storage for firmware config).
     fn sysreg_read_word(&self, offset: u32) -> u32 {
         match offset {
             0x000 => 0x47010203, // reg 0x00: CHIP_ID (BCM4701)
@@ -69,9 +75,25 @@ impl MmioController {
             0x00C => 0x0114B820, // reg 0x03: LLID_CAPTURE_MASK
             0x018 => 0x00000006, // reg 0x06: LLID_ACTIVE_BITMAP
             0x030 => 0x0000FFFF, // reg 0x0C: RX_GRANT_MASK
-            0x050 => self.timer_counter as u32, // Timer counter (read by timer1_get_current_value)
+            0x050 => self.timer_counter as u32, // Timer counter
             0x1E0 => 0x45504F4E, // reg 0x78: EPON signature ("EPON")
-            _ => 0,
+            _ => {
+                // Read-write storage for firmware-configured registers
+                let idx = (offset / 4) as usize;
+                if idx < self.sysreg_store.len() {
+                    self.sysreg_store[idx]
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// BCM55030 EPON MAC / system register writes.
+    fn sysreg_write_word(&mut self, offset: u32, val: u32) {
+        let idx = (offset / 4) as usize;
+        if idx < self.sysreg_store.len() {
+            self.sysreg_store[idx] = val;
         }
     }
 
@@ -209,8 +231,10 @@ impl MmioController {
             return Ok(());
         }
         if Self::is_sysreg(addr) {
+            let offset = addr - SYSREG_BASE;
+            self.sysreg_write_word(offset, val);
             if self.trace {
-                eprintln!("[MMIO] write word  0x{:08X} = 0x{:08X} (sysreg+0x{:02X})", addr, val, addr - SYSREG_BASE);
+                eprintln!("[MMIO] write word  0x{:08X} = 0x{:08X} (sysreg+0x{:02X})", addr, val, offset);
             }
             return Ok(());
         }

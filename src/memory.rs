@@ -210,6 +210,7 @@ impl Memory {
     pub fn write_byte(&mut self, addr: u32, val: u8) -> Result<(), Exception> {
         if self.iccm.is_some() {
             if let Some(off) = self.dccm_offset(addr) {
+                // (no debug)
                 self.data[off] = val;
                 return Ok(());
             }

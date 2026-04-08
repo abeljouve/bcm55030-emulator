@@ -146,7 +146,7 @@ impl Cpu {
 
         // Execute
         self.state.pc_written = false;
-        // (no debug)
+        // (debug removed)
         executor::execute(&decoded, &mut self.state, &mut self.mem)?;
 
         // PC update logic
