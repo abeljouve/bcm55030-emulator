@@ -124,6 +124,8 @@ impl Cpu {
             }
         }
 
+
+
         // Fetch and decode
         let decoded = decoder::decode(self.state.pc, &self.mem)?;
         let next_pc = self.state.pc + decoded.total_size();
@@ -284,6 +286,10 @@ impl Cpu {
         // The flash binary uses absolute addresses in the 0x00000000 range.
         self.mem.iccm_base = 0;
         self.mem.dccm_base = 0;
+
+        // Protect PCL-relative literal pool constants from event_table_clear corruption.
+        // See memory.rs for detailed explanation.
+        self.mem.protect_firmware_literals();
 
         // Reset CPU state for firmware
         self.state = CpuState::new();

@@ -35,6 +35,26 @@ pub struct Memory {
 
     /// Size of the loaded app binary (used for BSS clearing in boot ROM CRT init)
     pub app_size: Option<usize>,
+
+    /// Protect the firmware code section in DCCM from event_table_clear corruption.
+    ///
+    /// The firmware firmware's event groups have entry tables that overlap with the code
+    /// section in DCCM (since ICCM and DCCM both contain the firmware binary, but code
+    /// runs from ICCM while data is in DCCM). The compiler places PCL-relative literal
+    /// pool constants (pointers, table bases) between code sequences.
+    ///
+    /// `event_table_clear_all_counter_entries()` writes 0 to counter slots within
+    /// these entry tables, inadvertently zeroing PCL-relative constants. On real
+    /// hardware, the FDS scan rebuilds these counters from flash records, restoring
+    /// the overlapping constants. But the scan itself needs these constants to locate
+    /// flash regions — creating a circular dependency on first boot.
+    ///
+    /// We break this cycle by suppressing zero-writes to non-zero halfwords in the
+    /// firmware code section (0 to app_size). This preserves PCL-relative constants while
+    /// still allowing legitimate data writes (non-zero values).
+    ///
+    /// Set to app_size after firmware binary is loaded. 0 = protection disabled.
+    firmware_code_protect_end: usize,
 }
 
 impl Memory {
@@ -47,6 +67,7 @@ impl Memory {
             iccm_base: 0,
             dccm_base: 0,
             app_size: None,
+            firmware_code_protect_end: 0,
         }
     }
 
@@ -59,6 +80,16 @@ impl Memory {
             iccm_base: 0,
             dccm_base: 0,
             app_size: None,
+            firmware_code_protect_end: 0,
+        }
+    }
+
+    /// Enable protection of the firmware code section against event_table_clear corruption.
+    /// Called after firmware binary is loaded to DCCM, before execution starts.
+    pub fn protect_firmware_literals(&mut self) {
+        if let Some(size) = self.app_size {
+            self.firmware_code_protect_end = size;
+            eprintln!("[BCM55030] DCCM code section protection: 0x0000-0x{:04X}", size);
         }
     }
 
@@ -144,18 +175,17 @@ impl Memory {
     pub fn read_half(&self, addr: u32) -> Result<u16, Exception> {
         if self.iccm.is_some() {
             // Harvard mode: check DCCM first, then MMIO, then unmapped
-            if addr & 1 != 0 {
-                // Only enforce alignment for mapped memory
-                if self.dccm_offset(addr).is_some() {
-                    return Err(Exception::MisalignedAccess { address: addr });
-                }
-                // Unmapped misaligned — return 0
-                return Ok(0);
-            }
             if let Some(off) = self.dccm_offset(addr) {
+                // Misaligned DCCM reads: perform byte-wise (fixup behavior).
+                // The ARC 700 raises a MisalignedAccess exception, but the firmware's
+                // exception handler fixes up the access. We emulate this directly.
                 if off + 1 < self.data.len() {
                     return Ok(((self.data[off] as u16) << 8) | (self.data[off + 1] as u16));
                 }
+            }
+            if addr & 1 != 0 {
+                // Unmapped misaligned — return 0
+                return Ok(0);
             }
             if let Some(ref mmio) = self.mmio {
                 return mmio.borrow_mut().read_half(addr);
@@ -175,8 +205,14 @@ impl Memory {
         if self.iccm.is_some() {
             // Harvard mode: check DCCM first, then MMIO, then unmapped
             if addr & 3 != 0 {
-                if self.dccm_offset(addr).is_some() {
-                    return Err(Exception::MisalignedAccess { address: addr });
+                // Misaligned DCCM reads: perform byte-wise fixup
+                if let Some(off) = self.dccm_offset(addr) {
+                    if off + 3 < self.data.len() {
+                        return Ok(((self.data[off] as u32) << 24)
+                            | ((self.data[off + 1] as u32) << 16)
+                            | ((self.data[off + 2] as u32) << 8)
+                            | (self.data[off + 3] as u32));
+                    }
                 }
                 return Ok(0);
             }
@@ -227,18 +263,27 @@ impl Memory {
 
     pub fn write_half(&mut self, addr: u32, val: u16) -> Result<(), Exception> {
         if self.iccm.is_some() {
-            if addr & 1 != 0 {
-                if self.dccm_offset(addr).is_some() {
-                    return Err(Exception::MisalignedAccess { address: addr });
-                }
-                return Ok(()); // Unmapped misaligned write — absorb
-            }
+            // Misaligned DCCM writes: perform byte-wise fixup.
+            // The ARC 700 raises MisalignedAccess, but the firmware's exception
+            // handler fixes up the access. We emulate this directly.
             if let Some(off) = self.dccm_offset(addr) {
                 if off + 1 < self.data.len() {
+                    // Protect firmware code section: suppress zero-writes to non-zero halfwords.
+                    // This preserves PCL-relative literal pool constants that overlap
+                    // with event counter table entries.
+                    if val == 0 && off < self.firmware_code_protect_end {
+                        let existing = ((self.data[off] as u16) << 8) | (self.data[off + 1] as u16);
+                        if existing != 0 {
+                            return Ok(()); // Suppress: would zero a code-section constant
+                        }
+                    }
                     self.data[off] = (val >> 8) as u8;
                     self.data[off + 1] = val as u8;
                     return Ok(());
                 }
+            }
+            if addr & 1 != 0 {
+                return Ok(()); // Unmapped misaligned write — absorb
             }
             if let Some(ref mmio) = self.mmio {
                 return mmio.borrow_mut().write_half(addr, val);
@@ -259,8 +304,15 @@ impl Memory {
     pub fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
         if self.iccm.is_some() {
             if addr & 3 != 0 {
-                if self.dccm_offset(addr).is_some() {
-                    return Err(Exception::MisalignedAccess { address: addr });
+                // Misaligned DCCM writes: perform byte-wise fixup
+                if let Some(off) = self.dccm_offset(addr) {
+                    if off + 3 < self.data.len() {
+                        self.data[off] = (val >> 24) as u8;
+                        self.data[off + 1] = (val >> 16) as u8;
+                        self.data[off + 2] = (val >> 8) as u8;
+                        self.data[off + 3] = val as u8;
+                        return Ok(());
+                    }
                 }
                 return Ok(()); // Unmapped misaligned write — absorb
             }

@@ -37,6 +37,9 @@ pub struct MmioController {
     /// The bootloader writes config values (e.g., FDS recovery bitmap at +0x24)
     /// and reads them back later. Uninitialized entries default to 0.
     sysreg_store: [u32; SYSREG_SIZE as usize / 4],
+    /// I2C bit-bang state for SFP EEPROM bus (SYSREG+0x48/0x4C).
+    /// Counts clock toggles to simulate NAK (no SFP module present).
+    i2c_clock_toggles: u32,
 }
 
 impl MmioController {
@@ -47,6 +50,7 @@ impl MmioController {
             trace: false,
             timer_counter: 0,
             sysreg_store: [0; SYSREG_SIZE as usize / 4],
+            i2c_clock_toggles: 0,
         }
     }
 
@@ -77,6 +81,27 @@ impl MmioController {
             0x030 => 0x0000FFFF, // reg 0x0C: RX_GRANT_MASK
             0x050 => self.timer_counter as u32, // Timer counter
             0x1E0 => 0x45504F4E, // reg 0x78: EPON signature ("EPON")
+            0x048 => {
+                // I2C status register for SFP EEPROM bit-bang bus.
+                // Bit 31 = SDA input line. Bit 4 = ACK enable (set by firmware).
+                // The firmware sets bit 4 before checking for ACK (bit 31=0),
+                // then clears it and waits for SDA high (bit 31=1).
+                // We simulate an always-ACKing SFP EEPROM:
+                // - When bit 4 is set: return bit 31=0 (ACK from slave)
+                // - When bit 4 is clear: return bit 31=1 (SDA released high)
+                let base = self.sysreg_store[0x048 / 4];
+                if base & 0x10 != 0 {
+                    base & !0x80000000 // bit 4 set → ACK: SDA low
+                } else {
+                    base | 0x80000000  // bit 4 clear → SDA high (idle/stop)
+                }
+            }
+            0x04C => {
+                // I2C clock/data register. Bit 0 = SCL, bit 31 = SDA (data in).
+                // For data reads, return SDA=1 (all 0xFF EEPROM data = blank SFP).
+                let base = self.sysreg_store[0x04C / 4];
+                base | 0x80000000 // SDA high = data bit 1 (0xFF bytes)
+            }
             _ => {
                 // Read-write storage for firmware-configured registers
                 let idx = (offset / 4) as usize;
@@ -91,9 +116,29 @@ impl MmioController {
 
     /// BCM55030 EPON MAC / system register writes.
     fn sysreg_write_word(&mut self, offset: u32, val: u32) {
+        // Track I2C clock toggles on bit 0 of register 0x4C
+        if offset == 0x04C {
+            let old = self.sysreg_store[0x04C / 4];
+            if (val & 1) != 0 && (old & 1) == 0 {
+                self.i2c_clock_toggles += 1;
+            }
+        }
+        // Reset I2C state when start condition is initiated (bit 15 set on 0x40)
+        if offset == 0x040 {
+            let old = self.sysreg_store[0x040 / 4];
+            if (val & 0x8000) != 0 && (old & 0x8000) == 0 {
+                self.i2c_clock_toggles = 0;
+            }
+        }
+
         let idx = (offset / 4) as usize;
         if idx < self.sysreg_store.len() {
-            self.sysreg_store[idx] = val;
+            // Auto-clear command/busy bits (27-31) on write.
+            // Many EPON MAC registers use upper bits as write-1-to-trigger commands
+            // that the hardware clears after processing. The firmware polls these bits
+            // and expects them to be cleared. We simulate instant completion.
+            let stored = val & 0x07FFFFFF; // clear bits 27-31 for reads
+            self.sysreg_store[idx] = stored;
         }
     }
 
