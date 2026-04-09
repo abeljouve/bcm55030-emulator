@@ -7,7 +7,14 @@
 use crate::cpu::exception::Exception;
 use crate::cpu::registers::CpuState;
 use crate::hooks::HookAction;
-use crate::memory::{Memory, DCCM_SIZE, ICCM_SIZE};
+use crate::memory::{Memory, ICCM_SIZE};
+
+/// Runtime base where firmware is loaded in ICCM/DCCM. Hardware-validated:
+/// `mem/rm 0x32000` on the real BCM55030 returns the firmware IVT signature.
+/// The bootloader stays in place at `0..0xA800`; firmware sits above it at this
+/// base. All firmware PC values, hook addresses, literal pool absolutes encoded
+/// by the linker assume this base.
+pub const FIRMWARE_BASE: u32 = 0x32000;
 
 /// Boot ROM "start app" — intercept at ICCM address 0x32000.
 ///
@@ -29,6 +36,15 @@ use crate::memory::{Memory, DCCM_SIZE, ICCM_SIZE};
 ///   +0x20: u24 code size (big-endian, upper 3 bytes of u32)
 ///   +0x27: code payload starts
 pub fn boot_rom_start_app(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
+    // The hook is installed at `FIRMWARE_BASE` (= 0x32000). It fires twice:
+    //  1. The bootloader does `jl 0x32000` to start firmware — first fire, we load
+    //     firmware from flash and set PC=FIRMWARE_BASE.
+    //  2. The CPU then steps to PC=FIRMWARE_BASE (now containing firmware's IVT slot 0,
+    //     which is a J to the startup code) — second fire. We must let firmware run.
+    if mem.app_size.is_some() {
+        return Ok(HookAction::Continue);
+    }
+
     let staging: usize = 0x32000;
     let firmware_signature: [u8; 4] = [0x21, 0x4A, 0x00, 0x00];
 
@@ -114,15 +130,22 @@ pub fn boot_rom_start_app(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
         }
     };
 
-    crate::vlog!("[Boot ROM] Loading firmware: {} bytes (0x{:X})", app_size, app_size);
+    crate::vlog!(
+        "[Boot ROM] Loading firmware: {} bytes (0x{:X}) at runtime base 0x{:X}",
+        app_size, app_size, FIRMWARE_BASE
+    );
 
-    // Load firmware into ICCM (code) and DCCM (data)
-    mem.load_iccm(0, &app_code);
-    mem.load_binary(0, &app_code);
+    // Load firmware into ICCM (code) and DCCM (data) at FIRMWARE_BASE.
+    // The bootloader bytes at 0..0xA800 are preserved (matching real HW).
+    mem.load_iccm(FIRMWARE_BASE, &app_code);
+    mem.load_binary(FIRMWARE_BASE, &app_code);
     mem.app_size = Some(app_size);
+    mem.app_load_base = FIRMWARE_BASE;
 
-    // Fill remaining ICCM with J_S [blink] (0x7EE0)
-    let fill_start = (app_size + 1) & !1;
+    // Fill ICCM tail above firmware with J_S [blink] (0x7EE0).
+    // Bootloader filler at 0xA800..0x32000 stays in place from main.rs::boot_from_flash.
+    let app_end = FIRMWARE_BASE as usize + app_size;
+    let fill_start = (app_end + 1) & !1;
     if fill_start < ICCM_SIZE {
         let mut fill = vec![0u8; ICCM_SIZE - fill_start];
         for chunk in fill.chunks_exact_mut(2) {
@@ -132,7 +155,7 @@ pub fn boot_rom_start_app(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
         mem.load_iccm(fill_start as u32, &fill);
     }
 
-    // Firmware runs at base 0
+    // Firmware runs in the same physical address space as the bootloader
     mem.iccm_base = 0;
     mem.dccm_base = 0;
 
@@ -155,238 +178,27 @@ pub fn boot_rom_start_app(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
     // IENABLE is set to all-enabled: the firmware never writes IENABLE itself,
     // it expects the boot ROM to have enabled all interrupt lines.
     *state = CpuState::new();
-    state.core_regs[28] = 0x10800; // SP
+    state.core_regs[28] = 0x10800; // SP (firmware startup will overwrite to 0x32000)
     state.aux_ienable = 0xFFFFFFFF; // Boot ROM enables all interrupt lines
-    state.pc = 0;
-
-    crate::vlog!("[Boot ROM] ICCM/DCCM base=0, firmware {} bytes, entry=0x00000000", app_size);
-    Ok(HookAction::Skip)
-}
-
-/// Boot ROM hw_init — stub (PLL, clocks, pin mux, SerDes).
-/// The emulator doesn't need hardware initialization.
-pub fn boot_rom_hw_init(state: &mut CpuState, _mem: &mut Memory) -> Result<HookAction, Exception> {
-    crate::vlog!("[Boot ROM] 0x{:05X}: boot_rom_hw_init — early HW init (stub, return to 0x{:05X})",
-        state.pc, state.core_regs[31]);
-    state.pc = state.core_regs[31];
-    state.instruction_count += 1;
-    Ok(HookAction::Skip)
-}
-
-/// Boot ROM crt_main — copies .data section, clears BSS, jumps to firmware_main_loop.
-///
-/// The real boot ROM CRT performs C runtime initialization:
-/// 1. Copy .data init values from ICCM (LMA) to their DCCM addresses (VMA)
-/// 2. Zero the .bss section
-/// 3. Jump to firmware_main_loop (0x20C)
-///
-/// The .data VMA occupies the top of DCCM: [DCCM_SIZE - data_size .. DCCM_SIZE).
-/// The data_size is stored in the TKF header at +0x10.
-/// The .data init values are packed in the binary at a constant offset (delta)
-/// below their VMA addresses. We derive delta by finding a VMA pointer in a
-/// literal pool and verifying the corresponding LMA contains valid data.
-pub fn boot_rom_crt_main(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
-    let app_size = mem.app_size.unwrap_or(0) as u32;
-    let dccm_size = DCCM_SIZE as u32;
-
-    // Read data_size from TKF header in flash (field +0x10).
-    let data_size = read_tkf_data_size(mem, app_size);
-
-    if data_size > 0 && data_size < dccm_size {
-        let data_vma = dccm_size - data_size;
-
-        // Find the flash code start offset for this app slot
-        let flash_code_start = find_flash_code_start(mem, app_size);
-        let binary_len = (app_size as usize).max(data_size as usize * 2);
-
-        let data_lma = find_data_lma(mem, flash_code_start, binary_len, data_vma, data_size);
-
-        crate::vlog!(
-            "[Boot ROM] 0x{:05X}: boot_rom_crt_main — .data: flash[0x{:X}..0x{:X}] → DCCM[0x{:X}..0x{:X}] ({} bytes)",
-            state.pc, data_lma, data_lma + data_size, data_vma, dccm_size, data_size
-        );
-
-        // Copy from flash to DCCM (the .data init values may extend beyond app_size in ICCM)
-        {
-            let mmio = mem.mmio().unwrap();
-            let flash = &mmio.pbc.flash.data;
-            let mut buf = vec![0u8; data_size as usize];
-            for i in 0..data_size as usize {
-                let flash_off = flash_code_start + data_lma as usize + i;
-                if flash_off < flash.len() {
-                    buf[i] = flash[flash_off];
-                }
-            }
-            drop(mmio);
-            mem.load_binary(data_vma, &buf);
-        }
-    }
-
-    // Clear BSS: zero from app_size to data_vma
-    let bss_end = if data_size > 0 { dccm_size - data_size } else { dccm_size };
-    if app_size < bss_end {
-        let zeros = vec![0u8; (bss_end - app_size) as usize];
-        mem.load_binary(app_size, &zeros);
-    }
-
-    // NOTE: IVT entries 16-31 (external IRQs at offsets 0x80-0xF8) are NOT overwritten
-    // with RTIE stubs in ICCM. The firmware has functions at these addresses (e.g.,
-    // firmware_update_check_and_trigger at 0xF8) that are called during init.
-    // Overwriting ICCM would destroy these functions.
-    // Instead, IRQ dispatch is handled by hooks in soc/mod.rs that check whether
-    // the CPU is in interrupt context (flag_a1/flag_a2) and perform RTIE in Rust.
+    state.pc = FIRMWARE_BASE;
 
     crate::vlog!(
-        "[Boot ROM] 0x{:05X}: boot_rom_crt_main — BSS cleared 0x{:X}-0x{:X} ({} bytes), jumping to firmware_main_loop (0x20C)",
-        state.pc, app_size, bss_end, bss_end - app_size
+        "[Boot ROM] ICCM/DCCM base=0, firmware {} bytes, entry=0x{:05X}",
+        app_size, FIRMWARE_BASE
     );
-
-    state.pc = 0x20C;
-
-    // Set hardware ready flags (real boot ROM hw_init would set these)
-    let _ = mem.write_byte(0x7E207, 1);
-
     Ok(HookAction::Skip)
 }
 
-/// Find the flash offset where this app's code starts (header_off + 0x27).
-fn find_flash_code_start(mem: &Memory, app_size: u32) -> usize {
-    let mmio = match mem.mmio() {
-        Some(m) => m,
-        None => return 0,
-    };
-    let flash = &mmio.pbc.flash.data;
-    for &header_off in &[0x120000usize, 0x1A0000, 0x270000] {
-        if header_off + 0x27 >= flash.len() { continue; }
-        let code_size = ((flash[header_off + 0x20] as u32) << 16)
-            | ((flash[header_off + 0x21] as u32) << 8)
-            | (flash[header_off + 0x22] as u32);
-        if code_size == app_size {
-            return header_off + 0x27;
-        }
-    }
-    0
-}
-
-/// Read the .data section size from the TKF header field +0x10 in flash.
-fn read_tkf_data_size(mem: &mut Memory, app_size: u32) -> u32 {
-    let mmio = match mem.mmio() {
-        Some(m) => m,
-        None => return 0,
-    };
-    let flash = &mmio.pbc.flash.data;
-    for &header_off in &[0x120000usize, 0x1A0000, 0x270000] {
-        if header_off + 0x27 >= flash.len() { continue; }
-        let code_size = ((flash[header_off + 0x20] as u32) << 16)
-            | ((flash[header_off + 0x21] as u32) << 8)
-            | (flash[header_off + 0x22] as u32);
-        if code_size == app_size {
-            return u32::from_be_bytes([
-                flash[header_off + 0x10], flash[header_off + 0x11],
-                flash[header_off + 0x12], flash[header_off + 0x13],
-            ]);
-        }
-    }
-    0
-}
-
-/// Find the VMA-to-LMA delta for the .data section.
-///
-/// Searches the binary (in flash) for the format string "\n%s %X" which is
-/// always present in the .data section (used by cli_print_firmware_version_info).
-/// The VMA of this string is read from a literal pool at a known ICCM offset
-/// (0x16118, the first literal pool of cli_print_firmware_version_info).
-/// delta = VMA - LMA, and data_lma = data_vma - delta.
-///
-/// Returns data_lma (the offset in the binary where .data init values start).
-fn find_data_lma(mem: &Memory, flash_code_start: usize, binary_len: usize, data_vma: u32, data_size: u32) -> u32 {
-    let fallback = data_vma.saturating_sub(data_size);
-
-    // Read the VMA pointer from the literal pool at ICCM 0x16118
-    // This is the format string pointer used by cli_print_firmware_version_info
-    let string_vma = mem.fetch_word(0x16118).unwrap_or(0);
-    if string_vma < data_vma || string_vma >= data_vma + data_size {
-        // Fallback: try to find VMA pointer by scanning literal pools
-        return find_data_lma_by_gp(mem, flash_code_start, binary_len, data_vma, data_size);
-    }
-
-    // Search for "\n%s %X" in the flash binary
-    let needle: &[u8] = &[0x0A, 0x25, 0x73, 0x20, 0x25, 0x58]; // "\n%s %X"
-    let mmio = match mem.mmio() {
-        Some(m) => m,
-        None => return fallback,
-    };
-    let flash = &mmio.pbc.flash.data;
-
-    for off in 0..binary_len.saturating_sub(needle.len()) {
-        let flash_off = flash_code_start + off;
-        if flash_off + needle.len() > flash.len() { break; }
-        if flash[flash_off..flash_off + needle.len()] == *needle {
-            let string_lma = off as u32;
-            let delta = string_vma - string_lma;
-            let data_lma = data_vma.saturating_sub(delta);
-            crate::vlog!(
-                "[Boot ROM] .data delta: string VMA=0x{:X} LMA=0x{:X} delta=0x{:X} → data_lma=0x{:X}",
-                string_vma, string_lma, delta, data_lma
-            );
-            return data_lma;
-        }
-    }
-
-    fallback
-}
-
-/// Fallback: find data_lma using GP register heuristic.
-fn find_data_lma_by_gp(mem: &Memory, flash_code_start: usize, binary_len: usize, data_vma: u32, data_size: u32) -> u32 {
-    let fallback = data_vma.saturating_sub(data_size);
-
-    let gp = mem.fetch_word(0x7C).unwrap_or(0);
-    if gp < data_vma || gp >= data_vma + data_size {
-        return fallback;
-    }
-
-    let mmio = match mem.mmio() {
-        Some(m) => m,
-        None => return fallback,
-    };
-    let flash = &mmio.pbc.flash.data;
-    let gp_offset_in_data = gp - data_vma;
-    let data_end = data_vma + data_size;
-
-    let mut best_score = 0u32;
-    let mut best_lma = fallback;
-
-    let lma_max = binary_len.saturating_sub(data_size as usize) as u32;
-    let mut lma = 0u32;
-    while lma <= lma_max {
-        let gp_lma_flash = flash_code_start + lma as usize + gp_offset_in_data as usize;
-        if gp_lma_flash + 128 > flash.len() { break; }
-
-        let mut score = 0u32;
-        for i in 0..32u32 {
-            let off = gp_lma_flash + (i * 4) as usize;
-            if off + 3 < flash.len() {
-                let w = u32::from_be_bytes([flash[off], flash[off+1], flash[off+2], flash[off+3]]);
-                if w >= data_vma && w < data_end {
-                    score += 1;
-                }
-            }
-        }
-        if score > best_score {
-            best_score = score;
-            best_lma = lma;
-        }
-        lma += 4;
-    }
-
-    if best_score >= 4 { best_lma } else { fallback }
-}
-
-/// Boot ROM exception handler stubs.
-pub fn boot_rom_exception_handler(state: &mut CpuState, _mem: &mut Memory) -> Result<HookAction, Exception> {
-    crate::vlog!("[Boot ROM] 0x{:05X}: boot_rom_exception_handler (stub, return to 0x{:05X})",
-        state.pc, state.core_regs[31]);
-    state.pc = state.core_regs[31];
-    state.instruction_count += 1;
-    Ok(HookAction::Skip)
-}
+// NOTE: previous helper functions removed (2026-04-10):
+//   boot_rom_hw_init           — firmware does its own hw_init at runtime 0x79450
+//   boot_rom_crt_main          — firmware does its own .data copy + BSS clear at 0x74E24
+//   boot_rom_exception_handler — firmware installs its own exception handlers
+//   boot_rom_log_write_callback — firmware has its own UART writer at 0x74BD8
+//   read_tkf_data_size, find_data_lma, find_data_lma_by_gp, find_flash_code_start
+//                              — only used by boot_rom_crt_main, no longer needed
+//
+// All these "boot ROM functions" we previously hooked turned out to be regular
+// firmware functions inside firmware's binary (verified via `mem/rm` on real hardware
+// vs. Ghidra `read_memory` byte-for-byte match). The real boot ROM is minimal —
+// it just stages the binary into ICCM/DCCM (which `boot_rom_start_app` does)
+// and jumps to FIRMWARE_BASE.

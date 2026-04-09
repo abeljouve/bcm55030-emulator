@@ -36,24 +36,17 @@ pub struct Memory {
     /// Size of the loaded app binary (used for BSS clearing in boot ROM CRT init)
     pub app_size: Option<usize>,
 
+    /// Runtime base address where the firmware binary is loaded in ICCM/DCCM.
+    /// `0` until firmware loads. Firmware is loaded at `0x32000` matching real BCM55030
+    /// hardware: bootloader stays at `0..0xA800`, firmware at `0x32000..`.
+    /// Validated via `mem/rm 0x32000` returning the firmware IVT signature on real HW.
+    pub app_load_base: u32,
+
     /// Protect the firmware code section in DCCM from event_table_clear corruption.
-    ///
-    /// The firmware firmware's event groups have entry tables that overlap with the code
-    /// section in DCCM (since ICCM and DCCM both contain the firmware binary, but code
-    /// runs from ICCM while data is in DCCM). The compiler places PCL-relative literal
-    /// pool constants (pointers, table bases) between code sequences.
-    ///
-    /// `event_table_clear_all_counter_entries()` writes 0 to counter slots within
-    /// these entry tables, inadvertently zeroing PCL-relative constants. On real
-    /// hardware, the FDS scan rebuilds these counters from flash records, restoring
-    /// the overlapping constants. But the scan itself needs these constants to locate
-    /// flash regions — creating a circular dependency on first boot.
-    ///
-    /// We break this cycle by suppressing zero-writes to non-zero halfwords in the
-    /// firmware code section (0 to app_size). This preserves PCL-relative constants while
-    /// still allowing legitimate data writes (non-zero values).
-    ///
-    /// Set to app_size after firmware binary is loaded. 0 = protection disabled.
+    /// Range `[firmware_code_protect_start..firmware_code_protect_end]` (DCCM offsets).
+    /// With `app_load_base = 0x32000`, literal pools no longer alias .data counter
+    /// tables, so this protection should become unnecessary. Kept until validated.
+    firmware_code_protect_start: usize,
     firmware_code_protect_end: usize,
 
     /// DCCM write watchpoint address (temporary diagnostic).
@@ -71,6 +64,8 @@ impl Memory {
             iccm_base: 0,
             dccm_base: 0,
             app_size: None,
+            app_load_base: 0,
+            firmware_code_protect_start: 0,
             firmware_code_protect_end: 0,
             dccm_watchpoint: None,
         }
@@ -85,6 +80,8 @@ impl Memory {
             iccm_base: 0,
             dccm_base: 0,
             app_size: None,
+            app_load_base: 0,
+            firmware_code_protect_start: 0,
             firmware_code_protect_end: 0,
             dccm_watchpoint: None,
         }
@@ -99,10 +96,12 @@ impl Memory {
                     ((self.data[wp_off] as u32) << 24) | ((self.data[wp_off+1] as u32) << 16)
                     | ((self.data[wp_off+2] as u32) << 8) | (self.data[wp_off+3] as u32)
                 } else { 0 };
-                let pc = self.mmio.as_ref().map(|m| m.borrow().current_pc).unwrap_or(0);
+                let (pc, blink) = self.mmio.as_ref()
+                    .map(|m| { let b = m.borrow(); (b.current_pc, b.current_blink) })
+                    .unwrap_or((0, 0));
                 eprintln!(
-                    "[WATCHPOINT] DCCM 0x{:05X} ({}B) hits watch 0x{:05X}, old=0x{:08X}, PC=0x{:05X}",
-                    off, size, wp_off, old, pc
+                    "[WATCHPOINT] DCCM 0x{:05X} ({}B) hits watch 0x{:05X}, old=0x{:08X}, PC=0x{:05X}, blink=0x{:05X}",
+                    off, size, wp_off, old, pc, blink
                 );
             }
         }
@@ -110,10 +109,15 @@ impl Memory {
 
     /// Enable protection of the firmware code section against event_table_clear corruption.
     /// Called after firmware binary is loaded to DCCM, before execution starts.
+    /// Range is `[app_load_base..app_load_base+app_size]` (DCCM offsets).
     pub fn protect_firmware_literals(&mut self) {
         if let Some(size) = self.app_size {
-            self.firmware_code_protect_end = size;
-            crate::vlog!("[BCM55030] DCCM code section protection: 0x0000-0x{:04X}", size);
+            self.firmware_code_protect_start = self.app_load_base as usize;
+            self.firmware_code_protect_end = self.firmware_code_protect_start + size;
+            crate::vlog!(
+                "[BCM55030] DCCM code section protection: 0x{:05X}-0x{:05X}",
+                self.firmware_code_protect_start, self.firmware_code_protect_end
+            );
         }
     }
 
@@ -295,8 +299,13 @@ impl Memory {
                     self.check_watchpoint(off, 2);
                     // Protect firmware code section: suppress zero-writes to non-zero halfwords.
                     // This preserves PCL-relative literal pool constants that overlap
-                    // with event counter table entries.
-                    if val == 0 && off < self.firmware_code_protect_end {
+                    // with event counter table entries (only relevant when app_load_base
+                    // is wrong and creates the alias; with app_load_base=0x32000 there
+                    // should be no aliasing and this protection becomes a no-op).
+                    if val == 0
+                        && off >= self.firmware_code_protect_start
+                        && off < self.firmware_code_protect_end
+                    {
                         let existing = ((self.data[off] as u16) << 8) | (self.data[off + 1] as u16);
                         if existing != 0 {
                             return Ok(()); // Suppress: would zero a code-section constant
@@ -349,12 +358,18 @@ impl Memory {
                     self.data[off + 1] = (val >> 16) as u8;
                     self.data[off + 2] = (val >> 8) as u8;
                     self.data[off + 3] = val as u8;
-                    // Mirror to ICCM for the IVT area (0x00-0xFF): firmware installs
-                    // interrupt handlers via hw_auxreg_write_entry data writes.
-                    // On real BCM55030, these writes update ICCM (dual-ported for
-                    // the vector table). Only the IVT area is mirrored to avoid
-                    // corrupting code when BSS/bzero writes hit the code section.
-                    if addr < 0x100 {
+                    // Mirror to ICCM for the IVT area: firmware installs interrupt
+                    // handlers via hw_auxreg_write_entry data writes. On real BCM55030,
+                    // these writes update ICCM (dual-ported for the vector table).
+                    //
+                    // Two IVT ranges are mirrored:
+                    //  - `0x00..0x100`: bootloader IVT (bootloader runs at base 0)
+                    //  - `app_load_base..app_load_base+0x100`: firmware IVT (when loaded)
+                    let in_bootloader_ivt = addr < 0x100;
+                    let in_firmware_ivt = self.app_load_base != 0
+                        && addr >= self.app_load_base
+                        && addr < self.app_load_base + 0x100;
+                    if in_bootloader_ivt || in_firmware_ivt {
                         if let Some(ref mut iccm) = self.iccm {
                             let iccm_off = (addr.wrapping_sub(self.iccm_base)) as usize;
                             if iccm_off + 3 < iccm.len() {

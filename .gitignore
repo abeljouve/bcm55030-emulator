@@ -4,3 +4,4 @@ firmwares/
 knowledge/
 unhandled_mmio.json
 NEXT_SESSION_PROMPT.md
+CLI_REVERSE_ENGINEERING_PROMPT.md
