@@ -128,6 +128,7 @@ impl Cpu {
         // Update MMIO PC context for unhandled register logging
         if let Some(mut mmio) = self.mem.mmio() {
             mmio.current_pc = self.state.pc;
+            mmio.current_blink = self.state.core_regs[31];
         }
 
         // Execute

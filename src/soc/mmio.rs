@@ -32,6 +32,9 @@ pub struct MmioController {
     /// Current CPU PC — set by the CPU step loop before MMIO access.
     /// Used to provide context in unhandled register warnings.
     pub current_pc: u32,
+    /// Current blink (caller return address) — set by the CPU step loop.
+    /// Used by the watchpoint to identify which function called the writer.
+    pub current_blink: u32,
     /// BCM55030 EPON MAC timer counter at SYSREG+0x050.
     /// Read by timer1_get_current_value (0x45E4) as a 16-bit hardware counter.
     /// Incremented each time Timer1 interrupt fires.
@@ -61,6 +64,7 @@ impl MmioController {
             pbc: PeripheralBusController::new(),
             trace: false,
             current_pc: 0,
+            current_blink: 0,
             timer_counter: 0,
             sysreg_store: vec![0u32; num_entries],
             sysreg_pending_clear: vec![0u32; num_entries],
