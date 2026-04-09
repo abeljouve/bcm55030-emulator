@@ -18,6 +18,7 @@ fn usage(prog: &str) {
     eprintln!("  --max-cycles <N>            Maximum instructions (default: unlimited)");
     eprintln!("  --trace                     Log each instruction to stderr");
     eprintln!("  --trace-mmio                Log MMIO accesses to stderr");
+    eprintln!("  --verbose, -v               Show debug messages ([Hook], [MMIO], [Boot ROM]...)");
     eprintln!("  --break <ADDR>              Stop at address (hex)");
     eprintln!("  --dccm-dump <FILE>          Dump DCCM to file on exit");
     eprintln!("  --persist-flash             Save modified flash to <flash.bin>.persist on exit");
@@ -29,6 +30,7 @@ struct Config {
     max_cycles: u64,
     trace: bool,
     trace_mmio: bool,
+    verbose: bool,
     breakpoint: Option<u32>,
     dccm_dump: Option<String>,
     persist_flash: bool,
@@ -50,6 +52,7 @@ fn parse_args() -> Config {
         max_cycles: u64::MAX,
         trace: false,
         trace_mmio: false,
+        verbose: false,
         breakpoint: None,
         dccm_dump: None,
         persist_flash: false,
@@ -83,6 +86,7 @@ fn parse_args() -> Config {
             }
             "--trace" => cfg.trace = true,
             "--trace-mmio" => cfg.trace_mmio = true,
+            "--verbose" | "-v" => cfg.verbose = true,
             "--break" => {
                 i += 1;
                 if i >= args.len() {
@@ -161,8 +165,13 @@ fn detect_bootloader_size(flash: &[u8]) -> usize {
 fn setup_raw_terminal() -> Option<libc::termios> {
     unsafe {
         let fd = std::io::stdin().as_raw_fd();
+        // Always set O_NONBLOCK on stdin (needed for piped/non-tty input too)
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+
         let mut orig: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(fd, &mut orig) != 0 {
+            // Not a terminal (piped stdin) — O_NONBLOCK is set, no raw mode needed
             return None;
         }
         let mut raw = orig;
@@ -172,9 +181,7 @@ fn setup_raw_terminal() -> Option<libc::termios> {
         if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
             return None;
         }
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        eprintln!("[BCM55030] Terminal: raw mode (Ctrl-C to exit)");
+        bcm55030_emulator::vlog!("[BCM55030] Terminal: raw mode (Ctrl-C to exit)");
         Some(orig)
     }
 }
@@ -257,7 +264,7 @@ fn boot_from_flash(cpu: &mut Cpu, entry_point: u32) {
         let mmio = cpu.mem.mmio().unwrap();
         detect_bootloader_size(&mmio.pbc.flash.data)
     };
-    eprintln!("[BCM55030] Boot ROM: bootloader detected, {} bytes (0x{:X})", boot_size, boot_size);
+    bcm55030_emulator::vlog!("[BCM55030] Boot ROM: bootloader detected, {} bytes (0x{:X})", boot_size, boot_size);
 
     // 2. Copy bootloader from flash to ICCM and DCCM
     {
@@ -280,7 +287,7 @@ fn boot_from_flash(cpu: &mut Cpu, entry_point: u32) {
             }
             cpu.mem.load_iccm(fill_start as u32, &fill);
         }
-        eprintln!(
+        bcm55030_emulator::vlog!(
             "[BCM55030] Boot ROM: ICCM filled from 0x{:05X} with J_S [blink]",
             fill_start
         );
@@ -318,7 +325,7 @@ fn boot_from_flash(cpu: &mut Cpu, entry_point: u32) {
             let vector_offset = (16 + irq) * 8;
             cpu.mem.load_iccm(vector_offset, &j_handler);
         }
-        eprintln!(
+        bcm55030_emulator::vlog!(
             "[BCM55030] Boot ROM: IRQ handler at 0x{:04X}, IVT vectors 0x80-0xF8 installed",
             handler_addr
         );
@@ -330,7 +337,7 @@ fn boot_from_flash(cpu: &mut Cpu, entry_point: u32) {
         ];
         let uart_vector = (16 + 5) * 8;
         cpu.mem.load_iccm(uart_vector, &j_uart_isr);
-        eprintln!(
+        bcm55030_emulator::vlog!(
             "[BCM55030] Boot ROM: UART ISR at 0x4348, vector 0x{:02X} (IRQ 5, level 1)",
             uart_vector
         );
@@ -338,7 +345,7 @@ fn boot_from_flash(cpu: &mut Cpu, entry_point: u32) {
 
     // 6. Set entry point
     cpu.state.pc = entry_point;
-    eprintln!(
+    bcm55030_emulator::vlog!(
         "[BCM55030] Entry: 0x{:08X}, ICCM=512KB, DCCM=512KB",
         entry_point
     );
@@ -367,13 +374,14 @@ fn reset_cpu_for_reboot(cpu: &mut Cpu) {
 
 fn main() {
     let cfg = parse_args();
+    bcm55030_emulator::set_verbose(cfg.verbose);
 
     // Read flash image (or persisted version if available)
     let persist_path = format!("{}.persist", cfg.flash_path);
     let (flash_data, using_persisted) = if cfg.persist_flash {
         match fs::read(&persist_path) {
             Ok(b) => {
-                eprintln!("[BCM55030] Loading persisted flash: {}", persist_path);
+                bcm55030_emulator::vlog!("[BCM55030] Loading persisted flash: {}", persist_path);
                 (b, true)
             }
             Err(_) => {
@@ -398,7 +406,7 @@ fn main() {
         (data, false)
     };
 
-    eprintln!(
+    bcm55030_emulator::vlog!(
         "[BCM55030] Flash image: {} ({} bytes{})",
         cfg.flash_path,
         flash_data.len(),
@@ -417,7 +425,7 @@ fn main() {
         let flash_size = mmio.pbc.flash.data.len();
         let copy_len = flash_data.len().min(flash_size);
         mmio.pbc.flash.data[..copy_len].copy_from_slice(&flash_data[..copy_len]);
-        eprintln!("[BCM55030] SPI flash: {} bytes loaded", copy_len);
+        bcm55030_emulator::vlog!("[BCM55030] SPI flash: {} bytes loaded", copy_len);
     }
 
     // --- Initial boot from flash ---
@@ -450,11 +458,11 @@ fn main() {
             RunResult::Reboot => {
                 reboot_count += 1;
                 if reboot_count > MAX_REBOOTS {
-                    eprintln!("[BCM55030] Max reboots ({}) reached, stopping", MAX_REBOOTS);
+                    bcm55030_emulator::vlog!("[BCM55030] Max reboots ({}) reached, stopping", MAX_REBOOTS);
                     final_result = result;
                     break;
                 }
-                eprintln!(
+                bcm55030_emulator::vlog!(
                     "\n[BCM55030] === REBOOT #{} (FLAG 1 = hardware reset) ===\n",
                     reboot_count
                 );
@@ -525,7 +533,7 @@ fn main() {
 
     // DCCM dump
     if let Some(ref path) = cfg.dccm_dump {
-        eprintln!("[BCM55030] Dumping DCCM to {}", path);
+        bcm55030_emulator::vlog!("[BCM55030] Dumping DCCM to {}", path);
         let size = cpu.mem.dccm_size();
         let mut buf = Vec::with_capacity(size);
         for addr in 0..size {
@@ -542,11 +550,11 @@ fn main() {
         if is_dirty {
             let flash_data: Vec<u8> = cpu.mem.mmio().unwrap().pbc.flash.data.clone();
             match fs::write(&persist_path, &flash_data) {
-                Ok(_) => eprintln!("[BCM55030] Flash persisted to {} ({} bytes)", persist_path, flash_data.len()),
+                Ok(_) => bcm55030_emulator::vlog!("[BCM55030] Flash persisted to {} ({} bytes)", persist_path, flash_data.len()),
                 Err(e) => eprintln!("Error persisting flash: {}", e),
             }
         } else {
-            eprintln!("[BCM55030] Flash not modified, nothing to persist");
+            bcm55030_emulator::vlog!("[BCM55030] Flash not modified, nothing to persist");
         }
     }
 }

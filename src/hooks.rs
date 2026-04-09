@@ -56,7 +56,7 @@ pub fn execute_hook(
             Ok(HookAction::Skip)
         }
         Hook::Log(msg) => {
-            eprintln!("[Hook] {} at PC=0x{:04X}, insn={}",
+            crate::vlog!("[Hook] {} at PC=0x{:04X}, insn={}",
                 msg, state.pc, state.instruction_count);
             Ok(HookAction::Continue)
         }

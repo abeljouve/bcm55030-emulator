@@ -86,7 +86,7 @@ pub fn boot_rom_start_app(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
 
             if code_size == 0 || code_off + code_size > flash.len() { continue; }
 
-            eprintln!("[Boot ROM] TKF slot at 0x{:06X}: ROM version 0x{:08X}, code {} bytes",
+            crate::vlog!("[Boot ROM] TKF slot at 0x{:06X}: ROM version 0x{:08X}, code {} bytes",
                 header_off, rom_ver, code_size);
 
             // Pick the slot with highest ROM version
@@ -103,18 +103,18 @@ pub fn boot_rom_start_app(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
             Some((header_off, rom_ver, code_size)) => {
                 let code_off = header_off + tkf_header_size;
                 let code = flash[code_off..code_off + code_size].to_vec();
-                eprintln!("[Boot ROM] Selected slot at 0x{:06X} (ROM ver 0x{:08X}), {} bytes",
+                crate::vlog!("[Boot ROM] Selected slot at 0x{:06X} (ROM ver 0x{:08X}), {} bytes",
                     header_off, rom_ver, code_size);
                 (code, code_size)
             }
             None => {
-                eprintln!("[Boot ROM] No valid TKF firmware found in flash");
+                crate::vlog!("[Boot ROM] No valid TKF firmware found in flash");
                 return Ok(HookAction::Continue);
             }
         }
     };
 
-    eprintln!("[Boot ROM] Loading firmware: {} bytes (0x{:X})", app_size, app_size);
+    crate::vlog!("[Boot ROM] Loading firmware: {} bytes (0x{:X})", app_size, app_size);
 
     // Load firmware into ICCM (code) and DCCM (data)
     mem.load_iccm(0, &app_code);
@@ -150,20 +150,23 @@ pub fn boot_rom_start_app(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
     mem.protect_firmware_literals();
 
     // Reset CPU state for firmware.
-    // Interrupts start DISABLED — the firmware enables them via
+    // Interrupts start DISABLED (E1=E2=false) — the firmware enables them via
     // irq_setup_vector_and_enable() after installing exception handlers.
+    // IENABLE is set to all-enabled: the firmware never writes IENABLE itself,
+    // it expects the boot ROM to have enabled all interrupt lines.
     *state = CpuState::new();
     state.core_regs[28] = 0x10800; // SP
+    state.aux_ienable = 0xFFFFFFFF; // Boot ROM enables all interrupt lines
     state.pc = 0;
 
-    eprintln!("[Boot ROM] ICCM/DCCM base=0, firmware {} bytes, entry=0x00000000", app_size);
+    crate::vlog!("[Boot ROM] ICCM/DCCM base=0, firmware {} bytes, entry=0x00000000", app_size);
     Ok(HookAction::Skip)
 }
 
 /// Boot ROM hw_init — stub (PLL, clocks, pin mux, SerDes).
 /// The emulator doesn't need hardware initialization.
 pub fn boot_rom_hw_init(state: &mut CpuState, _mem: &mut Memory) -> Result<HookAction, Exception> {
-    eprintln!("[Boot ROM] 0x{:05X}: boot_rom_hw_init — early HW init (stub, return to 0x{:05X})",
+    crate::vlog!("[Boot ROM] 0x{:05X}: boot_rom_hw_init — early HW init (stub, return to 0x{:05X})",
         state.pc, state.core_regs[31]);
     state.pc = state.core_regs[31];
     state.instruction_count += 1;
@@ -198,7 +201,7 @@ pub fn boot_rom_crt_main(state: &mut CpuState, mem: &mut Memory) -> Result<HookA
 
         let data_lma = find_data_lma(mem, flash_code_start, binary_len, data_vma, data_size);
 
-        eprintln!(
+        crate::vlog!(
             "[Boot ROM] 0x{:05X}: boot_rom_crt_main — .data: flash[0x{:X}..0x{:X}] → DCCM[0x{:X}..0x{:X}] ({} bytes)",
             state.pc, data_lma, data_lma + data_size, data_vma, dccm_size, data_size
         );
@@ -226,22 +229,15 @@ pub fn boot_rom_crt_main(state: &mut CpuState, mem: &mut Memory) -> Result<HookA
         mem.load_binary(app_size, &zeros);
     }
 
-    // Install RTIE stubs at IVT entries 16-31 (external IRQs at offsets 0x80-0xF8).
-    // Done HERE (not in boot_rom_start_app) because the firmware startup code at
-    // 0x60-0x98 overlaps IVT entries 16-19 and must execute first.
-    // RTIE = immediate return from interrupt, preventing crashes from unhandled IRQs.
-    // The firmware's hw_irq_and_exception_init installs exception handlers (entries 1-15)
-    // via hw_auxreg_write_entry → ICCM mirror writes.
-    {
-        let rtie_stub: [u8; 8] = [0x24, 0x6F, 0x00, 0x3F, 0x78, 0xE0, 0x78, 0xE0];
-        for irq in 0..16u32 {
-            let vector_offset = (16 + irq) * 8;
-            mem.load_iccm(vector_offset, &rtie_stub);
-        }
-    }
+    // NOTE: IVT entries 16-31 (external IRQs at offsets 0x80-0xF8) are NOT overwritten
+    // with RTIE stubs in ICCM. The firmware has functions at these addresses (e.g.,
+    // firmware_update_check_and_trigger at 0xF8) that are called during init.
+    // Overwriting ICCM would destroy these functions.
+    // Instead, IRQ dispatch is handled by hooks in soc/mod.rs that check whether
+    // the CPU is in interrupt context (flag_a1/flag_a2) and perform RTIE in Rust.
 
-    eprintln!(
-        "[Boot ROM] 0x{:05X}: boot_rom_crt_main — BSS cleared 0x{:X}-0x{:X} ({} bytes), IRQ RTIE stubs installed, jumping to firmware_main_loop (0x20C)",
+    crate::vlog!(
+        "[Boot ROM] 0x{:05X}: boot_rom_crt_main — BSS cleared 0x{:X}-0x{:X} ({} bytes), jumping to firmware_main_loop (0x20C)",
         state.pc, app_size, bss_end, bss_end - app_size
     );
 
@@ -329,7 +325,7 @@ fn find_data_lma(mem: &Memory, flash_code_start: usize, binary_len: usize, data_
             let string_lma = off as u32;
             let delta = string_vma - string_lma;
             let data_lma = data_vma.saturating_sub(delta);
-            eprintln!(
+            crate::vlog!(
                 "[Boot ROM] .data delta: string VMA=0x{:X} LMA=0x{:X} delta=0x{:X} → data_lma=0x{:X}",
                 string_vma, string_lma, delta, data_lma
             );
@@ -388,7 +384,7 @@ fn find_data_lma_by_gp(mem: &Memory, flash_code_start: usize, binary_len: usize,
 
 /// Boot ROM exception handler stubs.
 pub fn boot_rom_exception_handler(state: &mut CpuState, _mem: &mut Memory) -> Result<HookAction, Exception> {
-    eprintln!("[Boot ROM] 0x{:05X}: boot_rom_exception_handler (stub, return to 0x{:05X})",
+    crate::vlog!("[Boot ROM] 0x{:05X}: boot_rom_exception_handler (stub, return to 0x{:05X})",
         state.pc, state.core_regs[31]);
     state.pc = state.core_regs[31];
     state.instruction_count += 1;

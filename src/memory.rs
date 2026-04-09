@@ -113,7 +113,7 @@ impl Memory {
     pub fn protect_firmware_literals(&mut self) {
         if let Some(size) = self.app_size {
             self.firmware_code_protect_end = size;
-            eprintln!("[BCM55030] DCCM code section protection: 0x0000-0x{:04X}", size);
+            crate::vlog!("[BCM55030] DCCM code section protection: 0x0000-0x{:04X}", size);
         }
     }
 

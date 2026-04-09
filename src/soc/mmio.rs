@@ -176,7 +176,7 @@ impl MmioController {
         if self.unhandled_logged.insert(aligned) {
             let idx = (aligned / 4) as usize;
             let val = if idx < self.sysreg_store.len() { self.sysreg_store[idx] } else { 0 };
-            eprintln!(
+            crate::vlog!(
                 "[MMIO] UNHANDLED READ  sysreg+0x{:04X} (0x{:08X}) → 0x{:08X}  at PC=0x{:05X}",
                 aligned, SYSREG_BASE + aligned, val, self.current_pc
             );
@@ -188,7 +188,7 @@ impl MmioController {
         // Use offset | 0x80000000 to distinguish write logs from read logs in the set
         let key = (offset & !3) | 0x80000000;
         if self.unhandled_logged.insert(key) {
-            eprintln!(
+            crate::vlog!(
                 "[MMIO] UNHANDLED WRITE sysreg+0x{:04X} (0x{:08X}) = 0x{:08X}  at PC=0x{:05X}",
                 offset & !3, SYSREG_BASE + (offset & !3), val, self.current_pc
             );

@@ -64,6 +64,21 @@ impl SimpleUart {
         val
     }
 
+    /// Get the raw IER register value (software-managed bits only).
+    pub fn ier(&self) -> u8 {
+        self.ier
+    }
+
+    /// Clear specific IER bits.
+    pub fn ier_clear(&mut self, mask: u8) {
+        self.ier &= !mask;
+    }
+
+    /// Set specific IER bits.
+    pub fn ier_set(&mut self, mask: u8) {
+        self.ier |= mask;
+    }
+
     /// Check if the UART should generate an IRQ.
     /// Returns true when TX or RX needs ISR service.
     pub fn irq_pending(&self) -> bool {
