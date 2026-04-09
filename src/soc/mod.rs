@@ -13,6 +13,7 @@ pub mod uart;
 
 use crate::cpu::exception::Exception;
 use crate::cpu::registers::CpuState;
+use crate::cpu::registers::REG_ILINK1;
 use crate::hooks::{Hook, HookAction, HookTable};
 use crate::memory::Memory;
 use crate::soc::boot_rom::FIRMWARE_BASE;
@@ -54,11 +55,22 @@ pub fn register_hooks(hooks: &mut HookTable) {
     // returns Continue (see early return in boot_rom_start_app).
     hooks.insert(FIRMWARE_BASE, Hook::Custom(boot_rom::boot_rom_start_app));
 
-    // ── Hardware feature stubs (real hardware behavior we don't emulate) ──
+    // ── Missing-hardware stubs (NOT firmware bypasses) ──────────────────
+    //
+    // These hooks compensate for hardware blocks we don't model at all
+    // (SerDes lanes). Without them, the firmware enters retry loops on
+    // SerDes register I/O during `serdes_init_all_lanes_hw`. They are NOT
+    // bypassing buggy firmware logic — they're providing a synthetic
+    // "ready/empty" answer for a hardware block that's silent in our
+    // emulator. To remove them, we'd need a real SerDes register model
+    // (~50 registers per lane × 4 lanes + PLL/common); see Phase 3 of the
+    // roadmap.
+    //
+    // Re-validated 2026-04-10: tested without these stubs → firmware stops in
+    // `serdes_init_all_lanes_hw` at insn 11.7M. With them → firmware reaches
+    // `cli_poll_and_process_input`.
 
     // serdes_reg_read_byte (file 0x12CA4) — return 0xFF for non-SPI bus types.
-    // BCM55030 has dedicated SerDes register buses (type 0x00) that we lack;
-    // 0xFF satisfies calibration/ready checks.
     hooks.insert(FIRMWARE_BASE + 0x12CA4, Hook::Custom(serdes_reg_read_byte_stub));
 
     // serdes_reg_write (file 0x12CD8) — skip for non-SPI bus types.
@@ -67,12 +79,35 @@ pub fn register_hooks(hooks: &mut HookTable) {
     // serdes_hw_ready_flag (file 0x1E6C) — always return 1 (ready).
     hooks.insert(FIRMWARE_BASE + 0x1E6C, Hook::ReturnValue(1));
 
-    // ── Workarounds being re-evaluated post architectural fix ────────────
+    // ── Workaround removed for re-validation 2026-04-10 ──────────────────
     //
-    // event_dispatch_stub (file 0x33A50): the firmware's event system stores
-    // handler addresses +4 past function entry. With the corrected base, this
-    // may behave correctly natively — to be re-validated.
-    hooks.insert(FIRMWARE_BASE + 0x33A50, Hook::Custom(event_dispatch_stub));
+    // event_dispatch_stub @ FIRMWARE_BASE+0x33A50 was the "+4 trampoline" hack
+    // we believed was needed because handler table addresses were stored
+    // 4 bytes past function entries. With the corrected load offset
+    // (FIRMWARE_BASE = 0x32000), this might no longer be needed because the
+    // handler addresses might now resolve correctly. To be re-validated.
+
+    // ── Firmware UART ISR (synthetic) ────────────────────────────────────────
+    //
+    // Firmware's `uart_putchar` enqueues bytes into a TX ring buffer at DCCM
+    // 0x348 (struct at 0x7E204) and sets bit 0x40 in the UART IER. The
+    // firmware expects an ISR to drain that buffer, but our IRQ 5 vector
+    // dispatch lands at the bootloader's IVT (since AUX_INT_VECTOR_BASE
+    // stays at 0), and the bootloader's ISR drains a DIFFERENT ring
+    // buffer. Result: firmware's TX buffer fills up and `uart_putchar` loops
+    // forever in `serdes_tx_queue_enqueue`.
+    //
+    // The IVT entry at runtime 0x320A8 contains 8 bytes that we don't yet
+    // decode/understand (`26 4a 70 00 26 4a 70 00`). Until we figure out
+    // the real mechanism (Phase 2 — could be polling, AUX vector base
+    // shift, or a custom ISR encoding), install a synthetic ISR at the
+    // bootloader's IVT entry 21 (PC 0xA8) that does the right thing for
+    // firmware only (gated on `mem.app_size.is_some()`).
+    //
+    // This is NOT a firmware function bypass — there's no firmware code
+    // at this address (it's a hardware vector slot). It's filling in a
+    // missing peripheral driver.
+    hooks.insert(0xA8, Hook::Custom(firmware_uart_isr));
 
     // Boot ROM IRQ generic handlers (formerly at offsets 0x80-0xF8): removed.
     // The firmware installs its own ISR addresses into the IVT during init,
@@ -96,6 +131,12 @@ pub fn register_hooks(hooks: &mut HookTable) {
     hooks.insert(FIRMWARE_BASE + 0x09834, Hook::Log("epon_runtime_full_init"));
     hooks.insert(FIRMWARE_BASE + 0x3573C, Hook::Log("hw_check_fatal_error_status"));
     hooks.insert(FIRMWARE_BASE + 0x099CC, Hook::Log("system_shutdown_and_flush"));
+    // Reboot path tracing — kept for the next phase (Phase 1 still in progress).
+    // The known shutdown trigger is `epon_poll_hw_state_changes` detecting false
+    // positives from un-modeled SerDes MMIO reads.
+    hooks.insert(FIRMWARE_BASE + 0x084FC, Hook::Log("firmware_update_trigger"));
+    hooks.insert(FIRMWARE_BASE + 0x33CF8, Hook::Log("system_reboot_infinite_loop ENTRY"));
+    hooks.insert(FIRMWARE_BASE + 0x1B268, Hook::Log("epon_poll_hw_state_changes"));
     hooks.insert(FIRMWARE_BASE + 0x06680, Hook::Log("epon_rx_flag_clear_init"));
     hooks.insert(FIRMWARE_BASE + 0x1AE2C, Hook::Log("mpcp_slot_and_timing_init"));
     hooks.insert(FIRMWARE_BASE + 0x20FD4, Hook::Log("hw_config_load_and_reset_init"));
@@ -116,22 +157,130 @@ pub fn register_hooks(hooks: &mut HookTable) {
     hooks.insert(FIRMWARE_BASE + 0x04138, Hook::Log("fds_init_default_hw_record_if_missing"));
 }
 
-// ── Hook implementations ─────────────────────────────────────────────────
-
-/// Event dispatch stub — skip handler calls during firmware execution.
-/// The firmware's event system stores handler table addresses (from ICCM literal pools)
-/// that are +4 past the actual function entry, skipping the FP save prologue.
-/// On real hardware, the boot ROM likely installs trampolines at these addresses.
-fn event_dispatch_stub(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
+/// Synthetic UART ISR for firmware (IRQ 5).
+///
+/// Drains firmware's TX ring buffer at DCCM 0x348 to the UART data register.
+/// Reads stdin into firmware's RX ring buffer at DCCM 0x248. Performs RTIE.
+///
+/// Triggered by the IRQ 5 vector at PC 0xA8. Only fires when:
+///   1. Firmware is loaded (mem.app_size is Some)
+///   2. The CPU is in interrupt context (flag_a1 set, set by check_interrupts)
+///
+/// Otherwise (bootloader running, or normal code execution at PC 0xA8),
+/// returns Continue and lets the bootloader's J 0x4348 ISR run.
+///
+/// Firmware UART struct layout at DCCM 0x7E204:
+///   +0: rx_empty flag (0 = has data)
+///   +1: rx_write index
+///   +2: rx_read  index
+///   +3: tx_trigger flag (set by ISR after drain to re-arm next batch)
+///   +4: tx_write index
+///   +5: tx_read  index
+///
+/// TX buffer at DCCM 0x348, RX buffer at DCCM 0x248 (256 bytes each).
+fn firmware_uart_isr(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
+    // Only intercept when firmware is loaded
     if mem.app_size.is_none() {
         return Ok(HookAction::Continue);
     }
-    state.pc = state.core_regs[31]; // blink
+
+    // Only intercept on actual IRQ entry (not when normal code happens to PC=0xA8)
+    if !state.flag_a1 && !state.flag_a2 {
+        return Ok(HookAction::Continue);
+    }
+
+    const UART_STRUCT: u32 = 0x7E204;
+    const TX_BUF: u32 = 0x348;
+    const RX_BUF: u32 = 0x248;
+
+    // Phase 1: snapshot UART HW state and drain incoming RX queue
+    let (ier, rx_bytes) = {
+        let mut mmio = mem.mmio().unwrap();
+        let ier = mmio.uart.ier();
+        let rx: Vec<u8> = mmio.uart.rx_queue.drain(..).collect();
+        (ier, rx)
+    };
+
+    // Phase 2: TX — drain firmware's TX ring buffer to stdout (via UART HW)
+    if ier & 0x40 != 0 {
+        let tx_write = mem.read_byte(UART_STRUCT + 4)?;
+        let mut tx_read = mem.read_byte(UART_STRUCT + 5)?;
+
+        if tx_read != tx_write {
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            while tx_read != tx_write {
+                let byte = mem.read_byte(TX_BUF + tx_read as u32)?;
+                let _ = std::io::Write::write_all(&mut handle, &[byte]);
+                tx_read = tx_read.wrapping_add(1);
+            }
+            let _ = std::io::Write::flush(&mut handle);
+            mem.write_byte(UART_STRUCT + 5, tx_read)?;
+        }
+
+        // Buffer drained: clear TXIE and re-arm trigger for next batch
+        {
+            let mut mmio = mem.mmio().unwrap();
+            mmio.uart.ier_clear(0x40);
+        }
+        mem.write_byte(UART_STRUCT + 3, 1)?;
+    }
+
+    // Phase 3: RX — fill firmware's RX ring buffer from stdin
+    if !rx_bytes.is_empty() {
+        let mut pushed = 0usize;
+        for &byte in &rx_bytes {
+            let rx_write = mem.read_byte(UART_STRUCT + 1)?;
+            let rx_read = mem.read_byte(UART_STRUCT + 2)?;
+
+            if rx_write.wrapping_add(1) == rx_read {
+                break; // Ring buffer full
+            }
+
+            mem.write_byte(RX_BUF + rx_write as u32, byte)?;
+            mem.write_byte(UART_STRUCT + 1, rx_write.wrapping_add(1))?;
+            mem.write_byte(UART_STRUCT + 0, 0)?;
+            pushed += 1;
+        }
+
+        if pushed < rx_bytes.len() {
+            let mut mmio = mem.mmio().unwrap();
+            for &byte in &rx_bytes[pushed..] {
+                mmio.uart.rx_queue.push_back(byte);
+            }
+        }
+    }
+
+    // Ensure RXIE (bit 2) is set so future stdin data triggers UART IRQ
+    {
+        let mut mmio = mem.mmio().unwrap();
+        mmio.uart.ier_set(0x04);
+    }
+
+    // RTIE: restore STATUS32 and PC from saved interrupt state
+    if state.flag_a2 {
+        let saved = state.aux_status32_l2;
+        state.set_status32(saved);
+        state.pc = state.core_regs[crate::cpu::registers::REG_ILINK2 as usize];
+        state.aux_bta = state.aux_bta_l2;
+    } else {
+        let saved = state.aux_status32_l1;
+        state.set_status32(saved);
+        state.pc = state.core_regs[REG_ILINK1 as usize];
+        state.aux_bta = state.aux_bta_l1;
+    }
+    state.pc_written = true;
     state.instruction_count += 1;
     Ok(HookAction::Skip)
 }
 
-/// serdes_reg_read_byte stub — returns 0xFF for non-SPI bus types.
+// ── Hook implementations: SerDes stubs ───────────────────────────────────
+//
+// These compensate for the missing SerDes register model. They check the
+// bus type encoded in r0 high byte and short-circuit only for the bus
+// type the SerDes block uses (which we have no peripheral for).
+
+/// `serdes_reg_read_byte` stub: returns 0xFF for the missing-HW bus type.
 fn serdes_reg_read_byte_stub(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
     if mem.app_size.is_none() {
         return Ok(HookAction::Continue);
@@ -147,7 +296,7 @@ fn serdes_reg_read_byte_stub(state: &mut CpuState, mem: &mut Memory) -> Result<H
     }
 }
 
-/// serdes_reg_write stub — skip for non-SPI bus types.
+/// `serdes_reg_write` stub: silently swallows writes for the missing-HW bus type.
 fn serdes_reg_write_stub(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
     if mem.app_size.is_none() {
         return Ok(HookAction::Continue);

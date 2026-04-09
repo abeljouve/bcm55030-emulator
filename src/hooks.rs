@@ -56,8 +56,8 @@ pub fn execute_hook(
             Ok(HookAction::Skip)
         }
         Hook::Log(msg) => {
-            crate::vlog!("[Hook] {} at PC=0x{:04X}, insn={}",
-                msg, state.pc, state.instruction_count);
+            crate::vlog!("[Hook] {} at PC=0x{:05X}, blink=0x{:05X}, insn={}",
+                msg, state.pc, state.core_regs[31], state.instruction_count);
             Ok(HookAction::Continue)
         }
         Hook::Custom(f) => f(state, mem),
