@@ -159,15 +159,6 @@ pub fn boot_rom_start_app(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
     mem.iccm_base = 0;
     mem.dccm_base = 0;
 
-    // Install generic IRQ handlers at IVT entries 16-31 (external IRQs at offsets 0x80-0xF8).
-    // The firmware's hw_irq_and_exception_init installs exception handlers (entries 1-15)
-    // via hw_auxreg_write_entry → ICCM mirror. But external IRQ entries (16+) are NOT
-    // written by the firmware — the boot ROM installs them before firmware starts.
-    // The handler at 0x33BD0 is the firmware's generic exception/IRQ dispatch function
-    // (read from literal pool at 0x1C04 by hw_auxreg_write_entry).
-    // NOTE: IRQ vector stubs are installed in boot_rom_crt_main (not here) because
-    // the firmware startup code at 0x60-0x98 overlaps the IVT IRQ entries (0x80-0x98).
-    // The startup code must execute first before we overwrite those addresses.
 
     // Protect PCL-relative literal pool constants
     mem.protect_firmware_literals();

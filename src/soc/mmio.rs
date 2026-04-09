@@ -143,6 +143,21 @@ impl MmioController {
                 self.store_read(offset) | 0x100 // bit 8 = drain complete
             }
 
+            // ── LLID interrupt status registers (W1C semantics) ─────────
+            // The polled SerDes block at +0x1404+N*0x200 contains per-LLID
+            // interrupt status. Real HW returns 0 (`mem/rm 0x1001404..0x1001E04`)
+            // because the events being tracked don't occur on a quiescent ONU.
+            // Our store-and-return default would return whatever the firmware
+            // wrote to these (e.g., 0x100), causing `epon_poll_hw_state_changes`
+            // to detect false positives and trigger `system_shutdown_and_flush`.
+            //
+            // Phase 1 minimal fix: return 0 for the 6 specific polled addresses
+            // (entries 9-14 of the descriptor table at .data 0x7ED90, reg
+            // indices 0x501/0x581/0x601/0x681/0x701/0x781).
+            //
+            // To extend in Phase 2 if other LLID intr regs need the same.
+            0x1404 | 0x1604 | 0x1804 | 0x1A04 | 0x1C04 | 0x1E04 => 0,
+
             // ── Fatal Error Status (0x2804) ──────────────────────────────
             // hw_check_fatal_error_status reads base 0x010027B8 + 0x4C = offset 0x2804.
             // Write side (error mask) shares the same address. Return 0 = no errors.
@@ -204,7 +219,8 @@ impl MmioController {
         // Log unhandled writes (offsets without explicit read handlers)
         match offset {
             0x000 | 0x004 | 0x00C | 0x018 | 0x030 | 0x050 |
-            0x040 | 0x048 | 0x04C | 0x194 | 0x1D4 | 0x1E0 | 0x2804 => {}
+            0x040 | 0x048 | 0x04C | 0x194 | 0x1D4 | 0x1E0 | 0x2804 |
+            0x1404 | 0x1604 | 0x1804 | 0x1A04 | 0x1C04 | 0x1E04 => {}
             o if (0x1400..=0x3FFF).contains(&o) && (o.wrapping_sub(0x143C)) % 0x200 == 0 => {}
             _ => self.log_unhandled_write(offset, val),
         }
