@@ -3,3 +3,4 @@ target/
 firmwares/
 knowledge/
 unhandled_mmio.json
+NEXT_SESSION_PROMPT.md
