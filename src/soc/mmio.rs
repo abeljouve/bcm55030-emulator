@@ -417,6 +417,29 @@ impl MmioController {
             }
         }
 
+        // ── LLID config registers (stats/epon) ───────────────────────────
+        //
+        // The LLID rx/tx config registers are at:
+        //   0x010003BC + llid * 4   (1G mode, used by hw_pon_get_llid_tx_config_1g
+        //                            @ the decompiler 0x2003e0c8) — wait, base is 0x0100043C
+        //   0x01000D00 + llid * 4   (10G mode, used by hw_pon_get_llid_rx_config_10g
+        //                            @ the decompiler 0x2003e870)
+        //
+        // The boot-time init writes 0x00017FFF (low 16 = 0x7FFF = 32767) to
+        // the registers for LLID 0 and LLID 31 (the channel-zero and
+        // channel-31 anchors); LLIDs 1-30 stay at 0. On real hardware those
+        // two registers read back with bit 0 of the low 16 cleared (0x7FFE
+        // = 32766), so the `mpcp_get_llid_rx_config_by_speed` getter prints
+        // 32766 instead of 32767. The other 30 LLIDs are unaffected.
+        //
+        // Mask bit 0 of the low 16 on write so the stored value matches
+        // what real HW returns to a subsequent read.
+        let val = if matches!(offset, 0x043C | 0x04B8 | 0x0D00 | 0x0D7C) {
+            val & !0x0001
+        } else {
+            val
+        };
+
         let idx = (offset / 4) as usize;
         if idx < self.sysreg_store.len() {
             self.sysreg_store[idx] = val;
