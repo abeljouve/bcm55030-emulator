@@ -228,6 +228,22 @@ impl MmioController {
             }
             0x1E0 => 0x45504F4E, // EPON signature ("EPON")
 
+            // ── HW counter result registers (stats/fifo, stats/epon, …) ──
+            //
+            // `hw_chan_latch_and_read_hw_counter` @ the decompiler 0x2000de6c writes
+            // a `(group, chan, field)` selector to base+0x8 then reads the
+            // 32-bit counter result from base+0xC. Base is
+            // `0x010015cc + group * 0x200`, so the result registers live at
+            // 0x010015D8, 0x010017D8, 0x010019D8, 0x01001BD8, 0x01001DD8,
+            // 0x01001FD8.
+            //
+            // Real HW returns 0 for every (chan, field) on a quiescent ONU
+            // (no traffic, no FIFO fill, no error counts). Our default
+            // `store_read` path leaks whatever the firmware (or init code)
+            // last wrote to the same offset, which produces nonsense values
+            // like 30 in `stats/fifo`. Returning 0 matches real HW.
+            o if (o & 0x1FF) == 0x1D8 && (0x15D8..=0x1FD8).contains(&o) => 0,
+
             // ── DMA/IRQ cluster (0x13DC-0x15FF) ─────────────────────────
             // DMA Channel Queue Drain Register: base 0x143C, stride 0x200.
             // epon_rx_queue_wait_drain_done polls bit 8 (0x100) until set.
