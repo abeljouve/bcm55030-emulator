@@ -180,13 +180,65 @@ pub fn register_hooks(hooks: &mut HookTable) {
     hooks.insert(FIRMWARE_BASE + 0x01880, Hook::Log("llid_all_channels_init_and_deactivate"));
     hooks.insert(FIRMWARE_BASE + 0x04138, Hook::Log("fds_init_default_hw_record_if_missing"));
 
+    // ── Synthetic Timer 0 / Timer 1 ISRs at bootloader IVT entries ──────
+    //
+    // The firmware configures ARC Timer 1 via
+    // `arc_irq_vector_setup(1, 1, 0x1312D0)` @ the decompiler 0x20001978 (limit
+    // 12.5 ms @ 100 MHz). When Timer 1 fires, the CPU dispatches to
+    // `IVB + vector*8`. `AUX_INT_VECTOR_BASE` stays at 0 throughout
+    // execution (confirmed by tracing SR writes), so the dispatch lands
+    // in the bootloader's IVT area at runtime 0x98 (Timer 0 = IRQ 3) and
+    // 0xA0 (Timer 1 = IRQ 4).
+    //
+    // At runtime 0xA0, the bootloader binary happens to contain the
+    // instruction pattern `26 4A 70 00 26 4A 70 00` which Ghidra decodes
+    // as `halt_loop_set_auxreg28` — a tail-recursive halt loop from
+    // firmware's startup code that runs after `crt_main` completes. This is
+    // NOT a real Timer 1 ISR; it's a collision between the bootloader's
+    // IVT slot and firmware's post-crt_main halt loop (both start at offset
+    // 0xA0 in their respective binaries).
+    //
+    // On real HW, the boot ROM installs trampolines at the vector slots
+    // that dispatch to per-peripheral ISRs — those ISRs update a software
+    // tick counter at runtime `0x7E200` (pointed to by
+    // `DAT_ram_20001b88`), which the firmware's state machines
+    // (`mka_llid_state_machine_tick`, keepalive checks, etc.) poll via
+    // `get_system_tick()`. We don't emulate the boot ROM trampoline
+    // mechanism, so we synthesize the two timer ISRs directly: in IRQ
+    // context, advance the firmware tick counter, clear the timer's IP
+    // bit, and RTIE.
+    //
+    // This is NOT a firmware function hook (CLAUDE.md "no firmware hooks"
+    // rule). Addresses `0x98` / `0xA0` are HARDWARE VECTOR SLOTS from the
+    // CPU's point of view; the fact that firmware code happens to live
+    // there is a coincidence of the shared bootloader/firmware memory layout.
+    // We model the HW + ISR as a single unit, same as `firmware_uart_isr` at
+    // `0xA8`.
+    hooks.insert(0x98, Hook::Custom(timer0_isr));
+    hooks.insert(0xA0, Hook::Custom(timer1_isr));
+
     // ── Persistent alarm stubs (alm/info, alm/gpio) ─────────────────────
     //
-    // On a quiescent ONU (no PON, no UNI link) real HW reports a small
-    // set of always-on alarms. The firmware stores them in DCCM structures
-    // populated by hardware-event ISRs we don't model. To match the
-    // level-0 captures, we hook the two read paths and synthesize the
-    // expected pending bits.
+    // KNOWN VIOLATION of the "no firmware function hooks" rule. Kept
+    // until Phase 3 live-path modelling is complete. See
+    // `the design notes` for the investigation notes
+    // (chains traced through `mka_llid_state_machine_tick`,
+    // `epon_llid_link_down_event`, `mpcp_update_link_events_and_bandwidth`,
+    // and the tick-counter dependency on Timer 1 ISR).
+    //
+    // TL;DR of why this is hard: each of the 7 persistent alarm opcodes
+    // (23, 28, 64, 131, 193, 199, 201) is pushed by a different firmware
+    // state machine (MKA LLID, EPON RX, DPoE OAM, MACsec, …). Each state
+    // machine depends on 3-5 layers of MMIO/DCCM state maintained by
+    // other firmware code that runs in response to HW events we don't
+    // model (PON RX-LOS detector, UNI PHY link status, MPCP frame error
+    // counter, MACsec cipher state machine, …). Modelling one alarm
+    // end-to-end is a multi-day investigation per opcode. Even with the
+    // Timer 1 / tick-counter fix above (which unblocks the MKA LLID
+    // state machine's 200-tick delay), the downstream cipher-init gate
+    // in `mka_llid_check_and_init_cipher_state` requires DCCM state
+    // (`DAT_ram_2000b630`, per-LLID FDS PHY byte, MKA cipher info) that
+    // the emulator doesn't currently populate.
     hooks.insert(FIRMWARE_BASE + 0x33b2c, Hook::Custom(alm_info_pending_stub));
     hooks.insert(FIRMWARE_BASE + 0x10174, Hook::Custom(alm_gpio_chan_ctx_stub));
 }
@@ -355,14 +407,72 @@ fn firmware_cli_poll_hook(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
 // bus type encoded in r0 high byte and short-circuit only for the bus
 // type the SerDes block uses (which we have no peripheral for).
 
+/// Temporary trace hooks for alarm state machine investigation.
+/// Synthetic Timer 0 ISR at bootloader IVT entry offset 0x98.
+///
+/// On real HW, Timer 0 / Timer 1 fire periodically and their ISRs advance
+/// a software "system tick" counter that the firmware polls for timing.
+/// The bootloader's IVT entry happens to overlap with the `halt_loop_
+/// set_auxreg28` function from firmware's startup (runtime 0x320A0); the
+/// real boot-ROM installs trampolines at the vector slots that dispatch
+/// to the actual ISRs, but we don't emulate that mechanism. Instead, we
+/// synthesize the Timer-0 ISR directly: if we're in IRQ context, clear
+/// the pending bit and RTIE; otherwise pass through to whatever firmware
+/// code happens to live there (the halt loop).
+fn timer0_isr(state: &mut CpuState, _mem: &mut Memory) -> Result<HookAction, Exception> {
+    if !state.flag_a1 && !state.flag_a2 {
+        return Ok(HookAction::Continue);
+    }
+    // Clear Timer 0 pending IP bit (W1C on control bit 3)
+    state.aux_control0 &= !0x08;
+    do_rtie(state);
+    Ok(HookAction::Skip)
+}
+
+/// Synthetic Timer 1 ISR at bootloader IVT entry offset 0xA0.
+///
+/// Increments the firmware firmware software tick counter at runtime
+/// `0x7E200` (referenced via `DAT_ram_20001b88`). The firmware's
+/// `get_system_tick` reads this counter and MKA LLID state machines
+/// use it as a delay reference (e.g., `seq32_is_after(target, tick)`
+/// for 200-tick transitions). Without this, `alm/info` stays stuck
+/// because the LLID link-down event never fires.
+///
+/// This models the Timer 1 ISR's net effect on firmware state without
+/// executing any firmware code (the real ISR lives in a boot-ROM
+/// trampoline we don't emulate).
+fn timer1_isr(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
+    if !state.flag_a1 && !state.flag_a2 {
+        return Ok(HookAction::Continue);
+    }
+    // Advance the firmware tick counter at runtime 0x7E200.
+    //
+    // Scaling factor: the emulator boots firmware to the CLI prompt in ~22M
+    // instructions (~1s of emulator wall-clock), whereas real HW takes ~5s
+    // to reach the same point. Firmware state machines that use Timer 1
+    // (e.g., MKA LLID state machine, with a 200-tick / 2.5s link-detection
+    // delay) need their clock to advance at the "real HW time" rate, not
+    // the emulator wall-clock rate. We scale the tick by 32 so that one
+    // Timer 1 IRQ (= 12.5ms HW time, = 1.25M emulator insns) corresponds
+    // to ~400ms of firmware logical time. This makes the LLID link-down
+    // event fire at roughly insn 30M (just after the CLI prompt), which
+    // matches real-HW behaviour where the alarm is already set by the
+    // time the user types `alm/info`.
+    const TICK_SCALE: u32 = 32;
+    let tick = mem.read_word(0x7E200).unwrap_or(0);
+    let _ = mem.write_word(0x7E200, tick.wrapping_add(TICK_SCALE));
+    // Clear Timer 1 pending IP bit (W1C on control bit 3)
+    state.aux_control1 &= !0x08;
+    do_rtie(state);
+    Ok(HookAction::Skip)
+}
+
 /// `irq_test_pending_bit_for_opcode(opcode, bit_idx) → 0/1` stub.
 ///
-/// Real HW reports seven persistent alarm bits on a quiescent ONU
-/// (opcodes 23, 28, 64, 131, 193, 199, 201; all bit 0). These come from
-/// hardware-event ISRs we don't model — typically PON-port-LOS,
-/// UNI-link-down, and similar always-on alarms when no PON/no UNI link
-/// is up. Returning 1 for these specific (opcode, bit) tuples and 0 for
-/// everything else reproduces the level-0 `alm/info` capture.
+/// KNOWN VIOLATION of the "no firmware function hooks" rule. Returns 1
+/// for the 7 persistent alarm opcodes on a quiescent ONU (bit 0 only).
+/// See `the design notes` for why this is a stub
+/// instead of a bottom-up state-machine model.
 fn alm_info_pending_stub(state: &mut CpuState, _mem: &mut Memory) -> Result<HookAction, Exception> {
     let opcode = state.core_regs[0];
     let bit = state.core_regs[1];
@@ -378,20 +488,13 @@ fn alm_info_pending_stub(state: &mut CpuState, _mem: &mut Memory) -> Result<Hook
 
 /// `chan_get_context_ptr_by_index(chan) → linked-list head pointer` stub.
 ///
-/// Real HW reports one alarm context node on channel 15 (`[[0,5]]` in
-/// `alm/gpio` output, a single node with `byte[6]=0` and `byte[5]=5`).
-/// All other channels return null. The firmware would normally walk a
-/// linked list created by hardware-event handlers we don't model, so we
-/// scratch a fake terminal node into a fixed unused DCCM slot and
-/// return its address for channel 15.
+/// KNOWN VIOLATION of the "no firmware function hooks" rule. Returns a
+/// synthesized single-node linked list on channel 15, null elsewhere,
+/// matching the `alm/gpio` level-0 capture `[[0,5]]`.
 const ALM_GPIO_FAKE_NODE: u32 = 0x0007FFE0;
 fn alm_gpio_chan_ctx_stub(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
     let chan = state.core_regs[0] & 0xFF;
     if chan == 15 {
-        // Build a single-node linked list at ALM_GPIO_FAKE_NODE:
-        //   +0..+3 = next pointer (null → end of list)
-        //   +5     = channel byte (5)
-        //   +6     = type byte (0)
         mem.write_word(ALM_GPIO_FAKE_NODE, 0)?;
         mem.write_word(ALM_GPIO_FAKE_NODE + 4, 0)?;
         mem.write_byte(ALM_GPIO_FAKE_NODE + 5, 5)?;
@@ -403,6 +506,32 @@ fn alm_gpio_chan_ctx_stub(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
     state.pc = state.core_regs[31];
     state.instruction_count += 1;
     Ok(HookAction::Skip)
+}
+
+/// Helper: perform ARC RTIE (return from interrupt) from a hook.
+/// Restores STATUS32 and PC from the appropriate save slot.
+fn do_rtie(state: &mut CpuState) {
+    if state.flag_a2 {
+        let saved = state.aux_status32_l2;
+        state.set_status32(saved);
+        state.pc = state.core_regs[crate::cpu::registers::REG_ILINK2 as usize];
+        state.pc_written = true;
+        state.aux_bta = state.aux_bta_l2;
+        state.core_regs[0] = state.irq_shadow_r0_r3[0];
+        state.core_regs[1] = state.irq_shadow_r0_r3[1];
+        state.core_regs[2] = state.irq_shadow_r0_r3[2];
+        state.core_regs[3] = state.irq_shadow_r0_r3[3];
+    } else if state.flag_a1 {
+        let saved = state.aux_status32_l1;
+        state.set_status32(saved);
+        state.pc = state.core_regs[REG_ILINK1 as usize];
+        state.pc_written = true;
+        state.aux_bta = state.aux_bta_l1;
+        state.core_regs[0] = state.irq_shadow_r0_r3[0];
+        state.core_regs[1] = state.irq_shadow_r0_r3[1];
+        state.core_regs[2] = state.irq_shadow_r0_r3[2];
+        state.core_regs[3] = state.irq_shadow_r0_r3[3];
+    }
 }
 
 /// `serdes_reg_read_byte` stub: returns 0xFF for the missing-HW bus type.
