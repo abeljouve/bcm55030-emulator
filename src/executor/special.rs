@@ -75,12 +75,19 @@ pub fn execute_loop(
     decoded: &DecodedInstruction,
     state: &mut CpuState,
 ) -> Result<(), Exception> {
+    // ISA: "aux_reg[LP_END] = cPCL + s13" — the LP target is computed
+    // from cPCL (current PC longword = PC & ~3), NOT raw PC. For LP at a
+    // half-word-aligned address (e.g. 0x...c2 after a 16-bit instruction),
+    // the offset must be added to the 4-byte-aligned PC, otherwise
+    // LP_END is off by 2 and the loop body runs only once.
+    let pcl = decoded.pc & 0xFFFFFFFC;
+
     if let Some(cc) = cc {
         if !cc.evaluate(state.flag_z, state.flag_n, state.flag_c, state.flag_v) {
             // Condition not met: skip the loop body by jumping to lp_end.
             // ARC 700 ISA: "If the condition is not satisfied, no loop is
             // set up and a branch is made to the target of the LP instruction"
-            state.pc = decoded.pc.wrapping_add(offset);
+            state.pc = pcl.wrapping_add(offset);
             state.pc_written = true;
             return Ok(());
         }
@@ -91,7 +98,7 @@ pub fn execute_loop(
 
     let next_pc = decoded.pc + decoded.total_size();
     state.aux_lp_start = next_pc;
-    state.aux_lp_end = decoded.pc.wrapping_add(offset);
+    state.aux_lp_end = pcl.wrapping_add(offset);
 
     Ok(())
 }
