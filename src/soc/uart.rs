@@ -32,6 +32,13 @@ pub struct SimpleUart {
     baud_div_hi: u8,
     /// Pending RX data from stdin, fed into the data register
     pub rx_queue: VecDeque<u8>,
+    /// Stdin bytes that arrived during the bootloader phase (mem.app_size
+    /// is None). The bootloader's UART ISR consumes the live rx_queue
+    /// then discards the bytes when no CLI prompt is active, so we hold a
+    /// parallel copy here. The `firmware_cli_poll_hook` drains this back into
+    /// rx_queue on the first call to `cli_poll_and_process_input`, once
+    /// firmware's CLI is ready to consume input.
+    pub held_pre_firmware: VecDeque<u8>,
 }
 
 impl SimpleUart {
@@ -41,6 +48,7 @@ impl SimpleUart {
             baud_div_lo: 0,
             baud_div_hi: 0,
             rx_queue: VecDeque::new(),
+            held_pre_firmware: VecDeque::new(),
         }
     }
 

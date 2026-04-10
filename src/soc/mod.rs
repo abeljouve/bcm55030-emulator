@@ -141,7 +141,7 @@ pub fn register_hooks(hooks: &mut HookTable) {
     hooks.insert(FIRMWARE_BASE + 0x1AE2C, Hook::Log("mpcp_slot_and_timing_init"));
     hooks.insert(FIRMWARE_BASE + 0x20FD4, Hook::Log("hw_config_load_and_reset_init"));
     hooks.insert(FIRMWARE_BASE + 0x3C4B4, Hook::Log("epon_llid_queue_table_init"));
-    hooks.insert(FIRMWARE_BASE + 0x16014, Hook::Log("cli_poll_and_process_input"));
+    hooks.insert(FIRMWARE_BASE + 0x16014, Hook::Custom(firmware_cli_poll_hook));
     hooks.insert(FIRMWARE_BASE + 0x02750, Hook::Log("irq_setup_vector_and_enable"));
     // Remaining init functions after irq_setup_vector_and_enable
     hooks.insert(FIRMWARE_BASE + 0x2F800, Hook::Log("stats_counter_reset_all_init"));
@@ -280,6 +280,39 @@ fn firmware_uart_isr(state: &mut CpuState, mem: &mut Memory) -> Result<HookActio
     state.pc_written = true;
     state.instruction_count += 1;
     Ok(HookAction::Skip)
+}
+
+/// Replay any stdin bytes that arrived during the bootloader phase, on the
+/// FIRST call to `cli_poll_and_process_input`. By that point firmware's BSS has
+/// been cleared, the UART struct at 0x7E204 has been initialized, and the
+/// CLI is ready to consume input. Replaying earlier (e.g. in
+/// `boot_rom_start_app` or in `cli_uart_init`) races with .data/BSS init and
+/// either gets the bytes wiped or causes the firmware to read uninitialized
+/// state and dump garbage.
+///
+/// The bootloader's UART ISR drains `mmio.uart.rx_queue` into its own
+/// 0xF968 RX ring buffer and throws the bytes away when no CLI prompt is
+/// active. The host-side stdin loop in main.rs holds a parallel copy in
+/// `mmio.uart.held_pre_firmware` so we can recover them here.
+fn firmware_cli_poll_hook(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
+    crate::vlog!(
+        "[Hook] cli_poll_and_process_input at PC=0x{:05X}, blink=0x{:05X}, insn=N/A",
+        state.pc, state.core_regs[31]
+    );
+    if let Some(mut mmio) = mem.mmio() {
+        if !mmio.uart.held_pre_firmware.is_empty() {
+            let held: Vec<u8> = mmio.uart.held_pre_firmware.drain(..).collect();
+            let n = held.len();
+            for byte in held {
+                mmio.uart.rx_queue.push_back(byte);
+            }
+            crate::vlog!(
+                "[Hook] cli_poll: replayed {} pre-firmware stdin bytes into UART rx_queue",
+                n
+            );
+        }
+    }
+    Ok(HookAction::Continue)
 }
 
 // ── Hook implementations: SerDes stubs ───────────────────────────────────

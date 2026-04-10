@@ -264,6 +264,7 @@ fn run_emulator(cpu: &mut Cpu, cfg: &Config) -> RunResult {
 
         // Poll stdin every 1024 steps — feed into UART RX queue
         if step % 1024 == 0 {
+            let firmware_loaded = cpu.mem.app_size.is_some();
             while let Some(byte) = try_read_stdin() {
                 if byte == 3 {
                     eprintln!("\n[BCM55030] Ctrl-C, stopping");
@@ -272,6 +273,15 @@ fn run_emulator(cpu: &mut Cpu, cfg: &Config) -> RunResult {
                 }
                 if let Some(mut mmio) = cpu.mem.mmio() {
                     mmio.uart.rx_queue.push_back(byte);
+                    // While the bootloader is still running, also stash a
+                    // copy: the bootloader's UART ISR drains rx_queue then
+                    // throws the bytes away (no CLI prompt active). The
+                    // boot ROM transition replays held_pre_firmware into
+                    // rx_queue so firmware actually sees keystrokes typed
+                    // before its prompt is up.
+                    if !firmware_loaded {
+                        mmio.uart.held_pre_firmware.push_back(byte);
+                    }
                 }
             }
         }
