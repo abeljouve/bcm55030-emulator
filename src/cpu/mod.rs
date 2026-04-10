@@ -258,6 +258,12 @@ impl Cpu {
             self.state.flag_de = false;
             self.state.flag_u = false;
             self.state.flag_l = true; // ISA: disable ZOL on interrupt entry
+
+            // ARC 700 fast IRQ register banking — same as level-1 path.
+            self.state.irq_shadow_r0_r3[0] = self.state.core_regs[0];
+            self.state.irq_shadow_r0_r3[1] = self.state.core_regs[1];
+            self.state.irq_shadow_r0_r3[2] = self.state.core_regs[2];
+            self.state.irq_shadow_r0_r3[3] = self.state.core_regs[3];
         } else {
             if !self.state.flag_e1 || self.state.flag_a1 {
                 return false;
@@ -272,6 +278,15 @@ impl Cpu {
             self.state.flag_de = false;
             self.state.flag_u = false;
             self.state.flag_l = true; // ISA: disable ZOL on interrupt entry
+
+            // ARC 700 fast IRQ register banking: save r0..r3 to shadow set
+            // and clear them. The bootloader's IRQ handler at 0xA800 freely
+            // clobbers r0..r3 without saving — relies on this behavior.
+            // Restored on RTIE.
+            self.state.irq_shadow_r0_r3[0] = self.state.core_regs[0];
+            self.state.irq_shadow_r0_r3[1] = self.state.core_regs[1];
+            self.state.irq_shadow_r0_r3[2] = self.state.core_regs[2];
+            self.state.irq_shadow_r0_r3[3] = self.state.core_regs[3];
         }
 
         self.state.aux_irq_pending &= !(1 << irq);

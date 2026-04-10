@@ -43,6 +43,11 @@ pub fn execute_zero_op(zop: &ZeroOp, state: &mut CpuState) -> Result<(), Excepti
                 state.pc = state.core_regs[REG_ILINK2 as usize];
                 state.pc_written = true;
                 state.aux_bta = state.aux_bta_l2;
+                // Restore r0..r3 from fast-IRQ shadow set
+                state.core_regs[0] = state.irq_shadow_r0_r3[0];
+                state.core_regs[1] = state.irq_shadow_r0_r3[1];
+                state.core_regs[2] = state.irq_shadow_r0_r3[2];
+                state.core_regs[3] = state.irq_shadow_r0_r3[3];
             } else {
                 // Return from level 1 interrupt
                 let saved = state.aux_status32_l1;
@@ -50,6 +55,13 @@ pub fn execute_zero_op(zop: &ZeroOp, state: &mut CpuState) -> Result<(), Excepti
                 state.pc = state.core_regs[REG_ILINK1 as usize];
                 state.pc_written = true;
                 state.aux_bta = state.aux_bta_l1;
+                // ARC 700 fast IRQ register banking: restore r0..r3 from
+                // shadow set saved on level-1 IRQ entry. See cpu/mod.rs
+                // check_interrupts.
+                state.core_regs[0] = state.irq_shadow_r0_r3[0];
+                state.core_regs[1] = state.irq_shadow_r0_r3[1];
+                state.core_regs[2] = state.irq_shadow_r0_r3[2];
+                state.core_regs[3] = state.irq_shadow_r0_r3[3];
             }
             Ok(())
         }

@@ -167,6 +167,14 @@ pub struct CpuState {
     /// Set by executor when PC is explicitly written (branch/jump/RTIE).
     /// Used by step() to distinguish "branch to same address" from "no branch".
     pub pc_written: bool,
+
+    /// ARC 700 fast IRQ register banking shadow set for r0..r3.
+    /// On level-1 IRQ entry, r0..r3 are saved here and zeroed; on RTIE,
+    /// they're restored. This matches the BCM55030 hardware behavior where
+    /// the bootloader's IRQ handler at 0xA800 freely clobbers r0..r3
+    /// without saving them — relies on HW shadowing.
+    /// See `check_interrupts` and `executor::special::execute_rtie`.
+    pub irq_shadow_r0_r3: [u32; 4],
 }
 
 impl CpuState {
@@ -223,6 +231,7 @@ impl CpuState {
             sleeping: false,
             instruction_count: 0,
             pc_written: false,
+            irq_shadow_r0_r3: [0u32; 4],
         };
         // Set default IDENTITY: ARC 700 v1 (ARCVER = 0x31)
         state.core_regs[REG_PCL as usize] = 0;

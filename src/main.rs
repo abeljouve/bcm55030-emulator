@@ -29,6 +29,7 @@ struct Config {
     entry_point: u32,
     max_cycles: u64,
     trace: bool,
+    trace_from_insn: Option<u64>,
     trace_mmio: bool,
     verbose: bool,
     breakpoint: Option<u32>,
@@ -52,6 +53,7 @@ fn parse_args() -> Config {
         entry_point: 0,
         max_cycles: u64::MAX,
         trace: false,
+        trace_from_insn: None,
         trace_mmio: false,
         verbose: false,
         breakpoint: None,
@@ -87,6 +89,17 @@ fn parse_args() -> Config {
                 });
             }
             "--trace" => cfg.trace = true,
+            "--trace-from-insn" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --trace-from-insn requires a number");
+                    process::exit(1);
+                }
+                cfg.trace_from_insn = Some(args[i].parse().unwrap_or_else(|_| {
+                    eprintln!("Error: invalid number: {}", args[i]);
+                    process::exit(1);
+                }));
+            }
             "--trace-mmio" => cfg.trace_mmio = true,
             "--verbose" | "-v" => cfg.verbose = true,
             "--break" => {
@@ -232,9 +245,21 @@ enum RunResult {
 }
 
 fn run_emulator(cpu: &mut Cpu, cfg: &Config) -> RunResult {
+    let mut trace_armed = cfg.trace_from_insn.is_some();
     for step in 0..cfg.max_cycles {
         if cpu.state.halted {
             return RunResult::Reboot;
+        }
+
+        // Late-arm tracing once instruction count crosses the threshold.
+        if trace_armed {
+            if let Some(threshold) = cfg.trace_from_insn {
+                if cpu.state.instruction_count >= threshold {
+                    cpu.trace = true;
+                    trace_armed = false;
+                    eprintln!("[TRACE] Tracing armed at insn={}", cpu.state.instruction_count);
+                }
+            }
         }
 
         // Poll stdin every 1024 steps — feed into UART RX queue

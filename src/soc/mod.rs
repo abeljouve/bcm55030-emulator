@@ -257,7 +257,11 @@ fn firmware_uart_isr(state: &mut CpuState, mem: &mut Memory) -> Result<HookActio
         mmio.uart.ier_set(0x04);
     }
 
-    // RTIE: restore STATUS32 and PC from saved interrupt state
+    // RTIE: restore STATUS32 and PC from saved interrupt state.
+    // For level-1 IRQ, also restore r0..r3 from the fast-IRQ shadow set
+    // saved by check_interrupts. The bootloader's IRQ handler at 0xA800
+    // (which we may bypass via this hook) freely clobbers r0..r3 — real
+    // HW shadow registers protect the firmware's GP state.
     if state.flag_a2 {
         let saved = state.aux_status32_l2;
         state.set_status32(saved);
@@ -268,6 +272,10 @@ fn firmware_uart_isr(state: &mut CpuState, mem: &mut Memory) -> Result<HookActio
         state.set_status32(saved);
         state.pc = state.core_regs[REG_ILINK1 as usize];
         state.aux_bta = state.aux_bta_l1;
+        state.core_regs[0] = state.irq_shadow_r0_r3[0];
+        state.core_regs[1] = state.irq_shadow_r0_r3[1];
+        state.core_regs[2] = state.irq_shadow_r0_r3[2];
+        state.core_regs[3] = state.irq_shadow_r0_r3[3];
     }
     state.pc_written = true;
     state.instruction_count += 1;
