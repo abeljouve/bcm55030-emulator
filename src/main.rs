@@ -35,6 +35,7 @@ struct Config {
     dccm_dump: Option<String>,
     persist_flash: bool,
     watch_dccm: Option<u32>,
+    dump_mmio_trace: Option<String>,
 }
 
 fn parse_hex(s: &str) -> Option<u32> {
@@ -57,6 +58,7 @@ fn parse_args() -> Config {
         dccm_dump: None,
         persist_flash: false,
         watch_dccm: None,
+        dump_mmio_trace: None,
     };
 
     let mut i = 1;
@@ -117,6 +119,14 @@ fn parse_args() -> Config {
                     eprintln!("Error: invalid hex address: {}", args[i]);
                     process::exit(1);
                 }));
+            }
+            "--dump-mmio-trace" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --dump-mmio-trace requires a file path");
+                    process::exit(1);
+                }
+                cfg.dump_mmio_trace = Some(args[i].clone());
             }
             "--help" | "-h" => {
                 usage(prog);
@@ -439,6 +449,11 @@ fn main() {
             mmio.pbc.trace = true;
         }
     }
+    if cfg.dump_mmio_trace.is_some() {
+        if let Some(mut mmio) = cpu.mem.mmio() {
+            mmio.mmio_trace = Some(std::collections::HashMap::new());
+        }
+    }
 
     let orig_termios = setup_raw_terminal();
 
@@ -541,6 +556,38 @@ fn main() {
         }
         if let Err(e) = fs::write(path, &buf) {
             eprintln!("Error writing DCCM dump: {}", e);
+        }
+    }
+
+    // Unhandled MMIO trace dump
+    if let Some(ref path) = cfg.dump_mmio_trace {
+        if let Some(mut mmio) = cpu.mem.mmio() {
+            if let Some(trace) = mmio.mmio_trace.take() {
+                let mut entries: Vec<(u32, bcm55030_emulator::soc::mmio::MmioTraceEntry)> =
+                    trace.into_iter().collect();
+                entries.sort_by_key(|(off, _)| *off);
+                let mut text = String::new();
+                text.push_str("# Unhandled MMIO accesses (sorted by sysreg offset)\n");
+                text.push_str("# offset      addr        reads  writes  last_read   last_write  first_pc  first_insn\n");
+                for (off, e) in &entries {
+                    text.push_str(&format!(
+                        "0x{:04X}  0x{:08X}  {:6}  {:6}  0x{:08X}  0x{:08X}  0x{:05X}  {}\n",
+                        off,
+                        0x01000000u32 + off,
+                        e.reads,
+                        e.writes,
+                        e.last_read_value,
+                        e.last_write_value,
+                        e.first_pc,
+                        e.first_insn,
+                    ));
+                }
+                if let Err(err) = fs::write(path, text) {
+                    eprintln!("Error writing MMIO trace: {}", err);
+                } else {
+                    eprintln!("[BCM55030] MMIO trace ({} unique addresses) → {}", entries.len(), path);
+                }
+            }
         }
     }
 

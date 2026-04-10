@@ -129,6 +129,7 @@ impl Cpu {
         if let Some(mut mmio) = self.mem.mmio() {
             mmio.current_pc = self.state.pc;
             mmio.current_blink = self.state.core_regs[31];
+            mmio.current_insn = self.state.instruction_count;
         }
 
         // Execute

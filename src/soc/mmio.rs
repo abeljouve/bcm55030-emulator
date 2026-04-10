@@ -1,8 +1,19 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::cpu::exception::Exception;
 use super::uart::SimpleUart;
 use super::pbc::PeripheralBusController;
+
+/// One unhandled MMIO access stat (aggregated per address).
+#[derive(Default, Clone)]
+pub struct MmioTraceEntry {
+    pub reads: u64,
+    pub writes: u64,
+    pub last_read_value: u32,
+    pub last_write_value: u32,
+    pub first_pc: u32,
+    pub first_insn: u64,
+}
 
 /// UART base address in the SoC MMIO space.
 /// Hardware base pointer is 0x00FC0FE8; data register at +0x28, IER at +0x2C.
@@ -54,6 +65,12 @@ pub struct MmioController {
     /// Track which unhandled SYSREG offsets have been logged (first-access only).
     /// Prevents flooding from polling loops while showing every unique register.
     unhandled_logged: HashSet<u32>,
+    /// Optional aggregated trace of all unhandled MMIO accesses.
+    /// Enabled via `--dump-mmio-trace`. Indexed by sysreg offset (word-aligned).
+    /// Used to inventory which registers a CLI command touches (Phase 2 prep).
+    pub mmio_trace: Option<HashMap<u32, MmioTraceEntry>>,
+    /// Current CPU instruction count, for trace timestamps.
+    pub current_insn: u64,
 }
 
 impl MmioController {
@@ -70,6 +87,8 @@ impl MmioController {
             sysreg_pending_clear: vec![0u32; num_entries],
             i2c_clock_toggles: 0,
             unhandled_logged: HashSet::new(),
+            mmio_trace: None,
+            current_insn: 0,
         }
     }
 
@@ -190,27 +209,48 @@ impl MmioController {
 
     /// Log the first read from an unhandled SYSREG offset.
     /// Shows PC context for Ghidra reverse engineering.
+    /// Also accumulates into the optional `mmio_trace` map.
     fn log_unhandled_read(&mut self, offset: u32) {
         let aligned = offset & !3;
+        let idx = (aligned / 4) as usize;
+        let val = if idx < self.sysreg_store.len() { self.sysreg_store[idx] } else { 0 };
         if self.unhandled_logged.insert(aligned) {
-            let idx = (aligned / 4) as usize;
-            let val = if idx < self.sysreg_store.len() { self.sysreg_store[idx] } else { 0 };
             crate::vlog!(
                 "[MMIO] UNHANDLED READ  sysreg+0x{:04X} (0x{:08X}) → 0x{:08X}  at PC=0x{:05X}",
                 aligned, SYSREG_BASE + aligned, val, self.current_pc
             );
         }
+        if let Some(ref mut trace) = self.mmio_trace {
+            let entry = trace.entry(aligned).or_insert_with(|| MmioTraceEntry {
+                first_pc: self.current_pc,
+                first_insn: self.current_insn,
+                ..Default::default()
+            });
+            entry.reads += 1;
+            entry.last_read_value = val;
+        }
     }
 
     /// Log the first write to an unhandled SYSREG offset.
+    /// Also accumulates into the optional `mmio_trace` map.
     fn log_unhandled_write(&mut self, offset: u32, val: u32) {
+        let aligned = offset & !3;
         // Use offset | 0x80000000 to distinguish write logs from read logs in the set
-        let key = (offset & !3) | 0x80000000;
+        let key = aligned | 0x80000000;
         if self.unhandled_logged.insert(key) {
             crate::vlog!(
                 "[MMIO] UNHANDLED WRITE sysreg+0x{:04X} (0x{:08X}) = 0x{:08X}  at PC=0x{:05X}",
-                offset & !3, SYSREG_BASE + (offset & !3), val, self.current_pc
+                aligned, SYSREG_BASE + aligned, val, self.current_pc
             );
+        }
+        if let Some(ref mut trace) = self.mmio_trace {
+            let entry = trace.entry(aligned).or_insert_with(|| MmioTraceEntry {
+                first_pc: self.current_pc,
+                first_insn: self.current_insn,
+                ..Default::default()
+            });
+            entry.writes += 1;
+            entry.last_write_value = val;
         }
     }
 
