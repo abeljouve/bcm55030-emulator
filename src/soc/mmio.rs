@@ -3,6 +3,42 @@ use std::collections::{HashMap, HashSet};
 use crate::cpu::exception::Exception;
 use super::uart::SimpleUart;
 use super::pbc::PeripheralBusController;
+use super::sfp_eeprom;
+
+/// BSC I2C (Broadcom Serial Controller) state for SFP EEPROM reads.
+///
+/// The BSC is exposed to the firmware via three MMIO registers at
+/// sysreg offsets `0x140`, `0x14C`, `0x150` (base `0x010000F8 + 0x48/0x54/0x58`).
+/// `dpoe_lane_read_bytes_from_table` @ the decompiler 0x20032e44 drives them via
+/// three helpers:
+///   - `dpoe_lane_cmd_config_and_wait` @ 0x20032c68 writes 0x140 and polls
+///     bits [27-31] until they auto-clear.
+///   - `dpoe_lane_cmd_write_and_wait` @ 0x20032d44 writes 0x150 and polls
+///     bit 31 until it clears. Carries an encoded byte address in bits
+///     [3-13] when used in "set address" mode (`param_2 == 2`).
+///   - `dpoe_get_lane_state_field_from_table` @ 0x20032ccc calls
+///     cmd_config with `param_4 = 1` and `param_5 = word_idx + 0x100`,
+///     then reads the 32-bit result from 0x14C.
+///
+/// To emulate the controller faithfully enough for `access/read 4 <inst>
+/// <addr> <len>`, we track the pending read word index, the base byte
+/// offset set via cmd_write_and_wait, and the current device (A0h vs A2h).
+#[derive(Default)]
+pub struct BscI2cState {
+    /// Base byte offset within the SFP EEPROM, as set by a
+    /// `dpoe_lane_cmd_write_and_wait(..., param_2 = 2, param_4 = addr)` call
+    /// (write to 0x150 with bit 1 set).
+    pub base_addr: u16,
+    /// Byte offset of the next word the firmware expects to read from 0x14C.
+    /// Updated every time `dpoe_get_lane_state_field_from_table` writes 0x140
+    /// with the `word_idx + 0x100` length field and the `param_4 = 1` cmd bit.
+    pub pending_read_off: u16,
+    /// True when a 0x14C read should return an SFP word.
+    pub read_ready: bool,
+    /// Selected EEPROM device: 0 = A0h (ID page), 1 = A2h (DDM page).
+    /// Set from the "lanes" field (bits 16-17) of the 0x140 command word.
+    pub device: u8,
+}
 
 /// One unhandled MMIO access stat (aggregated per address).
 #[derive(Default, Clone)]
@@ -59,9 +95,14 @@ pub struct MmioController {
     /// register, the hardware clears them after processing. We clear them on the next
     /// read (simulating instant completion).
     sysreg_pending_clear: Vec<u32>,
-    /// I2C bit-bang state for SFP EEPROM bus (SYSREG+0x48/0x4C).
-    /// Counts clock toggles to simulate NAK (no SFP module present).
+    /// I2C bit-bang state for SYSREG+0x48/0x4C. Despite the old name this
+    /// block is NOT the SFP I2C controller — that lives at
+    /// SYSREG+0x140/0x14C/0x150 (see `bsc`). This bit-bang is likely the
+    /// eFuse UDR bus (64-byte OTP reads via `serial_bus_read_80bytes`).
+    /// Counts clock toggles to simulate a benign empty response.
     i2c_clock_toggles: u32,
+    /// BSC I2C state machine for SFP EEPROM reads (SYSREG+0x140/0x14C/0x150).
+    pub bsc: BscI2cState,
     /// Track which unhandled SYSREG offsets have been logged (first-access only).
     /// Prevents flooding from polling loops while showing every unique register.
     unhandled_logged: HashSet<u32>,
@@ -86,6 +127,7 @@ impl MmioController {
             sysreg_store: vec![0u32; num_entries],
             sysreg_pending_clear: vec![0u32; num_entries],
             i2c_clock_toggles: 0,
+            bsc: BscI2cState::default(),
             unhandled_logged: HashSet::new(),
             mmio_trace: None,
             current_insn: 0,
@@ -145,6 +187,37 @@ impl MmioController {
                 // I2C clock/data register. Bit 0 = SCL, bit 31 = SDA (data in).
                 let base = self.sysreg_store[0x04C / 4];
                 base | 0x80000000 // SDA high = data bit 1 (0xFF bytes)
+            }
+            // ── BSC I2C (SFP EEPROM) — 0x140/0x14C/0x150 ─────────────────
+            //
+            // Command/config register 0x140: after a firmware write with
+            // cmd bits at [27-31], the hardware clears those bits when the
+            // operation completes. `sysreg_pending_clear` already handles
+            // the generic 0xF8000000 mask, so the default store_read path
+            // behaves correctly here.
+            0x140 => self.store_read(offset),
+            // Data register 0x14C: returns the 32-bit word at the byte
+            // offset set up by the previous 0x140 + 0x150 command sequence.
+            // The firmware reads this register once per
+            // `dpoe_get_lane_state_field_from_table` call, which bumps the
+            // word index itself — we only honour `read_ready` to avoid
+            // leaking data when the firmware is polling.
+            0x14C => {
+                if self.bsc.read_ready {
+                    let w = sfp_eeprom::read_word(self.bsc.device, self.bsc.pending_read_off);
+                    self.bsc.read_ready = false;
+                    w
+                } else {
+                    self.store_read(offset)
+                }
+            }
+            // Write/trigger register 0x150: bit 31 is the "busy" flag.
+            // Auto-clear it on read to simulate instant completion.
+            0x150 => {
+                let idx = 0x150 / 4;
+                let val = self.sysreg_store[idx];
+                self.sysreg_store[idx] = val & !0x80000000;
+                val & !0x80000000
             }
             0x194 | 0x1D4 => {
                 // SerDes lane link lock status registers.
@@ -271,9 +344,46 @@ impl MmioController {
         match offset {
             0x000 | 0x004 | 0x00C | 0x018 | 0x030 | 0x050 |
             0x040 | 0x048 | 0x04C | 0x194 | 0x1D4 | 0x1E0 | 0x2804 | 0x3604 |
+            0x140 | 0x14C | 0x150 |
             0x1404 | 0x1604 | 0x1804 | 0x1A04 | 0x1C04 | 0x1E04 => {}
             o if (0x1400..=0x3FFF).contains(&o) && (o.wrapping_sub(0x143C)) % 0x200 == 0 => {}
             _ => self.log_unhandled_write(offset, val),
+        }
+
+        // ── BSC I2C state machine writes ────────────────────────────────
+        //
+        // 0x140 command/config register encoding (from
+        // `dpoe_lane_cmd_config_and_wait` @ the decompiler 0x20032c68):
+        //   bits [0-6]:   param_2 & 0x7f
+        //   bits [16-17]: (param_3 & 3) << 16  — EEPROM device select
+        //   bits [18-26]: (param_5 & 0x1ff) << 18
+        //   bits [27-31]: param_4 << 27  — command bits, auto-cleared
+        //
+        // `dpoe_get_lane_state_field_from_table` @ 0x20032ccc calls
+        // cmd_config with `param_4 = 1` and `param_5 = word_idx + 0x100`,
+        // so the trigger for "prepare read" is:
+        //   (val >> 27) & 1 = 1 and ((val >> 18) & 0x1ff) >= 0x100
+        // In that case the word index is `((val >> 18) & 0xff)` and we
+        // schedule a read of 4 SFP bytes at `base_addr + word_idx*4`.
+        if offset == 0x140 {
+            let param_5 = (val >> 18) & 0x1FF;
+            let cmd_hi = (val >> 27) & 0x1F;
+            if (cmd_hi & 1) != 0 && param_5 >= 0x100 {
+                let word_idx = (param_5 - 0x100) as u16;
+                self.bsc.pending_read_off = self.bsc.base_addr.wrapping_add(word_idx * 4);
+                self.bsc.read_ready = true;
+            }
+            // The CLI `inst` parameter (0 = A0h, 1 = A2h) is propagated as
+            // bit 0 of the descriptor's `desc[2:4]` field, which lands in
+            // bits[0-6] of the 0x140 write (`param_2 & 0x7f`). On this
+            // hardware bit 0 toggles between 0x50 (A0h) and 0x51 (A2h).
+            self.bsc.device = (val & 0x1) as u8;
+        }
+        // Writes to 0x14C set the base byte offset for subsequent reads.
+        // `dpoe_set_lane_state_field_in_table` @ the decompiler 0x20032d08 issues
+        // `st.di r4,[r1,0x54]` with `r4 = CLI addr`, then calls cmd_config.
+        if offset == 0x14C {
+            self.bsc.base_addr = (val & 0xFFFF) as u16;
         }
 
         // Track I2C clock toggles on bit 0 of register 0x4C

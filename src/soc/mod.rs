@@ -8,6 +8,7 @@
 pub mod boot_rom;
 pub mod mmio;
 pub mod pbc;
+pub mod sfp_eeprom;
 pub mod spi_flash;
 pub mod uart;
 
