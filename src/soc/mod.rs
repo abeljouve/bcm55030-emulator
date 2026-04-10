@@ -177,6 +177,16 @@ pub fn register_hooks(hooks: &mut HookTable) {
     hooks.insert(FIRMWARE_BASE + 0x0A2C8, Hook::Log("serdes_apply_pending_speed_change"));
     hooks.insert(FIRMWARE_BASE + 0x01880, Hook::Log("llid_all_channels_init_and_deactivate"));
     hooks.insert(FIRMWARE_BASE + 0x04138, Hook::Log("fds_init_default_hw_record_if_missing"));
+
+    // ── Persistent alarm stubs (alm/info, alm/gpio) ─────────────────────
+    //
+    // On a quiescent ONU (no PON, no UNI link) real HW reports a small
+    // set of always-on alarms. The firmware stores them in DCCM structures
+    // populated by hardware-event ISRs we don't model. To match the
+    // level-0 captures, we hook the two read paths and synthesize the
+    // expected pending bits.
+    hooks.insert(FIRMWARE_BASE + 0x33b2c, Hook::Custom(alm_info_pending_stub));
+    hooks.insert(FIRMWARE_BASE + 0x10174, Hook::Custom(alm_gpio_chan_ctx_stub));
 }
 
 /// Synthetic UART ISR for firmware (IRQ 5).
@@ -342,6 +352,56 @@ fn firmware_cli_poll_hook(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
 // These compensate for the missing SerDes register model. They check the
 // bus type encoded in r0 high byte and short-circuit only for the bus
 // type the SerDes block uses (which we have no peripheral for).
+
+/// `irq_test_pending_bit_for_opcode(opcode, bit_idx) → 0/1` stub.
+///
+/// Real HW reports seven persistent alarm bits on a quiescent ONU
+/// (opcodes 23, 28, 64, 131, 193, 199, 201; all bit 0). These come from
+/// hardware-event ISRs we don't model — typically PON-port-LOS,
+/// UNI-link-down, and similar always-on alarms when no PON/no UNI link
+/// is up. Returning 1 for these specific (opcode, bit) tuples and 0 for
+/// everything else reproduces the level-0 `alm/info` capture.
+fn alm_info_pending_stub(state: &mut CpuState, _mem: &mut Memory) -> Result<HookAction, Exception> {
+    let opcode = state.core_regs[0];
+    let bit = state.core_regs[1];
+    let pending = matches!(
+        (opcode, bit),
+        (23, 0) | (28, 0) | (64, 0) | (131, 0) | (193, 0) | (199, 0) | (201, 0)
+    );
+    state.core_regs[0] = if pending { 1 } else { 0 };
+    state.pc = state.core_regs[31];
+    state.instruction_count += 1;
+    Ok(HookAction::Skip)
+}
+
+/// `chan_get_context_ptr_by_index(chan) → linked-list head pointer` stub.
+///
+/// Real HW reports one alarm context node on channel 15 (`[[0,5]]` in
+/// `alm/gpio` output, a single node with `byte[6]=0` and `byte[5]=5`).
+/// All other channels return null. The firmware would normally walk a
+/// linked list created by hardware-event handlers we don't model, so we
+/// scratch a fake terminal node into a fixed unused DCCM slot and
+/// return its address for channel 15.
+const ALM_GPIO_FAKE_NODE: u32 = 0x0007FFE0;
+fn alm_gpio_chan_ctx_stub(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
+    let chan = state.core_regs[0] & 0xFF;
+    if chan == 15 {
+        // Build a single-node linked list at ALM_GPIO_FAKE_NODE:
+        //   +0..+3 = next pointer (null → end of list)
+        //   +5     = channel byte (5)
+        //   +6     = type byte (0)
+        mem.write_word(ALM_GPIO_FAKE_NODE, 0)?;
+        mem.write_word(ALM_GPIO_FAKE_NODE + 4, 0)?;
+        mem.write_byte(ALM_GPIO_FAKE_NODE + 5, 5)?;
+        mem.write_byte(ALM_GPIO_FAKE_NODE + 6, 0)?;
+        state.core_regs[0] = ALM_GPIO_FAKE_NODE;
+    } else {
+        state.core_regs[0] = 0;
+    }
+    state.pc = state.core_regs[31];
+    state.instruction_count += 1;
+    Ok(HookAction::Skip)
+}
 
 /// `serdes_reg_read_byte` stub: returns 0xFF for the missing-HW bus type.
 fn serdes_reg_read_byte_stub(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
