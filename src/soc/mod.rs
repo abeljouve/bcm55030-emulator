@@ -142,6 +142,27 @@ pub fn register_hooks(hooks: &mut HookTable) {
     hooks.insert(FIRMWARE_BASE + 0x20FD4, Hook::Log("hw_config_load_and_reset_init"));
     hooks.insert(FIRMWARE_BASE + 0x3C4B4, Hook::Log("epon_llid_queue_table_init"));
     hooks.insert(FIRMWARE_BASE + 0x16014, Hook::Custom(firmware_cli_poll_hook));
+
+    // ── Stub: epon_poll_hw_state_changes ────────────────────────────────
+    //
+    // This function (file 0x1B268) walks a 24-entry table at .data 0x7ED90
+    // and reads sysreg[idx] for each entry, comparing against a stored
+    // previous value. On any (current != 0 && current != prev) it calls
+    // log_printf to dump a "state change" message — and on certain bit
+    // transitions it triggers `system_shutdown_and_flush`.
+    //
+    // Real HW returns 0 for ALL these registers on a quiescent ONU. Our
+    // store-and-return default leaves residual values from prior writes
+    // (e.g. 0xFFFF0 mask clears), which the firmware misreads as state
+    // changes — dumping the entire .rodata string region to UART or
+    // entering the shutdown path.
+    //
+    // We can't blindly return 0 for these specific sysreg offsets because
+    // some of them are also used as configuration/state registers by other
+    // firmware code (returning 0 there breaks init). The cleanest fix is
+    // to stub the polling function itself to a no-op return — until we
+    // have real HW models for the SerDes/MPCP/EPON status registers.
+    hooks.insert(FIRMWARE_BASE + 0x1B268, Hook::ReturnImmediate);
     hooks.insert(FIRMWARE_BASE + 0x02750, Hook::Log("irq_setup_vector_and_enable"));
     // Remaining init functions after irq_setup_vector_and_enable
     hooks.insert(FIRMWARE_BASE + 0x2F800, Hook::Log("stats_counter_reset_all_init"));

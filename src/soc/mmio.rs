@@ -182,6 +182,17 @@ impl MmioController {
             // Write side (error mask) shares the same address. Return 0 = no errors.
             0x2804 => 0,
 
+            // ── SerDes Error Status (0x3604) ─────────────────────────────
+            // serdes_check_error_status @ 0x20011940 reads (val & 0xFFFF0).
+            // The firmware writes 0x000FFFF0 to clear errors then reads back.
+            // On real HW these bits are W1C — reading after the clear returns 0.
+            // Without this stub, our store returns the written 0xFFFF0, and
+            // `epon_llid_mka_tick_all_channels` calls the heavy
+            // `macsec_hw_session_init` every iteration (~370k insns/loop),
+            // so the cli_poll loop only runs ~5 times/second and the second
+            // command typed at the prompt gets dropped.
+            0x3604 => 0,
+
             // ── Default: read-write store with auto-clear ────────────────
             _ => {
                 self.log_unhandled_read(offset);
@@ -259,7 +270,7 @@ impl MmioController {
         // Log unhandled writes (offsets without explicit read handlers)
         match offset {
             0x000 | 0x004 | 0x00C | 0x018 | 0x030 | 0x050 |
-            0x040 | 0x048 | 0x04C | 0x194 | 0x1D4 | 0x1E0 | 0x2804 |
+            0x040 | 0x048 | 0x04C | 0x194 | 0x1D4 | 0x1E0 | 0x2804 | 0x3604 |
             0x1404 | 0x1604 | 0x1804 | 0x1A04 | 0x1C04 | 0x1E04 => {}
             o if (0x1400..=0x3FFF).contains(&o) && (o.wrapping_sub(0x143C)) % 0x200 == 0 => {}
             _ => self.log_unhandled_write(offset, val),
