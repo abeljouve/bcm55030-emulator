@@ -117,6 +117,16 @@ pub struct MmioController {
 impl MmioController {
     pub fn new() -> Self {
         let num_entries = SYSREG_SIZE as usize / 4;
+        let mut sysreg_store = vec![0u32; num_entries];
+        // Pre-populate from live HW snapshot (post-boot state captured 2026-04-10
+        // on running ONU). 304 non-zero registers. See src/soc/mmio_init.rs and
+        // docs/hw_snapshot_full.txt for the source data.
+        for &(off, val) in super::mmio_init::SYSREG_INIT_VALUES {
+            let idx = (off / 4) as usize;
+            if idx < sysreg_store.len() {
+                sysreg_store[idx] = val;
+            }
+        }
         Self {
             uart: SimpleUart::new(),
             pbc: PeripheralBusController::new(),
@@ -124,7 +134,7 @@ impl MmioController {
             current_pc: 0,
             current_blink: 0,
             timer_counter: 0,
-            sysreg_store: vec![0u32; num_entries],
+            sysreg_store,
             sysreg_pending_clear: vec![0u32; num_entries],
             i2c_clock_toggles: 0,
             bsc: BscI2cState::default(),
@@ -315,10 +325,17 @@ impl MmioController {
         let idx = (aligned / 4) as usize;
         let val = if idx < self.sysreg_store.len() { self.sysreg_store[idx] } else { 0 };
         if self.unhandled_logged.insert(aligned) {
-            crate::vlog!(
-                "[MMIO] UNHANDLED READ  sysreg+0x{:04X} (0x{:08X}) → 0x{:08X}  at PC=0x{:05X}",
-                aligned, SYSREG_BASE + aligned, val, self.current_pc
-            );
+            let abs = SYSREG_BASE + aligned;
+            match super::mmio_blocks::lookup(abs) {
+                Some(info) => crate::vlog!(
+                    "[MMIO] UNHANDLED READ  sysreg+0x{:04X} (0x{:08X}) → 0x{:08X}  at PC=0x{:05X}  [#{} {}::{}]",
+                    aligned, abs, val, self.current_pc, info.block_id, info.block_name, info.reg_name
+                ),
+                None => crate::vlog!(
+                    "[MMIO] UNHANDLED READ  sysreg+0x{:04X} (0x{:08X}) → 0x{:08X}  at PC=0x{:05X}",
+                    aligned, abs, val, self.current_pc
+                ),
+            }
         }
         if let Some(ref mut trace) = self.mmio_trace {
             let entry = trace.entry(aligned).or_insert_with(|| MmioTraceEntry {
@@ -338,10 +355,17 @@ impl MmioController {
         // Use offset | 0x80000000 to distinguish write logs from read logs in the set
         let key = aligned | 0x80000000;
         if self.unhandled_logged.insert(key) {
-            crate::vlog!(
-                "[MMIO] UNHANDLED WRITE sysreg+0x{:04X} (0x{:08X}) = 0x{:08X}  at PC=0x{:05X}",
-                aligned, SYSREG_BASE + aligned, val, self.current_pc
-            );
+            let abs = SYSREG_BASE + aligned;
+            match super::mmio_blocks::lookup(abs) {
+                Some(info) => crate::vlog!(
+                    "[MMIO] UNHANDLED WRITE sysreg+0x{:04X} (0x{:08X}) = 0x{:08X}  at PC=0x{:05X}  [#{} {}::{}]",
+                    aligned, abs, val, self.current_pc, info.block_id, info.block_name, info.reg_name
+                ),
+                None => crate::vlog!(
+                    "[MMIO] UNHANDLED WRITE sysreg+0x{:04X} (0x{:08X}) = 0x{:08X}  at PC=0x{:05X}",
+                    aligned, abs, val, self.current_pc
+                ),
+            }
         }
         if let Some(ref mut trace) = self.mmio_trace {
             let entry = trace.entry(aligned).or_insert_with(|| MmioTraceEntry {
