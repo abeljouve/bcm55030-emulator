@@ -281,6 +281,28 @@ impl MmioController {
             // Write side (error mask) shares the same address. Return 0 = no errors.
             0x2804 => 0,
 
+            // ── MDIO Clause 22/45 Controller data register (0x0064) ─────
+            //
+            // `mdio_bus_read_reg` @ ram:20033420 writes a read command to
+            // this same register then reads back (val & 0xFFFF) as the PHY
+            // response. `mdio_bus_write_reg` @ ram:200332a8 writes the
+            // write-data variant but does not check the response.
+            //
+            // Real BCM55030 has no PHYs wired to the clause 22/45 MDIO
+            // bus when used as a standalone ONU (the Device module does
+            // not expose an external MDIO bus). `mdio/read X Y` on live
+            // hardware returns `ffff` for every (phy, reg) — the standard
+            // "no PHY pulldown" value.
+            //
+            // Preserve the command bits (so the firmware's subsequent
+            // polls of the same register read what it wrote for the
+            // trigger/ack) and force bits [15:0] to 0xFFFF so a read
+            // response returns the no-PHY pattern.
+            0x0064 => {
+                let val = self.store_read(offset);
+                (val & 0xFFFF_0000) | 0x0000_FFFF
+            }
+
             // ── SerDes Error Status (0x3604) ─────────────────────────────
             // serdes_check_error_status @ 0x20011940 reads (val & 0xFFFF0).
             // The firmware writes 0x000FFFF0 to clear errors then reads back.
