@@ -60,26 +60,9 @@ pub fn register_hooks(hooks: &mut HookTable) {
 
     // ── Missing-hardware stubs (NOT firmware bypasses) ──────────────────
     //
-    // These hooks compensate for hardware blocks we don't model at all
-    // (SerDes lanes). Without them, the firmware enters retry loops on
-    // SerDes register I/O during `serdes_init_all_lanes_hw`. They are NOT
-    // bypassing buggy firmware logic — they're providing a synthetic
-    // "ready/empty" answer for a hardware block that's silent in our
-    // emulator. To remove them, we'd need a real SerDes register model
-    // (~50 registers per lane × 4 lanes + PLL/common); see Phase 3 of the
-    // roadmap.
-    //
-    // Re-validated 2026-04-10: tested without these stubs → firmware stops in
-    // `serdes_init_all_lanes_hw` at insn 11.7M. With them → firmware reaches
-    // `cli_poll_and_process_input`.
-
-    // serdes_reg_read_byte (file 0x12CA4) — return 0xFF for non-SPI bus types.
-    hooks.insert(FIRMWARE_BASE + 0x12CA4, Hook::Custom(serdes_reg_read_byte_stub));
-
-    // serdes_reg_write (file 0x12CD8) — skip for non-SPI bus types.
-    hooks.insert(FIRMWARE_BASE + 0x12CD8, Hook::Custom(serdes_reg_write_stub));
-
-    // serdes_hw_ready_flag (file 0x1E6C) — always return 1 (ready).
+    // `serdes_hw_ready_flag` reports "ready/link-up" for a hardware signal
+    // we don't drive at all. Returning 1 is the "quiescent ONU" answer.
+    // Removing it requires modelling the SerDes lane state machine (Phase 3).
     hooks.insert(FIRMWARE_BASE + 0x1E6C, Hook::ReturnValue(1));
 
     // ── Workaround removed for re-validation 2026-04-10 ──────────────────
@@ -534,33 +517,3 @@ fn do_rtie(state: &mut CpuState) {
     }
 }
 
-/// `serdes_reg_read_byte` stub: returns 0xFF for the missing-HW bus type.
-fn serdes_reg_read_byte_stub(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
-    if mem.app_size.is_none() {
-        return Ok(HookAction::Continue);
-    }
-    let bus_type = (state.core_regs[0] >> 8) & 0xFF;
-    if bus_type != 0x06 {
-        state.core_regs[0] = 0xFF;
-        state.pc = state.core_regs[31]; // blink
-        state.instruction_count += 1;
-        Ok(HookAction::Skip)
-    } else {
-        Ok(HookAction::Continue)
-    }
-}
-
-/// `serdes_reg_write` stub: silently swallows writes for the missing-HW bus type.
-fn serdes_reg_write_stub(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
-    if mem.app_size.is_none() {
-        return Ok(HookAction::Continue);
-    }
-    let bus_type = (state.core_regs[0] >> 8) & 0xFF;
-    if bus_type != 0x06 {
-        state.pc = state.core_regs[31];
-        state.instruction_count += 1;
-        Ok(HookAction::Skip)
-    } else {
-        Ok(HookAction::Continue)
-    }
-}
