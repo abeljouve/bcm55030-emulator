@@ -134,6 +134,18 @@ impl DCache {
         self.find_way(set, tag).is_some()
     }
 
+    /// Read a byte from the cache without updating LRU.
+    /// Used by direct SRAM access paths (hooks, DMA) to maintain coherence
+    /// with data written through the D-cache.
+    pub fn peek_byte(&self, addr: u32) -> Option<u8> {
+        let (tag, set, offset) = Self::decompose(addr);
+        if let Some(way) = self.find_way(set, tag) {
+            Some(self.lines[set][way].data[offset])
+        } else {
+            None
+        }
+    }
+
     /// Read a byte from the cache. Returns Some(byte) on hit, None on miss.
     /// Updates LRU on hit.
     pub fn read_byte(&mut self, addr: u32) -> Option<u8> {

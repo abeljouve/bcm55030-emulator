@@ -139,9 +139,32 @@ impl Memory {
         None
     }
 
+    /// Read byte from backing store (SRAM/MMIO) without checking D-cache.
+    /// Used for .di bypass path and instruction fetch.
+    fn read_byte_backing(&self, addr: u32) -> Result<u8, Exception> {
+        if self.mmio.is_some() {
+            if let Some(off) = self.sram_offset(addr) {
+                return Ok(self.data[off]);
+            }
+            if let Some(ref mmio) = self.mmio {
+                return mmio.borrow_mut().read_byte(addr);
+            }
+            return Ok(0);
+        }
+        self.check_bounds(addr, 1)?;
+        Ok(self.data[addr as usize])
+    }
+
+    /// Read byte — cache-coherent. If the address is in the D-cache,
+    /// returns the cached value. Used by hooks and internal code that must
+    /// see the same memory view as firmware LD instructions.
     pub fn read_byte(&self, addr: u32) -> Result<u8, Exception> {
         if self.mmio.is_some() {
-            // SoC mode: route by address
+            if let Some(ref dc) = self.dcache {
+                if let Some(val) = dc.peek_byte(addr) {
+                    return Ok(val);
+                }
+            }
             if let Some(off) = self.sram_offset(addr) {
                 return Ok(self.data[off]);
             }
@@ -157,25 +180,26 @@ impl Memory {
         Ok(self.data[addr as usize])
     }
 
+    /// Cache-coherent halfword read. Checks D-cache first, then backing store.
     pub fn read_half(&self, addr: u32) -> Result<u16, Exception> {
+        // Check D-cache for coherence (hooks must see cached firmware data)
+        if let Some(ref dc) = self.dcache {
+            if let (Some(hi), Some(lo)) = (dc.peek_byte(addr), dc.peek_byte(addr + 1)) {
+                return Ok(((hi as u16) << 8) | (lo as u16));
+            }
+        }
         if self.mmio.is_some() {
-            // SoC mode: check SRAM first, then MMIO, then unmapped
             if let Some(off) = self.sram_offset(addr) {
-                // Misaligned SRAM reads: perform byte-wise (fixup behavior).
-                // The ARC 700 raises a MisalignedAccess exception, but the firmware's
-                // exception handler fixes up the access. We emulate this directly.
                 if off + 1 < self.data.len() {
                     return Ok(((self.data[off] as u16) << 8) | (self.data[off + 1] as u16));
                 }
             }
             if addr & 1 != 0 {
-                // Unmapped misaligned — return 0
                 return Ok(0);
             }
             if let Some(ref mmio) = self.mmio {
                 return mmio.borrow_mut().read_half(addr);
             }
-            // Unmapped address — return 0
             return Ok(0);
         }
         if addr & 1 != 0 {
@@ -186,11 +210,22 @@ impl Memory {
         Ok(((self.data[a] as u16) << 8) | (self.data[a + 1] as u16))
     }
 
+    /// Cache-coherent word read. Checks D-cache first, then backing store.
     pub fn read_word(&self, addr: u32) -> Result<u32, Exception> {
+        // Check D-cache for coherence (hooks must see cached firmware data)
+        if let Some(ref dc) = self.dcache {
+            if let (Some(b0), Some(b1), Some(b2), Some(b3)) = (
+                dc.peek_byte(addr),
+                dc.peek_byte(addr.wrapping_add(1)),
+                dc.peek_byte(addr.wrapping_add(2)),
+                dc.peek_byte(addr.wrapping_add(3)),
+            ) {
+                return Ok(((b0 as u32) << 24) | ((b1 as u32) << 16)
+                    | ((b2 as u32) << 8) | (b3 as u32));
+            }
+        }
         if self.mmio.is_some() {
-            // SoC mode: check SRAM first, then MMIO, then unmapped
             if addr & 3 != 0 {
-                // Misaligned SRAM reads: perform byte-wise fixup
                 if let Some(off) = self.sram_offset(addr) {
                     if off + 3 < self.data.len() {
                         return Ok(((self.data[off] as u32) << 24)
@@ -212,7 +247,6 @@ impl Memory {
             if let Some(ref mmio) = self.mmio {
                 return mmio.borrow_mut().read_word(addr);
             }
-            // Unmapped address — return 0
             return Ok(0);
         }
         if addr & 3 != 0 {
@@ -233,6 +267,10 @@ impl Memory {
             if let Some(off) = self.sram_offset(addr) {
                 self.check_watchpoint(off, 1);
                 self.data[off] = val;
+                // Update D-cache for coherence (hooks/DMA write to SRAM directly)
+                if let Some(ref mut dc) = self.dcache {
+                    dc.write_byte(addr, val);
+                }
                 return Ok(());
             }
             if let Some(ref mmio) = self.mmio {
@@ -248,14 +286,16 @@ impl Memory {
 
     pub fn write_half(&mut self, addr: u32, val: u16) -> Result<(), Exception> {
         if self.mmio.is_some() {
-            // Misaligned SRAM writes: perform byte-wise fixup.
-            // The ARC 700 raises MisalignedAccess, but the firmware's exception
-            // handler fixes up the access. We emulate this directly.
             if let Some(off) = self.sram_offset(addr) {
                 if off + 1 < self.data.len() {
                     self.check_watchpoint(off, 2);
                     self.data[off] = (val >> 8) as u8;
                     self.data[off + 1] = val as u8;
+                    // Update D-cache for coherence
+                    if let Some(ref mut dc) = self.dcache {
+                        dc.write_byte(addr, (val >> 8) as u8);
+                        dc.write_byte(addr + 1, val as u8);
+                    }
                     return Ok(());
                 }
             }
@@ -289,6 +329,13 @@ impl Memory {
                         self.data[off + 1] = (val >> 16) as u8;
                         self.data[off + 2] = (val >> 8) as u8;
                         self.data[off + 3] = val as u8;
+                        // Update D-cache for coherence
+                        if let Some(ref mut dc) = self.dcache {
+                            dc.write_byte(addr, (val >> 24) as u8);
+                            dc.write_byte(addr + 1, (val >> 16) as u8);
+                            dc.write_byte(addr + 2, (val >> 8) as u8);
+                            dc.write_byte(addr + 3, val as u8);
+                        }
                         return Ok(());
                     }
                 }
@@ -301,6 +348,13 @@ impl Memory {
                     self.data[off + 1] = (val >> 16) as u8;
                     self.data[off + 2] = (val >> 8) as u8;
                     self.data[off + 3] = val as u8;
+                    // Update D-cache for coherence
+                    if let Some(ref mut dc) = self.dcache {
+                        dc.write_byte(addr, (val >> 24) as u8);
+                        dc.write_byte(addr + 1, (val >> 16) as u8);
+                        dc.write_byte(addr + 2, (val >> 8) as u8);
+                        dc.write_byte(addr + 3, val as u8);
+                    }
                     return Ok(());
                 }
             }
@@ -428,9 +482,10 @@ impl Memory {
     }
 
     /// Data byte read through D-cache. Used by LD instructions.
+    /// When cache_bypass (.di) is set, reads from backing store directly.
     pub fn read_byte_data(&mut self, addr: u32, cache_bypass: bool) -> Result<u8, Exception> {
         if cache_bypass || !self.dcache_enabled() {
-            return self.read_byte(addr);
+            return self.read_byte_backing(addr);
         }
         self.ensure_cache_line(addr)?;
         Ok(self.dcache.as_mut().unwrap().read_byte(addr).unwrap())
@@ -439,7 +494,10 @@ impl Memory {
     /// Data halfword read through D-cache. Used by LD.H instructions.
     pub fn read_half_data(&mut self, addr: u32, cache_bypass: bool) -> Result<u16, Exception> {
         if cache_bypass || addr & 1 != 0 || !self.dcache_enabled() {
-            return self.read_half(addr);
+            // .di bypass or misaligned: read from backing store directly
+            let b0 = self.read_byte_backing(addr)?;
+            let b1 = self.read_byte_backing(addr.wrapping_add(1))?;
+            return Ok(((b0 as u16) << 8) | (b1 as u16));
         }
         self.ensure_cache_line(addr)?;
         let dc = self.dcache.as_mut().unwrap();
@@ -451,7 +509,12 @@ impl Memory {
     /// Data word read through D-cache. Used by LD instructions.
     pub fn read_word_data(&mut self, addr: u32, cache_bypass: bool) -> Result<u32, Exception> {
         if cache_bypass || addr & 3 != 0 || !self.dcache_enabled() {
-            return self.read_word(addr);
+            // .di bypass or misaligned: read from backing store directly
+            let b0 = self.read_byte_backing(addr)? as u32;
+            let b1 = self.read_byte_backing(addr.wrapping_add(1))? as u32;
+            let b2 = self.read_byte_backing(addr.wrapping_add(2))? as u32;
+            let b3 = self.read_byte_backing(addr.wrapping_add(3))? as u32;
+            return Ok((b0 << 24) | (b1 << 16) | (b2 << 8) | b3);
         }
         self.ensure_cache_line(addr)?;
         let dc = self.dcache.as_mut().unwrap();
@@ -463,14 +526,21 @@ impl Memory {
     }
 
     /// Data byte write through D-cache. Used by ST instructions.
-    /// Write-back policy: data goes to cache only, written to backing store on eviction.
+    /// Write-through for SRAM: updates both cache and backing store.
+    /// For MMIO without .di: absorbed by cache only (write-back).
     pub fn write_byte_data(&mut self, addr: u32, val: u8, cache_bypass: bool) -> Result<(), Exception> {
         if cache_bypass || !self.dcache_enabled() {
             return self.write_byte(addr, val);
         }
-        // Write-allocate: ensure line is cached
         self.ensure_cache_line(addr)?;
         self.dcache.as_mut().unwrap().write_byte(addr, val);
+        // Write-through for SRAM: also update backing store so .di reads
+        // see the correct value. MMIO stays write-back (absorbed by cache).
+        if let Some(off) = self.sram_offset(addr) {
+            if off < self.data.len() {
+                self.data[off] = val;
+            }
+        }
         Ok(())
     }
 
@@ -483,6 +553,13 @@ impl Memory {
         let dc = self.dcache.as_mut().unwrap();
         dc.write_byte(addr, (val >> 8) as u8);
         dc.write_byte(addr + 1, val as u8);
+        // Write-through for SRAM
+        if let Some(off) = self.sram_offset(addr) {
+            if off + 1 < self.data.len() {
+                self.data[off] = (val >> 8) as u8;
+                self.data[off + 1] = val as u8;
+            }
+        }
         Ok(())
     }
 
@@ -497,6 +574,15 @@ impl Memory {
         dc.write_byte(addr + 1, (val >> 16) as u8);
         dc.write_byte(addr + 2, (val >> 8) as u8);
         dc.write_byte(addr + 3, val as u8);
+        // Write-through for SRAM
+        if let Some(off) = self.sram_offset(addr) {
+            if off + 3 < self.data.len() {
+                self.data[off] = (val >> 24) as u8;
+                self.data[off + 1] = (val >> 16) as u8;
+                self.data[off + 2] = (val >> 8) as u8;
+                self.data[off + 3] = val as u8;
+            }
+        }
         Ok(())
     }
 
@@ -664,7 +750,7 @@ mod tests {
     // Use new_soc(4096) so SRAM covers addresses 0x000-0xFFF.
 
     #[test]
-    fn test_dcache_sram_write_read_through_cache() {
+    fn test_dcache_sram_write_through() {
         let mut mem = Memory::new_soc(4096);
         // Write 0xDEADBEEF to SRAM address 0x100 through D-cache (no .di)
         mem.write_word_data(0x100, 0xDEADBEEF, false).unwrap();
@@ -672,11 +758,12 @@ mod tests {
         // Read back through cache — should return cached value
         assert_eq!(mem.read_word_data(0x100, false).unwrap(), 0xDEADBEEF);
 
-        // SRAM backing store has NOT been updated (write-back, still in cache)
-        assert_eq!(mem.read_word(0x100).unwrap(), 0x00000000);
+        // Write-through: SRAM backing store is also updated
+        // .di bypass reads from raw SRAM and sees the correct value
+        assert_eq!(mem.read_word_data(0x100, true).unwrap(), 0xDEADBEEF);
 
-        // Read with .di bypasses cache and hits SRAM directly
-        assert_eq!(mem.read_word_data(0x100, true).unwrap(), 0x00000000);
+        // Direct read (cache-coherent) also sees it
+        assert_eq!(mem.read_word(0x100).unwrap(), 0xDEADBEEF);
     }
 
     #[test]
@@ -695,9 +782,11 @@ mod tests {
     #[test]
     fn test_dcache_invalidate_flushes_dirty() {
         let mut mem = Memory::new_soc(4096);
-        // Write to SRAM through cache (dirty in cache, not in SRAM)
+        // Write to SRAM through cache (write-through: also updates SRAM)
         mem.write_word_data(0x300, 0x12345678, false).unwrap();
-        assert_eq!(mem.read_word(0x300).unwrap(), 0x00000000); // not in SRAM yet
+        // All reads see the value (write-through keeps SRAM in sync)
+        assert_eq!(mem.read_word(0x300).unwrap(), 0x12345678);
+        assert_eq!(mem.read_word_data(0x300, true).unwrap(), 0x12345678);
 
         // Invalidate all (IM=1 by default → flush dirty lines)
         mem.dcache_invalidate_all().unwrap();
@@ -724,8 +813,9 @@ mod tests {
 
         // Now writes go to cache
         mem.write_word_data(0x100, 0xBBBBBBBB, false).unwrap();
-        assert_eq!(mem.read_word(0x100).unwrap(), 0xAAAAAAAA); // SRAM unchanged
-        assert_eq!(mem.read_word_data(0x100, false).unwrap(), 0xBBBBBBBB); // from cache
+        // Direct read is cache-coherent — sees the new cached value
+        assert_eq!(mem.read_word(0x100).unwrap(), 0xBBBBBBBB);
+        assert_eq!(mem.read_word_data(0x100, false).unwrap(), 0xBBBBBBBB);
     }
 
     #[test]
@@ -734,14 +824,15 @@ mod tests {
         // Byte write through cache
         mem.write_byte_data(0x200, 0xAB, false).unwrap();
         assert_eq!(mem.read_byte_data(0x200, false).unwrap(), 0xAB);
-        assert_eq!(mem.read_byte(0x200).unwrap(), 0x00); // not in SRAM
+        // Direct read is cache-coherent
+        assert_eq!(mem.read_byte(0x200).unwrap(), 0xAB);
 
         // Half write through cache (same 16-byte line as 0x200)
         mem.write_half_data(0x202, 0xCDEF, false).unwrap();
         assert_eq!(mem.read_half_data(0x202, false).unwrap(), 0xCDEF);
-        assert_eq!(mem.read_half(0x202).unwrap(), 0x0000); // not in SRAM
+        assert_eq!(mem.read_half(0x202).unwrap(), 0xCDEF);
 
-        // Flush
+        // Flush to SRAM backing store
         mem.dcache_invalidate_all().unwrap();
         assert_eq!(mem.read_byte(0x200).unwrap(), 0xAB);
         assert_eq!(mem.read_half(0x202).unwrap(), 0xCDEF);
@@ -758,22 +849,26 @@ mod tests {
     }
 
     #[test]
-    fn test_dcache_dma_invalidates_stale_lines() {
+    fn test_dcache_dma_stale_then_bypass() {
         let mut mem = Memory::new_soc(4096);
         // Fill cache with SRAM data at address 0x100
         mem.load_binary(0x100, &[0x11, 0x22, 0x33, 0x44]);
         assert_eq!(mem.read_word_data(0x100, false).unwrap(), 0x11223344);
 
-        // Cache holds the data — verify via bypass that SRAM matches
-        assert_eq!(mem.read_word_data(0x100, true).unwrap(), 0x11223344);
-
         // Direct SRAM overwrite (simulating DMA without cache invalidation)
-        mem.load_binary(0x100, &[0xAA, 0xBB, 0xCC, 0xDD]);
+        // load_binary writes to raw SRAM, does NOT update cache
+        mem.data[0x100] = 0xAA;
+        mem.data[0x101] = 0xBB;
+        mem.data[0x102] = 0xCC;
+        mem.data[0x103] = 0xDD;
 
-        // Cache still holds the OLD value (stale)
+        // Cache still holds the OLD value (stale) — non-.di read hits cache
         assert_eq!(mem.read_word_data(0x100, false).unwrap(), 0x11223344);
 
-        // Bypass reads the NEW value from SRAM
+        // .di bypass reads raw SRAM — sees the NEW DMA value
         assert_eq!(mem.read_word_data(0x100, true).unwrap(), 0xAABBCCDD);
+
+        // Cache-coherent read_word sees the cached (stale) value
+        assert_eq!(mem.read_word(0x100).unwrap(), 0x11223344);
     }
 }
