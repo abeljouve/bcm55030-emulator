@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 
-use crate::cache::DCache;
+use crate::cache::{DCache, ICache, IC_LINE_SIZE};
 use crate::cpu::exception::Exception;
 use crate::soc::mmio::MmioController;
 
@@ -37,10 +37,15 @@ pub struct Memory {
     /// When set, logs the first write to this word-aligned address with full context.
     pub dccm_watchpoint: Option<u32>,
 
-    /// ARC700 D-cache: 4 KB, 8-way set-associative, 16-byte lines.
-    /// Present in SoC mode only. Instruction fetch and DMA bypass the D-cache;
-    /// only LD/ST data accesses go through it (via read_*_data / write_*_data).
+    /// ARC700 D-cache: 8 KB, 4-way set-associative, 32-byte lines.
+    /// Present in SoC mode only. LD/ST data accesses go through it via
+    /// read_*_data / write_*_data. Direct read_*/write_* methods are
+    /// cache-coherent (peek/update cache if line present) for hook use.
     dcache: Option<DCache>,
+
+    /// ARC700 I-cache: 16 KB, 4-way set-associative, 32-byte lines.
+    /// Instruction fetch goes through it. DMA writes invalidate covered lines.
+    icache: Option<RefCell<ICache>>,
 }
 
 impl Memory {
@@ -54,6 +59,7 @@ impl Memory {
             app_load_base: 0,
             dccm_watchpoint: None,
             dcache: None,
+            icache: None,
         }
     }
 
@@ -68,6 +74,7 @@ impl Memory {
             app_load_base: 0,
             dccm_watchpoint: None,
             dcache: Some(DCache::new()),
+            icache: Some(RefCell::new(ICache::new())),
         }
     }
 
@@ -392,12 +399,24 @@ impl Memory {
                     self.data[start..end].copy_from_slice(&dma_write.data);
                     // Invalidate D-cache lines covering the DMA range
                     if let Some(ref mut dc) = self.dcache {
-                        let base = dma_write.dccm_addr & !0xF;
+                        let base = dma_write.dccm_addr & !0x1F;
                         let last = (dma_write.dccm_addr + dma_write.data.len() as u32).saturating_sub(1);
                         let mut addr = base;
-                        while addr <= (last & !0xF) {
+                        while addr <= (last & !0x1F) {
                             dc.invalidate_line(addr);
-                            addr += 16;
+                            addr += 32;
+                        }
+                    }
+                    // Invalidate I-cache lines too (DMA modifies instructions)
+                    if let Some(ref ic_cell) = self.icache {
+                        let mut ic = ic_cell.borrow_mut();
+                        let line_mask = (IC_LINE_SIZE as u32) - 1;
+                        let base = dma_write.dccm_addr & !line_mask;
+                        let last = (dma_write.dccm_addr + dma_write.data.len() as u32).saturating_sub(1);
+                        let mut addr = base;
+                        while addr <= (last & !line_mask) {
+                            ic.invalidate_line(addr);
+                            addr += IC_LINE_SIZE as u32;
                         }
                     }
                 }
@@ -430,33 +449,33 @@ impl Memory {
         self.dcache.as_ref().map_or(false, |dc| dc.is_enabled())
     }
 
-    /// Read a 16-byte cache line from the backing store (SRAM or MMIO),
+    /// Read a 32-byte cache line from the backing store (SRAM or MMIO),
     /// bypassing the D-cache. Used for cache fills on miss.
-    fn read_line_from_backing(&self, line_addr: u32) -> Result<[u8; 16], Exception> {
-        let mut data = [0u8; 16];
+    fn read_line_from_backing(&self, line_addr: u32) -> Result<[u8; 32], Exception> {
+        let mut data = [0u8; 32];
         if let Some(off) = self.sram_offset(line_addr) {
             // SRAM path — fast bulk copy
-            let end = (off + 16).min(self.data.len());
+            let end = (off + 32).min(self.data.len());
             let count = end - off;
             data[..count].copy_from_slice(&self.data[off..end]);
         } else if let Some(ref mmio) = self.mmio {
             // MMIO path — byte-by-byte (each read may have side effects)
-            for i in 0..16u32 {
+            for i in 0..32u32 {
                 data[i as usize] = mmio.borrow_mut().read_byte(line_addr + i)?;
             }
         }
         Ok(data)
     }
 
-    /// Write a 16-byte evicted dirty cache line back to the backing store.
-    fn writeback_line(&mut self, line_addr: u32, data: &[u8; 16]) -> Result<(), Exception> {
+    /// Write a 32-byte evicted dirty cache line back to the backing store.
+    fn writeback_line(&mut self, line_addr: u32, data: &[u8; 32]) -> Result<(), Exception> {
         if let Some(off) = self.sram_offset(line_addr) {
             // SRAM path — fast bulk copy
-            let end = (off + 16).min(self.data.len());
+            let end = (off + 32).min(self.data.len());
             let count = end - off;
             self.data[off..end].copy_from_slice(&data[..count]);
         } else if let Some(ref mmio) = self.mmio {
-            for i in 0..16u32 {
+            for i in 0..32u32 {
                 mmio.borrow_mut().write_byte(line_addr + i, data[i as usize])?;
             }
         }
@@ -470,7 +489,7 @@ impl Memory {
             return Ok(());
         }
         // Miss: read line from backing store
-        let line_addr = addr & !0xF;
+        let line_addr = addr & !0x1F;
         let line_data = self.read_line_from_backing(line_addr)?;
 
         // Fill cache (may evict a dirty line)
@@ -526,21 +545,16 @@ impl Memory {
     }
 
     /// Data byte write through D-cache. Used by ST instructions.
-    /// Write-through for SRAM: updates both cache and backing store.
-    /// For MMIO without .di: absorbed by cache only (write-back).
+    /// HW-faithful write-back, write-allocate: data stays in cache until
+    /// eviction/invalidation. With .di (cache_bypass), writes directly to
+    /// backing store without touching the cache (scan7b test 7 verified:
+    /// .di stores do NOT update or invalidate cached copies).
     pub fn write_byte_data(&mut self, addr: u32, val: u8, cache_bypass: bool) -> Result<(), Exception> {
         if cache_bypass || !self.dcache_enabled() {
             return self.write_byte(addr, val);
         }
         self.ensure_cache_line(addr)?;
         self.dcache.as_mut().unwrap().write_byte(addr, val);
-        // Write-through for SRAM: also update backing store so .di reads
-        // see the correct value. MMIO stays write-back (absorbed by cache).
-        if let Some(off) = self.sram_offset(addr) {
-            if off < self.data.len() {
-                self.data[off] = val;
-            }
-        }
         Ok(())
     }
 
@@ -553,13 +567,6 @@ impl Memory {
         let dc = self.dcache.as_mut().unwrap();
         dc.write_byte(addr, (val >> 8) as u8);
         dc.write_byte(addr + 1, val as u8);
-        // Write-through for SRAM
-        if let Some(off) = self.sram_offset(addr) {
-            if off + 1 < self.data.len() {
-                self.data[off] = (val >> 8) as u8;
-                self.data[off + 1] = val as u8;
-            }
-        }
         Ok(())
     }
 
@@ -628,13 +635,100 @@ impl Memory {
         Ok(())
     }
 
-    // ========== Instruction fetch (SRAM in SoC mode, flat otherwise) ==========
+    /// Flush a single D-cache line to SRAM without invalidating (DC_FLSH aux 0x4B).
+    /// Line stays valid in cache, dirty bit cleared.
+    pub fn dcache_flush_line(&mut self, addr: u32) -> Result<(), Exception> {
+        let evicted = if let Some(ref mut dc) = self.dcache {
+            dc.flush_line(addr)
+        } else {
+            None
+        };
+        if let Some(ev) = evicted {
+            self.writeback_line(ev.addr, &ev.data)?;
+        }
+        Ok(())
+    }
+
+    /// Set DC_RAM_ADDR (aux 0x58) on the D-cache for direct probe.
+    pub fn dcache_set_ram_addr(&mut self, addr: u32) {
+        if let Some(ref mut dc) = self.dcache {
+            dc.set_ram_addr(addr);
+        }
+    }
+
+    /// Read DC_TAG (aux 0x59) — returns (line_base | valid_bit) for probe address.
+    pub fn dcache_read_tag(&self) -> u32 {
+        self.dcache.as_ref().map_or(0, |dc| dc.read_tag())
+    }
+
+    /// Read DC_DATA (aux 0x5B) — returns 32-bit word at probe address.
+    pub fn dcache_read_data(&self) -> u32 {
+        self.dcache.as_ref().map_or(0, |dc| dc.read_data())
+    }
+
+    // ========== I-cache control ==========
+
+    /// Invalidate entire I-cache (IC_IVIC aux 0x10).
+    pub fn icache_invalidate_all(&self) {
+        if let Some(ref ic) = self.icache {
+            ic.borrow_mut().invalidate_all();
+        }
+    }
+
+    /// Invalidate single I-cache line (IC_IVIL aux 0x19).
+    pub fn icache_invalidate_line(&self, addr: u32) {
+        if let Some(ref ic) = self.icache {
+            ic.borrow_mut().invalidate_line(addr);
+        }
+    }
+
+    /// Ensure an I-cache line containing `addr` is loaded from SRAM.
+    /// Called on I-cache miss during instruction fetch.
+    fn icache_fill(&self, addr: u32) {
+        if let Some(ref ic_cell) = self.icache {
+            let mut ic = ic_cell.borrow_mut();
+            if ic.contains(addr) {
+                return;
+            }
+            // Read line from SRAM (no MMIO for instruction fetch)
+            let line_addr = addr & !((IC_LINE_SIZE as u32) - 1);
+            let mut data = [0u8; IC_LINE_SIZE];
+            if let Some(off) = self.sram_offset(line_addr) {
+                let end = (off + IC_LINE_SIZE).min(self.data.len());
+                let count = end - off;
+                data[..count].copy_from_slice(&self.data[off..end]);
+            }
+            ic.fill_line(addr, &data);
+        }
+    }
+
+    // ========== Instruction fetch (goes through I-cache in SoC mode) ==========
 
     pub fn fetch_half(&self, addr: u32) -> Result<u16, Exception> {
         if addr & 1 != 0 {
             return Err(Exception::MisalignedAccess { address: addr });
         }
         if self.mmio.is_some() {
+            // Try I-cache first
+            if let Some(ref ic_cell) = self.icache {
+                let enabled = ic_cell.borrow().is_enabled();
+                if enabled {
+                    // Fast path: hit
+                    {
+                        let ic = ic_cell.borrow();
+                        if let Some(val) = ic.peek_half(addr) {
+                            return Ok(val);
+                        }
+                    }
+                    // Miss: fill from SRAM and retry
+                    self.icache_fill(addr);
+                    let ic = ic_cell.borrow();
+                    if let Some(val) = ic.peek_half(addr) {
+                        return Ok(val);
+                    }
+                }
+            }
+            // Fallback: direct SRAM read (I-cache disabled or fill failed)
             if let Some(a) = self.sram_offset(addr) {
                 if a + 1 < self.data.len() {
                     return Ok(((self.data[a] as u16) << 8) | (self.data[a + 1] as u16));
@@ -652,6 +746,35 @@ impl Memory {
             return Err(Exception::MisalignedAccess { address: addr });
         }
         if self.mmio.is_some() {
+            // Try I-cache first. A 32-bit word spanning a 32B line boundary
+            // requires two line fetches — handle that case via halfwords.
+            if let Some(ref ic_cell) = self.icache {
+                let enabled = ic_cell.borrow().is_enabled();
+                if enabled {
+                    let line_mask = (IC_LINE_SIZE as u32) - 1;
+                    let line_end = (addr & !line_mask) + IC_LINE_SIZE as u32;
+                    if addr + 4 <= line_end {
+                        // Word fits in one line
+                        {
+                            let ic = ic_cell.borrow();
+                            if let Some(val) = ic.peek_word(addr) {
+                                return Ok(val);
+                            }
+                        }
+                        self.icache_fill(addr);
+                        let ic = ic_cell.borrow();
+                        if let Some(val) = ic.peek_word(addr) {
+                            return Ok(val);
+                        }
+                    } else {
+                        // Cross-line: fetch halfwords separately
+                        let hi = self.fetch_half(addr)? as u32;
+                        let lo = self.fetch_half(addr + 2)? as u32;
+                        return Ok((hi << 16) | lo);
+                    }
+                }
+            }
+            // Fallback: direct SRAM read
             if let Some(a) = self.sram_offset(addr) {
                 if a + 3 < self.data.len() {
                     return Ok(((self.data[a] as u32) << 24)

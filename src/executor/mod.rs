@@ -119,7 +119,22 @@ pub fn execute(
             special::execute_loop(*offset, *cc, decoded, state)?;
         }
         Instruction::LoadAux { dst, addr } => {
-            load_store::execute_load_aux(*dst, *addr, state)?;
+            let addr_val = resolve_value(*addr, state)?;
+            // Intercept D-cache debug registers: DC_TAG (0x59) and DC_DATA (0x5B).
+            // These return cache state based on DC_RAM_ADDR (0x58) previously set.
+            match addr_val {
+                0x59 => {
+                    let val = mem.dcache_read_tag();
+                    write_dest(*dst, val, state)?;
+                }
+                0x5B => {
+                    let val = mem.dcache_read_data();
+                    write_dest(*dst, val, state)?;
+                }
+                _ => {
+                    load_store::execute_load_aux(*dst, *addr, state)?;
+                }
+            }
         }
         Instruction::StoreAux { src, addr } => {
             let addr_val = resolve_value(*addr, state)?;
@@ -142,6 +157,28 @@ pub fn execute(
                     // DC_IVDL: invalidate single cache line
                     let val = resolve_value(*src, state)?;
                     mem.dcache_invalidate_line(val)?;
+                }
+                0x4B => {
+                    // DC_FLSH: flush single cache line (without invalidating)
+                    let val = resolve_value(*src, state)?;
+                    mem.dcache_flush_line(val)?;
+                }
+                0x58 => {
+                    // DC_RAM_ADDR: set probe address for DC_TAG/DC_DATA reads
+                    let val = resolve_value(*src, state)?;
+                    mem.dcache_set_ram_addr(val);
+                }
+                0x10 => {
+                    // IC_IVIC: invalidate entire I-cache
+                    let val = resolve_value(*src, state)?;
+                    if val & 1 != 0 {
+                        mem.icache_invalidate_all();
+                    }
+                }
+                0x19 => {
+                    // IC_IVIL: invalidate single I-cache line
+                    let val = resolve_value(*src, state)?;
+                    mem.icache_invalidate_line(val);
                 }
                 _ => {}
             }

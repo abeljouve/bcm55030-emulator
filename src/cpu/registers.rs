@@ -548,8 +548,9 @@ impl CpuState {
             0x47 => Ok(()),  // DC_IVDC: write handled by executor post-processing
             0x48 => {
                 // DC_CTRL: update shadow register. Executor syncs to DCache.
-                // Bit 1 always reads as 1 on BCM55030 (HW reset 0xC2).
-                self.aux_dc_ctrl = val | (1 << 1);
+                // RW mask 0xE7 applied per HW verification (scan7b test 5).
+                // Only bits 0, 1, 2, 5, 6, 7 are writable.
+                self.aux_dc_ctrl = val & 0xE7;
                 Ok(())
             }
             0x49 => Ok(()),  // DC_LDL / CACHE_BYPASS: ignored for now
