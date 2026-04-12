@@ -4,4 +4,23 @@ firmwares/
 knowledge/
 unhandled_mmio.json
 NEXT_SESSION_PROMPT.md
+NEXT_SESSION.md
 CLI_REVERSE_ENGINEERING_PROMPT.md
+
+# Claude Code local state
+.claude/settings.json
+.claude/skills/
+.claude/worktrees/
+
+# Work-in-progress RE notes (local only)
+docs/
+.hw_faithful_baseline
+
+# Local hooks
+.githooks/
+
+# Temp files
+tmp/
+
+# Python cache
+__pycache__/
