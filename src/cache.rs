@@ -1,30 +1,30 @@
 /// ARC700 D-cache model for BCM55030.
 ///
+/// Geometry verified on real hardware via bare-metal scans scan7b / scan7c:
+///   Capacity        : 4 KB   (scan7b test 3: evict at 8192, not at 4096)
+///   Line size       : 32 B   (scan7b test 1: DC_IVDL refill test)
+///   Associativity   : 2-way  (scan7c v6 Test 5: DC_TAG probe shows only
+///                              two distinct physical slots per set; bit 11
+///                              of DC_RAM_ADDR selects the way)
+///   Sets            : 64     (4096 / (2 * 32))
+///   Write policy    : write-back, write-allocate
+///   Read allocation : scan7c suggests read-no-allocate on miss (TBD)
+///   Replacement     : round-robin per set (scan7c v7: cached_write hit
+///                              did NOT protect L0 from eviction,
+///                              identical result with/without touch)
+///
 /// BCR 0x72 (D_CACHE_BUILD) = 0x00013001:
-///   4 KB total, 8-way set-associative, 16-byte cache lines.
-///   32 sets x 8 ways = 256 cache lines.
-///
-/// Address decomposition (16-byte lines, 32 sets):
-///   bits [3:0]  = byte offset within line (4 bits)
-///   bits [8:4]  = set index (5 bits)
-///   bits [31:9] = tag (23 bits)
-///
-/// Write policy: write-back, write-allocate.
-/// Replacement: pseudo-LRU via per-way counters.
+///   ver[3:0]=1, cfg[7:4]=0, ll[11:8]=0, ways[15:12]=3, cap[19:16]=1
+///   On this core `ways=3` encodes 2-way and `cap=1` encodes 4 KB.
 ///
 /// DC_CTRL (aux 0x48) bit layout:
 ///   bit 0 (DC): 0 = cache enabled, 1 = cache disabled
-///   bit 6 (IM): invalidate mode (0 = invalidate only, 1 = invalidate + flush dirty)
-///   bit 7 (LM): lock mode (0 = no flush locked, 1 = flush locked)
+///   bit 6 (IM): invalidate mode
+///   bit 7 (LM): lock mode
 ///   BCM55030 reset value: 0xC2 (enabled, IM=1, LM=1, bit1=1)
 
-// Verified on real HW via scan7b (2026-04-12):
-//   Line size: 32 bytes (DC_IVDL refill test)
-//   Capacity:  8 KB (4096 no-evict, 8192 evict)
-//   Associativity: 4-way (stride=2048 evict at n=5)
-//   Sets: 8192 / (4 × 32) = 64
 const LINE_SIZE: usize = 32;
-const NUM_WAYS: usize = 4;
+const NUM_WAYS: usize = 2;
 const NUM_SETS: usize = 64;
 
 const OFFSET_BITS: u32 = 5; // log2(32)
@@ -63,11 +63,14 @@ pub const DC_CTRL_RW_MASK: u32 = 0xE7;
 pub const DC_CTRL_RESET: u32 = 0xC2;
 
 pub struct DCache {
-    // 4-way × 64 sets ≈ 9 KB — box to avoid huge stack frames at construction.
+    // 2-way × 64 sets = 4 KB — box to keep the DCache struct off the stack.
     lines: Box<[[CacheLine; NUM_WAYS]; NUM_SETS]>,
-    /// Per-way counter for pseudo-LRU replacement within each set.
-    /// Lower value = used more recently. On access, set to 0 and increment others.
-    lru: Box<[[u8; NUM_WAYS]; NUM_SETS]>,
+    /// Per-set round-robin counter: next way to evict on a miss.
+    /// Wraps modulo NUM_WAYS after each fill. scan7c v7 confirmed the
+    /// BCM55030 D-cache does not track recency — `cached_write` hits do
+    /// not protect a line from eviction, so replacement is RR (or FIFO,
+    /// indistinguishable in a 2-way cache).
+    next_way: Box<[u8; NUM_SETS]>,
     // DC_CTRL decoded fields (DC_CTRL raw value preserved in ctrl_raw)
     enabled: bool,
     im: bool,
@@ -84,7 +87,7 @@ impl DCache {
     pub fn new() -> Self {
         Self {
             lines: Box::new([[CacheLine::empty(); NUM_WAYS]; NUM_SETS]),
-            lru: Box::new([[0; NUM_WAYS]; NUM_SETS]),
+            next_way: Box::new([0; NUM_SETS]),
             enabled: true, // DC bit 0 = 0 → enabled
             im: true,      // IM bit 6 = 1
             lm: true,      // LM bit 7 = 1
@@ -120,43 +123,27 @@ impl DCache {
         None
     }
 
-    /// Update LRU counters: mark `way` as most recently used in `set`.
-    fn touch_lru(&mut self, set: usize, way: usize) {
-        let old = self.lru[set][way];
-        for w in 0..NUM_WAYS {
-            if self.lru[set][w] < old {
-                self.lru[set][w] = self.lru[set][w].saturating_add(1);
-            }
-        }
-        self.lru[set][way] = 0;
-    }
-
-    /// Find the LRU victim way in a set (highest counter value).
-    fn lru_victim(&self, set: usize) -> usize {
-        let mut victim = 0;
-        let mut max_val = 0;
+    /// Select the next victim way in a set using round-robin.
+    /// Prefers invalid ways first (so the counter only advances on an
+    /// actual eviction of a valid line). Advances the counter afterwards.
+    fn rr_victim(&mut self, set: usize) -> usize {
         for way in 0..NUM_WAYS {
-            // Prefer invalid lines first
             if !self.lines[set][way].valid {
                 return way;
             }
-            if self.lru[set][way] > max_val {
-                max_val = self.lru[set][way];
-                victim = way;
-            }
         }
+        let victim = self.next_way[set] as usize;
+        self.next_way[set] = ((victim + 1) % NUM_WAYS) as u8;
         victim
     }
 
-    /// Check if addr is cached without updating LRU state.
+    /// Check if addr is cached without changing cache state.
     pub fn contains(&self, addr: u32) -> bool {
         let (tag, set, _) = Self::decompose(addr);
         self.find_way(set, tag).is_some()
     }
 
-    /// Read a byte from the cache without updating LRU.
-    /// Used by direct SRAM access paths (hooks, DMA) to maintain coherence
-    /// with data written through the D-cache.
+    /// Read a byte from the cache without touching replacement state.
     pub fn peek_byte(&self, addr: u32) -> Option<u8> {
         let (tag, set, offset) = Self::decompose(addr);
         if let Some(way) = self.find_way(set, tag) {
@@ -167,15 +154,11 @@ impl DCache {
     }
 
     /// Read a byte from the cache. Returns Some(byte) on hit, None on miss.
-    /// Updates LRU on hit.
+    /// RR replacement does not care about reads, so hit state is untouched.
     pub fn read_byte(&mut self, addr: u32) -> Option<u8> {
         let (tag, set, offset) = Self::decompose(addr);
-        if let Some(way) = self.find_way(set, tag) {
-            self.touch_lru(set, way);
-            Some(self.lines[set][way].data[offset])
-        } else {
-            None
-        }
+        self.find_way(set, tag)
+            .map(|way| self.lines[set][way].data[offset])
     }
 
     /// Write a byte to the cache. Returns true on hit (line updated + marked dirty),
@@ -185,7 +168,6 @@ impl DCache {
         if let Some(way) = self.find_way(set, tag) {
             self.lines[set][way].data[offset] = val;
             self.lines[set][way].dirty = true;
-            self.touch_lru(set, way);
             true
         } else {
             false
@@ -194,16 +176,16 @@ impl DCache {
 
     /// Fill a cache line with data from backing store.
     /// If the victim way holds a dirty line, it is returned for writeback.
-    /// After fill, the new line is valid, clean, and marked MRU.
+    /// After fill, the new line is valid and clean. The round-robin counter
+    /// advances only when an actual eviction happens.
     pub fn fill_line(&mut self, addr: u32, data: &[u8; LINE_SIZE]) -> Option<EvictedLine> {
         let (tag, set, _offset) = Self::decompose(addr);
 
-        // Don't double-allocate if already present
         if self.find_way(set, tag).is_some() {
             return None;
         }
 
-        let victim_way = self.lru_victim(set);
+        let victim_way = self.rr_victim(set);
         let evicted = if self.lines[set][victim_way].valid && self.lines[set][victim_way].dirty {
             let victim = &self.lines[set][victim_way];
             Some(EvictedLine {
@@ -220,7 +202,6 @@ impl DCache {
             tag,
             data: *data,
         };
-        self.touch_lru(set, victim_way);
 
         evicted
     }
@@ -242,7 +223,7 @@ impl DCache {
                 }
                 self.lines[set][way] = CacheLine::empty();
             }
-            self.lru[set] = [0; NUM_WAYS];
+            self.next_way[set] = 0;
         }
         evicted
     }
@@ -269,25 +250,14 @@ impl DCache {
         }
     }
 
-    /// Flush a single dirty cache line to backing store WITHOUT invalidating.
-    /// Returns the dirty line data if the line was dirty; the line stays
-    /// valid in the cache with dirty=false after the flush.
+    /// DC_FLSH (aux 0x4B): no-op on BCM55030.
     ///
-    /// Corresponds to DC_FLSH (aux 0x4B). Per scan7b on real BCM55030,
-    /// this opcode showed no observable effect. We implement it for
-    /// software compatibility regardless.
+    /// Per scan7b test 9 on real hardware, writing DC_FLSH had no observable
+    /// effect — a dirty cached line was NOT written back to SRAM, and the
+    /// cached copy remained unchanged. We model this faithfully: the call is
+    /// a no-op (no writeback, no dirty-bit clear, cache state untouched).
     pub fn flush_line(&mut self, addr: u32) -> Option<EvictedLine> {
-        let (tag, set, _) = Self::decompose(addr);
-        if let Some(way) = self.find_way(set, tag) {
-            if self.lines[set][way].dirty {
-                let evicted = EvictedLine {
-                    addr: Self::base_addr(tag, set),
-                    data: self.lines[set][way].data,
-                };
-                self.lines[set][way].dirty = false;
-                return Some(evicted);
-            }
-        }
+        let _ = addr;
         None
     }
 
@@ -565,31 +535,87 @@ mod tests {
 
     #[test]
     fn test_eviction_on_full_set() {
+        // 2-way round-robin: fill both ways of set 1, then a third fill
+        // must evict way 0 (the first one filled = counter starts at 0).
         let mut cache = DCache::new();
-        let base_set_index = 1usize; // target set index 1
+        let base_set_index = 1usize;
 
-        // Fill all 8 ways in set 1
         for way in 0..NUM_WAYS {
-            // Addresses that map to set 1 with different tags:
-            // addr = tag << 9 | set_index << 4
             let addr = ((way as u32 + 1) << (OFFSET_BITS + INDEX_BITS))
                 | ((base_set_index as u32) << OFFSET_BITS);
             let mut data = [0u8; LINE_SIZE];
             data[0] = way as u8;
             cache.fill_line(addr, &data);
-            // Write to make dirty
+            // Make it dirty so eviction produces a writeback.
             cache.write_byte(addr, way as u8 + 0x10);
         }
 
-        // 9th access — should evict the LRU way (way 0, the first filled)
-        let new_addr = ((9u32) << (OFFSET_BITS + INDEX_BITS))
+        let new_tag = (NUM_WAYS as u32) + 1;
+        let new_addr = (new_tag << (OFFSET_BITS + INDEX_BITS))
             | ((base_set_index as u32) << OFFSET_BITS);
         let new_data = [0xEE; LINE_SIZE];
-        let evicted = cache.fill_line(new_addr, &new_data);
-        assert!(evicted.is_some());
-        let ev = evicted.unwrap();
-        // The evicted line should have dirty data (0x10 from write_byte to way 0)
-        assert_eq!(ev.data[0], 0x10);
+        let evicted = cache.fill_line(new_addr, &new_data).expect("eviction expected");
+        // RR evicts way 0 first; its dirty byte is 0x10.
+        assert_eq!(evicted.data[0], 0x10);
+    }
+
+    #[test]
+    fn test_rr_cycles_through_ways() {
+        // Sequentially filling N+1 distinct tags in one set evicts way 0,
+        // then way 1, then way 0 again.
+        let mut cache = DCache::new();
+        let set_index: u32 = 3;
+        let addr_for = |tag: u32| -> u32 {
+            (tag << (OFFSET_BITS + INDEX_BITS)) | (set_index << OFFSET_BITS)
+        };
+
+        let mut data = [0u8; LINE_SIZE];
+        for tag in 0..(NUM_WAYS as u32) {
+            data[0] = tag as u8 + 1;
+            cache.fill_line(addr_for(tag), &data);
+            cache.write_byte(addr_for(tag), tag as u8 + 1);
+        }
+
+        // NUM_WAYS-th insert -> evicts way 0 (tag 0).
+        data[0] = 0xAA;
+        cache.fill_line(addr_for(NUM_WAYS as u32), &data);
+        cache.write_byte(addr_for(NUM_WAYS as u32), 0xAA);
+        // (fill evicted tag 0 way 0; check via next eviction)
+
+        // Next insert -> evicts way 1 (tag 1) per RR.
+        data[0] = 0xBB;
+        cache.fill_line(addr_for(NUM_WAYS as u32 + 1), &data);
+        cache.write_byte(addr_for(NUM_WAYS as u32 + 1), 0xBB);
+
+        // Third extra insert -> back to way 0, which now holds the
+        // NUM_WAYS-th fill (dirty byte 0xAA).
+        data[0] = 0xCC;
+        let ev = cache
+            .fill_line(addr_for(NUM_WAYS as u32 + 2), &data)
+            .expect("third eviction");
+        assert_eq!(ev.data[0], 0xAA);
+    }
+
+    #[test]
+    fn test_write_hit_does_not_protect_line() {
+        // scan7c v7 verified: a cached_write hit on L0 does NOT save it
+        // from being the next RR victim. Touches are irrelevant.
+        let mut cache = DCache::new();
+        let set_index: u32 = 5;
+        let addr_for = |tag: u32| -> u32 {
+            (tag << (OFFSET_BITS + INDEX_BITS)) | (set_index << OFFSET_BITS)
+        };
+
+        cache.fill_line(addr_for(0), &[0xA0; LINE_SIZE]); // way 0
+        cache.fill_line(addr_for(1), &[0xA1; LINE_SIZE]); // way 1
+        // Write-hit to L0 (the future RR victim).
+        assert!(cache.write_byte(addr_for(0), 0xFF));
+        // Insert a third line -> RR picks way 0 regardless of the touch.
+        let ev = cache
+            .fill_line(addr_for(2), &[0xA2; LINE_SIZE])
+            .expect("eviction expected");
+        assert_eq!(ev.addr, addr_for(0));
+        assert_eq!(ev.data[0], 0xFF); // dirty byte from the touch
     }
 
     #[test]
@@ -748,22 +774,22 @@ mod tests {
     }
 
     #[test]
-    fn test_flush_line_keeps_valid() {
+    fn test_flush_line_is_noop() {
+        // scan7b test 9 verified DC_FLSH has no effect on real BCM55030.
+        // flush_line must never evict or clear the dirty bit.
         let mut cache = DCache::new();
         let addr = 0x1000u32;
 
         cache.fill_line(addr, &[0x00; LINE_SIZE]);
         cache.write_byte(addr, 0xAB);
 
-        let ev = cache.flush_line(addr);
-        assert!(ev.is_some());
-        assert_eq!(ev.unwrap().data[0], 0xAB);
-
-        // Line still valid after flush (flush != invalidate)
+        assert!(cache.flush_line(addr).is_none());
         assert_eq!(cache.read_byte(addr), Some(0xAB));
 
-        // Subsequent flush returns None (not dirty anymore)
-        assert!(cache.flush_line(addr).is_none());
+        // Line is still dirty: invalidate with IM=1 must still flush it.
+        let evicted = cache.invalidate_all();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].data[0], 0xAB);
     }
 
     #[test]
