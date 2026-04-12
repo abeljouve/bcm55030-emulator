@@ -385,13 +385,15 @@ fn test_zero_overhead_loop() {
     // ADD r0, r0, #1    (loop body, 4 bytes)
     // BRK_S             (at LP_END address)
     let mov_lp_count = alu32(0x0A, 60, 5, 0, 0b01, false); // MOV r60, #5
-    let lp = lp32(4);                                         // LP u6=4 → offset=8 (shifted <<1 for 16-bit alignment)
+    // LP u6=5 → offset = 5<<1 = 10. LP at PC=0x06, cPCL = 0x06 & ~3 = 0x04.
+    // LP_END = cPCL + 10 = 0x0E (the BRK_S address, past the loop body).
+    let lp = lp32(5);
     let add_r0_1 = alu32(0x00, 0, 1, 0, 0b01, false);       // ADD r0, r0, #1
 
     let cpu = Program::new()
         .emit16(mov_s(0, 0))     // 0x00: r0 = 0
         .emit32(mov_lp_count)    // 0x02: r60 = LP_COUNT = 5
-        .emit32(lp)              // 0x06: LP 8 → LP_START=0x0A, LP_END=0x0E
+        .emit32(lp)              // 0x06: LP → LP_START=0x0A, LP_END=0x0E
         .emit32(add_r0_1)        // 0x0A: r0 += 1  (loop body)
         .emit16(brk_s())         // 0x0E: halt (at LP_END)
         .run(100);

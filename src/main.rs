@@ -4,7 +4,6 @@ use std::os::unix::io::AsRawFd;
 use std::process;
 
 use bcm55030_emulator::cpu::Cpu;
-use bcm55030_emulator::memory::SRAM_SIZE;
 
 fn usage(prog: &str) {
     eprintln!("BCM55030 ARC 700 Emulator");
