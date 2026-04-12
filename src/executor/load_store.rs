@@ -13,8 +13,9 @@ pub fn execute_load(
     data_size: DataSize,
     do_sign_ext: bool,
     writeback: WritebackMode,
+    cache_bypass: bool,
     state: &mut CpuState,
-    mem: &Memory,
+    mem: &mut Memory,
 ) -> Result<(), Exception> {
     // ARC 700: LD to extension regs (r32-r59) or LP_COUNT (r60) raises InstructionError
     if let Operand::Reg(r) = dst {
@@ -28,13 +29,11 @@ pub fn execute_load(
 
     let ea = compute_ea(base_val, offset_val, data_size, writeback);
 
-    // With unified SRAM (no separate ICCM/DCCM), all loads go through the
-    // same data path. PCL-relative loads read from the same backing store
-    // as any other load.
+    // Data loads go through D-cache unless .di (cache_bypass) is set.
     let value = match data_size {
-        DataSize::Word => mem.read_word(ea)?,
+        DataSize::Word => mem.read_word_data(ea, cache_bypass)?,
         DataSize::Byte => {
-            let b = mem.read_byte(ea)? as u32;
+            let b = mem.read_byte_data(ea, cache_bypass)? as u32;
             if do_sign_ext {
                 fields::sign_extend(b, 8) as u32
             } else {
@@ -42,7 +41,7 @@ pub fn execute_load(
             }
         }
         DataSize::HalfWord => {
-            let h = mem.read_half(ea)? as u32;
+            let h = mem.read_half_data(ea, cache_bypass)? as u32;
             if do_sign_ext {
                 fields::sign_extend(h, 16) as u32
             } else {
@@ -69,6 +68,7 @@ pub fn execute_store(
     offset: Operand,
     data_size: DataSize,
     writeback: WritebackMode,
+    cache_bypass: bool,
     state: &mut CpuState,
     mem: &mut Memory,
 ) -> Result<(), Exception> {
@@ -78,10 +78,11 @@ pub fn execute_store(
 
     let ea = compute_ea(base_val, offset_val, data_size, writeback);
 
+    // Data stores go through D-cache unless .di (cache_bypass) is set.
     match data_size {
-        DataSize::Word => mem.write_word(ea, src_val)?,
-        DataSize::Byte => mem.write_byte(ea, src_val as u8)?,
-        DataSize::HalfWord => mem.write_half(ea, src_val as u16)?,
+        DataSize::Word => mem.write_word_data(ea, src_val, cache_bypass)?,
+        DataSize::Byte => mem.write_byte_data(ea, src_val as u8, cache_bypass)?,
+        DataSize::HalfWord => mem.write_half_data(ea, src_val as u16, cache_bypass)?,
     }
 
     if matches!(writeback, WritebackMode::PreWrite | WritebackMode::PostWrite) {

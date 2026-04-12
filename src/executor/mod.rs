@@ -89,7 +89,7 @@ pub fn execute(
             data_size,
             sign_extend: do_sign_ext,
             writeback,
-            ..
+            cache_bypass,
         } => {
             load_store::execute_load(
                 *dst,
@@ -98,6 +98,7 @@ pub fn execute(
                 *data_size,
                 *do_sign_ext,
                 *writeback,
+                *cache_bypass,
                 state,
                 mem,
             )?;
@@ -108,9 +109,11 @@ pub fn execute(
             offset,
             data_size,
             writeback,
-            ..
+            cache_bypass,
         } => {
-            load_store::execute_store(*src, *base, *offset, *data_size, *writeback, state, mem)?;
+            load_store::execute_store(
+                *src, *base, *offset, *data_size, *writeback, *cache_bypass, state, mem,
+            )?;
         }
         Instruction::Loop { offset, cc } => {
             special::execute_loop(*offset, *cc, decoded, state)?;
@@ -119,7 +122,29 @@ pub fn execute(
             load_store::execute_load_aux(*dst, *addr, state)?;
         }
         Instruction::StoreAux { src, addr } => {
+            let addr_val = resolve_value(*addr, state)?;
             load_store::execute_store_aux(*src, *addr, state)?;
+            // Post-process D-cache control writes
+            match addr_val {
+                0x47 => {
+                    // DC_IVDC: invalidate entire D-cache
+                    let val = resolve_value(*src, state)?;
+                    if val & 1 != 0 {
+                        mem.dcache_invalidate_all()?;
+                    }
+                }
+                0x48 => {
+                    // DC_CTRL: sync cache enable/IM/LM state
+                    let val = state.read_aux_reg(0x48)?;
+                    mem.dcache_sync_ctrl(val);
+                }
+                0x4A => {
+                    // DC_IVDL: invalidate single cache line
+                    let val = resolve_value(*src, state)?;
+                    mem.dcache_invalidate_line(val)?;
+                }
+                _ => {}
+            }
         }
         Instruction::Flag { src, cc } => {
             special::execute_flag(*src, *cc, state)?;

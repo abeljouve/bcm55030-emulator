@@ -179,6 +179,12 @@ pub struct CpuState {
     /// without saving them — relies on HW shadowing.
     /// See `check_interrupts` and `executor::special::execute_rtie`.
     pub irq_shadow_r0_r3: [u32; 4],
+
+    /// DC_CTRL (aux 0x48) shadow: the authoritative copy lives in the DCache
+    /// model in Memory, but CpuState needs a copy for read_aux_reg/write_aux_reg.
+    /// Synced to DCache via executor post-processing on StoreAux(0x48).
+    /// BCM55030 reset value: 0xC2 (cache enabled, IM=1, LM=1, bit1=1).
+    pub aux_dc_ctrl: u32,
 }
 
 impl CpuState {
@@ -236,6 +242,7 @@ impl CpuState {
             instruction_count: 0,
             pc_written: false,
             irq_shadow_r0_r3: [0u32; 4],
+            aux_dc_ctrl: 0xC2, // BCM55030 reset: cache enabled, IM=1, LM=1
         };
         // Set default IDENTITY: ARC 700 v1 (ARCVER = 0x31)
         state.core_regs[REG_PCL as usize] = 0;
@@ -389,7 +396,7 @@ impl CpuState {
             AUX_ICCM_BUILD => Ok(0x00),            // no ICCM (unified SRAM)
             // Cache control registers (D-cache 4KB 8-way, I-cache 8KB 8-way)
             0x47 => Ok(0x00),                      // IC_CTRL
-            0x48 => Ok(0xC2),                      // DC_CTRL (cache enabled, IM bits)
+            0x48 => Ok(self.aux_dc_ctrl),          // DC_CTRL (shadow, synced to DCache in Memory)
             0x49 => Ok(0x00),                      // CACHE_BYPASS
             AUX_D_CACHE_BUILD => Ok(0x00013001),   // 4KB D-cache present
             AUX_I_CACHE_BUILD => Ok(0x00023001),   // 8KB I-cache present
@@ -537,8 +544,15 @@ impl CpuState {
                 self.aux_irq_pulse_cancel = val;
                 Ok(())
             }
-            // Cache control registers (no caches, ignore writes)
-            0x47 | 0x48 | 0x49 => Ok(()),
+            // Cache control registers
+            0x47 => Ok(()),  // DC_IVDC: write handled by executor post-processing
+            0x48 => {
+                // DC_CTRL: update shadow register. Executor syncs to DCache.
+                // Bit 1 always reads as 1 on BCM55030 (HW reset 0xC2).
+                self.aux_dc_ctrl = val | (1 << 1);
+                Ok(())
+            }
+            0x49 => Ok(()),  // DC_LDL / CACHE_BYPASS: ignored for now
             // AUX 0x10 — gap dans la baseline ARCompact ISA (entre STATUS32_L2 0x0C
             // et MULHI 0x12). Le firmware BCM55030 (hw_auxreg_trigger_write @ 0x5A50)
             // y écrit 0 comme "trigger". Sur le vrai hardware, c'est probablement

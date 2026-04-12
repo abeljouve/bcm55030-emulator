@@ -437,11 +437,9 @@ fn timer1_isr(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exce
     // delay) need their clock to advance at the "real HW time" rate, not
     // the emulator wall-clock rate. We scale the tick by 32 so that one
     // Timer 1 IRQ (= 12.5ms HW time, = 1.25M emulator insns) corresponds
-    // to ~400ms of firmware logical time. This makes the LLID link-down
-    // event fire at roughly insn 30M (just after the CLI prompt), which
-    // matches real-HW behaviour where the alarm is already set by the
-    // time the user types `alm/info`.
-    const TICK_SCALE: u32 = 32;
+    // With the 1.76x timer prescaler, Timer1 fires at a realistic rate.
+    // Each IRQ increments the firmware tick counter by 1 (no artificial scaling).
+    const TICK_SCALE: u32 = 1;
     let tick = mem.read_word(0x7E200).unwrap_or(0);
     let _ = mem.write_word(0x7E200, tick.wrapping_add(TICK_SCALE));
     // Clear Timer 1 pending IP bit (W1C on control bit 3)

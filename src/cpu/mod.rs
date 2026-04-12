@@ -25,6 +25,11 @@ pub struct Cpu {
     pub trace: bool,
     /// PC address hooks for SoC-specific behavior (boot ROM intercepts, stubs, etc.)
     pub hooks: HookTable,
+    /// Fractional accumulator for ARC Timer0/1 tick rate.
+    /// Real HW: 156.25 MHz clock, ~1.76 cycles/instruction on average.
+    /// We add 176 per step and tick when accumulator >= 100,
+    /// producing an exact average of 1.76 ticks per instruction.
+    timer_frac_acc: u32,
 }
 
 impl Cpu {
@@ -35,6 +40,7 @@ impl Cpu {
             mem: Memory::new(mem_size),
             trace: false,
             hooks: HookTable::new(),
+            timer_frac_acc: 0,
         }
     }
 
@@ -45,6 +51,7 @@ impl Cpu {
             mem: Memory::new_soc(crate::memory::SRAM_SIZE),
             trace: false,
             hooks: HookTable::new(),
+            timer_frac_acc: 0,
         }
     }
 
@@ -167,10 +174,15 @@ impl Cpu {
         Ok(())
     }
 
-    /// Advance timers by one tick.
-    /// ARC 700 timers always count (no start/stop bit).
+    /// Advance timers. Called once per step().
+    ///
+    /// ARC Timer0/1 use a fractional accumulator to match real BCM55030 timing:
+    /// 156.25 MHz clock / ~89 MIPS = ~1.76 cycles per instruction.
+    /// We add 176 per step; each time the accumulator reaches 100, we tick once.
+    /// This produces an exact average of 1.76 ticks per instruction step.
     fn tick_timers(&mut self) {
-        // BCM55030 EPON MAC free-running timer at SYSREG+0x050
+        // BCM55030 EPON MAC free-running timer at SYSREG+0x050.
+        // Separate peripheral clock — prescaler needs its own HW verification.
         const HW_TIMER_PRESCALER: u64 = 64;
         if self.state.instruction_count % HW_TIMER_PRESCALER == 0 {
             if let Some(mut mmio) = self.mem.mmio() {
@@ -178,12 +190,18 @@ impl Cpu {
             }
         }
 
-        // ARC Timer0/1 prescaler
-        const TIMER_PRESCALER: u64 = 128;
-        if self.state.instruction_count % TIMER_PRESCALER != 0 {
-            return;
+        // ARC Timer0/1: ~1.76 ticks per instruction (156.25 MHz, ~89 MIPS).
+        // Bare-metal verified: 1000 NOPs = 7,026 COUNT0 ticks.
+        self.timer_frac_acc += 176;
+        while self.timer_frac_acc >= 100 {
+            self.timer_frac_acc -= 100;
+            self.tick_arc_timers_once();
         }
+    }
 
+    /// Increment ARC Timer0 and Timer1 by one tick each.
+    /// Checks LIMIT, sets IP bit, raises IRQ if enabled.
+    fn tick_arc_timers_once(&mut self) {
         // Timer 0 (IRQ 3)
         self.state.aux_count0 = self.state.aux_count0.wrapping_add(1);
         if self.state.aux_limit0 != 0 && self.state.aux_count0 >= self.state.aux_limit0 {

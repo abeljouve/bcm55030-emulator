@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 
+use crate::cache::DCache;
 use crate::cpu::exception::Exception;
 use crate::soc::mmio::MmioController;
 
@@ -35,6 +36,11 @@ pub struct Memory {
     /// SRAM write watchpoint address (temporary diagnostic).
     /// When set, logs the first write to this word-aligned address with full context.
     pub dccm_watchpoint: Option<u32>,
+
+    /// ARC700 D-cache: 4 KB, 8-way set-associative, 16-byte lines.
+    /// Present in SoC mode only. Instruction fetch and DMA bypass the D-cache;
+    /// only LD/ST data accesses go through it (via read_*_data / write_*_data).
+    dcache: Option<DCache>,
 }
 
 impl Memory {
@@ -47,6 +53,7 @@ impl Memory {
             app_size: None,
             app_load_base: 0,
             dccm_watchpoint: None,
+            dcache: None,
         }
     }
 
@@ -60,6 +67,7 @@ impl Memory {
             app_size: None,
             app_load_base: 0,
             dccm_watchpoint: None,
+            dcache: Some(DCache::new()),
         }
     }
 
@@ -316,7 +324,9 @@ impl Memory {
         Ok(())
     }
 
-    /// Apply pending DMA transfers from the PBC
+    /// Apply pending DMA transfers from the PBC.
+    /// DMA writes bypass the D-cache, so we invalidate affected cache lines
+    /// to prevent stale reads.
     fn apply_pending_dma(&mut self) {
         if let Some(ref mmio) = self.mmio {
             // Apply flash -> DCCM reads
@@ -326,6 +336,16 @@ impl Memory {
                 let end = start + dma_write.data.len();
                 if end <= self.data.len() {
                     self.data[start..end].copy_from_slice(&dma_write.data);
+                    // Invalidate D-cache lines covering the DMA range
+                    if let Some(ref mut dc) = self.dcache {
+                        let base = dma_write.dccm_addr & !0xF;
+                        let last = (dma_write.dccm_addr + dma_write.data.len() as u32).saturating_sub(1);
+                        let mut addr = base;
+                        while addr <= (last & !0xF) {
+                            dc.invalidate_line(addr);
+                            addr += 16;
+                        }
+                    }
                 }
             }
 
@@ -340,6 +360,186 @@ impl Memory {
                 }
             }
         }
+    }
+
+    // ========== D-cache data access (LD/ST instructions) ==========
+    //
+    // These methods route through the D-cache when:
+    //   - cache_bypass is false (no .di flag on the instruction)
+    //   - D-cache is present and enabled (DC_CTRL bit 0 = 0)
+    // Otherwise they fall through to direct SRAM/MMIO access.
+    //
+    // Instruction fetch and DMA use the non-cached read_*/write_* methods above.
+
+    /// Check if the D-cache is present and enabled.
+    fn dcache_enabled(&self) -> bool {
+        self.dcache.as_ref().map_or(false, |dc| dc.is_enabled())
+    }
+
+    /// Read a 16-byte cache line from the backing store (SRAM or MMIO),
+    /// bypassing the D-cache. Used for cache fills on miss.
+    fn read_line_from_backing(&self, line_addr: u32) -> Result<[u8; 16], Exception> {
+        let mut data = [0u8; 16];
+        if let Some(off) = self.sram_offset(line_addr) {
+            // SRAM path — fast bulk copy
+            let end = (off + 16).min(self.data.len());
+            let count = end - off;
+            data[..count].copy_from_slice(&self.data[off..end]);
+        } else if let Some(ref mmio) = self.mmio {
+            // MMIO path — byte-by-byte (each read may have side effects)
+            for i in 0..16u32 {
+                data[i as usize] = mmio.borrow_mut().read_byte(line_addr + i)?;
+            }
+        }
+        Ok(data)
+    }
+
+    /// Write a 16-byte evicted dirty cache line back to the backing store.
+    fn writeback_line(&mut self, line_addr: u32, data: &[u8; 16]) -> Result<(), Exception> {
+        if let Some(off) = self.sram_offset(line_addr) {
+            // SRAM path — fast bulk copy
+            let end = (off + 16).min(self.data.len());
+            let count = end - off;
+            self.data[off..end].copy_from_slice(&data[..count]);
+        } else if let Some(ref mmio) = self.mmio {
+            for i in 0..16u32 {
+                mmio.borrow_mut().write_byte(line_addr + i, data[i as usize])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ensure a cache line containing `addr` is loaded. Fills on miss,
+    /// writes back any evicted dirty line.
+    fn ensure_cache_line(&mut self, addr: u32) -> Result<(), Exception> {
+        if self.dcache.as_ref().unwrap().contains(addr) {
+            return Ok(());
+        }
+        // Miss: read line from backing store
+        let line_addr = addr & !0xF;
+        let line_data = self.read_line_from_backing(line_addr)?;
+
+        // Fill cache (may evict a dirty line)
+        let evicted = self.dcache.as_mut().unwrap().fill_line(addr, &line_data);
+        if let Some(ev) = evicted {
+            self.writeback_line(ev.addr, &ev.data)?;
+        }
+        Ok(())
+    }
+
+    /// Data byte read through D-cache. Used by LD instructions.
+    pub fn read_byte_data(&mut self, addr: u32, cache_bypass: bool) -> Result<u8, Exception> {
+        if cache_bypass || !self.dcache_enabled() {
+            return self.read_byte(addr);
+        }
+        self.ensure_cache_line(addr)?;
+        Ok(self.dcache.as_mut().unwrap().read_byte(addr).unwrap())
+    }
+
+    /// Data halfword read through D-cache. Used by LD.H instructions.
+    pub fn read_half_data(&mut self, addr: u32, cache_bypass: bool) -> Result<u16, Exception> {
+        if cache_bypass || addr & 1 != 0 || !self.dcache_enabled() {
+            return self.read_half(addr);
+        }
+        self.ensure_cache_line(addr)?;
+        let dc = self.dcache.as_mut().unwrap();
+        let hi = dc.read_byte(addr).unwrap() as u16;
+        let lo = dc.read_byte(addr + 1).unwrap() as u16;
+        Ok((hi << 8) | lo)
+    }
+
+    /// Data word read through D-cache. Used by LD instructions.
+    pub fn read_word_data(&mut self, addr: u32, cache_bypass: bool) -> Result<u32, Exception> {
+        if cache_bypass || addr & 3 != 0 || !self.dcache_enabled() {
+            return self.read_word(addr);
+        }
+        self.ensure_cache_line(addr)?;
+        let dc = self.dcache.as_mut().unwrap();
+        let b0 = dc.read_byte(addr).unwrap() as u32;
+        let b1 = dc.read_byte(addr + 1).unwrap() as u32;
+        let b2 = dc.read_byte(addr + 2).unwrap() as u32;
+        let b3 = dc.read_byte(addr + 3).unwrap() as u32;
+        Ok((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+    }
+
+    /// Data byte write through D-cache. Used by ST instructions.
+    /// Write-back policy: data goes to cache only, written to backing store on eviction.
+    pub fn write_byte_data(&mut self, addr: u32, val: u8, cache_bypass: bool) -> Result<(), Exception> {
+        if cache_bypass || !self.dcache_enabled() {
+            return self.write_byte(addr, val);
+        }
+        // Write-allocate: ensure line is cached
+        self.ensure_cache_line(addr)?;
+        self.dcache.as_mut().unwrap().write_byte(addr, val);
+        Ok(())
+    }
+
+    /// Data halfword write through D-cache. Used by ST.H instructions.
+    pub fn write_half_data(&mut self, addr: u32, val: u16, cache_bypass: bool) -> Result<(), Exception> {
+        if cache_bypass || addr & 1 != 0 || !self.dcache_enabled() {
+            return self.write_half(addr, val);
+        }
+        self.ensure_cache_line(addr)?;
+        let dc = self.dcache.as_mut().unwrap();
+        dc.write_byte(addr, (val >> 8) as u8);
+        dc.write_byte(addr + 1, val as u8);
+        Ok(())
+    }
+
+    /// Data word write through D-cache. Used by ST instructions.
+    pub fn write_word_data(&mut self, addr: u32, val: u32, cache_bypass: bool) -> Result<(), Exception> {
+        if cache_bypass || addr & 3 != 0 || !self.dcache_enabled() {
+            return self.write_word(addr, val);
+        }
+        self.ensure_cache_line(addr)?;
+        let dc = self.dcache.as_mut().unwrap();
+        dc.write_byte(addr, (val >> 24) as u8);
+        dc.write_byte(addr + 1, (val >> 16) as u8);
+        dc.write_byte(addr + 2, (val >> 8) as u8);
+        dc.write_byte(addr + 3, val as u8);
+        Ok(())
+    }
+
+    // ========== D-cache control (DC_CTRL / DC_IVDC) ==========
+
+    /// Read DC_CTRL (aux 0x48) from the D-cache model.
+    /// Returns the BCM55030 reset value 0xC2 if no cache is present.
+    pub fn dcache_read_ctrl(&self) -> u32 {
+        self.dcache.as_ref().map_or(0xC2, |dc| dc.read_dc_ctrl())
+    }
+
+    /// Sync DC_CTRL (aux 0x48) write to the D-cache model.
+    pub fn dcache_sync_ctrl(&mut self, val: u32) {
+        if let Some(ref mut dc) = self.dcache {
+            dc.write_dc_ctrl(val);
+        }
+    }
+
+    /// Invalidate entire D-cache (DC_IVDC aux 0x47 write).
+    /// Dirty lines are flushed to backing store if IM=1 in DC_CTRL.
+    pub fn dcache_invalidate_all(&mut self) -> Result<(), Exception> {
+        let evicted = if let Some(ref mut dc) = self.dcache {
+            dc.invalidate_all()
+        } else {
+            Vec::new()
+        };
+        for ev in evicted {
+            self.writeback_line(ev.addr, &ev.data)?;
+        }
+        Ok(())
+    }
+
+    /// Invalidate a single D-cache line (DC_IVDL aux 0x4A write).
+    pub fn dcache_invalidate_line(&mut self, addr: u32) -> Result<(), Exception> {
+        let evicted = if let Some(ref mut dc) = self.dcache {
+            dc.invalidate_line(addr)
+        } else {
+            None
+        };
+        if let Some(ev) = evicted {
+            self.writeback_line(ev.addr, &ev.data)?;
+        }
+        Ok(())
     }
 
     // ========== Instruction fetch (SRAM in SoC mode, flat otherwise) ==========
@@ -455,5 +655,125 @@ mod tests {
         // MMIO reads return 0 for unstubbed addresses
         assert_eq!(mem.read_byte(0x00FC0000).unwrap(), 0);
         assert_eq!(mem.read_word(0xDE000000).unwrap(), 0);
+    }
+
+    // ========== D-cache integration tests ==========
+
+    // ========== D-cache integration tests ==========
+    //
+    // Use new_soc(4096) so SRAM covers addresses 0x000-0xFFF.
+
+    #[test]
+    fn test_dcache_sram_write_read_through_cache() {
+        let mut mem = Memory::new_soc(4096);
+        // Write 0xDEADBEEF to SRAM address 0x100 through D-cache (no .di)
+        mem.write_word_data(0x100, 0xDEADBEEF, false).unwrap();
+
+        // Read back through cache — should return cached value
+        assert_eq!(mem.read_word_data(0x100, false).unwrap(), 0xDEADBEEF);
+
+        // SRAM backing store has NOT been updated (write-back, still in cache)
+        assert_eq!(mem.read_word(0x100).unwrap(), 0x00000000);
+
+        // Read with .di bypasses cache and hits SRAM directly
+        assert_eq!(mem.read_word_data(0x100, true).unwrap(), 0x00000000);
+    }
+
+    #[test]
+    fn test_dcache_bypass_writes_to_sram() {
+        let mut mem = Memory::new_soc(4096);
+        // Write with .di — bypasses cache, goes directly to SRAM
+        mem.write_word_data(0x200, 0xCAFEBABE, true).unwrap();
+
+        // SRAM has the value
+        assert_eq!(mem.read_word(0x200).unwrap(), 0xCAFEBABE);
+
+        // Read without .di fills cache from SRAM
+        assert_eq!(mem.read_word_data(0x200, false).unwrap(), 0xCAFEBABE);
+    }
+
+    #[test]
+    fn test_dcache_invalidate_flushes_dirty() {
+        let mut mem = Memory::new_soc(4096);
+        // Write to SRAM through cache (dirty in cache, not in SRAM)
+        mem.write_word_data(0x300, 0x12345678, false).unwrap();
+        assert_eq!(mem.read_word(0x300).unwrap(), 0x00000000); // not in SRAM yet
+
+        // Invalidate all (IM=1 by default → flush dirty lines)
+        mem.dcache_invalidate_all().unwrap();
+
+        // Now SRAM should have the value (flushed from cache)
+        assert_eq!(mem.read_word(0x300).unwrap(), 0x12345678);
+
+        // Cache is empty — reading without .di fills fresh from SRAM
+        assert_eq!(mem.read_word_data(0x300, false).unwrap(), 0x12345678);
+    }
+
+    #[test]
+    fn test_dcache_disable_bypasses_all() {
+        let mut mem = Memory::new_soc(4096);
+        // Disable cache via DC_CTRL (bit 0 = 1 → disabled)
+        mem.dcache_sync_ctrl(0xC3);
+
+        // Write without .di — should go directly to SRAM (cache disabled)
+        mem.write_word_data(0x100, 0xAAAAAAAA, false).unwrap();
+        assert_eq!(mem.read_word(0x100).unwrap(), 0xAAAAAAAA);
+
+        // Re-enable cache
+        mem.dcache_sync_ctrl(0xC2);
+
+        // Now writes go to cache
+        mem.write_word_data(0x100, 0xBBBBBBBB, false).unwrap();
+        assert_eq!(mem.read_word(0x100).unwrap(), 0xAAAAAAAA); // SRAM unchanged
+        assert_eq!(mem.read_word_data(0x100, false).unwrap(), 0xBBBBBBBB); // from cache
+    }
+
+    #[test]
+    fn test_dcache_byte_and_half() {
+        let mut mem = Memory::new_soc(4096);
+        // Byte write through cache
+        mem.write_byte_data(0x200, 0xAB, false).unwrap();
+        assert_eq!(mem.read_byte_data(0x200, false).unwrap(), 0xAB);
+        assert_eq!(mem.read_byte(0x200).unwrap(), 0x00); // not in SRAM
+
+        // Half write through cache (same 16-byte line as 0x200)
+        mem.write_half_data(0x202, 0xCDEF, false).unwrap();
+        assert_eq!(mem.read_half_data(0x202, false).unwrap(), 0xCDEF);
+        assert_eq!(mem.read_half(0x202).unwrap(), 0x0000); // not in SRAM
+
+        // Flush
+        mem.dcache_invalidate_all().unwrap();
+        assert_eq!(mem.read_byte(0x200).unwrap(), 0xAB);
+        assert_eq!(mem.read_half(0x202).unwrap(), 0xCDEF);
+    }
+
+    #[test]
+    fn test_dcache_flat_mode_no_cache() {
+        let mut mem = Memory::new(1024);
+        // Flat mode (no DCache) — all accesses go directly to memory
+        mem.write_word_data(0x0, 0xDEADBEEF, false).unwrap();
+        assert_eq!(mem.read_word_data(0x0, false).unwrap(), 0xDEADBEEF);
+        // Direct read also sees it (no cache layer)
+        assert_eq!(mem.read_word(0x0).unwrap(), 0xDEADBEEF);
+    }
+
+    #[test]
+    fn test_dcache_dma_invalidates_stale_lines() {
+        let mut mem = Memory::new_soc(4096);
+        // Fill cache with SRAM data at address 0x100
+        mem.load_binary(0x100, &[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(mem.read_word_data(0x100, false).unwrap(), 0x11223344);
+
+        // Cache holds the data — verify via bypass that SRAM matches
+        assert_eq!(mem.read_word_data(0x100, true).unwrap(), 0x11223344);
+
+        // Direct SRAM overwrite (simulating DMA without cache invalidation)
+        mem.load_binary(0x100, &[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        // Cache still holds the OLD value (stale)
+        assert_eq!(mem.read_word_data(0x100, false).unwrap(), 0x11223344);
+
+        // Bypass reads the NEW value from SRAM
+        assert_eq!(mem.read_word_data(0x100, true).unwrap(), 0xAABBCCDD);
     }
 }
