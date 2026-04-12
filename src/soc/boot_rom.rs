@@ -7,7 +7,7 @@
 use crate::cpu::exception::Exception;
 use crate::cpu::registers::CpuState;
 use crate::hooks::HookAction;
-use crate::memory::{Memory, ICCM_SIZE};
+use crate::memory::Memory;
 
 /// Runtime base where firmware is loaded in ICCM/DCCM. Hardware-validated:
 /// `mem/rm 0x32000` on the real BCM55030 returns the firmware IVT signature.
@@ -135,33 +135,14 @@ pub fn boot_rom_start_app(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
         app_size, app_size, FIRMWARE_BASE
     );
 
-    // Load firmware into ICCM (code) and DCCM (data) at FIRMWARE_BASE.
+    // Load firmware into unified SRAM at FIRMWARE_BASE.
     // The bootloader bytes at 0..0xA800 are preserved (matching real HW).
-    mem.load_iccm(FIRMWARE_BASE, &app_code);
     mem.load_binary(FIRMWARE_BASE, &app_code);
     mem.app_size = Some(app_size);
     mem.app_load_base = FIRMWARE_BASE;
 
-    // Fill ICCM tail above firmware with J_S [blink] (0x7EE0).
-    // Bootloader filler at 0xA800..0x32000 stays in place from main.rs::boot_from_flash.
-    let app_end = FIRMWARE_BASE as usize + app_size;
-    let fill_start = (app_end + 1) & !1;
-    if fill_start < ICCM_SIZE {
-        let mut fill = vec![0u8; ICCM_SIZE - fill_start];
-        for chunk in fill.chunks_exact_mut(2) {
-            chunk[0] = 0x7E;
-            chunk[1] = 0xE0;
-        }
-        mem.load_iccm(fill_start as u32, &fill);
-    }
-
     // Firmware runs in the same physical address space as the bootloader
-    mem.iccm_base = 0;
     mem.dccm_base = 0;
-
-
-    // Protect PCL-relative literal pool constants
-    mem.protect_firmware_literals();
 
     // Reset CPU state for firmware.
     // Interrupts start DISABLED (E1=E2=false) — the firmware enables them via
@@ -174,7 +155,7 @@ pub fn boot_rom_start_app(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
     state.pc = FIRMWARE_BASE;
 
     crate::vlog!(
-        "[Boot ROM] ICCM/DCCM base=0, firmware {} bytes, entry=0x{:05X}",
+        "[Boot ROM] SRAM base=0, firmware {} bytes, entry=0x{:05X}",
         app_size, FIRMWARE_BASE
     );
     Ok(HookAction::Skip)

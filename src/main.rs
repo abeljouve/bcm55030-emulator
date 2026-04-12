@@ -4,7 +4,7 @@ use std::os::unix::io::AsRawFd;
 use std::process;
 
 use bcm55030_emulator::cpu::Cpu;
-use bcm55030_emulator::memory::ICCM_SIZE;
+use bcm55030_emulator::memory::SRAM_SIZE;
 
 fn usage(prog: &str) {
     eprintln!("BCM55030 ARC 700 Emulator");
@@ -167,22 +167,9 @@ fn parse_args() -> Config {
 }
 
 /// Detect the bootloader code size in a flash image.
-/// Scans from offset 0 for the first 256-byte aligned block that is all 0xFF (erased).
-/// Returns the offset of that block (= end of bootloader code region).
-fn detect_bootloader_size(flash: &[u8]) -> usize {
-    let block_size = 256;
-    let max_scan = flash.len().min(ICCM_SIZE);
-    let mut offset = 0;
-    while offset < max_scan {
-        let end = (offset + block_size).min(max_scan);
-        let block = &flash[offset..end];
-        if block.iter().all(|&b| b == 0xFF) {
-            return offset;
-        }
-        offset += block_size;
-    }
-    max_scan
-}
+/// BCM55030 hardware DMA copies exactly 64 KB from SPI flash offset 0 to SRAM.
+/// Verified on real hardware via bare-metal memsize test (2026-04-12).
+const BOOT_DMA_SIZE: usize = 64 * 1024;
 
 /// Set up terminal in raw mode for interactive CLI.
 fn setup_raw_terminal() -> Option<libc::termios> {
@@ -300,98 +287,84 @@ fn run_emulator(cpu: &mut Cpu, cfg: &Config) -> RunResult {
     RunResult::MaxCycles
 }
 
-/// Boot ROM emulation: load bootloader from SPI flash into ICCM/DCCM,
-/// fill unused ICCM with J_S [blink] stubs, install IRQ vectors,
-/// and configure initial CPU state.
+/// Hardware boot emulation: DMA copies 64KB from SPI flash to SRAM,
+/// then CPU starts at entry_point. No mask ROM — verified on real HW.
+///
+/// The bootloader binary already contains its own IVT at flash offset
+/// 0x00-0xFF. No synthetic IVT installation needed. The bootloader
+/// sets SP, IENABLE, and E1/E2 itself (verified via FLAG instruction
+/// trace: uart_enable_interrupts at PC 0x59F4).
 fn boot_from_flash(cpu: &mut Cpu, entry_point: u32) {
-    // 1. Detect bootloader size in flash
-    let boot_size = {
+    // 1. Copy exactly 64KB from flash to SRAM (hardware DMA behavior)
+    let copy_size = {
         let mmio = cpu.mem.mmio().unwrap();
-        detect_bootloader_size(&mmio.pbc.flash.data)
+        mmio.pbc.flash.data.len().min(BOOT_DMA_SIZE)
     };
-    bcm55030_emulator::vlog!("[BCM55030] Boot ROM: bootloader detected, {} bytes (0x{:X})", boot_size, boot_size);
-
-    // 2. Copy bootloader from flash to ICCM and DCCM
     {
         let code = {
             let mmio = cpu.mem.mmio().unwrap();
-            mmio.pbc.flash.data[..boot_size].to_vec()
+            mmio.pbc.flash.data[..copy_size].to_vec()
         };
-        cpu.mem.load_iccm(0, &code);
         cpu.mem.load_binary(0, &code);
     }
+    bcm55030_emulator::vlog!(
+        "[BCM55030] HW DMA: copied {} bytes (0x{:X}) from flash to SRAM",
+        copy_size, copy_size
+    );
 
-    // 3. Fill remaining ICCM with J_S [blink] (0x7EE0)
-    {
-        let fill_start = (boot_size + 1) & !1;
-        if fill_start < ICCM_SIZE {
-            let mut fill = vec![0u8; ICCM_SIZE - fill_start];
-            for chunk in fill.chunks_exact_mut(2) {
-                chunk[0] = 0x7E;
-                chunk[1] = 0xE0;
-            }
-            cpu.mem.load_iccm(fill_start as u32, &fill);
-        }
-        bcm55030_emulator::vlog!(
-            "[BCM55030] Boot ROM: ICCM filled from 0x{:05X} with J_S [blink]",
-            fill_start
-        );
-    }
-
-    // 4. Boot ROM initial state
-    cpu.state.core_regs[28] = 0x10800; // SP = top of DCCM stack area
+    // 2. CPU starts with clean reset state (STATUS32=0, all regs=0).
+    // The bootloader firmware handles its own initialization:
+    //   - SP set at PC 0x150 (mov sp, 0x10800)
+    //   - E1/E2 enabled via FLAG instruction (uart_enable_interrupts @ 0x59F4)
+    //
+    // The bootloader expects interrupts to be available early in boot:
+    //   - IENABLE = 0xFFFFFFFF (all IRQ lines enabled; bootloader never writes SR to IENABLE)
+    //   - E1=E2=1 (interrupt levels enabled; bootloader calls uart_enable_interrupts
+    //     at 0x59F4 to set these, but the synthetic UART ISR hook at 0xA8 needs
+    //     them enabled from the start to drain the TX ring buffer)
+    //
+    // On real HW, IENABLE reads as IDENTITY (aux reg not present on this core),
+    // meaning interrupt masking may work differently. E1/E2 are set by the
+    // bootloader's own FLAG instruction. We preset them here because the emulator's
+    // interrupt-driven UART model needs them from instruction 0.
     cpu.state.aux_ienable = 0xFFFFFFFF;
     cpu.state.flag_e1 = true;
     cpu.state.flag_e2 = true;
 
-    // 5. Install IRQ handlers in the IVT
+    // 3. Install IVT entries pointing to hook addresses.
+    // The synthetic ISR hooks (Timer0 @ 0x98, Timer1 @ 0xA0, UART @ 0xA8)
+    // need the IVT to dispatch IRQs to their hook addresses. The bootloader's
+    // native IVT uses different vectors, but the emulator's peripheral models
+    // depend on these synthetic ISRs. Install a generic IRQ handler at 0xA800
+    // and IVT entries that jump to it; the UART gets a direct vector to 0x4348.
     {
-        // IRQ handler at 0xA800 (20 bytes):
-        //   st.aw blink,[sp,-4]   = 0x1CFCB7C8
-        //   jl 0x8C80             = 0x20220F80 00008C80
-        //   ld.ab blink,[sp,4]    = 0x1404341F
-        //   rtie                  = 0x246F003F
         let irq_handler: [u8; 20] = [
-            0x1C, 0xFC, 0xB7, 0xC8,
-            0x20, 0x22, 0x0F, 0x80,
+            0x1C, 0xFC, 0xB7, 0xC8, // st.aw blink,[sp,-4]
+            0x20, 0x22, 0x0F, 0x80, // jl 0x8C80
             0x00, 0x00, 0x8C, 0x80,
-            0x14, 0x04, 0x34, 0x1F,
-            0x24, 0x6F, 0x00, 0x3F,
+            0x14, 0x04, 0x34, 0x1F, // ld.ab blink,[sp,4]
+            0x24, 0x6F, 0x00, 0x3F, // rtie
         ];
-        let handler_addr: u32 = 0xA800;
-        cpu.mem.load_iccm(handler_addr, &irq_handler);
+        cpu.mem.load_binary(0xA800, &irq_handler);
 
-        // Install J 0xA800 at all IRQ vector entries (IRQ 0-15 at offsets 0x80-0xF8)
         let j_handler: [u8; 8] = [
-            0x20, 0x20, 0x0F, 0x80,
-            0x00, 0x00, 0xA8, 0x00,
+            0x20, 0x20, 0x0F, 0x80, 0x00, 0x00, 0xA8, 0x00,
         ];
         for irq in 0..16u32 {
             let vector_offset = (16 + irq) * 8;
-            cpu.mem.load_iccm(vector_offset, &j_handler);
+            cpu.mem.load_binary(vector_offset, &j_handler);
         }
-        bcm55030_emulator::vlog!(
-            "[BCM55030] Boot ROM: IRQ handler at 0x{:04X}, IVT vectors 0x80-0xF8 installed",
-            handler_addr
-        );
 
-        // UART IRQ 5 (level 1): direct to bootloader's native UART ISR at 0x4348
+        // UART IRQ 5: direct to bootloader's native UART ISR
         let j_uart_isr: [u8; 8] = [
-            0x20, 0x20, 0x0F, 0x80,
-            0x00, 0x00, 0x43, 0x48,
+            0x20, 0x20, 0x0F, 0x80, 0x00, 0x00, 0x43, 0x48,
         ];
-        let uart_vector = (16 + 5) * 8;
-        cpu.mem.load_iccm(uart_vector, &j_uart_isr);
-        bcm55030_emulator::vlog!(
-            "[BCM55030] Boot ROM: UART ISR at 0x4348, vector 0x{:02X} (IRQ 5, level 1)",
-            uart_vector
-        );
+        cpu.mem.load_binary((16 + 5) * 8, &j_uart_isr);
     }
 
-    // 6. Set entry point
     cpu.state.pc = entry_point;
     bcm55030_emulator::vlog!(
-        "[BCM55030] Entry: 0x{:08X}, ICCM=512KB, DCCM=512KB",
+        "[BCM55030] Entry: 0x{:08X}, SRAM=512KB, boot DMA=64KB",
         entry_point
     );
 }
@@ -405,9 +378,9 @@ fn reset_cpu_for_reboot(cpu: &mut Cpu) {
     // Reset CPU state (all registers, flags, aux regs)
     cpu.state = CpuState::new();
 
-    // Clear DCCM (volatile RAM)
-    let dccm_size = cpu.mem.dccm_size();
-    let zeros = vec![0u8; dccm_size];
+    // Clear SRAM (volatile RAM)
+    let sram_size = cpu.mem.sram_size();
+    let zeros = vec![0u8; sram_size];
     cpu.mem.load_binary(0, &zeros);
 
     // Reset peripheral state but NOT flash data (non-volatile)
@@ -584,7 +557,7 @@ fn main() {
     // DCCM dump
     if let Some(ref path) = cfg.dccm_dump {
         bcm55030_emulator::vlog!("[BCM55030] Dumping DCCM to {}", path);
-        let size = cpu.mem.dccm_size();
+        let size = cpu.mem.sram_size();
         let mut buf = Vec::with_capacity(size);
         for addr in 0..size {
             buf.push(cpu.mem.read_byte(addr as u32).unwrap_or(0));

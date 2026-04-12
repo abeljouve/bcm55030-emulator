@@ -50,6 +50,10 @@ pub const AUX_BTA_L2: u32 = 0x414;
 pub const AUX_IRQ_PULSE_CANCEL: u32 = 0x415;
 pub const AUX_IRQ_PENDING: u32 = 0x416;
 
+/// BCM55030 IDENTITY register value (verified on real hardware 2026-04-12).
+/// ARCVER=0x24, build=0xB4. Non-existent aux regs also return this value.
+pub const IDENTITY_VALUE: u32 = 0x00B40124;
+
 // BCR addresses
 pub const AUX_BCR_VER: u32 = 0x60;
 pub const AUX_BTA_LINK_BUILD: u32 = 0x63;
@@ -342,11 +346,8 @@ impl CpuState {
             AUX_SEMAPHORE => Ok(self.aux_semaphore),
             AUX_LP_START => Ok(self.aux_lp_start),
             AUX_LP_END => Ok(self.aux_lp_end),
-            AUX_IDENTITY => {
-                // ARCVER=0x34 (ARC 700, BCM55030 silicon)
-                Ok(0x00000034)
-            }
-            AUX_DEBUG => Ok(0), // simplified
+            AUX_IDENTITY => Ok(IDENTITY_VALUE),
+            AUX_DEBUG => Ok(0x00400000), // bit 22 set (verified on real HW)
             AUX_PC => Ok(self.pc & 0xFFFFFFFE),
             AUX_STATUS32 => Ok(self.status32()),
             AUX_STATUS32_L1 => Ok(self.aux_status32_l1),
@@ -377,36 +378,37 @@ impl CpuState {
             AUX_BTA_L2 => Ok(self.aux_bta_l2),
             AUX_IRQ_PENDING => Ok(self.aux_irq_pending),
             // BCR registers (read-only build config)
-            AUX_BCR_VER => Ok(0x02),         // BCR version 2
-            AUX_BTA_LINK_BUILD => Ok(0x01),  // BTA registers present
-            AUX_EA_BUILD => Ok(0x02),        // Extended arithmetic v2
-            AUX_VECBASE_AC_BUILD => Ok(0x01), // ARC 700 interrupt model
-            AUX_RF_BUILD => Ok(0x02),        // 32-entry, version 2
-            AUX_TIMER_BUILD => Ok(0x02 | (1 << 2) | (1 << 3)), // v2, T0+T1
-            AUX_DCCM_BUILD => {
-                // DCCM BCR: version 3, 512 KB
-                // bits[3:0] = version (3), bits[7:4] = size code
-                // Size code for 512KB: log2(512K/256) = log2(2048) = 11 → 0x0B
-                Ok(0x03 | (0x0B << 4))
-            }
-            AUX_ICCM_BUILD => {
-                // ICCM BCR: version 1, 512 KB
-                Ok(0x01 | (0x0B << 4))
-            }
-            // Cache control registers (no caches present, return 0)
-            0x47 => Ok(0x00),   // IC_CTRL (I-Cache control)
-            0x48 => Ok(0x00),   // DC_CTRL (D-Cache control)
-            0x49 => Ok(0x00),   // CACHE_BYPASS
-            AUX_D_CACHE_BUILD => Ok(0x00),   // No D-Cache
-            AUX_I_CACHE_BUILD => Ok(0x00),   // No I-Cache
-            AUX_MULTIPLY_BUILD => Ok(0x02),  // MPY with any result reg
+            // All values verified on real BCM55030 hardware (2026-04-12)
+            AUX_BCR_VER => Ok(0x02),
+            AUX_BTA_LINK_BUILD => Ok(0x00),       // absent on real HW
+            AUX_EA_BUILD => Ok(0x00),              // absent on real HW
+            AUX_VECBASE_AC_BUILD => Ok(0x00),      // absent on real HW
+            AUX_RF_BUILD => Ok(0x01),              // register file v1
+            AUX_TIMER_BUILD => Ok(0x0303),         // v3, T0+T1
+            AUX_DCCM_BUILD => Ok(0x00),            // no DCCM (unified SRAM)
+            AUX_ICCM_BUILD => Ok(0x00),            // no ICCM (unified SRAM)
+            // Cache control registers (D-cache 4KB 8-way, I-cache 8KB 8-way)
+            0x47 => Ok(0x00),                      // IC_CTRL
+            0x48 => Ok(0xC2),                      // DC_CTRL (cache enabled, IM bits)
+            0x49 => Ok(0x00),                      // CACHE_BYPASS
+            AUX_D_CACHE_BUILD => Ok(0x00013001),   // 4KB D-cache present
+            AUX_I_CACHE_BUILD => Ok(0x00023001),   // 8KB I-cache present
+            AUX_MULTIPLY_BUILD => Ok(0x00),        // absent on real HW
             AUX_SWAP_BUILD => Ok(0x01),
             AUX_NORM_BUILD => Ok(0x02),
-            AUX_MINMAX_BUILD => Ok(0x02),
-            AUX_BARREL_BUILD => Ok(0x02),
-            // Unknown BCR registers (0x60-0x7F): return 0 (not present)
+            AUX_MINMAX_BUILD => Ok(0x00),          // absent on real HW
+            AUX_BARREL_BUILD => Ok(0x00),          // absent on real HW
+            // BCM55030-specific BCRs (verified on real HW)
+            0x62 => Ok(0x01),                      // unknown BCM55030 BCR
+            0x67 => Ok(0x05),                      // unknown (possibly IRQ config)
+            0x69 => Ok(0x00FC0001),                // contains UART address prefix
+            // Other BCR registers (0x60-0x7F, 0xC0-0xFF): return 0
             0x60..=0x7F => Ok(0x00),
-            _ => Err(Exception::InstructionError { address: self.pc }),
+            0xC0..=0xFF => Ok(0x00),
+            // Non-existent aux regs return IDENTITY on real HW (not exception).
+            // The emulator uses struct fields for internal interrupt/exception
+            // state, so this only affects firmware LR reads of unknown regs.
+            _ => Ok(IDENTITY_VALUE),
         }
     }
 
@@ -543,16 +545,13 @@ impl CpuState {
             // un NOP silencieux (slot réservé). Voir Q-BCR-02 dans
             // ~/workspace/device/analysis/canonical/OPEN_QUESTIONS.md.
             0x10 => Ok(()),
-            // Read-only registers
+            // Read-only registers — writes silently ignored on real HW
             AUX_STATUS | AUX_IDENTITY | AUX_DEBUG | AUX_PC | AUX_ECR | AUX_ICAUSE1
-            | AUX_ICAUSE2 | AUX_IRQ_PENDING | AUX_BTA => {
-                Err(Exception::InstructionError { address: self.pc })
-            }
-            // BCR registers are read-only
-            0x60..=0x7F | 0xC0..=0xFF => {
-                Err(Exception::InstructionError { address: self.pc })
-            }
-            _ => Err(Exception::InstructionError { address: self.pc }),
+            | AUX_ICAUSE2 | AUX_IRQ_PENDING | AUX_BTA => Ok(()),
+            // BCR registers are read-only — writes silently ignored
+            0x60..=0x7F | 0xC0..=0xFF => Ok(()),
+            // Non-existent aux regs: writes silently absorbed on real HW
+            _ => Ok(()),
         }
     }
 }

@@ -51,10 +51,15 @@ pub struct MmioTraceEntry {
     pub first_insn: u64,
 }
 
-/// UART base address in the SoC MMIO space.
-/// Hardware base pointer is 0x00FC0FE8; data register at +0x28, IER at +0x2C.
-const UART_BASE: u32 = 0x00FC1010;
-const UART_SIZE: u32 = 0x10; // +0x00 through +0x0F (data, IER, baud_lo, baud_hi)
+/// UART MMIO block: 0x00FC1000-0x00FC10FF (256 bytes).
+/// Single controller mirrored 8× every 0x20 bytes (verified on real HW).
+/// Registers per channel: DATA=+0x10, STATUS/CTL=+0x14, BAUD_LO=+0x18, BAUD_HI=+0x1C.
+const UART_RANGE_START: u32 = 0x00FC1000;
+const UART_RANGE_SIZE: u32 = 0x100; // 8 channels × 0x20
+/// Per-channel register stride
+const UART_CHANNEL_SIZE: u32 = 0x20;
+/// Offset within a channel where the known registers start (DATA at 0x10)
+const UART_REG_OFFSET: u32 = 0x10;
 
 /// Peripheral Bus Controller (SPI + MDIO) base address
 const PBC_BASE: u32 = 0x010001F0;
@@ -146,7 +151,18 @@ impl MmioController {
 
     #[inline]
     fn is_uart(addr: u32) -> bool {
-        addr >= UART_BASE && addr < UART_BASE + UART_SIZE
+        addr >= UART_RANGE_START && addr < UART_RANGE_START + UART_RANGE_SIZE
+    }
+
+    /// Map an absolute UART address to the uart.rs register offset (0x00-0x0C).
+    /// Returns None for per-channel offsets below 0x10 (unknown registers).
+    fn uart_reg_offset(addr: u32) -> Option<u32> {
+        let channel_off = (addr - UART_RANGE_START) % UART_CHANNEL_SIZE;
+        if channel_off >= UART_REG_OFFSET {
+            Some(channel_off - UART_REG_OFFSET)
+        } else {
+            None // Unknown register in lower part of channel
+        }
     }
 
     #[inline]
@@ -508,7 +524,10 @@ impl MmioController {
 
     pub fn read_byte(&mut self, addr: u32) -> Result<u8, Exception> {
         if Self::is_uart(addr) {
-            return self.uart.read_byte(addr - UART_BASE);
+            return match Self::uart_reg_offset(addr) {
+                Some(off) => self.uart.read_byte(off),
+                None => Ok(0), // unknown per-channel register
+            };
         }
         if Self::is_pbc(addr) {
             let offset = addr - PBC_BASE;
@@ -538,7 +557,10 @@ impl MmioController {
 
     pub fn write_byte(&mut self, addr: u32, val: u8) -> Result<(), Exception> {
         if Self::is_uart(addr) {
-            return self.uart.write_byte(addr - UART_BASE, val);
+            return match Self::uart_reg_offset(addr) {
+                Some(off) => self.uart.write_byte(off, val),
+                None => Ok(()), // unknown per-channel register
+            };
         }
         if Self::is_sysreg(addr) {
             // Byte write to sysreg: read-modify-write the containing word
@@ -563,8 +585,14 @@ impl MmioController {
 
     pub fn read_half(&mut self, addr: u32) -> Result<u16, Exception> {
         if Self::is_uart(addr) {
-            let hi = self.uart.read_byte(addr - UART_BASE)? as u16;
-            let lo = self.uart.read_byte(addr + 1 - UART_BASE)? as u16;
+            let hi = match Self::uart_reg_offset(addr) {
+                Some(off) => self.uart.read_byte(off)? as u16,
+                None => 0u16,
+            };
+            let lo = match Self::uart_reg_offset(addr + 1) {
+                Some(off) => self.uart.read_byte(off)? as u16,
+                None => 0u16,
+            };
             return Ok((hi << 8) | lo);
         }
         if Self::is_sysreg(addr) {
@@ -588,8 +616,12 @@ impl MmioController {
 
     pub fn write_half(&mut self, addr: u32, val: u16) -> Result<(), Exception> {
         if Self::is_uart(addr) {
-            self.uart.write_byte(addr - UART_BASE, (val >> 8) as u8)?;
-            self.uart.write_byte(addr + 1 - UART_BASE, val as u8)?;
+            if let Some(off) = Self::uart_reg_offset(addr) {
+                self.uart.write_byte(off, (val >> 8) as u8)?;
+            }
+            if let Some(off) = Self::uart_reg_offset(addr + 1) {
+                self.uart.write_byte(off, val as u8)?;
+            }
             return Ok(());
         }
         if Self::is_sysreg(addr) {
@@ -615,7 +647,10 @@ impl MmioController {
 
     pub fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
         if Self::is_uart(addr) {
-            return self.uart.read_word(addr - UART_BASE);
+            return match Self::uart_reg_offset(addr) {
+                Some(off) => self.uart.read_word(off),
+                None => Ok(0),
+            };
         }
         if Self::is_pbc(addr) {
             let offset = addr - PBC_BASE;
@@ -647,7 +682,10 @@ impl MmioController {
 
     pub fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
         if Self::is_uart(addr) {
-            return self.uart.write_word(addr - UART_BASE, val);
+            return match Self::uart_reg_offset(addr) {
+                Some(off) => self.uart.write_word(off, val),
+                None => Ok(()),
+            };
         }
         if Self::is_pbc(addr) {
             let offset = addr - PBC_BASE;

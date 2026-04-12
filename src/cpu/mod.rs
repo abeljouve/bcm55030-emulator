@@ -38,14 +38,11 @@ impl Cpu {
         }
     }
 
-    /// Create a BCM55030 CPU with Harvard architecture (separate ICCM/DCCM + MMIO).
+    /// Create a BCM55030 CPU with unified SRAM + MMIO.
     pub fn new_bcm55030() -> Self {
         Self {
             state: CpuState::new(),
-            mem: Memory::new_harvard(
-                crate::memory::ICCM_SIZE,
-                crate::memory::DCCM_SIZE,
-            ),
+            mem: Memory::new_soc(crate::memory::SRAM_SIZE),
             trace: false,
             hooks: HookTable::new(),
         }

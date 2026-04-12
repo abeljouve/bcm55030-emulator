@@ -28,29 +28,13 @@ pub fn execute_load(
 
     let ea = compute_ea(base_val, offset_val, data_size, writeback);
 
-    // ARC 700 Harvard architecture: PC-relative loads access the Code Space
-    // (ICCM), not the Data Space (DCCM). From the ISA manual:
-    //   "Code Space: accessible via instruction fetch and PC relative ops"
-    //   "Data Space: accessible using load (LD) and store (ST) operations"
-    // When base register is PCL (r63), use instruction fetch path (ICCM).
-    let is_pcl_relative = matches!(base, Operand::Reg(63));
-
+    // With unified SRAM (no separate ICCM/DCCM), all loads go through the
+    // same data path. PCL-relative loads read from the same backing store
+    // as any other load.
     let value = match data_size {
-        DataSize::Word => {
-            if is_pcl_relative {
-                mem.fetch_word(ea)?
-            } else {
-                mem.read_word(ea)?
-            }
-        }
+        DataSize::Word => mem.read_word(ea)?,
         DataSize::Byte => {
-            let b = if is_pcl_relative {
-                // fetch_half gets 2 bytes from ICCM; extract the target byte
-                let h = mem.fetch_half(ea & !1)?;
-                if ea & 1 == 0 { (h >> 8) as u8 } else { h as u8 }
-            } else {
-                mem.read_byte(ea)?
-            } as u32;
+            let b = mem.read_byte(ea)? as u32;
             if do_sign_ext {
                 fields::sign_extend(b, 8) as u32
             } else {
@@ -58,11 +42,7 @@ pub fn execute_load(
             }
         }
         DataSize::HalfWord => {
-            let h = if is_pcl_relative {
-                mem.fetch_half(ea)?
-            } else {
-                mem.read_half(ea)?
-            } as u32;
+            let h = mem.read_half(ea)? as u32;
             if do_sign_ext {
                 fields::sign_extend(h, 16) as u32
             } else {

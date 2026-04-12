@@ -63,12 +63,10 @@ impl SimpleUart {
         } else {
             val &= !0x20;
         }
-        // bit 7: TX IRQ pending = TXIE (TX is always ready, instant stdout)
-        if val & 0x40 != 0 {
-            val |= 0x80;
-        } else {
-            val &= !0x80;
-        }
+        // bit 7: TX complete — always 1 since TX is instant (stdout).
+        // On real HW this clears while a byte is being shifted out, then
+        // re-asserts.  Polled firmware checks this before writing DATA.
+        val |= 0x80;
         val
     }
 

@@ -3,53 +3,36 @@ use std::cell::RefCell;
 use crate::cpu::exception::Exception;
 use crate::soc::mmio::MmioController;
 
-/// BCM55030 DCCM size: 512 KB
-pub const DCCM_SIZE: usize = 512 * 1024;
-/// BCM55030 ICCM size: 512 KB
-pub const ICCM_SIZE: usize = 512 * 1024;
+/// BCM55030 unified SRAM size: 512 KB
+/// Hardware confirmed: BCR 0x74 (ICCM) = 0, BCR 0x78 (DCCM) = 0.
+/// The BCM55030 has unified 512 KB SRAM with I-cache/D-cache, no ICCM/DCCM.
+pub const SRAM_SIZE: usize = 512 * 1024;
 
 pub struct Memory {
-    /// Primary data store.
-    /// - Flat mode: single unified memory (for tests).
-    /// - Harvard mode: DCCM (data closely coupled memory).
+    /// Primary data store (unified SRAM in SoC mode, flat memory for tests).
+    /// In SoC mode, both instruction fetch and data access read/write this store.
     data: Vec<u8>,
 
-    /// Instruction memory (Harvard mode only).
-    /// When present, `fetch_half`/`fetch_word` read from here.
-    iccm: Option<Vec<u8>>,
-
-    /// MMIO peripheral controller (Harvard mode only).
+    /// MMIO peripheral controller (SoC mode only).
     /// Uses RefCell for interior mutability: reads may have side effects
     /// (e.g. UART status register clears on read).
     mmio: Option<RefCell<MmioController>>,
 
-    /// ICCM base address (Harvard mode). Instruction fetch at PC in
-    /// [iccm_base, iccm_base + iccm_size) reads from ICCM.
-    /// Default 0 for bootloader, 0x20000000 for firmware.
-    pub iccm_base: u32,
-
-    /// DCCM base address (Harvard mode). Data access at addr in
-    /// [dccm_base, dccm_base + dccm_size) reads/writes DCCM.
+    /// SRAM base address (SoC mode). Data/instruction access at addr in
+    /// [dccm_base, dccm_base + sram_size) reads/writes SRAM.
     /// Default 0 for bootloader, 0x20000000 for firmware.
     pub dccm_base: u32,
 
     /// Size of the loaded app binary (used for BSS clearing in boot ROM CRT init)
     pub app_size: Option<usize>,
 
-    /// Runtime base address where the firmware binary is loaded in ICCM/DCCM.
+    /// Runtime base address where the firmware binary is loaded in SRAM.
     /// `0` until firmware loads. Firmware is loaded at `0x32000` matching real BCM55030
     /// hardware: bootloader stays at `0..0xA800`, firmware at `0x32000..`.
     /// Validated via `mem/rm 0x32000` returning the firmware IVT signature on real HW.
     pub app_load_base: u32,
 
-    /// Protect the firmware code section in DCCM from event_table_clear corruption.
-    /// Range `[firmware_code_protect_start..firmware_code_protect_end]` (DCCM offsets).
-    /// With `app_load_base = 0x32000`, literal pools no longer alias .data counter
-    /// tables, so this protection should become unnecessary. Kept until validated.
-    firmware_code_protect_start: usize,
-    firmware_code_protect_end: usize,
-
-    /// DCCM write watchpoint address (temporary diagnostic).
+    /// SRAM write watchpoint address (temporary diagnostic).
     /// When set, logs the first write to this word-aligned address with full context.
     pub dccm_watchpoint: Option<u32>,
 }
@@ -59,30 +42,23 @@ impl Memory {
     pub fn new(size: usize) -> Self {
         Self {
             data: vec![0u8; size],
-            iccm: None,
             mmio: None,
-            iccm_base: 0,
             dccm_base: 0,
             app_size: None,
             app_load_base: 0,
-            firmware_code_protect_start: 0,
-            firmware_code_protect_end: 0,
             dccm_watchpoint: None,
         }
     }
 
-    /// Create a Harvard-architecture memory with separate ICCM, DCCM, and MMIO.
-    pub fn new_harvard(iccm_size: usize, dccm_size: usize) -> Self {
+    /// Create a SoC memory with unified SRAM + MMIO controller.
+    /// BCM55030 has 512 KB unified SRAM (no separate ICCM/DCCM).
+    pub fn new_soc(sram_size: usize) -> Self {
         Self {
-            data: vec![0u8; dccm_size],
-            iccm: Some(vec![0u8; iccm_size]),
+            data: vec![0u8; sram_size],
             mmio: Some(RefCell::new(MmioController::new())),
-            iccm_base: 0,
             dccm_base: 0,
             app_size: None,
             app_load_base: 0,
-            firmware_code_protect_start: 0,
-            firmware_code_protect_end: 0,
             dccm_watchpoint: None,
         }
     }
@@ -107,29 +83,15 @@ impl Memory {
         }
     }
 
-    /// Enable protection of the firmware code section against event_table_clear corruption.
-    /// Called after firmware binary is loaded to DCCM, before execution starts.
-    /// Range is `[app_load_base..app_load_base+app_size]` (DCCM offsets).
-    pub fn protect_firmware_literals(&mut self) {
-        if let Some(size) = self.app_size {
-            self.firmware_code_protect_start = self.app_load_base as usize;
-            self.firmware_code_protect_end = self.firmware_code_protect_start + size;
-            crate::vlog!(
-                "[BCM55030] DCCM code section protection: 0x{:05X}-0x{:05X}",
-                self.firmware_code_protect_start, self.firmware_code_protect_end
-            );
-        }
+    pub fn is_soc(&self) -> bool {
+        self.mmio.is_some()
     }
 
-    pub fn is_harvard(&self) -> bool {
-        self.iccm.is_some()
-    }
-
-    pub fn dccm_size(&self) -> usize {
+    pub fn sram_size(&self) -> usize {
         self.data.len()
     }
 
-    /// Load a binary blob into the primary data store (flat) or DCCM (Harvard).
+    /// Load a binary blob into SRAM (unified memory).
     pub fn load_binary(&mut self, addr: u32, binary: &[u8]) {
         let start = addr as usize;
         let end = start + binary.len();
@@ -137,20 +99,7 @@ impl Memory {
         self.data[start..end].copy_from_slice(binary);
     }
 
-    /// Load a binary blob into ICCM (Harvard mode).
-    /// In flat mode, falls back to load_binary.
-    pub fn load_iccm(&mut self, addr: u32, binary: &[u8]) {
-        if let Some(ref mut iccm) = self.iccm {
-            let start = addr as usize;
-            let end = start + binary.len();
-            assert!(end <= iccm.len(), "binary exceeds ICCM size");
-            iccm[start..end].copy_from_slice(binary);
-        } else {
-            self.load_binary(addr, binary);
-        }
-    }
-
-    /// Access the MMIO controller (Harvard mode only).
+    /// Access the MMIO controller (SoC mode only).
     pub fn mmio(&self) -> Option<std::cell::RefMut<'_, MmioController>> {
         self.mmio.as_ref().map(|rc| rc.borrow_mut())
     }
@@ -168,11 +117,11 @@ impl Memory {
         Ok(())
     }
 
-    // ========== Data reads (DCCM in Harvard, flat otherwise) ==========
+    // ========== Data reads (SRAM in SoC mode, flat otherwise) ==========
 
-    /// Check if an address falls in the DCCM range and return the offset.
+    /// Check if an address falls in the SRAM range and return the offset.
     #[inline]
-    fn dccm_offset(&self, addr: u32) -> Option<usize> {
+    fn sram_offset(&self, addr: u32) -> Option<usize> {
         if addr >= self.dccm_base {
             let off = (addr - self.dccm_base) as usize;
             if off < self.data.len() {
@@ -183,9 +132,9 @@ impl Memory {
     }
 
     pub fn read_byte(&self, addr: u32) -> Result<u8, Exception> {
-        if self.iccm.is_some() {
-            // Harvard mode: route by address
-            if let Some(off) = self.dccm_offset(addr) {
+        if self.mmio.is_some() {
+            // SoC mode: route by address
+            if let Some(off) = self.sram_offset(addr) {
                 return Ok(self.data[off]);
             }
             // MMIO
@@ -201,10 +150,10 @@ impl Memory {
     }
 
     pub fn read_half(&self, addr: u32) -> Result<u16, Exception> {
-        if self.iccm.is_some() {
-            // Harvard mode: check DCCM first, then MMIO, then unmapped
-            if let Some(off) = self.dccm_offset(addr) {
-                // Misaligned DCCM reads: perform byte-wise (fixup behavior).
+        if self.mmio.is_some() {
+            // SoC mode: check SRAM first, then MMIO, then unmapped
+            if let Some(off) = self.sram_offset(addr) {
+                // Misaligned SRAM reads: perform byte-wise (fixup behavior).
                 // The ARC 700 raises a MisalignedAccess exception, but the firmware's
                 // exception handler fixes up the access. We emulate this directly.
                 if off + 1 < self.data.len() {
@@ -230,11 +179,11 @@ impl Memory {
     }
 
     pub fn read_word(&self, addr: u32) -> Result<u32, Exception> {
-        if self.iccm.is_some() {
-            // Harvard mode: check DCCM first, then MMIO, then unmapped
+        if self.mmio.is_some() {
+            // SoC mode: check SRAM first, then MMIO, then unmapped
             if addr & 3 != 0 {
-                // Misaligned DCCM reads: perform byte-wise fixup
-                if let Some(off) = self.dccm_offset(addr) {
+                // Misaligned SRAM reads: perform byte-wise fixup
+                if let Some(off) = self.sram_offset(addr) {
                     if off + 3 < self.data.len() {
                         return Ok(((self.data[off] as u32) << 24)
                             | ((self.data[off + 1] as u32) << 16)
@@ -244,7 +193,7 @@ impl Memory {
                 }
                 return Ok(0);
             }
-            if let Some(off) = self.dccm_offset(addr) {
+            if let Some(off) = self.sram_offset(addr) {
                 if off + 3 < self.data.len() {
                     return Ok(((self.data[off] as u32) << 24)
                         | ((self.data[off + 1] as u32) << 16)
@@ -269,11 +218,11 @@ impl Memory {
             | (self.data[a + 3] as u32))
     }
 
-    // ========== Data writes (DCCM in Harvard, flat otherwise) ==========
+    // ========== Data writes (SRAM in SoC mode, flat otherwise) ==========
 
     pub fn write_byte(&mut self, addr: u32, val: u8) -> Result<(), Exception> {
-        if self.iccm.is_some() {
-            if let Some(off) = self.dccm_offset(addr) {
+        if self.mmio.is_some() {
+            if let Some(off) = self.sram_offset(addr) {
                 self.check_watchpoint(off, 1);
                 self.data[off] = val;
                 return Ok(());
@@ -290,27 +239,13 @@ impl Memory {
     }
 
     pub fn write_half(&mut self, addr: u32, val: u16) -> Result<(), Exception> {
-        if self.iccm.is_some() {
-            // Misaligned DCCM writes: perform byte-wise fixup.
+        if self.mmio.is_some() {
+            // Misaligned SRAM writes: perform byte-wise fixup.
             // The ARC 700 raises MisalignedAccess, but the firmware's exception
             // handler fixes up the access. We emulate this directly.
-            if let Some(off) = self.dccm_offset(addr) {
+            if let Some(off) = self.sram_offset(addr) {
                 if off + 1 < self.data.len() {
                     self.check_watchpoint(off, 2);
-                    // Protect firmware code section: suppress zero-writes to non-zero halfwords.
-                    // This preserves PCL-relative literal pool constants that overlap
-                    // with event counter table entries (only relevant when app_load_base
-                    // is wrong and creates the alias; with app_load_base=0x32000 there
-                    // should be no aliasing and this protection becomes a no-op).
-                    if val == 0
-                        && off >= self.firmware_code_protect_start
-                        && off < self.firmware_code_protect_end
-                    {
-                        let existing = ((self.data[off] as u16) << 8) | (self.data[off + 1] as u16);
-                        if existing != 0 {
-                            return Ok(()); // Suppress: would zero a code-section constant
-                        }
-                    }
                     self.data[off] = (val >> 8) as u8;
                     self.data[off + 1] = val as u8;
                     return Ok(());
@@ -336,10 +271,10 @@ impl Memory {
     }
 
     pub fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
-        if self.iccm.is_some() {
+        if self.mmio.is_some() {
             if addr & 3 != 0 {
-                // Misaligned DCCM writes: perform byte-wise fixup
-                if let Some(off) = self.dccm_offset(addr) {
+                // Misaligned SRAM writes: perform byte-wise fixup
+                if let Some(off) = self.sram_offset(addr) {
                     if off + 3 < self.data.len() {
                         self.check_watchpoint(off, 4);
                         self.data[off] = (val >> 24) as u8;
@@ -351,35 +286,13 @@ impl Memory {
                 }
                 return Ok(()); // Unmapped misaligned write — absorb
             }
-            if let Some(off) = self.dccm_offset(addr) {
+            if let Some(off) = self.sram_offset(addr) {
                 if off + 3 < self.data.len() {
                     self.check_watchpoint(off, 4);
                     self.data[off] = (val >> 24) as u8;
                     self.data[off + 1] = (val >> 16) as u8;
                     self.data[off + 2] = (val >> 8) as u8;
                     self.data[off + 3] = val as u8;
-                    // Mirror to ICCM for the IVT area: firmware installs interrupt
-                    // handlers via hw_auxreg_write_entry data writes. On real BCM55030,
-                    // these writes update ICCM (dual-ported for the vector table).
-                    //
-                    // Two IVT ranges are mirrored:
-                    //  - `0x00..0x100`: bootloader IVT (bootloader runs at base 0)
-                    //  - `app_load_base..app_load_base+0x100`: firmware IVT (when loaded)
-                    let in_bootloader_ivt = addr < 0x100;
-                    let in_firmware_ivt = self.app_load_base != 0
-                        && addr >= self.app_load_base
-                        && addr < self.app_load_base + 0x100;
-                    if in_bootloader_ivt || in_firmware_ivt {
-                        if let Some(ref mut iccm) = self.iccm {
-                            let iccm_off = (addr.wrapping_sub(self.iccm_base)) as usize;
-                            if iccm_off + 3 < iccm.len() {
-                                iccm[iccm_off] = (val >> 24) as u8;
-                                iccm[iccm_off + 1] = (val >> 16) as u8;
-                                iccm[iccm_off + 2] = (val >> 8) as u8;
-                                iccm[iccm_off + 3] = val as u8;
-                            }
-                        }
-                    }
                     return Ok(());
                 }
             }
@@ -429,30 +342,16 @@ impl Memory {
         }
     }
 
-    // ========== Instruction fetch (ICCM in Harvard, flat otherwise) ==========
-
-    /// Check if an address falls in the ICCM range and return the offset.
-    #[inline]
-    fn iccm_offset(&self, addr: u32) -> Option<usize> {
-        if let Some(ref iccm) = self.iccm {
-            if addr >= self.iccm_base {
-                let off = (addr - self.iccm_base) as usize;
-                if off < iccm.len() {
-                    return Some(off);
-                }
-            }
-        }
-        None
-    }
+    // ========== Instruction fetch (SRAM in SoC mode, flat otherwise) ==========
 
     pub fn fetch_half(&self, addr: u32) -> Result<u16, Exception> {
         if addr & 1 != 0 {
             return Err(Exception::MisalignedAccess { address: addr });
         }
-        if let Some(ref iccm) = self.iccm {
-            if let Some(a) = self.iccm_offset(addr) {
-                if a + 1 < iccm.len() {
-                    return Ok(((iccm[a] as u16) << 8) | (iccm[a + 1] as u16));
+        if self.mmio.is_some() {
+            if let Some(a) = self.sram_offset(addr) {
+                if a + 1 < self.data.len() {
+                    return Ok(((self.data[a] as u16) << 8) | (self.data[a + 1] as u16));
                 }
             }
             return Err(Exception::MemoryError { address: addr, is_write: false });
@@ -466,13 +365,13 @@ impl Memory {
         if addr & 1 != 0 {
             return Err(Exception::MisalignedAccess { address: addr });
         }
-        if let Some(ref iccm) = self.iccm {
-            if let Some(a) = self.iccm_offset(addr) {
-                if a + 3 < iccm.len() {
-                    return Ok(((iccm[a] as u32) << 24)
-                        | ((iccm[a + 1] as u32) << 16)
-                        | ((iccm[a + 2] as u32) << 8)
-                        | (iccm[a + 3] as u32));
+        if self.mmio.is_some() {
+            if let Some(a) = self.sram_offset(addr) {
+                if a + 3 < self.data.len() {
+                    return Ok(((self.data[a] as u32) << 24)
+                        | ((self.data[a + 1] as u32) << 16)
+                        | ((self.data[a + 2] as u32) << 8)
+                        | (self.data[a + 3] as u32));
                 }
             }
             return Err(Exception::MemoryError { address: addr, is_write: false });
@@ -539,23 +438,20 @@ mod tests {
     }
 
     #[test]
-    fn test_harvard_separate_buses() {
-        let mut mem = Memory::new_harvard(1024, 1024);
-        // Write to ICCM
-        mem.load_iccm(0, &[0xAA, 0xBB, 0xCC, 0xDD]);
-        // Write to DCCM at same address
-        mem.load_binary(0, &[0x11, 0x22, 0x33, 0x44]);
-        // Fetch reads ICCM
+    fn test_unified_sram() {
+        let mut mem = Memory::new_soc(1024);
+        // Write data to SRAM
+        mem.load_binary(0, &[0xAA, 0xBB, 0xCC, 0xDD]);
+        // With unified SRAM, fetch and data read see the same backing store
         assert_eq!(mem.fetch_half(0).unwrap(), 0xAABB);
         assert_eq!(mem.fetch_word(0).unwrap(), 0xAABBCCDD);
-        // Data reads DCCM
-        assert_eq!(mem.read_half(0).unwrap(), 0x1122);
-        assert_eq!(mem.read_word(0).unwrap(), 0x11223344);
+        assert_eq!(mem.read_half(0).unwrap(), 0xAABB);
+        assert_eq!(mem.read_word(0).unwrap(), 0xAABBCCDD);
     }
 
     #[test]
-    fn test_harvard_mmio_stub() {
-        let mem = Memory::new_harvard(1024, 1024);
+    fn test_soc_mmio_stub() {
+        let mem = Memory::new_soc(1024);
         // MMIO reads return 0 for unstubbed addresses
         assert_eq!(mem.read_byte(0x00FC0000).unwrap(), 0);
         assert_eq!(mem.read_word(0xDE000000).unwrap(), 0);
