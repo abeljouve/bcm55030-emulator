@@ -319,19 +319,26 @@ impl DCache {
 
 // ========== I-cache ==========
 //
-// BCR 0x77 (I_CACHE_BUILD) = 0x00023001:
-//   ver=1, cfg=0, ll=0 (32 bytes), ways=3 (4-way), cap=2 (16 KB)
-// Sets: 16384 / (4 × 32) = 128
-// Address decomposition (32B lines, 128 sets):
-//   bits [4:0]   = byte offset (5 bits)
-//   bits [11:5]  = set index (7 bits)
-//   bits [31:12] = tag (20 bits)
+// Geometry verified on real hardware via bare-metal scan scan7d v2/v3:
+//   Capacity      : 4 KB  (capacity probe: 128 contiguous lines fit,
+//                          256 contiguous wrap back to set 0)
+//   Line size     : 32 B  (common ARC700 config; not independently probed)
+//   Associativity : 1-way direct-mapped
+//                   (scan7d n=2 already evicted slot 0 under stride-4096)
+//   Sets          : 128   (4096 / 32)
 //
-// Read-only cache. Instruction fetch paths check the I-cache first, then
-// fall back to SRAM. DMA writes invalidate covered lines for coherence.
+// BCR 0x77 (I_CACHE_BUILD) = 0x00023001:
+//   ver=1, cfg=0, ll=0 (32 B), ways=3, cap=2
+//   On this core `ways=3` / `cap=2` actually encodes 1-way / 4 KB.
+//
+// HW quirks:
+//   - IC_IVIL (aux 0x19, invalidate single line) is a NO-OP on BCM55030.
+//     scan7d sanity test showed the cached line survived an IC_IVIL call.
+//     Only IC_IVIC (aux 0x10, invalidate all) actually flushes.
+//   - `.di` stores do not touch the I-cache (separate hierarchy).
 
 pub const IC_LINE_SIZE: usize = 32;
-pub const IC_NUM_WAYS: usize = 4;
+pub const IC_NUM_WAYS: usize = 1;
 pub const IC_NUM_SETS: usize = 128;
 
 const IC_OFFSET_BITS: u32 = 5; // log2(32)
@@ -355,17 +362,15 @@ impl ICacheLine {
 }
 
 pub struct ICache {
-    // 16KB: 128 sets × 4 ways. Box to avoid huge stack frames.
-    lines: Box<[[ICacheLine; IC_NUM_WAYS]; IC_NUM_SETS]>,
-    lru: Box<[[u8; IC_NUM_WAYS]; IC_NUM_SETS]>,
+    // 4 KB: 128 sets × 1 way. Box to keep the struct off the stack.
+    lines: Box<[ICacheLine; IC_NUM_SETS]>,
     enabled: bool,
 }
 
 impl ICache {
     pub fn new() -> Self {
         Self {
-            lines: Box::new([[ICacheLine::empty(); IC_NUM_WAYS]; IC_NUM_SETS]),
-            lru: Box::new([[0; IC_NUM_WAYS]; IC_NUM_SETS]),
+            lines: Box::new([ICacheLine::empty(); IC_NUM_SETS]),
             enabled: true,
         }
     }
@@ -385,56 +390,22 @@ impl ICache {
         (tag, index, offset)
     }
 
-    fn find_way(&self, set: usize, tag: u32) -> Option<usize> {
-        for way in 0..IC_NUM_WAYS {
-            if self.lines[set][way].valid && self.lines[set][way].tag == tag {
-                return Some(way);
-            }
-        }
-        None
-    }
-
-    fn touch_lru(&mut self, set: usize, way: usize) {
-        let old = self.lru[set][way];
-        for w in 0..IC_NUM_WAYS {
-            if self.lru[set][w] < old {
-                self.lru[set][w] = self.lru[set][w].saturating_add(1);
-            }
-        }
-        self.lru[set][way] = 0;
-    }
-
-    fn lru_victim(&self, set: usize) -> usize {
-        let mut victim = 0;
-        let mut max_val = 0;
-        for way in 0..IC_NUM_WAYS {
-            if !self.lines[set][way].valid {
-                return way;
-            }
-            if self.lru[set][way] > max_val {
-                max_val = self.lru[set][way];
-                victim = way;
-            }
-        }
-        victim
-    }
-
-    /// Peek a halfword without updating LRU (used via peek for &self access).
+    /// Peek a halfword from the I-cache, or None on miss.
     pub fn peek_half(&self, addr: u32) -> Option<u16> {
         let (tag, set, offset) = Self::decompose(addr);
-        if let Some(way) = self.find_way(set, tag) {
-            let line = &self.lines[set][way];
+        let line = &self.lines[set];
+        if line.valid && line.tag == tag {
             Some(((line.data[offset] as u16) << 8) | (line.data[offset + 1] as u16))
         } else {
             None
         }
     }
 
-    /// Peek a word without updating LRU.
+    /// Peek a word from the I-cache, or None on miss.
     pub fn peek_word(&self, addr: u32) -> Option<u32> {
         let (tag, set, offset) = Self::decompose(addr);
-        if let Some(way) = self.find_way(set, tag) {
-            let line = &self.lines[set][way];
+        let line = &self.lines[set];
+        if line.valid && line.tag == tag {
             Some(
                 ((line.data[offset] as u32) << 24)
                     | ((line.data[offset + 1] as u32) << 16)
@@ -449,40 +420,33 @@ impl ICache {
     /// Check if address is cached.
     pub fn contains(&self, addr: u32) -> bool {
         let (tag, set, _) = Self::decompose(addr);
-        self.find_way(set, tag).is_some()
+        let line = &self.lines[set];
+        line.valid && line.tag == tag
     }
 
-    /// Fill a line with data from SRAM.
+    /// Fill the (single) line for this address. Direct-mapped, so any
+    /// existing occupant is unconditionally replaced.
     pub fn fill_line(&mut self, addr: u32, data: &[u8; IC_LINE_SIZE]) {
         let (tag, set, _) = Self::decompose(addr);
-        if self.find_way(set, tag).is_some() {
-            return; // already cached
-        }
-        let victim_way = self.lru_victim(set);
-        self.lines[set][victim_way] = ICacheLine {
+        self.lines[set] = ICacheLine {
             valid: true,
             tag,
             data: *data,
         };
-        self.touch_lru(set, victim_way);
     }
 
     /// Invalidate the entire I-cache (IC_IVIC aux 0x10).
     pub fn invalidate_all(&mut self) {
         for set in 0..IC_NUM_SETS {
-            for way in 0..IC_NUM_WAYS {
-                self.lines[set][way] = ICacheLine::empty();
-            }
-            self.lru[set] = [0; IC_NUM_WAYS];
+            self.lines[set] = ICacheLine::empty();
         }
     }
 
-    /// Invalidate a single line (IC_IVIL aux 0x19).
+    /// IC_IVIL (aux 0x19) single-line invalidate: NO-OP on BCM55030.
+    /// scan7d sanity test showed the cached line survives an IC_IVIL,
+    /// so we model it as a no-op to match hardware.
     pub fn invalidate_line(&mut self, addr: u32) {
-        let (tag, set, _) = Self::decompose(addr);
-        if let Some(way) = self.find_way(set, tag) {
-            self.lines[set][way] = ICacheLine::empty();
-        }
+        let _ = addr;
     }
 }
 
@@ -739,25 +703,30 @@ mod tests {
         assert_eq!(ic.peek_half(addr), Some(0xABCD));
         assert_eq!(ic.peek_half(addr + 2), Some(0xEF12));
 
-        // Invalidate line
+        // IC_IVIL is a no-op per scan7d: the line must still be cached.
         ic.invalidate_line(addr);
+        assert_eq!(ic.peek_word(addr), Some(0xABCDEF12));
+
+        // IC_IVIC does the real invalidation.
+        ic.invalidate_all();
         assert!(ic.peek_word(addr).is_none());
     }
 
     #[test]
-    fn test_icache_eviction() {
+    fn test_icache_direct_mapped_collision() {
+        // Two addresses mapping to the same set under 1-way direct-mapped:
+        // the second fill must displace the first.
         let mut ic = ICache::new();
-        // Fill 5 lines mapping to same set (IC_NUM_SETS=128, so stride=128*32=4096)
-        // Use tag differences to map to same set 0.
-        for i in 0..(IC_NUM_WAYS + 1) {
-            let addr = ((i as u32 + 1) << (IC_OFFSET_BITS + IC_INDEX_BITS));
-            let mut data = [0u8; IC_LINE_SIZE];
-            data[0] = i as u8;
-            ic.fill_line(addr, &data);
-        }
-        // After 5 fills with 4-way: first entry should be evicted
-        let first_addr = 1u32 << (IC_OFFSET_BITS + IC_INDEX_BITS);
-        assert!(ic.peek_word(first_addr).is_none());
+        let stride: u32 = (IC_NUM_SETS as u32) << IC_OFFSET_BITS;
+        let addr_a = 0x1000u32;
+        let addr_b = 0x1000u32 + stride; // same set, different tag
+
+        ic.fill_line(addr_a, &[0xAA; IC_LINE_SIZE]);
+        assert!(ic.contains(addr_a));
+
+        ic.fill_line(addr_b, &[0xBB; IC_LINE_SIZE]);
+        assert!(!ic.contains(addr_a));
+        assert!(ic.contains(addr_b));
     }
 
     #[test]
