@@ -2,13 +2,13 @@
 //!
 //! Guards against two classes of regression:
 //!
-//! 1. **Residual auto-clear invariant** (audit 5.8 partial).
-//!    The typed peripherals own their own bits `[31:27]` auto-
-//!    clear — the sysreg residual path still applies it to
-//!    unclaimed addresses because some firmware paths (DPoE
-//!    queue-priority region `0x01000080..0x010000BC`) rely on
-//!    the behaviour and regress the boot without it. The test
-//!    pins this as "observed HW parity", not "nice to remove".
+//! 1. **Residual has no auto-clear** (audit 5.8 — fully resolved
+//!    by deferral D7). The typed peripherals own their own bits
+//!    `[31:27]` auto-clear. The sysreg residual path is a plain
+//!    backing store: writes land untouched and reads return the
+//!    stored value forever. The only register that still needs
+//!    the command-bit semantic (`0x01000160`) is now claimed by
+//!    `epon_mac.rs::REG_MPCP_CMD_LATCH`.
 //!
 //! 2. **Sub-word routing**. Half / byte accesses to an address
 //!    owned by a sparse-claim peripheral (e.g. `epon_mac.rs`)
@@ -20,28 +20,38 @@
 
 use bcm55030_emulator::soc::bank::{BootMode, PeripheralBank};
 
-/// Write command bits to a residual sysreg address, read back.
-/// The first read returns the latched value; the second read
-/// returns the value with bits `[31:27]` cleared — this matches
-/// the silicon's busy-bit protocol that the firmware polls for
-/// queue-priority register initialisation.
+/// Residual sysreg addresses are a plain backing store — writes
+/// round-trip unmodified. The bits `[31:27]` command-bit auto-
+/// clear used to live here (audit 5.8) and regressed deferral
+/// D7. The single dependent register `0x01000160` now lives in
+/// `epon_mac.rs` with its own semantic.
 #[test]
-fn residual_sysreg_autoclears_cmd_bits_on_second_read() {
+fn residual_sysreg_is_plain_backing_store() {
     let mut bank = PeripheralBank::new(BootMode::Cold);
-    // 0x01000080 is in the 0x0080..0x00BC queue priority region
-    // that still falls through to the generic sysreg store.
+    // 0x01000080 is in the queue priority region — pure residual.
     let addr = 0x0100_0080;
     bank.write_word(addr, 0xF800_00AA).unwrap();
     let first = bank.read_word(addr).unwrap();
-    assert_eq!(first, 0xF800_00AA, "first read returns latched value");
+    assert_eq!(first, 0xF800_00AA, "residual read returns latched value");
     let second = bank.read_word(addr).unwrap();
     assert_eq!(
-        second, 0x0000_00AA,
-        "second read must clear command bits [31:27]"
+        second, 0xF800_00AA,
+        "residual store must be idempotent (no auto-clear)"
     );
-    // Subsequent reads stay cleared.
-    let third = bank.read_word(addr).unwrap();
-    assert_eq!(third, 0x0000_00AA);
+}
+
+/// The MPCP command-latch register at `0x01000160` keeps the
+/// command-bit `[31:27]` auto-clear semantic inside `epon_mac`,
+/// where the single dependent firmware path polls it.
+#[test]
+fn epon_mac_mpcp_cmd_latch_autoclears_on_second_read() {
+    let mut bank = PeripheralBank::new(BootMode::Cold);
+    let addr = 0x0100_0160;
+    bank.write_word(addr, 0xF800_00AA).unwrap();
+    let first = bank.read_word(addr).unwrap();
+    assert_eq!(first, 0xF800_00AA);
+    let second = bank.read_word(addr).unwrap();
+    assert_eq!(second, 0x0000_00AA);
 }
 
 /// Half / byte accesses at sub-word offsets of an epon_mac register

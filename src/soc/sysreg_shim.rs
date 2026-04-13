@@ -41,7 +41,6 @@ pub struct ShimTraceEntry {
 pub struct SysregShim {
     pub trace: bool,
     sysreg_store: Vec<u32>,
-    sysreg_pending_clear: Vec<u32>,
     unhandled_logged: HashSet<u32>,
     pub mmio_trace: Option<HashMap<u32, ShimTraceEntry>>,
     pub current_pc: u32,
@@ -54,7 +53,6 @@ impl SysregShim {
         Self {
             trace: false,
             sysreg_store: vec![0u32; num],
-            sysreg_pending_clear: vec![0u32; num],
             unhandled_logged: HashSet::new(),
             mmio_trace: None,
             current_pc: 0,
@@ -76,9 +74,6 @@ impl SysregShim {
     /// Cold reset. Zeroes the residual backing store.
     pub fn reset_cold(&mut self) {
         for slot in &mut self.sysreg_store {
-            *slot = 0;
-        }
-        for slot in &mut self.sysreg_pending_clear {
             *slot = 0;
         }
     }
@@ -152,30 +147,22 @@ impl SysregShim {
         }
     }
 
-    fn store_read(&mut self, offset: u32) -> u32 {
+    fn store_read(&self, offset: u32) -> u32 {
         let idx = (offset / 4) as usize;
         if idx < self.sysreg_store.len() {
-            let val = self.sysreg_store[idx];
-            let clear_mask = self.sysreg_pending_clear[idx];
-            if clear_mask != 0 {
-                self.sysreg_store[idx] = val & !clear_mask;
-                self.sysreg_pending_clear[idx] = 0;
-            }
-            val
+            self.sysreg_store[idx]
         } else {
             0
         }
     }
 
     fn sysreg_read_word(&mut self, offset: u32) -> u32 {
-        // Residual fallback for offsets no typed peripheral
-        // claims. The command-bit `[31:27]` auto-clear on read is
-        // kept here because one or more firmware paths still
-        // target unclaimed queue-priority / DPoE registers with
-        // the BCM55030 command protocol — audit 5.8 is partial,
-        // not fully resolved (boot regresses without this). Each
-        // typed peripheral now owns its own clear semantic, and
-        // the residual region shrinks as more peripherals land.
+        // Pure residual fallback. Deferral D7 bisected the
+        // previously-required bits `[31:27]` auto-clear and
+        // identified a single dependent register (`0x01000160`),
+        // now owned by `epon_mac.rs::REG_MPCP_CMD_LATCH`. The
+        // shim is a plain backing store for everything else.
+        // Audit 5.8 finally resolved.
         let val = self.store_read(offset);
         self.log_unhandled_read(offset, val);
         val
@@ -186,10 +173,6 @@ impl SysregShim {
         let idx = (offset / 4) as usize;
         if idx < self.sysreg_store.len() {
             self.sysreg_store[idx] = val;
-            let cmd_bits = val & 0xF800_0000;
-            if cmd_bits != 0 {
-                self.sysreg_pending_clear[idx] = cmd_bits;
-            }
         }
     }
 
