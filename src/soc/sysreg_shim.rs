@@ -40,10 +40,8 @@ pub struct ShimTraceEntry {
 
 pub struct SysregShim {
     pub trace: bool,
-    pub timer_counter: u16,
     sysreg_store: Vec<u32>,
     sysreg_pending_clear: Vec<u32>,
-    i2c_clock_toggles: u32,
     unhandled_logged: HashSet<u32>,
     pub mmio_trace: Option<HashMap<u32, ShimTraceEntry>>,
     pub current_pc: u32,
@@ -55,10 +53,8 @@ impl SysregShim {
         let num = (SYSREG_SIZE / 4) as usize;
         Self {
             trace: false,
-            timer_counter: 0,
             sysreg_store: vec![0u32; num],
             sysreg_pending_clear: vec![0u32; num],
-            i2c_clock_toggles: 0,
             unhandled_logged: HashSet::new(),
             mmio_trace: None,
             current_pc: 0,
@@ -77,7 +73,7 @@ impl SysregShim {
         self.current_insn = insn;
     }
 
-    /// Cold reset. Leaves timer counter + snapshot-derived regs at 0.
+    /// Cold reset. Zeroes the residual backing store.
     pub fn reset_cold(&mut self) {
         for slot in &mut self.sysreg_store {
             *slot = 0;
@@ -85,8 +81,6 @@ impl SysregShim {
         for slot in &mut self.sysreg_pending_clear {
             *slot = 0;
         }
-        self.i2c_clock_toggles = 0;
-        self.timer_counter = 0;
     }
 
     /// Warm reset — apply `SYSREG_INIT_VALUES` on top of cold reset.
@@ -100,12 +94,10 @@ impl SysregShim {
         }
     }
 
-    /// Advance the EPON MAC free-running counter. Called by
-    /// `PeripheralBank::tick`. Prescaler is coarse — the actual ratio to
-    /// the CPU clock is unverified (audit 3.1); Session 6 refines it.
-    pub fn tick(&mut self, _cpu_instructions: u64) {
-        self.timer_counter = self.timer_counter.wrapping_add(1);
-    }
+    /// No-op tick. The shim no longer owns any tick-driven state
+    /// — Session 6 migrated the EPON free-running counter to
+    /// `src/soc/timer.rs`.
+    pub fn tick(&mut self, _cpu_instructions: u64) {}
 
     fn log_unhandled_read(&mut self, offset: u32, val: u32) {
         let aligned = offset & !3;
@@ -176,58 +168,18 @@ impl SysregShim {
     }
 
     fn sysreg_read_word(&mut self, offset: u32) -> u32 {
-        match offset {
-            // EPON free-running counter stays here until Session 6
-            // carves out `timer.rs`.
-            0x050 => self.timer_counter as u32,
-            // eFuse UDR bit-bang responses stay here until Session 6
-            // carves out `efuse_udr.rs`.
-            0x048 => {
-                let base = self.sysreg_store[0x048 / 4];
-                if base & 0x10 != 0 {
-                    base & !0x80000000
-                } else {
-                    base | 0x80000000
-                }
-            }
-            0x04C => {
-                let base = self.sysreg_store[0x04C / 4];
-                base | 0x80000000
-            }
-            // Filter / fatal error register at 0x3604 stays here
-            // until Session 7 carves out `fatal_filter.rs`. Every
-            // EPON MAC / MACsec / DMA arm is now owned by its own
-            // peripheral — Sessions 3 and 4 resolved the LLID and
-            // channel windows respectively.
-            0x3604 => 0,
-            _ => {
-                let val = self.store_read(offset);
-                self.log_unhandled_read(offset, val);
-                val
-            }
-        }
+        // Pure residual fallback after Session 6. Every special
+        // arm (CHIP_ID, LLID masks, queue drain, timer counter,
+        // eFuse UDR, filter/fatal error) now lives inside its own
+        // peripheral module. Unknown addresses round-trip through
+        // the generic backing store with command-bit auto-clear.
+        let val = self.store_read(offset);
+        self.log_unhandled_read(offset, val);
+        val
     }
 
     fn sysreg_write_word(&mut self, offset: u32, val: u32) {
-        match offset {
-            0x050 | 0x040 | 0x048 | 0x04C | 0x3604 => {}
-            _ => self.log_unhandled_write(offset, val),
-        }
-
-        if offset == 0x04C {
-            let old = self.sysreg_store[0x04C / 4];
-            if (val & 1) != 0 && (old & 1) == 0 {
-                self.i2c_clock_toggles += 1;
-            }
-        }
-        if offset == 0x040 {
-            let old = self.sysreg_store[0x040 / 4];
-            if (val & 0x8000) != 0 && (old & 0x8000) == 0 {
-                self.i2c_clock_toggles = 0;
-            }
-        }
-
-        // LLID anchor bit-0 clear moved to `epon_mac.rs` (Session 3).
+        self.log_unhandled_write(offset, val);
         let idx = (offset / 4) as usize;
         if idx < self.sysreg_store.len() {
             self.sysreg_store[idx] = val;

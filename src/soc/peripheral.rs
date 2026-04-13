@@ -90,6 +90,38 @@ pub enum PeripheralEvent {
     Macsec(MacsecEvent),
     Dma(DmaEvent),
     Alarm(AlarmEvent),
+    Timer(TimerEvent),
+    Efuse(EfuseEvent),
+    FatalFilter(FatalFilterEvent),
+}
+
+#[derive(Clone, Debug)]
+pub enum TimerEvent {
+    /// Override the tick-to-counter ratio (default 1 tick per bank
+    /// tick). Higher values slow the counter; lower values speed
+    /// it up for debugging / UI scrubbing.
+    SetPrescaler(u32),
+    /// Force the free-running counter to a specific value.
+    SetCounter(u32),
+}
+
+#[derive(Clone, Debug)]
+pub enum EfuseEvent {
+    /// Replace the 80-byte eFuse backing blob with the provided
+    /// bytes (padded / truncated to 80).
+    SetSnapshot(Vec<u8>),
+}
+
+#[derive(Clone, Debug)]
+pub enum FatalFilterEvent {
+    /// Raise a fatal-error bit in the filter aggregator. The
+    /// firmware watches this register and triggers a rollback boot
+    /// on any non-zero latch.
+    InjectFatal(u32),
+    /// Clear all fatal bits — used by the UI "ack fault" button.
+    ClearFatal,
+    /// Toggle a PHY link-up status bit.
+    SetLinkUp(u8, bool),
 }
 
 /// Alarm dispatch UI-driven mutations. Session 5 exposes these as
@@ -210,6 +242,9 @@ pub enum PeripheralSnapshot {
     Macsec(MacsecSnapshot),
     Dma(DmaSnapshot),
     Alarm(AlarmSnapshot),
+    Timer(TimerSnapshot),
+    Efuse(EfuseSnapshot),
+    FatalFilter(FatalFilterSnapshot),
 }
 
 impl PeripheralSnapshot {
@@ -229,6 +264,9 @@ impl PeripheralSnapshot {
             Self::Macsec(_) => "macsec",
             Self::Dma(_) => "dma",
             Self::Alarm(_) => "alarm_events",
+            Self::Timer(_) => "timer",
+            Self::Efuse(_) => "efuse_udr",
+            Self::FatalFilter(_) => "fatal_filter",
         }
     }
 }
@@ -241,6 +279,24 @@ pub struct MacsecSnapshot {
     pub pn_threshold_busy: bool,
     pub sa_slots_programmed: u8,
     pub pn_overflow_mask: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct TimerSnapshot {
+    pub counter: u32,
+    pub prescaler: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct EfuseSnapshot {
+    pub udr_status: u32,
+    pub clock_toggles: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct FatalFilterSnapshot {
+    pub fatal_status: u32,
+    pub link_up_bitmap: u32,
 }
 
 #[derive(Clone, Debug)]
