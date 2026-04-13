@@ -86,6 +86,20 @@ pub enum PeripheralEvent {
     Bsc(BscEvent),
     Pbc(PbcEvent),
     SerDes(SerDesEvent),
+    Epon(EponEvent),
+}
+
+/// EPON MAC UI-driven mutations.
+#[derive(Clone, Debug)]
+pub enum EponEvent {
+    /// Set the active bitmap bit for a given LLID index.
+    SetLlidActive(u8, bool),
+    /// Raise the per-LLID IRQ pending bit — the firmware reads this
+    /// via the IRQ status registers at stride `0x200`.
+    InjectLlidInterrupt(u8),
+    /// Clear every LLID counter back to zero. The UI surfaces this
+    /// as a "reset counters" button.
+    ResetCounters,
 }
 
 #[derive(Clone, Debug)]
@@ -151,6 +165,7 @@ pub enum PeripheralSnapshot {
     Pbc(PbcSnapshot),
     Bsc(BscSnapshot),
     SerDes(SerDesSnapshot),
+    EponMac(EponMacSnapshot),
 }
 
 impl PeripheralSnapshot {
@@ -166,8 +181,21 @@ impl PeripheralSnapshot {
             Self::Pbc(_) => "pbc",
             Self::Bsc(_) => "bsc_i2c",
             Self::SerDes(_) => "serdes",
+            Self::EponMac(_) => "epon_mac",
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct EponMacSnapshot {
+    pub chip_id: u32,
+    pub chip_rev: u32,
+    pub llid_active_bitmap: u32,
+    pub llid_capture_mask: u32,
+    pub rx_grant_mask: u32,
+    pub tx_grant_mask: u32,
+    pub irq_mask: u32,
+    pub llid_irq_pending: [u32; 6],
 }
 
 #[derive(Clone, Debug)]

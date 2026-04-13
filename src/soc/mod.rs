@@ -15,6 +15,7 @@ pub mod bank;
 pub mod boot_rom;
 pub mod bsc_i2c;
 pub mod default_store;
+pub mod epon_mac;
 pub mod mmio_blocks;
 pub mod mmio_init;
 pub mod pbc;

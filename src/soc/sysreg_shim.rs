@@ -177,13 +177,11 @@ impl SysregShim {
 
     fn sysreg_read_word(&mut self, offset: u32) -> u32 {
         match offset {
-            // ── EPON MAC core ──
-            0x000 => 0x47010203, // CHIP_ID
-            0x004 => 0xB2110816, // CHIP_REV
-            0x00C => 0x0114B820, // LLID_CAPTURE_MASK
-            0x018 => 0x00000006, // LLID_ACTIVE_BITMAP
-            0x030 => 0x0000FFFF, // RX_GRANT_MASK
+            // EPON free-running counter stays here until Session 6
+            // carves out `timer.rs`.
             0x050 => self.timer_counter as u32,
+            // eFuse UDR bit-bang responses stay here until Session 6
+            // carves out `efuse_udr.rs`.
             0x048 => {
                 let base = self.sysreg_store[0x048 / 4];
                 if base & 0x10 != 0 {
@@ -196,22 +194,21 @@ impl SysregShim {
                 let base = self.sysreg_store[0x04C / 4];
                 base | 0x80000000
             }
-            // BSC registers 0x140/0x14C/0x150 are NOT routed here — the
-            // BscI2c peripheral claims them first in the bank router.
-            // SerDes lane lock registers 0x194/0x1D4 likewise now route
-            // to the SerDes peripheral (Session 2, audit 5.3).
-            0x1E0 => 0x45504F4E, // EPON signature ("EPON")
-            o if (o & 0x1FF) == 0x1D8 && (0x15D8..=0x1FD8).contains(&o) => 0,
-            o @ 0x1400..=0x3FFF if (o.wrapping_sub(0x143C)) % 0x200 == 0 => {
+            // Filter / fatal error register at 0x3604 stays here
+            // until Session 7 carves out `fatal_filter.rs`. Every
+            // EPON MAC arm in `0x1400..0x2000` (CHIP_ID, CHIP_REV,
+            // LLID masks, LLID anchors, IRQ status, queue drain,
+            // counter stats) is now owned by `epon_mac.rs`
+            // (Session 3).
+            0x3604 => 0,
+            // Residual queue drain arms in the `0x2000..0x3FFF`
+            // stride range — not claimed by EPON MAC. Sessions 4–7
+            // (MACsec, DMA, fatal_filter) will carve these out.
+            // Keep the "bit 8 always set" behaviour so any polling
+            // loop that reaches the higher strides still advances.
+            o @ 0x2000..=0x3FFF if (o.wrapping_sub(0x143C)) % 0x200 == 0 => {
                 self.store_read(offset) | 0x100
             }
-            0x1404 | 0x1604 | 0x1804 | 0x1A04 | 0x1C04 | 0x1E04 => 0,
-            0x2804 => 0,
-            0x0064 => {
-                let val = self.store_read(offset);
-                (val & 0xFFFF_0000) | 0x0000_FFFF
-            }
-            0x3604 => 0,
             _ => {
                 let val = self.store_read(offset);
                 self.log_unhandled_read(offset, val);
@@ -222,10 +219,8 @@ impl SysregShim {
 
     fn sysreg_write_word(&mut self, offset: u32, val: u32) {
         match offset {
-            0x000 | 0x004 | 0x00C | 0x018 | 0x030 | 0x050 | 0x040 | 0x048 | 0x04C
-            | 0x1E0 | 0x2804 | 0x3604 | 0x1404 | 0x1604 | 0x1804
-            | 0x1A04 | 0x1C04 | 0x1E04 => {}
-            o if (0x1400..=0x3FFF).contains(&o) && (o.wrapping_sub(0x143C)) % 0x200 == 0 => {}
+            0x050 | 0x040 | 0x048 | 0x04C | 0x3604 => {}
+            o @ 0x2000..=0x3FFF if (o.wrapping_sub(0x143C)) % 0x200 == 0 => {}
             _ => self.log_unhandled_write(offset, val),
         }
 
@@ -242,13 +237,7 @@ impl SysregShim {
             }
         }
 
-        // LLID rx/tx config anchors (LLID 0/31): HW clears bit 0 on write-back.
-        let val = if matches!(offset, 0x043C | 0x04B8 | 0x0D00 | 0x0D7C) {
-            val & !0x0001
-        } else {
-            val
-        };
-
+        // LLID anchor bit-0 clear moved to `epon_mac.rs` (Session 3).
         let idx = (offset / 4) as usize;
         if idx < self.sysreg_store.len() {
             self.sysreg_store[idx] = val;
