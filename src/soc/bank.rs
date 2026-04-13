@@ -103,6 +103,13 @@ pub struct PeripheralBank {
 
     /// Boot mode — peripherals snapshot this during construction.
     pub boot_mode: BootMode,
+
+    /// Audit 2.2: when `true`, MMIO accesses that no peripheral
+    /// claims return [`Exception::MemoryError`] instead of silently
+    /// reading as zero. Off by default; opt in via
+    /// `--unmapped-exception` on the main binary to surface
+    /// unmodelled firmware probes.
+    pub unmapped_exception: bool,
 }
 
 impl PeripheralBank {
@@ -130,6 +137,7 @@ impl PeripheralBank {
             trace: false,
             irq_pending: 0,
             boot_mode,
+            unmapped_exception: false,
         };
         // Apply the requested reset flavour.
         match boot_mode {
@@ -333,6 +341,9 @@ impl PeripheralBank {
         if self.trace {
             eprintln!("[MMIO] read  word  0x{:08X} → 0x00000000 (unmapped)", addr);
         }
+        if self.unmapped_exception {
+            return Err(Exception::MemoryError { address: addr, is_write: false });
+        }
         Ok(0)
     }
 
@@ -381,6 +392,9 @@ impl PeripheralBank {
         if self.trace {
             eprintln!("[MMIO] write word  0x{:08X} = 0x{:08X} (unmapped)", addr, val);
         }
+        if self.unmapped_exception {
+            return Err(Exception::MemoryError { address: addr, is_write: true });
+        }
         Ok(())
     }
 
@@ -417,6 +431,9 @@ impl PeripheralBank {
         }
         if self.sysreg.claims(addr) {
             return self.sysreg.read_half(addr);
+        }
+        if self.unmapped_exception {
+            return Err(Exception::MemoryError { address: addr, is_write: false });
         }
         Ok(0)
     }
@@ -455,6 +472,9 @@ impl PeripheralBank {
         if self.sysreg.claims(addr) {
             return self.sysreg.write_half(addr, val);
         }
+        if self.unmapped_exception {
+            return Err(Exception::MemoryError { address: addr, is_write: true });
+        }
         Ok(())
     }
 
@@ -492,6 +512,9 @@ impl PeripheralBank {
         if self.sysreg.claims(addr) {
             return self.sysreg.read_byte(addr);
         }
+        if self.unmapped_exception {
+            return Err(Exception::MemoryError { address: addr, is_write: false });
+        }
         Ok(0)
     }
 
@@ -528,6 +551,9 @@ impl PeripheralBank {
         }
         if self.sysreg.claims(addr) {
             return self.sysreg.write_byte(addr, val);
+        }
+        if self.unmapped_exception {
+            return Err(Exception::MemoryError { address: addr, is_write: true });
         }
         Ok(())
     }

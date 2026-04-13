@@ -30,6 +30,14 @@ pub struct Memory {
 
     /// I-cache: 4 KB, 1-way, 32 B lines. Instruction fetch path.
     icache: Option<RefCell<ICache>>,
+
+    /// Audit 2.2: policy for MMIO reads / writes that do not match any
+    /// peripheral claim. `false` (default) returns zero so existing
+    /// code that never probes unmapped addresses stays unaffected.
+    /// `true` returns [`Exception::MemoryError`] to surface hidden
+    /// firmware accesses — enable with `--unmapped-exception` to
+    /// discover new unmodelled registers.
+    pub unmapped_exception: bool,
 }
 
 impl Memory {
@@ -42,6 +50,7 @@ impl Memory {
             dccm_watchpoint: None,
             dcache: None,
             icache: None,
+            unmapped_exception: false,
         }
     }
 
@@ -56,6 +65,7 @@ impl Memory {
             dccm_watchpoint: None,
             dcache: Some(DCache::new()),
             icache: Some(RefCell::new(ICache::new())),
+            unmapped_exception: false,
         }
     }
 
@@ -486,6 +496,13 @@ impl Memory {
     }
 
     pub fn read_word_data(&mut self, addr: u32, cache_bypass: bool) -> Result<u32, Exception> {
+        // Audit 2.1: misaligned word reads currently fall through to
+        // byte-by-byte fixup. The ARCompact PRM says an unaligned
+        // access should raise `Exception::MisalignedAccess` unless
+        // the CPU is configured for unaligned support — we have no
+        // evidence either way on BCM55030 silicon, so we keep the
+        // fixup until a bare-metal scan (`scan7b.c` style) confirms
+        // the HW behaviour. Tracked for follow-up RE.
         if cache_bypass || addr & 3 != 0 || !self.dcache_enabled() {
             let b0 = self.read_byte_backing(addr)? as u32;
             let b1 = self.read_byte_backing(addr.wrapping_add(1))? as u32;

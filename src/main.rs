@@ -25,6 +25,8 @@ fn usage(prog: &str) {
     eprintln!("  --persist-flash             Save modified flash to <flash.bin>.persist on exit");
     eprintln!("  --cold-boot                 Start with zero sysreg / no IENABLE preset");
     eprintln!("  --warm-boot                 Start with SYSREG_INIT_VALUES (default)");
+    eprintln!("  --dump-mmio-trace-cold <F>  Cold-boot + dump MMIO trace catalog to <F>");
+    eprintln!("  --unmapped-exception        Trap unclaimed MMIO as MemoryError (audit 2.2)");
 }
 
 struct Config {
@@ -40,6 +42,9 @@ struct Config {
     persist_flash: bool,
     watch_dccm: Option<u32>,
     dump_mmio_trace: Option<String>,
+    /// Audit 2.2: trap unclaimed MMIO reads / writes as
+    /// `MemoryError` exceptions instead of returning zero.
+    unmapped_exception: bool,
     boot_mode: BootMode,
 }
 
@@ -65,6 +70,7 @@ fn parse_args() -> Config {
         persist_flash: false,
         watch_dccm: None,
         dump_mmio_trace: None,
+        unmapped_exception: false,
         boot_mode: BootMode::Warm,
     };
 
@@ -146,6 +152,16 @@ fn parse_args() -> Config {
                 }
                 cfg.dump_mmio_trace = Some(args[i].clone());
             }
+            "--dump-mmio-trace-cold" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --dump-mmio-trace-cold requires a file path");
+                    process::exit(1);
+                }
+                cfg.dump_mmio_trace = Some(args[i].clone());
+                cfg.boot_mode = BootMode::Cold;
+            }
+            "--unmapped-exception" => cfg.unmapped_exception = true,
             "--cold-boot" => cfg.boot_mode = BootMode::Cold,
             "--warm-boot" => cfg.boot_mode = BootMode::Warm,
             "--help" | "-h" => {
@@ -391,6 +407,10 @@ fn main() {
     if cfg.dump_mmio_trace.is_some() {
         let mut bank = cpu.bank().unwrap().write();
         bank.sysreg.mmio_trace = Some(std::collections::HashMap::new());
+    }
+    if cfg.unmapped_exception {
+        cpu.bank().unwrap().write().unmapped_exception = true;
+        bcm55030_emulator::vlog!("[BCM55030] Unmapped-access policy = Exception (audit 2.2)");
     }
 
     let orig_termios = setup_raw_terminal();
