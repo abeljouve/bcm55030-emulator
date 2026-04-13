@@ -23,6 +23,7 @@ pub mod macsec;
 pub mod mmio_blocks;
 pub mod mmio_init;
 pub mod mpcp;
+pub mod nco;
 pub mod pbc;
 pub mod peripheral;
 pub mod serdes;

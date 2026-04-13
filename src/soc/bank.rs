@@ -22,6 +22,7 @@ use crate::soc::epon_mac::EponMac;
 use crate::soc::fatal_filter::FatalFilter;
 use crate::soc::macsec::Macsec;
 use crate::soc::mpcp::Mpcp;
+use crate::soc::nco::Nco;
 use crate::soc::pbc::Pbc;
 use crate::soc::peripheral::{
     DatapathOp, Peripheral, PeripheralEvent, PeripheralId, PeripheralSnapshot,
@@ -73,6 +74,7 @@ pub struct PeripheralBank {
     pub efuse_udr: EfuseUdr,
     pub fatal_filter: FatalFilter,
     pub mpcp: Mpcp,
+    pub nco: Nco,
 
     /// Temporary residual-plus-legacy-arms for the SYSREG range
     /// (`0x01000000..0x01003800`). Hosts every stub that has not yet been
@@ -130,6 +132,7 @@ impl PeripheralBank {
             efuse_udr: EfuseUdr::new(),
             fatal_filter: FatalFilter::new(),
             mpcp: Mpcp::new(),
+            nco: Nco::new(),
             sysreg: SysregShim::new(),
             uart_rx_sender: tx,
             uart_rx_receiver: rx,
@@ -183,6 +186,7 @@ impl PeripheralBank {
         self.efuse_udr.tick(cpu_instructions);
         self.fatal_filter.tick(cpu_instructions);
         self.mpcp.tick(cpu_instructions);
+        self.nco.tick(cpu_instructions);
         self.sysreg.tick(cpu_instructions);
 
         // Aggregate IRQ pending bits. UART is the only v1 contributor
@@ -206,6 +210,7 @@ impl PeripheralBank {
         self.efuse_udr.reset_cold();
         self.fatal_filter.reset_cold();
         self.mpcp.reset_cold();
+        self.nco.reset_cold();
         self.sysreg.reset_cold();
         self.irq_pending = 0;
         self.current_pc = 0;
@@ -227,6 +232,7 @@ impl PeripheralBank {
         self.efuse_udr.reset_warm();
         self.fatal_filter.reset_warm();
         self.mpcp.reset_warm();
+        self.nco.reset_warm();
         self.sysreg.reset_warm();
         self.irq_pending = 0;
         self.current_pc = 0;
@@ -264,7 +270,7 @@ impl PeripheralBank {
 
     /// Dispatch a UI event to the peripheral that understands it.
     pub fn inject_event(&mut self, event: &PeripheralEvent) -> bool {
-        let targets: [&mut dyn Peripheral; 12] = [
+        let targets: [&mut dyn Peripheral; 13] = [
             &mut self.uart,
             &mut self.pbc,
             &mut self.bsc_i2c,
@@ -277,6 +283,7 @@ impl PeripheralBank {
             &mut self.efuse_udr,
             &mut self.fatal_filter,
             &mut self.mpcp,
+            &mut self.nco,
         ];
         for p in targets {
             if p.inject_event(event).is_ok() {
@@ -345,6 +352,9 @@ impl PeripheralBank {
         if self.mpcp.claims(addr) {
             return self.mpcp.read_word(addr);
         }
+        if self.nco.claims(addr) {
+            return self.nco.read_word(addr);
+        }
         if self.sysreg.claims(addr) {
             return self.sysreg.read_word(addr);
         }
@@ -399,6 +409,9 @@ impl PeripheralBank {
         if self.mpcp.claims(addr) {
             return self.mpcp.write_word(addr, val);
         }
+        if self.nco.claims(addr) {
+            return self.nco.write_word(addr, val);
+        }
         if self.sysreg.claims(addr) {
             return self.sysreg.write_word(addr, val);
         }
@@ -445,6 +458,9 @@ impl PeripheralBank {
         if self.mpcp.claims(addr) {
             return self.mpcp.read_half(addr);
         }
+        if self.nco.claims(addr) {
+            return self.nco.read_half(addr);
+        }
         if self.sysreg.claims(addr) {
             return self.sysreg.read_half(addr);
         }
@@ -487,6 +503,9 @@ impl PeripheralBank {
         }
         if self.mpcp.claims(addr) {
             return self.mpcp.write_half(addr, val);
+        }
+        if self.nco.claims(addr) {
+            return self.nco.write_half(addr, val);
         }
         if self.sysreg.claims(addr) {
             return self.sysreg.write_half(addr, val);
@@ -531,6 +550,9 @@ impl PeripheralBank {
         if self.mpcp.claims(addr) {
             return self.mpcp.read_byte(addr);
         }
+        if self.nco.claims(addr) {
+            return self.nco.read_byte(addr);
+        }
         if self.sysreg.claims(addr) {
             return self.sysreg.read_byte(addr);
         }
@@ -573,6 +595,9 @@ impl PeripheralBank {
         }
         if self.mpcp.claims(addr) {
             return self.mpcp.write_byte(addr, val);
+        }
+        if self.nco.claims(addr) {
+            return self.nco.write_byte(addr, val);
         }
         if self.sysreg.claims(addr) {
             return self.sysreg.write_byte(addr, val);
