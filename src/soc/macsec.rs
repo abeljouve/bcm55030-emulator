@@ -45,11 +45,30 @@ pub const MACSEC_SA_END: u32 = 0x0100_2D40;
 pub const MACSEC_KEY_TAIL_BASE: u32 = 0x0100_3500;
 pub const MACSEC_KEY_TAIL_END: u32 = 0x0100_3540;
 
-/// Mask covering the command bits that auto-clear on the next read.
-/// The firmware issues commands by writing a value with bits 27..31
-/// set (busy + cmd trigger) and then polls the same register for
-/// those bits to clear. Modelled as a pending-clear shadow store.
-const CMD_BIT_MASK: u32 = 0xF800_0000;
+/// Bit 31 is the command trigger on the BCM55030 MDIO / key engine
+/// busy registers. Software writes a value with bit 31 set to start
+/// an operation and polls the same register for that bit to clear.
+/// Applied only to the specific offsets listed in [`CMD_REGS`] —
+/// generic SA config registers in the same range are plain storage.
+const CMD_BIT: u32 = 0x8000_0000;
+
+/// Concrete registers inside the MACsec claim range that use the
+/// bit-31 command / busy protocol. Any other offset is a plain
+/// backing store.
+///
+///   * `0x0100240C` — MDIO PHY command register, 1 Gb bank
+///     (`DAT_ram_2003550c + 0x34`, `phy_mdio_rw_op`).
+///   * `0x0100280C` — same, 10 Gb bank (`+ 0x400`).
+///   * `0x01002644` — MPCP HW Command Engine slot 0
+///     (`DAT_ram_20035e4c`, `mpcp_slot_hw_dispatch_command_and_wait`).
+///   * `0x01002A44` — MPCP HW Command Engine slot 1 (`+ 0x400`).
+///
+/// Identified by tracing each busy-wait loop in Ghidra after a
+/// naive "clear bits [31:27] on every write" broke UART interactivity
+/// via false-positive state-change detections in
+/// `epon_poll_hw_state_changes`. Documented in the design notes as the D8
+/// investigation.
+const CMD_REGS: &[u32] = &[0x0100_240C, 0x0100_280C, 0x0100_2644, 0x0100_2A44];
 
 const MACSEC_SA_RANGES: &[AddressRange] = &[
     AddressRange::new(MACSEC_SA_BASE, MACSEC_SA_END),
@@ -66,6 +85,12 @@ pub struct Macsec {
     /// Bit `n` is set when SA slot `n` has a forced PN overflow.
     pn_overflow_mask: u32,
 
+    /// Software-written fatal error mask (`FATAL_ERROR_MASK` at
+    /// `0x01002804`). Kept separately so the backing store does
+    /// not alias the read-only `FATAL_ERROR_STATUS` at the same
+    /// address.
+    fatal_error_mask: u32,
+
     pub trace: bool,
 }
 
@@ -79,6 +104,7 @@ impl Macsec {
             key_tail_store: vec![0u32; tail_words],
             key_tail_pending_clear: vec![0u32; tail_words],
             pn_overflow_mask: 0,
+            fatal_error_mask: 0,
             trace: false,
         }
     }
@@ -111,16 +137,16 @@ impl Macsec {
         val
     }
 
-    fn write_slot(
+    fn write_slot_sparse(
         store: &mut [u32],
         pending: &mut [u32],
         idx: usize,
+        abs_addr: u32,
         val: u32,
     ) {
         store[idx] = val;
-        let cmd_bits = val & CMD_BIT_MASK;
-        if cmd_bits != 0 {
-            pending[idx] = cmd_bits;
+        if CMD_REGS.contains(&abs_addr) && (val & CMD_BIT) != 0 {
+            pending[idx] = CMD_BIT;
         }
     }
 
@@ -148,13 +174,26 @@ impl Peripheral for Macsec {
     }
 
     fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
+        // Write-one-read-another aliases at 0x01002804:
+        //   * Write path → block 5602 FATAL_ERROR_MASK (software sets
+        //     the fatal-error bit mask, typically 0x105C)
+        //   * Read path  → block 5601 FATAL_ERROR_STATUS, which on
+        //     silicon returns 0 when no fatal condition is latched
+        // A shared backing store would let the MASK write poison
+        // the STATUS read, which is exactly what Session 8's UART
+        // interactivity bug was — `epon_poll_hw_state_changes`
+        // saw bits 0x105C flipping and triggered a shutdown loop.
+        if addr == 0x0100_2804 {
+            return Ok(0);
+        }
         if (MACSEC_SA_BASE..MACSEC_SA_END).contains(&addr) {
             let idx = Self::sa_idx(addr);
-            return Ok(Self::read_slot(
+            let val = Self::read_slot(
                 &mut self.sa_store,
                 &mut self.sa_pending_clear,
                 idx,
-            ));
+            );
+            return Ok(val);
         }
         if (MACSEC_KEY_TAIL_BASE..MACSEC_KEY_TAIL_END).contains(&addr) {
             let idx = Self::key_tail_idx(addr);
@@ -170,20 +209,32 @@ impl Peripheral for Macsec {
     fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
         if (MACSEC_SA_BASE..MACSEC_SA_END).contains(&addr) {
             let idx = Self::sa_idx(addr);
-            Self::write_slot(
+            // FATAL_ERROR_MASK write (see the matching read arm
+            // above). Stash the value so the UI snapshot can
+            // surface it, but do not let it alias the STATUS
+            // read. A shared backing-store array would cause
+            // `epon_poll_hw_state_changes` to see bits flipping
+            // and fire an unexpected shutdown.
+            if addr == 0x0100_2804 {
+                self.fatal_error_mask = val;
+                return Ok(());
+            }
+            Self::write_slot_sparse(
                 &mut self.sa_store,
                 &mut self.sa_pending_clear,
                 idx,
+                addr,
                 val,
             );
             return Ok(());
         }
         if (MACSEC_KEY_TAIL_BASE..MACSEC_KEY_TAIL_END).contains(&addr) {
             let idx = Self::key_tail_idx(addr);
-            Self::write_slot(
+            Self::write_slot_sparse(
                 &mut self.key_tail_store,
                 &mut self.key_tail_pending_clear,
                 idx,
+                addr,
                 val,
             );
             return Ok(());
@@ -199,6 +250,7 @@ impl Peripheral for Macsec {
         self.key_tail_store.fill(0);
         self.key_tail_pending_clear.fill(0);
         self.pn_overflow_mask = 0;
+        self.fatal_error_mask = 0;
     }
 
     fn reset_warm(&mut self) {
@@ -255,12 +307,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sa_write_readback_with_command_bit_autoclear() {
+    fn sa_config_register_is_plain_backing_store() {
         let mut m = Macsec::new();
         m.write_word(0x0100_2480, 0x8000_00AA).unwrap();
+        // SA config registers do NOT use the command-bit protocol.
+        // Subsequent reads return the stored value unchanged.
         assert_eq!(m.read_word(0x0100_2480).unwrap(), 0x8000_00AA);
-        // After one read, command bits 27..31 drop out.
-        assert_eq!(m.read_word(0x0100_2480).unwrap(), 0x0000_00AA);
+        assert_eq!(m.read_word(0x0100_2480).unwrap(), 0x8000_00AA);
+    }
+
+    #[test]
+    fn mdio_command_register_clears_bit31_on_read() {
+        let mut m = Macsec::new();
+        // 0x0100240C is the 1 Gb MDIO PHY command register.
+        m.write_word(0x0100_240C, 0x8000_1234).unwrap();
+        assert_eq!(m.read_word(0x0100_240C).unwrap(), 0x8000_1234);
+        // Second read: bit 31 cleared (operation complete).
+        assert_eq!(m.read_word(0x0100_240C).unwrap(), 0x0000_1234);
+        // Same semantic for the 10 Gb bank.
+        m.write_word(0x0100_280C, 0x8000_5678).unwrap();
+        assert_eq!(m.read_word(0x0100_280C).unwrap(), 0x8000_5678);
+        assert_eq!(m.read_word(0x0100_280C).unwrap(), 0x0000_5678);
     }
 
     #[test]
