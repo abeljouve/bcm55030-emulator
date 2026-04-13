@@ -2,8 +2,10 @@ use std::env;
 use std::fs;
 use std::os::unix::io::AsRawFd;
 use std::process;
+use std::sync::mpsc::Sender;
 
 use bcm55030_emulator::cpu::Cpu;
+use bcm55030_emulator::soc::bank::BootMode;
 
 fn usage(prog: &str) {
     eprintln!("BCM55030 ARC 700 Emulator");
@@ -21,6 +23,8 @@ fn usage(prog: &str) {
     eprintln!("  --break <ADDR>              Stop at address (hex)");
     eprintln!("  --dccm-dump <FILE>          Dump DCCM to file on exit");
     eprintln!("  --persist-flash             Save modified flash to <flash.bin>.persist on exit");
+    eprintln!("  --cold-boot                 Start with zero sysreg / no IENABLE preset");
+    eprintln!("  --warm-boot                 Start with SYSREG_INIT_VALUES (default)");
 }
 
 struct Config {
@@ -36,6 +40,7 @@ struct Config {
     persist_flash: bool,
     watch_dccm: Option<u32>,
     dump_mmio_trace: Option<String>,
+    boot_mode: BootMode,
 }
 
 fn parse_hex(s: &str) -> Option<u32> {
@@ -60,6 +65,7 @@ fn parse_args() -> Config {
         persist_flash: false,
         watch_dccm: None,
         dump_mmio_trace: None,
+        boot_mode: BootMode::Warm,
     };
 
     let mut i = 1;
@@ -140,6 +146,8 @@ fn parse_args() -> Config {
                 }
                 cfg.dump_mmio_trace = Some(args[i].clone());
             }
+            "--cold-boot" => cfg.boot_mode = BootMode::Cold,
+            "--warm-boot" => cfg.boot_mode = BootMode::Warm,
             "--help" | "-h" => {
                 usage(prog);
                 process::exit(0);
@@ -165,22 +173,16 @@ fn parse_args() -> Config {
     cfg
 }
 
-/// Detect the bootloader code size in a flash image.
-/// BCM55030 hardware DMA copies exactly 64 KB from SPI flash offset 0 to SRAM.
-/// Verified on real hardware via bare-metal memsize test (2026-04-12).
 const BOOT_DMA_SIZE: usize = 64 * 1024;
 
-/// Set up terminal in raw mode for interactive CLI.
 fn setup_raw_terminal() -> Option<libc::termios> {
     unsafe {
         let fd = std::io::stdin().as_raw_fd();
-        // Always set O_NONBLOCK on stdin (needed for piped/non-tty input too)
         let flags = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
 
         let mut orig: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(fd, &mut orig) != 0 {
-            // Not a terminal (piped stdin) — O_NONBLOCK is set, no raw mode needed
             return None;
         }
         let mut raw = orig;
@@ -216,28 +218,21 @@ fn try_read_stdin() -> Option<u8> {
     }
 }
 
-/// Result of run_emulator: tells the caller what to do next.
 enum RunResult {
-    /// CPU halted (FLAG 1) — treat as hardware reset, reboot from flash
     Reboot,
-    /// User requested exit (Ctrl-C) — stop completely
     UserExit,
-    /// Breakpoint hit — stop for debugging
     Breakpoint,
-    /// CPU exception — stop with error
     Exception(bcm55030_emulator::cpu::exception::Exception),
-    /// Max cycles reached
     MaxCycles,
 }
 
-fn run_emulator(cpu: &mut Cpu, cfg: &Config) -> RunResult {
+fn run_emulator(cpu: &mut Cpu, cfg: &Config, uart_tx: &Sender<u8>) -> RunResult {
     let mut trace_armed = cfg.trace_from_insn.is_some();
     for step in 0..cfg.max_cycles {
         if cpu.state.halted {
             return RunResult::Reboot;
         }
 
-        // Late-arm tracing once instruction count crosses the threshold.
         if trace_armed {
             if let Some(threshold) = cfg.trace_from_insn {
                 if cpu.state.instruction_count >= threshold {
@@ -248,23 +243,18 @@ fn run_emulator(cpu: &mut Cpu, cfg: &Config) -> RunResult {
             }
         }
 
-        // Poll stdin every 1024 steps — feed into UART RX queue
+        // Poll stdin every 1024 steps — push bytes into the UART
+        // receive channel. No firmware-specific branching: bytes typed
+        // during the bootloader are consumed by the bootloader CLI,
+        // bytes typed during firmware by the firmware CLI. Hardware-faithful.
         if step % 1024 == 0 {
-            // Firmware phase: PC is past the bootloader footprint (0..0xA800).
-            let firmware_loaded = cpu.state.pc >= bcm55030_emulator::soc::boot_rom::FIRMWARE_BASE;
             while let Some(byte) = try_read_stdin() {
                 if byte == 3 {
                     eprintln!("\n[BCM55030] Ctrl-C, stopping");
                     cpu.state.halted = true;
                     return RunResult::UserExit;
                 }
-                if let Some(mut mmio) = cpu.mem.mmio() {
-                    mmio.uart.rx_queue.push_back(byte);
-                    // Pre-firmware bytes need a parallel copy — bootloader ISR drops them.
-                    if !firmware_loaded {
-                        mmio.uart.held_pre_firmware.push_back(byte);
-                    }
-                }
+                let _ = uart_tx.send(byte);
             }
         }
 
@@ -283,57 +273,54 @@ fn run_emulator(cpu: &mut Cpu, cfg: &Config) -> RunResult {
 }
 
 /// HW boot: DMA 64 KB flash → SRAM, start at entry_point.
-fn boot_from_flash(cpu: &mut Cpu, entry_point: u32) {
+fn boot_from_flash(cpu: &mut Cpu, entry_point: u32, mode: BootMode) {
     let copy_size = {
-        let mmio = cpu.mem.mmio().unwrap();
-        mmio.pbc.flash.data.len().min(BOOT_DMA_SIZE)
+        let bank = cpu.bank().unwrap().read();
+        bank.pbc.flash.data.len().min(BOOT_DMA_SIZE)
     };
-    {
-        let code = {
-            let mmio = cpu.mem.mmio().unwrap();
-            mmio.pbc.flash.data[..copy_size].to_vec()
-        };
-        cpu.mem.load_binary(0, &code);
-    }
+    let code = {
+        let bank = cpu.bank().unwrap().read();
+        bank.pbc.flash.data[..copy_size].to_vec()
+    };
+    cpu.mem.load_binary(0, &code);
     bcm55030_emulator::vlog!(
         "[BCM55030] HW DMA: copied {} bytes (0x{:X}) from flash to SRAM",
         copy_size, copy_size
     );
 
-    // Preset IENABLE/E1/E2 — bootloader enables them later but the emulator
-    // UART IRQ path needs them from instruction 0.
-    cpu.state.aux_ienable = 0xFFFFFFFF;
-    cpu.state.flag_e1 = true;
-    cpu.state.flag_e2 = true;
+    // Audit 1.1: only preset IENABLE/E1/E2 in warm-boot mode. Cold boot
+    // leaves them at cold-reset values so the firmware has to enable
+    // interrupts via its own FLAG instruction at uart_enable_interrupts.
+    if mode == BootMode::Warm {
+        cpu.state.aux_ienable = 0xFFFFFFFF;
+        cpu.state.flag_e1 = true;
+        cpu.state.flag_e2 = true;
+    }
 
     cpu.state.pc = entry_point;
     bcm55030_emulator::vlog!(
-        "[BCM55030] Entry: 0x{:08X}, SRAM=512KB, boot DMA=64KB",
-        entry_point
+        "[BCM55030] Entry: 0x{:08X}, SRAM=512KB, boot DMA=64KB, mode={:?}",
+        entry_point, mode
     );
 }
 
-/// Reset the CPU and DCCM for a fresh boot, preserving SPI flash state.
-/// This emulates a hardware reset: all volatile state (registers, DCCM)
-/// is cleared, but the SPI flash retains its contents.
 fn reset_cpu_for_reboot(cpu: &mut Cpu) {
     use bcm55030_emulator::cpu::registers::CpuState;
 
-    // Reset CPU state (all registers, flags, aux regs). Preserve SoC-integration
-    // fields that describe hardware wiring (timer IRQ lines).
     let saved_timer1_irq = cpu.state.timer1_irq;
     cpu.state = CpuState::new();
     cpu.state.timer1_irq = saved_timer1_irq;
 
-    // Clear SRAM (volatile RAM)
     let sram_size = cpu.mem.sram_size();
     let zeros = vec![0u8; sram_size];
     cpu.mem.load_binary(0, &zeros);
 
-    // Reset peripheral state but NOT flash data (non-volatile)
-    if let Some(mut mmio) = cpu.mem.mmio() {
-        mmio.uart.rx_queue.clear();
-        mmio.pbc.reset_state();
+    if let Some(bank) = cpu.bank() {
+        // Cold reset on reboot — the FLAG 1 chip reset is a hardware
+        // event, so all volatile peripheral state zeroes out. Flash
+        // contents persist (they live inside the PBC's `SpiFlash`
+        // which preserves `data` across `reset_cold`).
+        bank.write().reset_cold();
     }
 }
 
@@ -341,7 +328,6 @@ fn main() {
     let cfg = parse_args();
     bcm55030_emulator::set_verbose(cfg.verbose);
 
-    // Read flash image (or persisted version if available)
     let persist_path = format!("{}.persist", cfg.flash_path);
     let (flash_data, using_persisted) = if cfg.persist_flash {
         match fs::read(&persist_path) {
@@ -378,47 +364,46 @@ fn main() {
         if using_persisted { ", persisted state" } else { "" }
     );
 
-    // --- Create BCM55030 CPU ---
-    let mut cpu = Cpu::new_bcm55030();
+    let mut cpu = Cpu::new_bcm55030(cfg.boot_mode);
 
-    // --- Register BCM55030 SoC hooks ---
-    bcm55030_emulator::soc::register_hooks(&mut cpu.hooks);
+    // --- Acquire UART input sender for stdin → UART wiring ---
+    let uart_tx = cpu.bank().unwrap().read().uart_rx_sender();
 
     // --- Load flash image into SPI flash peripheral ---
     {
-        let mut mmio = cpu.mem.mmio().expect("BCM55030 must have MMIO");
-        let flash_size = mmio.pbc.flash.data.len();
+        let mut bank = cpu.bank().unwrap().write();
+        let flash_size = bank.pbc.flash.data.len();
         let copy_len = flash_data.len().min(flash_size);
-        mmio.pbc.flash.data[..copy_len].copy_from_slice(&flash_data[..copy_len]);
+        bank.pbc.flash.data[..copy_len].copy_from_slice(&flash_data[..copy_len]);
         bcm55030_emulator::vlog!("[BCM55030] SPI flash: {} bytes loaded", copy_len);
     }
 
-    // --- Initial boot from flash ---
-    boot_from_flash(&mut cpu, cfg.entry_point);
+    boot_from_flash(&mut cpu, cfg.entry_point, cfg.boot_mode);
 
     cpu.trace = cfg.trace;
     cpu.mem.dccm_watchpoint = cfg.watch_dccm;
     if cfg.trace_mmio {
-        if let Some(mut mmio) = cpu.mem.mmio() {
-            mmio.trace = true;
-            mmio.pbc.trace = true;
-        }
+        let mut bank = cpu.bank().unwrap().write();
+        bank.trace = true;
+        bank.sysreg.trace = true;
+        bank.pbc.trace = true;
     }
     if cfg.dump_mmio_trace.is_some() {
-        if let Some(mut mmio) = cpu.mem.mmio() {
-            mmio.mmio_trace = Some(std::collections::HashMap::new());
-        }
+        let mut bank = cpu.bank().unwrap().write();
+        bank.sysreg.mmio_trace = Some(std::collections::HashMap::new());
     }
 
     let orig_termios = setup_raw_terminal();
 
-    // FLAG 1 triggers chip reset. Flash persists across reboots.
-    const MAX_REBOOTS: u32 = 5;
+    // Safety rail: infinite-loop firmware gets N chances before we give
+    // up. Raised from 5 → u32::MAX (audit 8.3 — the old 5-reboot cap
+    // was an arbitrary development fence, not hardware behaviour).
+    const MAX_REBOOTS: u32 = u32::MAX;
     let mut reboot_count: u32 = 0;
     let final_result;
 
     loop {
-        let result = run_emulator(&mut cpu, &cfg);
+        let result = run_emulator(&mut cpu, &cfg, &uart_tx);
         match result {
             RunResult::Reboot => {
                 reboot_count += 1;
@@ -431,18 +416,15 @@ fn main() {
                     "\n[BCM55030] === REBOOT #{} (FLAG 1 = hardware reset) ===\n",
                     reboot_count
                 );
-                // Reset CPU and DCCM, keep flash state
                 reset_cpu_for_reboot(&mut cpu);
-                // Re-run boot ROM sequence from (possibly modified) flash
-                boot_from_flash(&mut cpu, cfg.entry_point);
+                boot_from_flash(&mut cpu, cfg.entry_point, cfg.boot_mode);
                 cpu.trace = cfg.trace;
                 if cfg.trace_mmio {
-                    if let Some(mut mmio) = cpu.mem.mmio() {
-                        mmio.trace = true;
-                        mmio.pbc.trace = true;
-                    }
+                    let mut bank = cpu.bank().unwrap().write();
+                    bank.trace = true;
+                    bank.sysreg.trace = true;
+                    bank.pbc.trace = true;
                 }
-                // Continue execution loop
             }
             _ => {
                 final_result = result;
@@ -459,7 +441,6 @@ fn main() {
         eprintln!("Exception at PC=0x{:08X}: {:?}", cpu.state.pc, e);
     }
 
-    // Final state
     eprintln!();
     eprintln!("=== Final State ===");
     eprintln!("PC: 0x{:08X}", cpu.state.pc);
@@ -496,7 +477,6 @@ fn main() {
     }
     eprintln!("Reboots: {}", reboot_count);
 
-    // DCCM dump
     if let Some(ref path) = cfg.dccm_dump {
         bcm55030_emulator::vlog!("[BCM55030] Dumping DCCM to {}", path);
         let size = cpu.mem.sram_size();
@@ -509,43 +489,45 @@ fn main() {
         }
     }
 
-    // Unhandled MMIO trace dump
     if let Some(ref path) = cfg.dump_mmio_trace {
-        if let Some(mut mmio) = cpu.mem.mmio() {
-            if let Some(trace) = mmio.mmio_trace.take() {
-                let mut entries: Vec<(u32, bcm55030_emulator::soc::mmio::MmioTraceEntry)> =
-                    trace.into_iter().collect();
-                entries.sort_by_key(|(off, _)| *off);
-                let mut text = String::new();
-                text.push_str("# Unhandled MMIO accesses (sorted by sysreg offset)\n");
-                text.push_str("# offset      addr        reads  writes  last_read   last_write  first_pc  first_insn\n");
-                for (off, e) in &entries {
-                    text.push_str(&format!(
-                        "0x{:04X}  0x{:08X}  {:6}  {:6}  0x{:08X}  0x{:08X}  0x{:05X}  {}\n",
-                        off,
-                        0x01000000u32 + off,
-                        e.reads,
-                        e.writes,
-                        e.last_read_value,
-                        e.last_write_value,
-                        e.first_pc,
-                        e.first_insn,
-                    ));
-                }
-                if let Err(err) = fs::write(path, text) {
-                    eprintln!("Error writing MMIO trace: {}", err);
-                } else {
-                    eprintln!("[BCM55030] MMIO trace ({} unique addresses) → {}", entries.len(), path);
-                }
+        let trace = {
+            let mut bank = cpu.bank().unwrap().write();
+            bank.sysreg.mmio_trace.take()
+        };
+        if let Some(trace) = trace {
+            let mut entries: Vec<(u32, bcm55030_emulator::soc::sysreg_shim::ShimTraceEntry)> =
+                trace.into_iter().collect();
+            entries.sort_by_key(|(off, _)| *off);
+            let mut text = String::new();
+            text.push_str("# Unhandled MMIO accesses (sorted by sysreg offset)\n");
+            text.push_str("# offset      addr        reads  writes  last_read   last_write  first_pc  first_insn\n");
+            for (off, e) in &entries {
+                text.push_str(&format!(
+                    "0x{:04X}  0x{:08X}  {:6}  {:6}  0x{:08X}  0x{:08X}  0x{:05X}  {}\n",
+                    off,
+                    0x01000000u32 + off,
+                    e.reads,
+                    e.writes,
+                    e.last_read_value,
+                    e.last_write_value,
+                    e.first_pc,
+                    e.first_insn,
+                ));
+            }
+            if let Err(err) = fs::write(path, text) {
+                eprintln!("Error writing MMIO trace: {}", err);
+            } else {
+                eprintln!("[BCM55030] MMIO trace ({} unique addresses) → {}", entries.len(), path);
             }
         }
     }
 
-    // Persist flash if requested and modified
     if cfg.persist_flash {
-        let is_dirty = cpu.mem.mmio().map_or(false, |mmio| mmio.pbc.flash.dirty);
+        let (is_dirty, flash_data) = {
+            let bank = cpu.bank().unwrap().read();
+            (bank.pbc.flash.dirty, bank.pbc.flash.data.clone())
+        };
         if is_dirty {
-            let flash_data: Vec<u8> = cpu.mem.mmio().unwrap().pbc.flash.data.clone();
             match fs::write(&persist_path, &flash_data) {
                 Ok(_) => bcm55030_emulator::vlog!("[BCM55030] Flash persisted to {} ({} bytes)", persist_path, flash_data.len()),
                 Err(e) => eprintln!("Error persisting flash: {}", e),

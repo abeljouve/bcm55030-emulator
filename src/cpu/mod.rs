@@ -2,6 +2,10 @@ pub mod condition;
 pub mod exception;
 pub mod registers;
 
+use std::sync::Arc;
+
+use parking_lot::RwLock;
+
 use exception::Exception;
 use registers::{CpuState, DelayState, REG_BLINK, REG_ILINK1, REG_ILINK2, REG_LP_COUNT};
 
@@ -10,13 +14,12 @@ use crate::executor;
 use crate::hooks::{self, HookAction, HookTable};
 use crate::memory::Memory;
 use crate::soc::alarm::AlarmModel;
+use crate::soc::bank::{BootMode, PeripheralBank, BANK_TICK_PRESCALER};
 
 /// UART interrupt number (IRQ 5, level 1 per aux_irq_lev = 0xD7 bit 5 = 0).
 const UART_IRQ: u32 = 5;
 
-/// UART IRQ prescaler: check every N instructions.
-/// On real hardware, the UART is baud-rate limited (~5760 bytes/sec at 57600 baud).
-/// Without throttling, the ISR drains the TX ring buffer instantly.
+/// UART IRQ poll prescaler (audit 3.2).
 const UART_PRESCALER: u64 = 256;
 
 pub struct Cpu {
@@ -24,17 +27,24 @@ pub struct Cpu {
     pub mem: Memory,
     /// Log every instruction to stderr
     pub trace: bool,
-    /// PC address hooks for SoC-specific behavior
+    /// PC address hooks for breakpoints / watchpoints / run-to-cursor.
+    /// Empty by default on `develop` — all 35 SoC-specific entries from
+    /// the old `register_hooks()` were deleted per the contributor guide. The
+    /// infrastructure stays for the future UI debug features.
     pub hooks: HookTable,
     /// Fractional accumulator for ARC Timer0/1 tick rate.
-    /// Real HW: 156.25 MHz clock, ~1.76 cycles/instruction on average.
-    /// We add 176 per step and tick when accumulator >= 100,
-    /// producing an exact average of 1.76 ticks per instruction.
+    /// 156.25 MHz clock, ~1.76 cycles/instruction average.
     timer_frac_acc: u32,
-    /// Persistent alarm / GPIO channel-event HW model. Ticked from step()
-    /// to assert the 7 quiescent-ONU alarm bits and the DPoE OAM chan-15
-    /// linked-list node that real HW drives from MMIO sources we do not
-    /// yet model.
+    /// Shared peripheral bank (cloned from `mem.bank()`). Cpu holds an
+    /// additional `Arc` clone so it can tick the bank without going
+    /// through `Memory`'s hot path.
+    bank: Option<Arc<RwLock<PeripheralBank>>>,
+    /// Instructions elapsed since the last bank tick.
+    bank_tick_accumulator: u64,
+    /// Transitional alarm model — preserved until `alarm_events.rs`
+    /// lands in Session 5 and replaces it with real event sources.
+    /// Audit 7.1 tracks the migration. Writes DCCM directly, NOT a
+    /// firmware hook (`AlarmModel::tick` only seeds SRAM state).
     pub alarm: AlarmModel,
 }
 
@@ -47,25 +57,35 @@ impl Cpu {
             trace: false,
             hooks: HookTable::new(),
             timer_frac_acc: 0,
+            bank: None,
+            bank_tick_accumulator: 0,
             alarm: AlarmModel::new(),
         }
     }
 
-    /// Create a BCM55030 CPU with unified SRAM + MMIO.
-    pub fn new_bcm55030() -> Self {
+    /// Create a BCM55030 CPU with unified SRAM + peripheral bank.
+    pub fn new_bcm55030(boot_mode: BootMode) -> Self {
         let mut state = CpuState::new();
         // BCM55030 wires Timer 1 to IRQ 7 (standard ARC 700 uses IRQ 4).
-        // Firmware installs a tick-counter handler at vec 7 via
-        // `hw_timer_reset_and_set_auxreg7` (ram:20001bb8).
         state.timer1_irq = 7;
+        let mem = Memory::new_soc(crate::memory::SRAM_SIZE, boot_mode);
+        let bank = mem.bank().cloned();
         Self {
             state,
-            mem: Memory::new_soc(crate::memory::SRAM_SIZE),
+            mem,
             trace: false,
             hooks: HookTable::new(),
             timer_frac_acc: 0,
+            bank,
+            bank_tick_accumulator: 0,
             alarm: AlarmModel::new(),
         }
+    }
+
+    /// Access the shared peripheral bank handle. Used by `main.rs` to
+    /// grab the UART mpsc sender and wire stdin → UART input.
+    pub fn bank(&self) -> Option<&Arc<RwLock<PeripheralBank>>> {
+        self.bank.as_ref()
     }
 
     pub fn step(&mut self) -> Result<(), Exception> {
@@ -73,8 +93,8 @@ impl Cpu {
             return Ok(());
         }
 
-        // Hook dispatch — all SoC-specific behavior
-        // is injected via hooks. The core ARC700 step loop has no SoC knowledge.
+        // Hook dispatch — only for UI breakpoints / watchpoints. The
+        // old 35 SoC hooks are gone.
         if !self.hooks.is_empty() {
             if let Some(&hook) = self.hooks.get(&self.state.pc) {
                 match hooks::execute_hook(hook, &mut self.state, &mut self.mem)? {
@@ -86,15 +106,8 @@ impl Cpu {
 
         // When sleeping, only tick timers and check interrupts.
         if self.state.sleeping {
-            self.tick_timers();
-            let uart_pending = if let Some(mmio) = self.mem.mmio() {
-                mmio.uart.irq_pending()
-            } else {
-                false
-            };
-            if uart_pending {
-                self.state.aux_irq_pending |= 1 << UART_IRQ;
-            }
+            self.tick_timers_and_bank();
+            self.check_uart_irq();
             if self.check_interrupts() {
                 self.state.sleeping = false;
             }
@@ -145,11 +158,14 @@ impl Cpu {
             self.state.write_core_reg(REG_BLINK, next_pc)?;
         }
 
-        // Update MMIO PC context for unhandled register logging
-        if let Some(mut mmio) = self.mem.mmio() {
-            mmio.current_pc = self.state.pc;
-            mmio.current_blink = self.state.core_regs[31];
-            mmio.current_insn = self.state.instruction_count;
+        // Update CPU context on the bank for watchpoint / trace output.
+        if let Some(ref bank) = self.bank {
+            let mut guard = bank.write();
+            guard.update_cpu_context(
+                self.state.pc,
+                self.state.core_regs[31],
+                self.state.instruction_count,
+            );
         }
 
         // Execute
@@ -167,19 +183,13 @@ impl Cpu {
 
         self.state.instruction_count += 1;
 
-        // Timer tick
-        self.tick_timers();
-
-        // UART peripheral IRQ
+        // Timers + peripheral bank
+        self.tick_timers_and_bank();
         self.check_uart_irq();
-
-        // Check for pending interrupts
         self.check_interrupts();
 
-        // Persistent alarm / GPIO chan-15 HW model. Seeds DCCM 0x1100C bit 0
-        // for the 7 quiescent-ONU opcodes and the chan-15 linked-list node
-        // after `chan_task_descriptor_init` has zeroed the GPIO head table,
-        // then re-asserts them when firmware clear paths wipe them.
+        // Transitional alarm model — seeds quiescent-ONU alarm bits.
+        // Replaced by `alarm_events.rs` in Session 5.
         if self.mem.is_soc() {
             self.alarm.tick(&mut self.mem, self.state.instruction_count);
         }
@@ -197,17 +207,9 @@ impl Cpu {
         Ok(())
     }
 
-    /// Advance timers. Fractional accumulator: 1.76 ticks/insn (156.25 MHz / ~89 MIPS).
-    fn tick_timers(&mut self) {
-        // BCM55030 EPON MAC free-running timer at SYSREG+0x050.
-        // Separate peripheral clock — prescaler needs its own HW verification.
-        const HW_TIMER_PRESCALER: u64 = 64;
-        if self.state.instruction_count % HW_TIMER_PRESCALER == 0 {
-            if let Some(mut mmio) = self.mem.mmio() {
-                mmio.timer_counter = mmio.timer_counter.wrapping_add(1);
-            }
-        }
-
+    /// Advance timers (CPU-side ARC Timer0/1) and the peripheral bank
+    /// (which drives per-peripheral tick state).
+    fn tick_timers_and_bank(&mut self) {
         // ARC Timer0/1: ~1.76 ticks per instruction (156.25 MHz, ~89 MIPS).
         // Bare-metal verified: 1000 NOPs = 7,026 COUNT0 ticks.
         self.timer_frac_acc += 176;
@@ -215,15 +217,25 @@ impl Cpu {
             self.timer_frac_acc -= 100;
             self.tick_arc_timers_once();
         }
+
+        // Peripheral bank tick (EPON free-running counter, PBC busy
+        // counters, BSC busy counters, UART mpsc drain, future SerDes /
+        // MACsec / etc.).
+        self.bank_tick_accumulator += 1;
+        if self.bank_tick_accumulator >= BANK_TICK_PRESCALER {
+            self.bank_tick_accumulator = 0;
+            if let Some(ref bank) = self.bank {
+                bank.write().tick(BANK_TICK_PRESCALER);
+            }
+        }
     }
 
     /// Increment ARC Timer0 and Timer1 by one tick each.
-    /// Checks LIMIT, sets IP bit, raises IRQ if enabled.
     fn tick_arc_timers_once(&mut self) {
         // Timer 0 (IRQ 3)
         self.state.aux_count0 = self.state.aux_count0.wrapping_add(1);
         if self.state.aux_limit0 != 0 && self.state.aux_count0 >= self.state.aux_limit0 {
-            self.state.aux_control0 |= 0x08; // IP bit
+            self.state.aux_control0 |= 0x08;
             if self.state.aux_control0 & 0x01 != 0 {
                 self.state.aux_irq_pending |= 1 << 3;
             }
@@ -231,12 +243,10 @@ impl Cpu {
                 self.state.aux_count0 = 0;
             }
         }
-        // Timer 1 (IRQ line from state.timer1_irq — default 4 per ARC 700
-        // Table 22, BCM55030 uses 7). Count always resets to 0 on limit hit
-        // per ARCompact spec (COUNT0/1 wraps at limit, interrupt pulse fires).
+        // Timer 1 (IRQ 7 on BCM55030).
         self.state.aux_count1 = self.state.aux_count1.wrapping_add(1);
         if self.state.aux_limit1 != 0 && self.state.aux_count1 >= self.state.aux_limit1 {
-            self.state.aux_control1 |= 0x08; // IP bit
+            self.state.aux_control1 |= 0x08;
             if self.state.aux_control1 & 0x01 != 0 {
                 self.state.aux_irq_pending |= 1 << self.state.timer1_irq;
             }
@@ -244,13 +254,14 @@ impl Cpu {
         }
     }
 
-    /// Set UART IRQ pending bit if the UART peripheral needs service.
+    /// Poll the UART IRQ line via the peripheral bank. Prescaled to
+    /// avoid hot-path contention on every instruction.
     fn check_uart_irq(&mut self) {
         if self.state.instruction_count % UART_PRESCALER != 0 {
             return;
         }
-        let pending = if let Some(mmio) = self.mem.mmio() {
-            mmio.uart.irq_pending()
+        let pending = if let Some(ref bank) = self.bank {
+            bank.read().uart.irq_pending() != 0
         } else {
             false
         };
@@ -260,7 +271,6 @@ impl Cpu {
     }
 
     /// Check and take pending interrupts.
-    /// Returns true if an interrupt was taken (PC changed to vector).
     fn check_interrupts(&mut self) -> bool {
         if self.state.delay_state != DelayState::None {
             return false;
@@ -286,13 +296,16 @@ impl Cpu {
             self.state.aux_bta_l2 = self.state.aux_bta;
             self.state.core_regs[REG_ILINK2 as usize] = self.state.pc;
             self.state.aux_icause2 = irq;
+            // L2 entry: keep E1 set (matches old behaviour). Audit 2.4
+            // asked for clearing both E1 and E2 per spec, but doing so
+            // caused a boot regression at 0x4428 — needs separate RE
+            // before re-enabling. Tracked in the design notes §2.4.
             self.state.flag_e2 = false;
             self.state.flag_a2 = true;
             self.state.flag_de = false;
             self.state.flag_u = false;
-            self.state.flag_l = true; // ISA: disable ZOL on interrupt entry
+            self.state.flag_l = true;
 
-            // ARC 700 fast IRQ register banking — same as level-1 path.
             self.state.irq_shadow_r0_r3[0] = self.state.core_regs[0];
             self.state.irq_shadow_r0_r3[1] = self.state.core_regs[1];
             self.state.irq_shadow_r0_r3[2] = self.state.core_regs[2];
@@ -310,10 +323,8 @@ impl Cpu {
             self.state.flag_a1 = true;
             self.state.flag_de = false;
             self.state.flag_u = false;
-            self.state.flag_l = true; // ISA: disable ZOL on interrupt entry
+            self.state.flag_l = true;
 
-            // ARC 700 fast IRQ register banking: save r0..r3 to shadow set.
-            // Restored on RTIE.
             self.state.irq_shadow_r0_r3[0] = self.state.core_regs[0];
             self.state.irq_shadow_r0_r3[1] = self.state.core_regs[1];
             self.state.irq_shadow_r0_r3[2] = self.state.core_regs[2];
@@ -322,7 +333,6 @@ impl Cpu {
 
         self.state.aux_irq_pending &= !(1 << irq);
 
-        // ARC 700 IVT: vector N lives at 8*N (NOT 16+N — that's ARCv2).
         let vector = irq;
         self.state.pc = self.state.aux_int_vector_base + vector * 8;
         self.state.pc_written = true;

@@ -437,6 +437,11 @@ pub const SFP_A2: [u8; 256] = GENERIC_SFP_A2.to_bytes();
 
 /// Returns 4 EEPROM bytes packed little-endian (byte 0 → LSB).
 /// `device`: 0=A0h, 1=A2h. `byte_offset` wraps modulo 256.
+///
+/// NOTE: this const-snapshot reader is preserved for the existing
+/// checksum / golden-byte tests. Runtime access goes through
+/// [`SfpEeprom::read_word`] on the live struct owned by the BSC
+/// peripheral.
 pub fn read_word(device: u8, byte_offset: u16) -> u32 {
     let page: &[u8; 256] = match device {
         1 => &SFP_A2,
@@ -448,6 +453,150 @@ pub fn read_word(device: u8, byte_offset: u16) -> u32 {
     let b2 = page[(off + 2) & 0xFF] as u32;
     let b3 = page[(off + 3) & 0xFF] as u32;
     (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+}
+
+// ── Runtime SFP module ─────────────────────────────────────────────────────
+//
+// `SfpEeprom` is the live instance of the SFP EEPROM that sits behind
+// the BSC I²C controller. The A0h / A2h base pages start from the
+// Generic GENERIC-BC+ snapshot, but:
+//
+//   * A2h bytes 96–109 (Real-time diagnostics) are replaced on every
+//     read by serialising the live `DdmLive` fields. This is what makes
+//     the `alm/dom`, `access/read 4 1 96`, etc. CLI queries show the
+//     values the UI has injected.
+//
+//   * A0h and A2h byte pages are held as `[u8; 256]` members so the UI
+//     can mutate vendor name, serial number, etc. via events.
+//
+// The Generic snapshot is still authoritative for checksums (CC_BASE,
+// CC_EXT, CC_DMI) at boot; UI-driven mutations may invalidate those
+// and the firmware is expected to handle that cleanly just as it does
+// on real malformed modules.
+
+/// Live digital-diagnostic overlay for A2h bytes 96–109. Values are in
+/// SFF-8472 wire units (1/256 °C, 100 µV, 2 µA, 0.1 µW). Serialised
+/// into the A2h byte page on every read.
+#[derive(Clone, Copy, Debug)]
+pub struct DdmLive {
+    pub temperature_c256: i16,
+    pub vcc_100uv: u16,
+    pub tx_bias_2ua: u16,
+    pub tx_power_01uw: u16,
+    pub rx_power_01uw: u16,
+    pub laser_temp_wavelength: u16,
+    pub tec_current: i16,
+}
+
+impl DdmLive {
+    /// Default = the Generic snapshot values at 2026-04-10 capture time.
+    pub const fn snapshot_default() -> Self {
+        Self {
+            temperature_c256: 0x2A71,  //  42.44 °C
+            vcc_100uv:         0x7FAB, //  3.2683 V
+            tx_bias_2ua:       0x0001, //  2 µA  (floor)
+            tx_power_01uw:     0x0001, //  0.1 µW (floor)
+            rx_power_01uw:     0x0001, //  0.1 µW (floor)
+            laser_temp_wavelength: 0xFFFF,
+            tec_current:           -1,
+        }
+    }
+}
+
+/// Runtime SFP EEPROM model owned by the BSC peripheral.
+#[derive(Clone)]
+pub struct SfpEeprom {
+    pub a0_bytes: [u8; 256],
+    pub a2_bytes: [u8; 256],
+    pub ddm: DdmLive,
+}
+
+impl SfpEeprom {
+    /// Initialise from the Generic GENERIC-BC+ snapshot.
+    pub fn new_default() -> Self {
+        Self {
+            a0_bytes: SFP_A0,
+            a2_bytes: SFP_A2,
+            ddm: DdmLive::snapshot_default(),
+        }
+    }
+
+    /// Reset to the captured snapshot, preserving no UI mutations.
+    pub fn reset_to_snapshot(&mut self) {
+        self.a0_bytes = SFP_A0;
+        self.a2_bytes = SFP_A2;
+        self.ddm = DdmLive::snapshot_default();
+    }
+
+    /// Read one byte from the selected device page. Byte offsets 96–109
+    /// on A2h return the live DDM serialisation.
+    pub fn read_byte(&self, device: u8, offset: u16) -> u8 {
+        let off = (offset as usize) & 0xFF;
+        match device {
+            1 => self.read_a2_byte(off),
+            _ => self.a0_bytes[off],
+        }
+    }
+
+    fn read_a2_byte(&self, off: usize) -> u8 {
+        match off {
+            96 => (self.ddm.temperature_c256 as u16 >> 8) as u8,
+            97 => (self.ddm.temperature_c256 as u16 & 0xFF) as u8,
+            98 => (self.ddm.vcc_100uv >> 8) as u8,
+            99 => (self.ddm.vcc_100uv & 0xFF) as u8,
+            100 => (self.ddm.tx_bias_2ua >> 8) as u8,
+            101 => (self.ddm.tx_bias_2ua & 0xFF) as u8,
+            102 => (self.ddm.tx_power_01uw >> 8) as u8,
+            103 => (self.ddm.tx_power_01uw & 0xFF) as u8,
+            104 => (self.ddm.rx_power_01uw >> 8) as u8,
+            105 => (self.ddm.rx_power_01uw & 0xFF) as u8,
+            106 => (self.ddm.laser_temp_wavelength >> 8) as u8,
+            107 => (self.ddm.laser_temp_wavelength & 0xFF) as u8,
+            108 => (self.ddm.tec_current as u16 >> 8) as u8,
+            109 => (self.ddm.tec_current as u16 & 0xFF) as u8,
+            _ => self.a2_bytes[off],
+        }
+    }
+
+    /// Four bytes packed little-endian — matches the BSC read wire
+    /// format used by `access/read 4`.
+    pub fn read_word(&self, device: u8, offset: u16) -> u32 {
+        let b0 = self.read_byte(device, offset) as u32;
+        let b1 = self.read_byte(device, offset.wrapping_add(1)) as u32;
+        let b2 = self.read_byte(device, offset.wrapping_add(2)) as u32;
+        let b3 = self.read_byte(device, offset.wrapping_add(3)) as u32;
+        (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+    }
+
+    pub fn set_vendor_name(&mut self, name: [u8; 16]) {
+        self.a0_bytes[20..36].copy_from_slice(&name);
+    }
+
+    pub fn set_serial_number(&mut self, sn: [u8; 16]) {
+        self.a0_bytes[68..84].copy_from_slice(&sn);
+    }
+
+    pub fn set_part_number(&mut self, pn: [u8; 16]) {
+        self.a0_bytes[40..56].copy_from_slice(&pn);
+    }
+
+    pub fn vendor_name(&self) -> String {
+        String::from_utf8_lossy(&self.a0_bytes[20..36]).trim().to_string()
+    }
+
+    pub fn serial_number(&self) -> String {
+        String::from_utf8_lossy(&self.a0_bytes[68..84]).trim().to_string()
+    }
+
+    pub fn part_number(&self) -> String {
+        String::from_utf8_lossy(&self.a0_bytes[40..56]).trim().to_string()
+    }
+}
+
+impl Default for SfpEeprom {
+    fn default() -> Self {
+        Self::new_default()
+    }
 }
 
 #[cfg(test)]

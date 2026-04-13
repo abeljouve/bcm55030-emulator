@@ -1,60 +1,64 @@
-/// Peripheral Bus Controller (SPI + MDIO)
-/// Base address: 0x010001F0
-/// Handles SPI flash FIFO commands, DMA transfers, and MDIO PHY access.
+//! Peripheral Bus Controller — SPI flash FIFO + SPI DMA + SerDes SPI
+//! slave stub. MMIO aperture `0x010001F0..0x01000240`.
+//!
+//! Owns the on-module `SpiFlash` instance by value. All SRAM ↔ flash
+//! DMA happens via [`DatapathOp`] emission — the bank drains them after
+//! releasing the write lock so `Memory::apply_datapath` can poke SRAM
+//! without recursive locking.
 
-use super::spi_flash::SpiFlash;
+use crate::cpu::exception::Exception;
+use crate::soc::peripheral::{
+    AddressRange, DatapathOp, Peripheral, PeripheralError, PeripheralEvent, PeripheralId,
+    PeripheralSnapshot, PbcEvent, PbcSnapshot,
+};
+use crate::soc::spi_flash::SpiFlash;
 
 /// DMA physical base for DCCM (the DMA engine sees DCCM at this address)
 const DMA_DCCM_BASE: u32 = 0xFFF80000;
-const DMA_DCCM_SIZE: u32 = 0x80000; // 512KB
+const DMA_DCCM_SIZE: u32 = 0x80000; // 512 KB
 
-/// Register offsets from base (0x010001F0)
-const REG_SPI_CONTROL: u32 = 0x10;     // RW: speed[2:0], bit 6 = CS mode
-const REG_SPI_STATUS: u32 = 0x1C;      // R: bit 0 = busy; W: triggers FIFO command
-const REG_SPI_FIFO_DATA: u32 = 0x20;   // RW: FIFO TX/RX data (word 0)
-const REG_SPI_FIFO_DATA1: u32 = 0x24;  // RW: FIFO data (word 1, bytes 4-7)
-const REG_SPI_READ_DATA: u32 = 0x2C;   // R: FIFO result (word 0)
-const REG_SPI_READ_DATA1: u32 = 0x30;  // R: FIFO result (word 1)
-const REG_SPI_CONFIG: u32 = 0x34;      // W: SPI configuration
-const REG_DMA_CTRL: u32 = 0x38;        // RW: bit 0 = busy/enable; W: triggers DMA
-const REG_DMA_ADDR: u32 = 0x3C;        // W: flash address for DMA
-const REG_DMA_DATA_ADDR: u32 = 0x40;   // W: memory address for DMA
+pub const PBC_BASE: u32 = 0x010001F0;
+pub const PBC_END: u32 = 0x01000240;
 
-/// Pending DMA transfer to DCCM (flash -> mem)
-pub struct DmaWrite {
-    pub dccm_addr: u32,
-    pub data: Vec<u8>,
-}
+const REG_SPI_CONTROL: u32 = 0x10;
+const REG_SPI_STATUS: u32 = 0x1C;
+const REG_SPI_FIFO_DATA: u32 = 0x20;
+const REG_SPI_FIFO_DATA1: u32 = 0x24;
+const REG_SPI_READ_DATA: u32 = 0x2C;
+const REG_SPI_READ_DATA1: u32 = 0x30;
+const REG_SPI_CONFIG: u32 = 0x34;
+const REG_DMA_CTRL: u32 = 0x38;
+const REG_DMA_ADDR: u32 = 0x3C;
+const REG_DMA_DATA_ADDR: u32 = 0x40;
 
-/// Pending DMA transfer from DCCM to flash (mem -> flash)
-pub struct DmaFlashWrite {
-    pub dccm_addr: u32,
-    pub flash_addr: u32,
-    pub length: usize,
-}
+const PBC_RANGES: &[AddressRange] = &[AddressRange::new(PBC_BASE, PBC_END)];
 
-pub struct PeripheralBusController {
+/// How many bank ticks the SPI busy bit stays set after a command.
+/// Audit 6.1: real hardware is slower than a single CPU step — the
+/// firmware polling loop must see `busy=1` at least once.
+const SPI_BUSY_TICKS: u8 = 2;
+
+pub struct Pbc {
     pub flash: SpiFlash,
     pub trace: bool,
 
-    // SPI registers
     spi_control: u32,
     spi_config: u32,
-    spi_fifo: [u32; 2],        // TX FIFO (2 words = 8 bytes max)
-    spi_rx: [u32; 2],          // RX buffer (2 words)
+    spi_fifo: [u32; 2],
+    spi_rx: [u32; 2],
+    spi_busy_counter: u8,
 
-    // DMA registers
     dma_ctrl: u32,
     dma_flash_addr: u32,
     dma_data_addr: u32,
+    dma_busy_counter: u8,
 
-    // Pending DMA transfers: flash -> DCCM
-    pending_dma: Vec<DmaWrite>,
-    // Pending DMA transfers: DCCM -> flash
-    pending_flash_writes: Vec<DmaFlashWrite>,
+    /// Pending datapath operations emitted by the last MMIO write. The
+    /// bank drains them after releasing the write lock.
+    pending_ops: Vec<DatapathOp>,
 }
 
-impl PeripheralBusController {
+impl Pbc {
     pub fn new() -> Self {
         Self {
             flash: SpiFlash::new(),
@@ -63,34 +67,44 @@ impl PeripheralBusController {
             spi_config: 0,
             spi_fifo: [0; 2],
             spi_rx: [0; 2],
+            spi_busy_counter: 0,
             dma_ctrl: 0,
             dma_flash_addr: 0,
             dma_data_addr: 0,
-            pending_dma: Vec::new(),
-            pending_flash_writes: Vec::new(),
+            dma_busy_counter: 0,
+            pending_ops: Vec::new(),
         }
     }
 
-    /// Reset all PBC state except flash contents.
-    /// Called on CPU reboot — SPI flash is non-volatile but registers are not.
-    pub fn reset_state(&mut self) {
-        self.spi_control = 0;
-        self.spi_config = 0;
-        self.spi_fifo = [0; 2];
-        self.spi_rx = [0; 2];
-        self.dma_ctrl = 0;
-        self.dma_flash_addr = 0;
-        self.dma_data_addr = 0;
-        self.pending_dma.clear();
-        self.pending_flash_writes.clear();
+    #[inline]
+    pub fn claims(&self, addr: u32) -> bool {
+        (PBC_BASE..PBC_END).contains(&addr)
     }
 
-    pub fn read_word(&mut self, offset: u32) -> u32 {
+    /// DCCM-side callback from `Memory::apply_datapath` with the bytes
+    /// read from SRAM to satisfy a `FlashWrite` op.
+    pub fn complete_flash_write(&mut self, flash_addr: u32, data: &[u8]) {
+        if self.trace {
+            eprintln!(
+                "[PBC] SPI DMA WRITE: {} bytes to flash 0x{:06X} data={:02X?}",
+                data.len(),
+                flash_addr,
+                &data[..data.len().min(16)]
+            );
+        }
+        self.flash.dma_write(flash_addr, data);
+    }
+
+    fn read_reg_word(&mut self, offset: u32) -> u32 {
         match offset {
             REG_SPI_CONTROL => self.spi_control,
             REG_SPI_STATUS => {
-                // Bit 0 = busy — always 0 (operations complete instantly)
-                0
+                if self.spi_busy_counter > 0 {
+                    self.spi_busy_counter -= 1;
+                    1
+                } else {
+                    0
+                }
             }
             REG_SPI_FIFO_DATA => self.spi_fifo[0],
             REG_SPI_FIFO_DATA1 => self.spi_fifo[1],
@@ -98,8 +112,12 @@ impl PeripheralBusController {
             REG_SPI_READ_DATA1 => self.spi_rx[1],
             REG_SPI_CONFIG => self.spi_config,
             REG_DMA_CTRL => {
-                // Bit 0 = busy — always 0 (DMA completes instantly)
-                0
+                if self.dma_busy_counter > 0 {
+                    self.dma_busy_counter -= 1;
+                    1
+                } else {
+                    0
+                }
             }
             REG_DMA_ADDR => self.dma_flash_addr,
             REG_DMA_DATA_ADDR => self.dma_data_addr,
@@ -112,15 +130,15 @@ impl PeripheralBusController {
         }
     }
 
-    pub fn write_word(&mut self, offset: u32, val: u32) {
+    fn write_reg_word(&mut self, offset: u32, val: u32) {
         match offset {
             REG_SPI_CONTROL => {
                 self.spi_control = val;
             }
             REG_SPI_STATUS => {
-                // Writing triggers a FIFO SPI command
                 if val & 1 != 0 {
                     self.execute_fifo_command(val);
+                    self.spi_busy_counter = SPI_BUSY_TICKS;
                 }
             }
             REG_SPI_FIFO_DATA => {
@@ -136,6 +154,7 @@ impl PeripheralBusController {
                 self.dma_ctrl = val;
                 if val & 1 != 0 {
                     self.execute_dma(val);
+                    self.dma_busy_counter = SPI_BUSY_TICKS;
                 }
             }
             REG_DMA_ADDR => {
@@ -152,33 +171,10 @@ impl PeripheralBusController {
         }
     }
 
-    /// Drain pending DMA reads (flash -> DCCM, to be applied by the memory subsystem)
-    pub fn take_pending_dma(&mut self) -> Vec<DmaWrite> {
-        std::mem::take(&mut self.pending_dma)
-    }
-
-    /// Drain pending DMA writes (DCCM -> flash, memory subsystem provides the data)
-    pub fn take_pending_flash_writes(&mut self) -> Vec<DmaFlashWrite> {
-        std::mem::take(&mut self.pending_flash_writes)
-    }
-
-    /// Complete a DCCM -> flash DMA write with actual DCCM data
-    pub fn complete_flash_write(&mut self, flash_addr: u32, data: &[u8]) {
-        if self.trace {
-            eprintln!(
-                "[PBC] SPI DMA WRITE: {} bytes to flash 0x{:06X} data={:02X?}",
-                data.len(), flash_addr, &data[..data.len().min(16)]
-            );
-        }
-        self.flash.dma_write(flash_addr, data);
-    }
-
-    /// Execute a FIFO-based SPI command
     fn execute_fifo_command(&mut self, cmd_word: u32) {
         let tx_len = ((cmd_word >> 4) & 0xF) as usize;
         let rx_len = ((cmd_word >> 8) & 0xFF) as usize;
 
-        // Extract TX bytes from FIFO (little-endian byte order within words)
         let mut tx = Vec::with_capacity(tx_len);
         for i in 0..tx_len {
             let word_idx = i / 4;
@@ -199,14 +195,16 @@ impl PeripheralBusController {
             );
         }
 
-        // SPI_CONTROL bit 6: 0=main flash, 1=SerDes slave (no real device, return 0xFF).
+        // SPI_CONTROL bit 6: 0 = main flash, 1 = SerDes SPI slave.
+        // Session 1: SerDes target returns 0xFF (audit 5.2). SerDes
+        // peripheral in Session 2 will replace this via cross-peripheral
+        // dispatch.
         let rx = if self.spi_control & 0x40 != 0 {
             vec![0xFFu8; rx_len]
         } else {
             self.flash.execute_fifo_command(&tx, rx_len)
         };
 
-        // Store result in RX buffer (little-endian byte order within words)
         self.spi_rx = [0; 2];
         for (i, &byte) in rx.iter().enumerate() {
             let word_idx = i / 4;
@@ -224,16 +222,15 @@ impl PeripheralBusController {
         }
     }
 
-    /// Execute a DMA transfer
-    /// bit 0 = enable, bit 1 = direction (0=flash->mem, 1=mem->flash), bits [21:4] = length (bytes)
     fn execute_dma(&mut self, ctrl: u32) {
         let length = ((ctrl >> 4) & 0x3FFFF) as usize;
         let flash_addr = self.dma_flash_addr;
         let mem_addr = self.dma_data_addr;
-        let write_to_flash = (ctrl & 0x2) != 0; // bit 1 = direction
+        let write_to_flash = (ctrl & 0x2) != 0;
 
-        // Translate DMA address to DCCM offset
-        let dccm_addr = if mem_addr >= DMA_DCCM_BASE && mem_addr.wrapping_sub(DMA_DCCM_BASE) < DMA_DCCM_SIZE {
+        let sram_addr = if mem_addr >= DMA_DCCM_BASE
+            && mem_addr.wrapping_sub(DMA_DCCM_BASE) < DMA_DCCM_SIZE
+        {
             Some(mem_addr - DMA_DCCM_BASE)
         } else if (mem_addr as usize) < 0x80000 {
             Some(mem_addr)
@@ -242,27 +239,23 @@ impl PeripheralBusController {
         };
 
         if write_to_flash {
-            // DMA WRITE: DCCM -> flash
             if self.trace {
                 eprintln!(
                     "[PBC] SPI DMA WRITE: ctrl=0x{:08X} mem=0x{:08X} → flash=0x{:06X} len={}",
                     ctrl, mem_addr, flash_addr, length
                 );
             }
-            if let Some(dccm_addr) = dccm_addr {
-                self.pending_flash_writes.push(DmaFlashWrite {
-                    dccm_addr,
+            if let Some(sram_addr) = sram_addr {
+                self.pending_ops.push(DatapathOp::FlashWrite {
+                    peripheral: PeripheralId::Pbc,
                     flash_addr,
+                    sram_addr,
                     length,
                 });
             } else if self.trace {
-                eprintln!(
-                    "[PBC] DMA WRITE: unmapped source address 0x{:08X}",
-                    mem_addr
-                );
+                eprintln!("[PBC] DMA WRITE: unmapped source address 0x{:08X}", mem_addr);
             }
         } else {
-            // DMA READ: flash -> DCCM
             if self.trace {
                 eprintln!(
                     "[PBC] SPI DMA READ: ctrl=0x{:08X} flash=0x{:06X} → mem=0x{:08X} len={}",
@@ -270,17 +263,113 @@ impl PeripheralBusController {
                 );
             }
             let data = self.flash.dma_read(flash_addr, length);
-            if let Some(dccm_addr) = dccm_addr {
-                self.pending_dma.push(DmaWrite {
-                    dccm_addr,
-                    data,
-                });
+            if let Some(sram_addr) = sram_addr {
+                self.pending_ops.push(DatapathOp::SramWrite { sram_addr, data });
             } else if self.trace {
-                eprintln!(
-                    "[PBC] DMA READ: unmapped target address 0x{:08X}",
-                    mem_addr
-                );
+                eprintln!("[PBC] DMA READ: unmapped target address 0x{:08X}", mem_addr);
             }
+        }
+    }
+}
+
+impl Peripheral for Pbc {
+    fn name(&self) -> &'static str {
+        "pbc"
+    }
+
+    fn address_ranges(&self) -> &'static [AddressRange] {
+        PBC_RANGES
+    }
+
+    fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
+        let off = addr - PBC_BASE;
+        Ok(self.read_reg_word(off))
+    }
+
+    fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
+        let off = addr - PBC_BASE;
+        self.write_reg_word(off, val);
+        Ok(())
+    }
+
+    fn read_byte(&mut self, addr: u32) -> Result<u8, Exception> {
+        let off = addr - PBC_BASE;
+        let word_off = off & !3;
+        let byte_idx = off & 3;
+        let word = self.read_reg_word(word_off);
+        Ok((word >> (24 - byte_idx * 8)) as u8)
+    }
+
+    fn tick(&mut self, _cpu_instructions: u64) {
+        // Busy bits also decrement on bank tick so they can clear
+        // between polling loop iterations.
+        if self.spi_busy_counter > 0 {
+            self.spi_busy_counter -= 1;
+        }
+        if self.dma_busy_counter > 0 {
+            self.dma_busy_counter -= 1;
+        }
+    }
+
+    fn reset_cold(&mut self) {
+        self.spi_control = 0;
+        self.spi_config = 0;
+        self.spi_fifo = [0; 2];
+        self.spi_rx = [0; 2];
+        self.spi_busy_counter = 0;
+        self.dma_ctrl = 0;
+        self.dma_flash_addr = 0;
+        self.dma_data_addr = 0;
+        self.dma_busy_counter = 0;
+        self.pending_ops.clear();
+        // flash data preserved — non-volatile
+    }
+
+    fn snapshot(&self) -> PeripheralSnapshot {
+        PeripheralSnapshot::Pbc(PbcSnapshot {
+            flash_dirty: self.flash.dirty,
+            flash_size: self.flash.data.len(),
+            spi_control: self.spi_control,
+            dma_flash_addr: self.dma_flash_addr,
+            dma_data_addr: self.dma_data_addr,
+        })
+    }
+
+    fn has_pending_datapath(&self) -> bool {
+        !self.pending_ops.is_empty()
+    }
+
+    fn take_pending_datapath(&mut self) -> Vec<DatapathOp> {
+        std::mem::take(&mut self.pending_ops)
+    }
+
+    fn inject_event(&mut self, event: &PeripheralEvent) -> Result<(), PeripheralError> {
+        match event {
+            PeripheralEvent::Pbc(ev) => match ev {
+                PbcEvent::LoadFlashFromFile(path) => {
+                    match std::fs::read(path) {
+                        Ok(data) => {
+                            let n = data.len().min(self.flash.data.len());
+                            self.flash.data[..n].copy_from_slice(&data[..n]);
+                            self.flash.dirty = false;
+                            Ok(())
+                        }
+                        Err(_) => Err(PeripheralError::InvalidParameter("read failed")),
+                    }
+                }
+                PbcEvent::DumpFlashToFile(path) => {
+                    std::fs::write(path, &self.flash.data)
+                        .map_err(|_| PeripheralError::InvalidParameter("write failed"))
+                }
+                PbcEvent::EraseSector(addr) => {
+                    let base = (*addr as usize) & !0xFFF;
+                    let end = (base + 4096).min(self.flash.data.len());
+                    self.flash.data[base..end].fill(0xFF);
+                    self.flash.dirty = true;
+                    Ok(())
+                }
+            },
+            _ => Err(PeripheralError::UnsupportedEvent),
         }
     }
 }

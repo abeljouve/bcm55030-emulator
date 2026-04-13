@@ -1,0 +1,311 @@
+//! Peripheral trait and shared types for the BCM55030 peripheral model.
+//!
+//! Every MMIO subsystem of the BCM55030 is modelled as a concrete Rust type
+//! implementing [`Peripheral`]. The [`PeripheralBank`](super::bank::PeripheralBank)
+//! owns them by value, routes MMIO accesses to the correct peripheral based
+//! on address ranges, ticks them periodically from the CPU, and exposes
+//! snapshots + event injection points for the UI and MCP server.
+
+use crate::cpu::exception::Exception;
+
+/// Contiguous `[start, end)` MMIO address range claimed by a peripheral.
+#[derive(Clone, Copy, Debug)]
+pub struct AddressRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl AddressRange {
+    #[inline]
+    pub const fn new(start: u32, end: u32) -> Self {
+        Self { start, end }
+    }
+
+    #[inline]
+    pub fn contains(&self, addr: u32) -> bool {
+        addr >= self.start && addr < self.end
+    }
+}
+
+/// Access width for MMIO reads and writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessWidth {
+    Byte,
+    Half,
+    Word,
+}
+
+/// DMA-style operations produced by a peripheral that target SRAM or flash.
+///
+/// A peripheral never touches [`Memory`](crate::memory::Memory) directly —
+/// it describes the desired operation via [`DatapathOp`] and the bank
+/// hands the list back to [`Memory`] after the bank lock is released.
+/// This keeps the lock-holding critical section short and makes it
+/// impossible for a peripheral to recursively acquire the bank lock while
+/// poking SRAM.
+#[derive(Clone, Debug)]
+pub enum DatapathOp {
+    /// DMA write into SRAM. Invalidates affected I/D cache lines on the
+    /// receiving side.
+    SramWrite {
+        sram_addr: u32,
+        data: Vec<u8>,
+    },
+    /// DCCM → flash write. The memory layer reads `length` bytes from
+    /// `sram_addr` and calls the PBC peripheral back with the data.
+    FlashWrite {
+        peripheral: PeripheralId,
+        flash_addr: u32,
+        sram_addr: u32,
+        length: usize,
+    },
+}
+
+/// Opaque identifier for a peripheral inside the bank.
+/// Used by [`DatapathOp::FlashWrite`] so the memory layer knows which
+/// peripheral to call back with the SRAM data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeripheralId {
+    Pbc,
+}
+
+/// Error returned by [`Peripheral::inject_event`] when the peripheral does
+/// not recognise the injected event variant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PeripheralError {
+    UnsupportedEvent,
+    InvalidParameter(&'static str),
+}
+
+/// UI-driven mutation events. One variant per peripheral — each
+/// peripheral dispatches on its own sub-enum.
+#[derive(Clone, Debug)]
+pub enum PeripheralEvent {
+    Uart(UartEvent),
+    Sfp(SfpEvent),
+    Bsc(BscEvent),
+    Pbc(PbcEvent),
+}
+
+#[derive(Clone, Debug)]
+pub enum UartEvent {
+    /// Inject a sequence of bytes into the UART receive queue. Equivalent
+    /// to the mpsc channel pathway but batched.
+    Bytes(Vec<u8>),
+    /// Emulate a break signal.
+    Break,
+    /// Clear the TX log ring.
+    ClearTxLog,
+}
+
+#[derive(Clone, Debug)]
+pub enum SfpEvent {
+    SetTemperatureC256(i16),
+    SetVccUv(u32),
+    SetTxBiasUa(u32),
+    SetTxPowerUw(u32),
+    SetRxPowerUw(u32),
+    SetVendorName([u8; 16]),
+    SetSerialNumber([u8; 16]),
+    SetPartNumber([u8; 16]),
+}
+
+#[derive(Clone, Debug)]
+pub enum BscEvent {
+    ForceNack,
+    Reset,
+}
+
+#[derive(Clone, Debug)]
+pub enum PbcEvent {
+    LoadFlashFromFile(std::path::PathBuf),
+    DumpFlashToFile(std::path::PathBuf),
+    EraseSector(u32),
+}
+
+/// Immutable snapshot of a peripheral's state for UI display. Peripherals
+/// return a variant-specific payload; the UI dispatches on the enum.
+#[derive(Clone, Debug)]
+pub enum PeripheralSnapshot {
+    Empty { name: &'static str },
+    Uart(UartSnapshot),
+    Sfp(SfpSnapshot),
+    Pbc(PbcSnapshot),
+    Bsc(BscSnapshot),
+}
+
+impl PeripheralSnapshot {
+    pub fn empty(name: &'static str) -> Self {
+        Self::Empty { name }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Empty { name } => name,
+            Self::Uart(_) => "uart",
+            Self::Sfp(_) => "sfp",
+            Self::Pbc(_) => "pbc",
+            Self::Bsc(_) => "bsc_i2c",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UartSnapshot {
+    pub ier: u8,
+    pub baud_divisor: u16,
+    pub rx_queue_len: usize,
+    pub tx_log_tail: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SfpSnapshot {
+    pub vendor: String,
+    pub serial: String,
+    pub part_number: String,
+    pub temperature_c256: i16,
+    pub vcc_uv: u32,
+    pub tx_bias_ua: u32,
+    pub tx_power_uw: u32,
+    pub rx_power_uw: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct PbcSnapshot {
+    pub flash_dirty: bool,
+    pub flash_size: usize,
+    pub spi_control: u32,
+    pub dma_flash_addr: u32,
+    pub dma_data_addr: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct BscSnapshot {
+    pub busy: bool,
+    pub last_device_addr: u8,
+    pub last_word_addr: u16,
+}
+
+/// Common contract implemented by every MMIO subsystem in the BCM55030
+/// model. Peripherals are `Send + Sync` so the bank can live behind an
+/// `Arc<RwLock<...>>`, shared between the CPU thread and the UI/MCP
+/// threads.
+pub trait Peripheral: Send + Sync {
+    /// Short canonical identifier used by logs, snapshots and tests.
+    fn name(&self) -> &'static str;
+
+    /// Contiguous MMIO ranges this peripheral owns. Must not overlap with
+    /// any other peripheral — the bank panics at construction time if
+    /// that invariant is violated.
+    fn address_ranges(&self) -> &'static [AddressRange];
+
+    /// Word-granular read with side effects. `addr` is absolute.
+    fn read_word(&mut self, addr: u32) -> Result<u32, Exception>;
+
+    /// Word-granular write with side effects.
+    fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception>;
+
+    /// Byte-granular read. Default implementation extracts the byte from
+    /// the containing word, which is safe for peripherals whose reads do
+    /// NOT have byte-level side effects. Peripherals with FIFO-pop-on-
+    /// read semantics (UART) must override this.
+    fn read_byte(&mut self, addr: u32) -> Result<u8, Exception> {
+        let word_addr = addr & !3;
+        let byte_idx = addr & 3;
+        let word = self.read_word(word_addr)?;
+        Ok((word >> (24 - byte_idx * 8)) as u8)
+    }
+
+    /// Halfword-granular read. Default implementation extracts the half
+    /// from the containing word. Override for side-effect-bearing reads.
+    fn read_half(&mut self, addr: u32) -> Result<u16, Exception> {
+        let word_addr = addr & !3;
+        let half_idx = (addr >> 1) & 1;
+        let word = self.read_word(word_addr)?;
+        Ok((word >> (16 - half_idx * 16)) as u16)
+    }
+
+    /// Byte-granular write. Default implementation read-modify-writes the
+    /// containing word. NOTE: this calls `read_word` which may trigger
+    /// side effects on peripherals that have them. UART must override.
+    fn write_byte(&mut self, addr: u32, val: u8) -> Result<(), Exception> {
+        let word_addr = addr & !3;
+        let byte_idx = addr & 3;
+        let old = self.read_word(word_addr)?;
+        let shift = 24 - byte_idx * 8;
+        let mask = !(0xFFu32 << shift);
+        let new = (old & mask) | ((val as u32) << shift);
+        self.write_word(word_addr, new)
+    }
+
+    /// Halfword-granular write. Default implementation read-modify-writes
+    /// the containing word.
+    fn write_half(&mut self, addr: u32, val: u16) -> Result<(), Exception> {
+        let word_addr = addr & !3;
+        let half_idx = (addr >> 1) & 1;
+        let old = self.read_word(word_addr)?;
+        let shift = 16 - half_idx * 16;
+        let mask = !(0xFFFFu32 << shift);
+        let new = (old & mask) | ((val as u32) << shift);
+        self.write_word(word_addr, new)
+    }
+
+    /// Periodic tick — invoked by the bank once per
+    /// `BANK_TICK_PRESCALER` CPU instructions. Peripherals use this to
+    /// advance timers, pop FIFO entries, raise IRQ pending bits, etc.
+    fn tick(&mut self, _cpu_instructions: u64) {}
+
+    /// Cold reset — zeroes all volatile state. Non-volatile storage
+    /// (flash, EEPROM, efuse snapshot) is preserved. Called on a hard
+    /// reboot (FLAG 1) and at startup when `--cold-boot` is passed.
+    fn reset_cold(&mut self);
+
+    /// Warm reset — called at startup when `--warm-boot` is passed
+    /// (default). Default implementation defers to `reset_cold`;
+    /// peripherals that need to load a snapshot of post-init state from
+    /// `src/soc/mmio_init.rs` override this method.
+    fn reset_warm(&mut self) {
+        self.reset_cold();
+    }
+
+    /// Snapshot the peripheral's display state for UI rendering. Default
+    /// returns [`PeripheralSnapshot::Empty`] — peripherals that have
+    /// interesting state should override.
+    fn snapshot(&self) -> PeripheralSnapshot {
+        PeripheralSnapshot::empty(self.name())
+    }
+
+    /// Apply a UI-driven state mutation. Default returns
+    /// [`PeripheralError::UnsupportedEvent`]; peripherals that accept
+    /// injection override this method and dispatch on their sub-enum.
+    fn inject_event(&mut self, _event: &PeripheralEvent) -> Result<(), PeripheralError> {
+        Err(PeripheralError::UnsupportedEvent)
+    }
+
+    /// Does this peripheral have pending datapath operations to apply?
+    /// The bank polls this after every `write_word` that modified the
+    /// peripheral's state; if true the bank calls
+    /// [`take_pending_datapath`](Self::take_pending_datapath).
+    fn has_pending_datapath(&self) -> bool {
+        false
+    }
+
+    /// Drain any pending datapath operations. The bank forwards the
+    /// returned `DatapathOp`s to `Memory::apply_datapath` after releasing
+    /// the bank lock.
+    fn take_pending_datapath(&mut self) -> Vec<DatapathOp> {
+        Vec::new()
+    }
+
+    /// Is this peripheral currently raising a CPU interrupt?
+    /// The bank ORs all peripherals' IRQ masks during `tick()`.
+    fn irq_pending(&self) -> u32 {
+        0
+    }
+}
+
+/// Helper: check if an address falls inside any of the ranges.
+#[inline]
+pub fn ranges_contain(ranges: &[AddressRange], addr: u32) -> bool {
+    ranges.iter().any(|r| r.contains(addr))
+}
