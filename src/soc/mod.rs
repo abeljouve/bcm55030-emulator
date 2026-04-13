@@ -24,38 +24,17 @@ use crate::soc::boot_rom::FIRMWARE_BASE;
 /// Called once at startup, before execution begins.
 ///
 /// All firmware hook addresses are computed as `FIRMWARE_BASE + file_offset` so that
-/// they match the runtime PCs after `boot_rom_start_app` loads firmware at
-/// `0x32000`. The Ghidra "ram:" addresses for firmware (with image base
-/// `0x20000000`) map to file offsets via `file_offset = the decompiler_addr - 0x20000000`.
+/// they match the runtime PCs once the bootloader loads firmware at `0x32000`.
+/// The Ghidra "ram:" addresses for firmware (with image base `0x20000000`) map
+/// to file offsets via `file_offset = the decompiler_addr - 0x20000000`.
+///
+/// Boot path is 100% native: the bootloader reads TKF headers and
+/// programs the PBC DMA engine (`spi_dma_setup_transfer @ 0x4a68`) to
+/// copy the selected slot into SRAM at `FIRMWARE_BASE`, then calls through
+/// a function pointer into it. The emulator's PBC model in
+/// `src/soc/pbc.rs` fulfills that path — no `boot_rom_start_app` hook is
+/// installed.
 pub fn register_hooks(hooks: &mut HookTable) {
-    // ── Boot ROM minimal intercept ───────────────────────────────────────
-    //
-    // ★ IMPORTANT (2026-04-09): Hardware validation via `mem/rm` showed that
-    // the addresses we previously called "boot ROM functions" (0x74B60,
-    // 0x74E24, 0x74BD8, 0x79190, 0x79450, 0x78F54, 0x78F78, 0x79214, 0x79238)
-    // are all INSIDE the firmware binary at runtime. They map to file offsets
-    // 0x42xxx/0x47xxx, contain real firmware code, and execute natively on the
-    // real BCM55030. The boot ROM is much simpler than we thought — it just
-    // loads the binary from flash and jumps into it. ALL of `hw_init`,
-    // `crt_main` (.data copy + BSS clear), exception handlers, and the log
-    // write callback are firmware functions that run natively from firmware.
-    //
-    // We removed every `boot_rom_*` hook except `boot_rom_start_app`, which
-    // emulates the mask ROM's job of staging the binary into ICCM/DCCM (we
-    // don't model the DMA path the real boot ROM uses).
-    //
-    // Hardware proofs (level1/mem_rm_*.txt + Ghidra read_memory):
-    //   mem/rm 0x74e24 → matches Ghidra ram:20042e24 byte-for-byte
-    //   mem/rm 0x79450 → matches Ghidra ram:20047450 byte-for-byte
-    //   mem/rm 0x74bd8 → matches Ghidra ram:20042bd8 byte-for-byte
-    //   ...all "boot ROM" addresses are inside the loaded binary.
-
-    // "Start app" — bootloader does `jl 0x32000` after staging firmware in DCCM.
-    // The hook loads firmware from flash to ICCM/DCCM at FIRMWARE_BASE and sets
-    // PC=FIRMWARE_BASE. The hook fires twice: once for the bootloader's `jl`
-    // call, once for the subsequent step at PC=FIRMWARE_BASE. The second fire
-    // returns Continue (see early return in boot_rom_start_app).
-    hooks.insert(FIRMWARE_BASE, Hook::Custom(boot_rom::boot_rom_start_app));
 
     // ── Missing-hardware stubs (NOT firmware bypasses) ──────────────────
     //
@@ -163,10 +142,10 @@ pub fn register_hooks(hooks: &mut HookTable) {
 /// Replay any stdin bytes that arrived during the bootloader phase, on the
 /// FIRST call to `cli_poll_and_process_input`. By that point firmware's BSS has
 /// been cleared, the UART struct at 0x7E204 has been initialized, and the
-/// CLI is ready to consume input. Replaying earlier (e.g. in
-/// `boot_rom_start_app` or in `cli_uart_init`) races with .data/BSS init and
-/// either gets the bytes wiped or causes the firmware to read uninitialized
-/// state and dump garbage.
+/// CLI is ready to consume input. Replaying earlier (e.g. during the
+/// bootloader → firmware handoff or in `cli_uart_init`) races with .data/BSS
+/// init and either gets the bytes wiped or causes the firmware to read
+/// uninitialized state and dump garbage.
 ///
 /// The bootloader's UART ISR drains `mmio.uart.rx_queue` into its own
 /// 0xF968 RX ring buffer and throws the bytes away when no CLI prompt is

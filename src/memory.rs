@@ -21,17 +21,7 @@ pub struct Memory {
 
     /// SRAM base address (SoC mode). Data/instruction access at addr in
     /// [dccm_base, dccm_base + sram_size) reads/writes SRAM.
-    /// Default 0 for bootloader, 0x20000000 for firmware.
     pub dccm_base: u32,
-
-    /// Size of the loaded app binary (used for BSS clearing in boot ROM CRT init)
-    pub app_size: Option<usize>,
-
-    /// Runtime base address where the firmware binary is loaded in SRAM.
-    /// `0` until firmware loads. Firmware is loaded at `0x32000` matching real BCM55030
-    /// hardware: bootloader stays at `0..0xA800`, firmware at `0x32000..`.
-    /// Validated via `mem/rm 0x32000` returning the firmware IVT signature on real HW.
-    pub app_load_base: u32,
 
     /// SRAM write watchpoint address (temporary diagnostic).
     /// When set, logs the first write to this word-aligned address with full context.
@@ -55,8 +45,6 @@ impl Memory {
             data: vec![0u8; size],
             mmio: None,
             dccm_base: 0,
-            app_size: None,
-            app_load_base: 0,
             dccm_watchpoint: None,
             dcache: None,
             icache: None,
@@ -70,8 +58,6 @@ impl Memory {
             data: vec![0u8; sram_size],
             mmio: Some(RefCell::new(MmioController::new())),
             dccm_base: 0,
-            app_size: None,
-            app_load_base: 0,
             dccm_watchpoint: None,
             dcache: Some(DCache::new()),
             icache: Some(RefCell::new(ICache::new())),

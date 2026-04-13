@@ -250,7 +250,8 @@ fn run_emulator(cpu: &mut Cpu, cfg: &Config) -> RunResult {
 
         // Poll stdin every 1024 steps — feed into UART RX queue
         if step % 1024 == 0 {
-            let firmware_loaded = cpu.mem.app_size.is_some();
+            // Firmware phase: PC is past the bootloader footprint (0..0xA800).
+            let firmware_loaded = cpu.state.pc >= bcm55030_emulator::soc::boot_rom::FIRMWARE_BASE;
             while let Some(byte) = try_read_stdin() {
                 if byte == 3 {
                     eprintln!("\n[BCM55030] Ctrl-C, stopping");
