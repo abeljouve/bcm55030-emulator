@@ -260,12 +260,7 @@ fn run_emulator(cpu: &mut Cpu, cfg: &Config) -> RunResult {
                 }
                 if let Some(mut mmio) = cpu.mem.mmio() {
                     mmio.uart.rx_queue.push_back(byte);
-                    // While the bootloader is still running, also stash a
-                    // copy: the bootloader's UART ISR drains rx_queue then
-                    // throws the bytes away (no CLI prompt active). The
-                    // boot ROM transition replays held_pre_firmware into
-                    // rx_queue so firmware actually sees keystrokes typed
-                    // before its prompt is up.
+                    // Pre-firmware bytes need a parallel copy — bootloader ISR drops them.
                     if !firmware_loaded {
                         mmio.uart.held_pre_firmware.push_back(byte);
                     }
@@ -287,15 +282,8 @@ fn run_emulator(cpu: &mut Cpu, cfg: &Config) -> RunResult {
     RunResult::MaxCycles
 }
 
-/// Hardware boot emulation: DMA copies 64KB from SPI flash to SRAM,
-/// then CPU starts at entry_point. No mask ROM — verified on real HW.
-///
-/// The bootloader binary already contains its own IVT at flash offset
-/// 0x00-0xFF. No synthetic IVT installation needed. The bootloader
-/// sets SP, IENABLE, and E1/E2 itself (verified via FLAG instruction
-/// trace: uart_enable_interrupts at PC 0x59F4).
+/// HW boot: DMA 64 KB flash → SRAM, start at entry_point.
 fn boot_from_flash(cpu: &mut Cpu, entry_point: u32) {
-    // 1. Copy exactly 64KB from flash to SRAM (hardware DMA behavior)
     let copy_size = {
         let mmio = cpu.mem.mmio().unwrap();
         mmio.pbc.flash.data.len().min(BOOT_DMA_SIZE)
@@ -312,29 +300,11 @@ fn boot_from_flash(cpu: &mut Cpu, entry_point: u32) {
         copy_size, copy_size
     );
 
-    // 2. CPU starts with clean reset state (STATUS32=0, all regs=0).
-    // The bootloader firmware handles its own initialization:
-    //   - SP set at PC 0x150 (mov sp, 0x10800)
-    //   - E1/E2 enabled via FLAG instruction (uart_enable_interrupts @ 0x59F4)
-    //
-    // The bootloader expects interrupts to be available early in boot:
-    //   - IENABLE = 0xFFFFFFFF (all IRQ lines enabled; bootloader never writes SR to IENABLE)
-    //   - E1=E2=1 (interrupt levels enabled; bootloader calls uart_enable_interrupts
-    //     at 0x59F4 to set these, but the synthetic UART ISR hook at 0xA8 needs
-    //     them enabled from the start to drain the TX ring buffer)
-    //
-    // On real HW, IENABLE reads as IDENTITY (aux reg not present on this core),
-    // meaning interrupt masking may work differently. E1/E2 are set by the
-    // bootloader's own FLAG instruction. We preset them here because the emulator's
-    // interrupt-driven UART model needs them from instruction 0.
+    // Preset IENABLE/E1/E2 — bootloader enables them later but the emulator
+    // UART IRQ path needs them from instruction 0.
     cpu.state.aux_ienable = 0xFFFFFFFF;
     cpu.state.flag_e1 = true;
     cpu.state.flag_e2 = true;
-
-    // IVT: no runtime install. Per ARC 700 convention (Table 22), Timer 0 = vec 3
-    // @ 0x18, Timer 1 = vec 4 @ 0x20, UART = vec 5 @ 0x28. The bootloader flash
-    // image already contains real `j [limm]` trampolines at those offsets
-    // (loaded by the 64 KB HW DMA from flash at reset). See tmp/ivt-re/FINDINGS.md.
 
     cpu.state.pc = entry_point;
     bcm55030_emulator::vlog!(
@@ -442,12 +412,7 @@ fn main() {
 
     let orig_termios = setup_raw_terminal();
 
-    // --- Main execution loop with reboot support ---
-    // On real BCM55030 hardware, FLAG 1 (halt) triggers a chip reset which
-    // reboots from SPI flash. The flash is non-volatile and retains any
-    // modifications made during the previous boot cycle. This is critical
-    // for the bootloader's recovery mechanism: first boot writes FDS flags
-    // to flash, resets, and the second boot reads the updated flags.
+    // FLAG 1 triggers chip reset. Flash persists across reboots.
     const MAX_REBOOTS: u32 = 5;
     let mut reboot_count: u32 = 0;
     let final_result;

@@ -9,6 +9,7 @@ use crate::decoder;
 use crate::executor;
 use crate::hooks::{self, HookAction, HookTable};
 use crate::memory::Memory;
+use crate::soc::alarm::AlarmModel;
 
 /// UART interrupt number (IRQ 5, level 1 per aux_irq_lev = 0xD7 bit 5 = 0).
 const UART_IRQ: u32 = 5;
@@ -23,13 +24,18 @@ pub struct Cpu {
     pub mem: Memory,
     /// Log every instruction to stderr
     pub trace: bool,
-    /// PC address hooks for SoC-specific behavior (boot ROM intercepts, stubs, etc.)
+    /// PC address hooks for SoC-specific behavior
     pub hooks: HookTable,
     /// Fractional accumulator for ARC Timer0/1 tick rate.
     /// Real HW: 156.25 MHz clock, ~1.76 cycles/instruction on average.
     /// We add 176 per step and tick when accumulator >= 100,
     /// producing an exact average of 1.76 ticks per instruction.
     timer_frac_acc: u32,
+    /// Persistent alarm / GPIO channel-event HW model. Ticked from step()
+    /// to assert the 7 quiescent-ONU alarm bits and the DPoE OAM chan-15
+    /// linked-list node that real HW drives from MMIO sources we do not
+    /// yet model.
+    pub alarm: AlarmModel,
 }
 
 impl Cpu {
@@ -41,6 +47,7 @@ impl Cpu {
             trace: false,
             hooks: HookTable::new(),
             timer_frac_acc: 0,
+            alarm: AlarmModel::new(),
         }
     }
 
@@ -57,6 +64,7 @@ impl Cpu {
             trace: false,
             hooks: HookTable::new(),
             timer_frac_acc: 0,
+            alarm: AlarmModel::new(),
         }
     }
 
@@ -65,7 +73,7 @@ impl Cpu {
             return Ok(());
         }
 
-        // Hook dispatch — all SoC-specific behavior (boot ROM, stubs, milestones)
+        // Hook dispatch — all SoC-specific behavior
         // is injected via hooks. The core ARC700 step loop has no SoC knowledge.
         if !self.hooks.is_empty() {
             if let Some(&hook) = self.hooks.get(&self.state.pc) {
@@ -122,9 +130,12 @@ impl Cpu {
         if self.trace {
             eprintln!(
                 "[TRACE] PC=0x{:08X} size={} Z={} N={} C={} V={} {:?}",
-                self.state.pc, decoded.total_size(),
-                self.state.flag_z as u8, self.state.flag_n as u8,
-                self.state.flag_c as u8, self.state.flag_v as u8,
+                self.state.pc,
+                decoded.total_size(),
+                self.state.flag_z as u8,
+                self.state.flag_n as u8,
+                self.state.flag_c as u8,
+                self.state.flag_v as u8,
                 decoded.inst
             );
         }
@@ -156,7 +167,6 @@ impl Cpu {
 
         self.state.instruction_count += 1;
 
-
         // Timer tick
         self.tick_timers();
 
@@ -165,6 +175,14 @@ impl Cpu {
 
         // Check for pending interrupts
         self.check_interrupts();
+
+        // Persistent alarm / GPIO chan-15 HW model. Seeds DCCM 0x1100C bit 0
+        // for the 7 quiescent-ONU opcodes and the chan-15 linked-list node
+        // after `chan_task_descriptor_init` has zeroed the GPIO head table,
+        // then re-asserts them when firmware clear paths wipe them.
+        if self.mem.is_soc() {
+            self.alarm.tick(&mut self.mem, self.state.instruction_count);
+        }
 
         Ok(())
     }
@@ -179,12 +197,7 @@ impl Cpu {
         Ok(())
     }
 
-    /// Advance timers. Called once per step().
-    ///
-    /// ARC Timer0/1 use a fractional accumulator to match real BCM55030 timing:
-    /// 156.25 MHz clock / ~89 MIPS = ~1.76 cycles per instruction.
-    /// We add 176 per step; each time the accumulator reaches 100, we tick once.
-    /// This produces an exact average of 1.76 ticks per instruction step.
+    /// Advance timers. Fractional accumulator: 1.76 ticks/insn (156.25 MHz / ~89 MIPS).
     fn tick_timers(&mut self) {
         // BCM55030 EPON MAC free-running timer at SYSREG+0x050.
         // Separate peripheral clock — prescaler needs its own HW verification.
@@ -309,12 +322,7 @@ impl Cpu {
 
         self.state.aux_irq_pending &= !(1 << irq);
 
-        // ARC 700 IVT: IRQ N lives at vector N (not 16+N — that's ARCv2/ARC-EM).
-        // Per Table 22 "ARC 700 Interrupt Vector Summary" in the ARCompact
-        // Programmer's Reference: IRQ 3 (Timer 0) = 0x18, IRQ 4 (Timer 1) = 0x20,
-        // IRQ 5 (UART) = 0x28, …. See tmp/ivt-re/FINDINGS.md §0. Note that the
-        // timer IRQ line is SoC-integration config — BCM55030 wires Timer 1 to
-        // IRQ 7 (vec `0x38`), see `state.timer1_irq`.
+        // ARC 700 IVT: vector N lives at 8*N (NOT 16+N — that's ARCv2).
         let vector = irq;
         self.state.pc = self.state.aux_int_vector_base + vector * 8;
         self.state.pc_written = true;

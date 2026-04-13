@@ -4,37 +4,24 @@ use crate::cache::{DCache, ICache, IC_LINE_SIZE};
 use crate::cpu::exception::Exception;
 use crate::soc::mmio::MmioController;
 
-/// BCM55030 unified SRAM size: 512 KB
-/// Hardware confirmed: BCR 0x74 (ICCM) = 0, BCR 0x78 (DCCM) = 0.
-/// The BCM55030 has unified 512 KB SRAM with I-cache/D-cache, no ICCM/DCCM.
+/// BCM55030 unified SRAM: 512 KB. No ICCM/DCCM.
 pub const SRAM_SIZE: usize = 512 * 1024;
 
 pub struct Memory {
-    /// Primary data store (unified SRAM in SoC mode, flat memory for tests).
-    /// In SoC mode, both instruction fetch and data access read/write this store.
+    /// Unified SRAM (SoC mode) / flat memory (tests).
     data: Vec<u8>,
 
-    /// MMIO peripheral controller (SoC mode only).
-    /// Uses RefCell for interior mutability: reads may have side effects
-    /// (e.g. UART status register clears on read).
     mmio: Option<RefCell<MmioController>>,
 
-    /// SRAM base address (SoC mode). Data/instruction access at addr in
-    /// [dccm_base, dccm_base + sram_size) reads/writes SRAM.
+    /// SRAM base addr. Access in [dccm_base, dccm_base+sram_size) hits SRAM.
     pub dccm_base: u32,
 
-    /// SRAM write watchpoint address (temporary diagnostic).
-    /// When set, logs the first write to this word-aligned address with full context.
     pub dccm_watchpoint: Option<u32>,
 
-    /// ARC700 D-cache: 8 KB, 4-way set-associative, 32-byte lines.
-    /// Present in SoC mode only. LD/ST data accesses go through it via
-    /// read_*_data / write_*_data. Direct read_*/write_* methods are
-    /// cache-coherent (peek/update cache if line present) for hook use.
+    /// D-cache: 4 KB, 2-way, 32 B lines. LD/ST path via `read_*_data`/`write_*_data`.
     dcache: Option<DCache>,
 
-    /// ARC700 I-cache: 16 KB, 4-way set-associative, 32-byte lines.
-    /// Instruction fetch goes through it. DMA writes invalidate covered lines.
+    /// I-cache: 4 KB, 1-way, 32 B lines. Instruction fetch path.
     icache: Option<RefCell<ICache>>,
 }
 
@@ -421,14 +408,7 @@ impl Memory {
         }
     }
 
-    // ========== D-cache data access (LD/ST instructions) ==========
-    //
-    // These methods route through the D-cache when:
-    //   - cache_bypass is false (no .di flag on the instruction)
-    //   - D-cache is present and enabled (DC_CTRL bit 0 = 0)
-    // Otherwise they fall through to direct SRAM/MMIO access.
-    //
-    // Instruction fetch and DMA use the non-cached read_*/write_* methods above.
+    // D-cache data path: LD/ST route here when cache_bypass=false and DC is enabled.
 
     /// Check if the D-cache is present and enabled.
     fn dcache_enabled(&self) -> bool {
@@ -530,11 +510,7 @@ impl Memory {
         Ok((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
     }
 
-    /// Data byte write through D-cache. Used by ST instructions.
-    /// HW-faithful write-back, write-allocate: data stays in cache until
-    /// eviction/invalidation. With .di (cache_bypass), writes directly to
-    /// backing store without touching the cache (scan7b test 7 verified:
-    /// .di stores do NOT update or invalidate cached copies).
+    /// ST data-path byte write. `.di` bypasses and leaves cached copies untouched.
     pub fn write_byte_data(&mut self, addr: u32, val: u8, cache_bypass: bool) -> Result<(), Exception> {
         if cache_bypass || !self.dcache_enabled() {
             return self.write_byte(addr, val);

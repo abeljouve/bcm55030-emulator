@@ -1,17 +1,4 @@
-//! SFP EEPROM contents for the BCM55030 BSC I2C controller.
-//!
-//! Captured from a real Device ONU with a Generic GENERIC-BC+ SFP+ module
-//! plugged in (2026-04-10). See `the design notes`
-//! for the full capture and field decoding.
-//!
-//! Two I2C devices live on the SFP bus:
-//!   - A0h @ inst=0 — SFF-8472 identification page (vendor, PN, SN, DoM, …)
-//!   - A2h @ inst=1 — SFF-8472 DDM diagnostics (thresholds + live values)
-//!
-//! Both pages are 256 bytes. The first 128 bytes of A0h are valid ID data;
-//! bytes 128-255 are zero on this module. A2h thresholds occupy bytes 0-55,
-//! live diagnostics are at bytes 96-105, and there's an 8-byte 0xFF tail at
-//! offset 248.
+//! Generic GENERIC-BC+ SFP EEPROM snapshot (A0h ID + A2h DDM), 256 B each.
 
 /// SFP A0h EEPROM (SFF-8472 identification page), 256 bytes.
 pub const SFP_A0: [u8; 256] = [
@@ -105,17 +92,8 @@ pub const SFP_A2: [u8; 256] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 ];
 
-/// Read a 32-bit word from the SFP EEPROM packed for the BSC controller.
-///
-/// `device`: 0 = A0h, 1 = A2h. Any other value reads from A0h.
-/// `byte_offset`: offset within the 256-byte page; wraps modulo 256.
-///
-/// The firmware extracts bytes from the returned 32-bit word LSB-first
-/// (see `dpoe_lane_read_bytes_from_table` @ the decompiler 0x20032eca: the byte
-/// index inside the word is `3 - (i & 3)` *from the high address*, which
-/// in big-endian memory means the LSB of the word becomes buffer[0]).
-/// To make `buffer[byte_offset + i]` equal `EEPROM[byte_offset + i]`,
-/// the word must be packed little-endian: byte 0 → LSB, byte 3 → MSB.
+/// Returns 4 EEPROM bytes packed little-endian (byte 0 → LSB).
+/// `device`: 0=A0h, 1=A2h. `byte_offset` wraps modulo 256.
 pub fn read_word(device: u8, byte_offset: u16) -> u32 {
     let page: &[u8; 256] = match device {
         1 => &SFP_A2,

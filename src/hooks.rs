@@ -1,8 +1,4 @@
-/// CPU hook system for SoC-specific behavior.
-///
-/// Hooks are registered at specific PC addresses and executed before
-/// the instruction at that address. This keeps the core ARC700 emulation
-/// free of SoC-specific logic (boot ROM intercepts, peripheral stubs, etc.).
+//! PC-indexed hooks, run before the instruction at that PC.
 
 use std::collections::HashMap;
 

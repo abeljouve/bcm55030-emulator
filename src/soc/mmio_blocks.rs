@@ -1,14 +1,4 @@
-//! BCM55030 MMIO block metadata — generated from hwregs DB + live HW probes.
-//!
-//! This module provides a lookup function to resolve an MMIO address to
-//! its block name and register name. Used by the MMIO trace and debug output
-//! to produce human-readable register access logs.
-//!
-//! Generated: 2026-04-10 from:
-//!   - hwregs JSON database (105 blocks, 358 registers)
-//!   - Live HW probes of 88 DAT_XXXX base pointers on an firmware-running ONU
-//!
-//! Do not hand-edit — regenerate via `docs/` tooling.
+//! MMIO block/register name lookup. Generated from hwregs DB — do not hand-edit.
 
 /// Resolved MMIO register entry.
 pub struct RegInfo {

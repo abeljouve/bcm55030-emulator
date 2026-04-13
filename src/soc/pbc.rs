@@ -199,18 +199,10 @@ impl PeripheralBusController {
             );
         }
 
-        // Route SPI command based on CS mode (bit 6 of SPI_CONTROL).
-        // Bit 6 clear = main SPI flash (normal mode).
-        // Bit 6 set = SerDes SPI slave (manual CS mode for SerDes register access).
+        // SPI_CONTROL bit 6: 0=main flash, 1=SerDes slave (no real device, return 0xFF).
         let rx = if self.spi_control & 0x40 != 0 {
-            // SerDes SPI target: no real device. Return 0xFF for all reads.
-            // This satisfies calibration-done checks (bit 7) and ready flags
-            // that the firmware polls during SerDes initialization.
-            // For RDSR (0x05): returns 0xFF = WEL set + all flags, but the firmware
-            // checks (status ^ 1) & 1 which gives 0 — handled by the caller.
             vec![0xFFu8; rx_len]
         } else {
-            // Main SPI flash
             self.flash.execute_fifo_command(&tx, rx_len)
         };
 

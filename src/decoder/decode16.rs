@@ -219,16 +219,7 @@ fn decode_0f_general(half: u16, pc: u32) -> Result<DecodedInstruction, Exception
             set_flags: false, cc: None,
         },
         0x13 => {
-            // NEG_S: B <- 0 - C
-            //
-            // Use AluOp::Sub with src1=0, src2=c so the executor computes
-            // `src1 - src2 = -c`. Cannot use AluOp::Rsub here because RSUB
-            // is implemented as `src2 - src1` (matching the 32-bit RSUB
-            // ISA: `rsub a,b,c` → a = c - b, where src1=b and src2=c).
-            // With Rsub it would compute `c - 0 = +c`, leaving NEG_S as a
-            // no-op — which silently corrupted code that relied on -c
-            // (e.g. cli_process_command_input ended up writing '!' (0x21)
-            // instead of '/' (0x2F) as the directory separator in `help`).
+            // NEG_S B,C: B = 0 - C. Must use Sub (not Rsub which is src2-src1).
             Instruction::Alu {
                 op: AluOp::Sub, dst: Operand::Reg(b), src1: Operand::Imm(0),
                 src2: Operand::Reg(c), set_flags: false, cc: None,

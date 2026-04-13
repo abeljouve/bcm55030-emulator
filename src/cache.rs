@@ -1,28 +1,5 @@
-/// ARC700 D-cache model for BCM55030.
-///
-/// Geometry verified on real hardware via bare-metal scans scan7b / scan7c:
-///   Capacity        : 4 KB   (scan7b test 3: evict at 8192, not at 4096)
-///   Line size       : 32 B   (scan7b test 1: DC_IVDL refill test)
-///   Associativity   : 2-way  (scan7c v6 Test 5: DC_TAG probe shows only
-///                              two distinct physical slots per set; bit 11
-///                              of DC_RAM_ADDR selects the way)
-///   Sets            : 64     (4096 / (2 * 32))
-///   Write policy    : write-back, write-allocate
-///   Read allocation : scan7c suggests read-no-allocate on miss (TBD)
-///   Replacement     : round-robin per set (scan7c v7: cached_write hit
-///                              did NOT protect L0 from eviction,
-///                              identical result with/without touch)
-///
-/// BCR 0x72 (D_CACHE_BUILD) = 0x00013001:
-///   ver[3:0]=1, cfg[7:4]=0, ll[11:8]=0, ways[15:12]=3, cap[19:16]=1
-///   On this core `ways=3` encodes 2-way and `cap=1` encodes 4 KB.
-///
-/// DC_CTRL (aux 0x48) bit layout:
-///   bit 0 (DC): 0 = cache enabled, 1 = cache disabled
-///   bit 6 (IM): invalidate mode
-///   bit 7 (LM): lock mode
-///   BCM55030 reset value: 0xC2 (enabled, IM=1, LM=1, bit1=1)
-
+/// BCM55030 D-cache: 4 KB, 2-way, 64 sets, 32 B lines, write-back, round-robin.
+/// DC_CTRL (aux 0x48): bit 0=DC (0=enabled), bit 6=IM, bit 7=LM. Reset: 0xC2.
 const LINE_SIZE: usize = 32;
 const NUM_WAYS: usize = 2;
 const NUM_SETS: usize = 64;
@@ -65,11 +42,7 @@ pub const DC_CTRL_RESET: u32 = 0xC2;
 pub struct DCache {
     // 2-way × 64 sets = 4 KB — box to keep the DCache struct off the stack.
     lines: Box<[[CacheLine; NUM_WAYS]; NUM_SETS]>,
-    /// Per-set round-robin counter: next way to evict on a miss.
-    /// Wraps modulo NUM_WAYS after each fill. scan7c v7 confirmed the
-    /// BCM55030 D-cache does not track recency — `cached_write` hits do
-    /// not protect a line from eviction, so replacement is RR (or FIFO,
-    /// indistinguishable in a 2-way cache).
+    /// Per-set round-robin counter. Replacement is RR (verified scan7c v7).
     next_way: Box<[u8; NUM_SETS]>,
     // DC_CTRL decoded fields (DC_CTRL raw value preserved in ctrl_raw)
     enabled: bool,
@@ -272,11 +245,7 @@ impl DCache {
         self.ram_addr = addr;
     }
 
-    /// Read DC_TAG (aux 0x59) for the probe address.
-    /// Format verified on real HW (scan7b test 8):
-    ///   (line_base_address) | valid_bit
-    ///   bit 0 = valid
-    ///   bits [31:5] = line-aligned address
+    /// DC_TAG (aux 0x59): bit 0 = valid, bits[31:5] = line base.
     pub fn read_tag(&self) -> u32 {
         let (tag, set, _) = Self::decompose(self.ram_addr);
         if self.find_way(set, tag).is_some() {
@@ -306,26 +275,8 @@ impl DCache {
     }
 }
 
-// ========== I-cache ==========
-//
-// Geometry verified on real hardware via bare-metal scan scan7d v2/v3:
-//   Capacity      : 4 KB  (capacity probe: 128 contiguous lines fit,
-//                          256 contiguous wrap back to set 0)
-//   Line size     : 32 B  (common ARC700 config; not independently probed)
-//   Associativity : 1-way direct-mapped
-//                   (scan7d n=2 already evicted slot 0 under stride-4096)
-//   Sets          : 128   (4096 / 32)
-//
-// BCR 0x77 (I_CACHE_BUILD) = 0x00023001:
-//   ver=1, cfg=0, ll=0 (32 B), ways=3, cap=2
-//   On this core `ways=3` / `cap=2` actually encodes 1-way / 4 KB.
-//
-// HW quirks:
-//   - IC_IVIL (aux 0x19, invalidate single line) is a NO-OP on BCM55030.
-//     scan7d sanity test showed the cached line survived an IC_IVIL call.
-//     Only IC_IVIC (aux 0x10, invalidate all) actually flushes.
-//   - `.di` stores do not touch the I-cache (separate hierarchy).
-
+// BCM55030 I-cache: 4 KB, 1-way direct, 128 sets, 32 B lines.
+// IC_IVIL is a HW no-op — only IC_IVIC flushes. `.di` stores skip I-cache.
 pub const IC_LINE_SIZE: usize = 32;
 pub const IC_NUM_WAYS: usize = 1;
 pub const IC_NUM_SETS: usize = 128;

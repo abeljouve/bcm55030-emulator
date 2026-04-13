@@ -1,38 +1,7 @@
-//! BCM55030 peripheral-bus post-boot register values, captured from live HW.
-//!
-//! Source: `mem/rm 0x01000000+` probes on a running ONU (firmware v3.2.9, CLI
-//! `pl alpha` level), 2026-04-10 session. See `docs/hw_snapshot_full.txt`
-//! for the raw dump and `the design notes` for the block→register
-//! cross-reference.
-//!
-//! These values represent the **post-boot steady state** of the peripheral bus
-//! after firmware has fully configured the SoC — not a cold-reset snapshot. On real
-//! HW, most of these registers start at 0 and are written by the firmware during
-//! `hw_init_*` functions. We pre-populate them to match real HW so that any
-//! custom firmware loaded against the emulator starts with a known-good register
-//! state without having to replay the BCM55030 init sequence.
-//!
-//! The 300+ non-zero values are spread across 49 resolved MMIO base addresses
-//! (see `mmio_blocks.rs` for block metadata). Integration into the MMIO
-//! controller is done in `MmioController::new()` which copies the table into
-//! `sysreg_store`.
-//!
-//! **DANGER**: the HW counter latches at offsets `0x1800-0x1FFF` (in the
-//! `0xC0-0xDF` subrange of each 0x200-strided block) cannot be probed blindly
-//! — reading them on real HW triggers a chip reboot. This table therefore has
-//! a gap in the `0x1800-0x1BFF` range; those registers remain at 0 in the
-//! emulator, which matches their behaviour under the emulator's specialized
-//! handlers at `0x1404/0x1604/…/0x1E04` (LLID interrupt status, forced to 0)
-//! and the `0x1D8` stride range (HW counter results, forced to 0).
-//!
-//! **Audit status**: applying all 304 values preserves the level-0 CLI
-//! regression baseline at 31/36 PASS — no new failures introduced by the init
-//! data. The 5 baseline failures (`alm_gpio`, `alm_info`, `log_show`,
-//! `log_show_T1`, `pers_read`) are unrelated, requiring HW alarm source
-//! modelling and FDS parser improvements.
+//! Post-boot sysreg snapshot from live HW (firmware v3.2.9, 2026-04-10).
+//! NOT cold-reset values — pre-populates `sysreg_store` so emulator skips replaying init.
 
-/// MMIO reset values for the peripheral bus 0x01000000-0x01003FFF.
-/// Tuple: (offset_from_0x01000000, init_value).
+/// (offset_from_0x01000000, init_value).
 pub const SYSREG_INIT_VALUES: &[(u32, u32)] = &[
     (0x0000, 0x47010203),
     (0x0004, 0xB2110816),

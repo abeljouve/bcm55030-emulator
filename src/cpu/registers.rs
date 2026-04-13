@@ -178,12 +178,7 @@ pub struct CpuState {
     /// Used by step() to distinguish "branch to same address" from "no branch".
     pub pc_written: bool,
 
-    /// ARC 700 fast IRQ register banking shadow set for r0..r3.
-    /// On level-1 IRQ entry, r0..r3 are saved here and zeroed; on RTIE,
-    /// they're restored. This matches the BCM55030 hardware behavior where
-    /// the bootloader's IRQ handler at 0xA800 freely clobbers r0..r3
-    /// without saving them — relies on HW shadowing.
-    /// See `check_interrupts` and `executor::special::execute_rtie`.
+    /// Fast IRQ shadow set for r0..r3. Saved on IRQ entry, restored on RTIE.
     pub irq_shadow_r0_r3: [u32; 4],
 
     /// DC_CTRL (aux 0x48) shadow: the authoritative copy lives in the DCache

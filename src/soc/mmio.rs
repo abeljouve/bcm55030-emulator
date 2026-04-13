@@ -5,38 +5,13 @@ use super::uart::SimpleUart;
 use super::pbc::PeripheralBusController;
 use super::sfp_eeprom;
 
-/// BSC I2C (Broadcom Serial Controller) state for SFP EEPROM reads.
-///
-/// The BSC is exposed to the firmware via three MMIO registers at
-/// sysreg offsets `0x140`, `0x14C`, `0x150` (base `0x010000F8 + 0x48/0x54/0x58`).
-/// `dpoe_lane_read_bytes_from_table` @ the decompiler 0x20032e44 drives them via
-/// three helpers:
-///   - `dpoe_lane_cmd_config_and_wait` @ 0x20032c68 writes 0x140 and polls
-///     bits [27-31] until they auto-clear.
-///   - `dpoe_lane_cmd_write_and_wait` @ 0x20032d44 writes 0x150 and polls
-///     bit 31 until it clears. Carries an encoded byte address in bits
-///     [3-13] when used in "set address" mode (`param_2 == 2`).
-///   - `dpoe_get_lane_state_field_from_table` @ 0x20032ccc calls
-///     cmd_config with `param_4 = 1` and `param_5 = word_idx + 0x100`,
-///     then reads the 32-bit result from 0x14C.
-///
-/// To emulate the controller faithfully enough for `access/read 4 <inst>
-/// <addr> <len>`, we track the pending read word index, the base byte
-/// offset set via cmd_write_and_wait, and the current device (A0h vs A2h).
+/// BSC I2C controller state (SFP EEPROM at sysreg 0x140/0x14C/0x150).
 #[derive(Default)]
 pub struct BscI2cState {
-    /// Base byte offset within the SFP EEPROM, as set by a
-    /// `dpoe_lane_cmd_write_and_wait(..., param_2 = 2, param_4 = addr)` call
-    /// (write to 0x150 with bit 1 set).
     pub base_addr: u16,
-    /// Byte offset of the next word the firmware expects to read from 0x14C.
-    /// Updated every time `dpoe_get_lane_state_field_from_table` writes 0x140
-    /// with the `word_idx + 0x100` length field and the `param_4 = 1` cmd bit.
     pub pending_read_off: u16,
-    /// True when a 0x14C read should return an SFP word.
     pub read_ready: bool,
-    /// Selected EEPROM device: 0 = A0h (ID page), 1 = A2h (DDM page).
-    /// Set from the "lanes" field (bits 16-17) of the 0x140 command word.
+    /// 0 = A0h ID page, 1 = A2h DDM page.
     pub device: u8,
 }
 
@@ -175,21 +150,7 @@ impl MmioController {
         addr >= SYSREG_BASE && addr < SYSREG_BASE + SYSREG_SIZE
     }
 
-    /// BCM55030 SoC register reads.
-    ///
-    /// Hardware-defined registers return fixed/computed values. All others use a
-    /// read-write store with auto-clear for command bits (27-31), simulating
-    /// instant hardware completion of write-triggered operations.
-    ///
-    /// The full register map was resolved from 85 hwregs base pointers via Ghidra.
-    /// Major clusters:
-    ///   0x000-0x1EF  EPON MAC core (CHIP_ID, timers, I2C, link lock, EPON sig)
-    ///   0x1F0-0x23F  PBC (handled separately, checked before sysreg)
-    ///   0x240-0xFFF  SerDes Speed/PHY, MACsec, MPCP LLID, misc
-    ///   0xFF8-0x13FF EPON MAC extended (timing, grants, slots, counters, LLIDs)
-    ///   0x13DC-0x15FF DMA/IRQ controller, channel drain, mailbox, counters
-    ///   0x2100-0x27FF DMA status, Lane HW, Fatal Error, MDIO, SerDes MDIO
-    ///   0x2B00-0x37FF MACsec Control, VLAN, Filter, Lane IRQ, Channel Config
+    /// Sysreg reads. Fixed values for HW regs; rest via store_read with cmd-bit auto-clear.
     fn sysreg_read_word(&mut self, offset: u32) -> u32 {
         match offset {
             // ── EPON MAC core (0x000-0x1EF) ──────────────────────────────
@@ -215,19 +176,7 @@ impl MmioController {
                 base | 0x80000000 // SDA high = data bit 1 (0xFF bytes)
             }
             // ── BSC I2C (SFP EEPROM) — 0x140/0x14C/0x150 ─────────────────
-            //
-            // Command/config register 0x140: after a firmware write with
-            // cmd bits at [27-31], the hardware clears those bits when the
-            // operation completes. `sysreg_pending_clear` already handles
-            // the generic 0xF8000000 mask, so the default store_read path
-            // behaves correctly here.
             0x140 => self.store_read(offset),
-            // Data register 0x14C: returns the 32-bit word at the byte
-            // offset set up by the previous 0x140 + 0x150 command sequence.
-            // The firmware reads this register once per
-            // `dpoe_get_lane_state_field_from_table` call, which bumps the
-            // word index itself — we only honour `read_ready` to avoid
-            // leaking data when the firmware is polling.
             0x14C => {
                 if self.bsc.read_ready {
                     let w = sfp_eeprom::read_word(self.bsc.device, self.bsc.pending_read_off);
@@ -237,8 +186,7 @@ impl MmioController {
                     self.store_read(offset)
                 }
             }
-            // Write/trigger register 0x150: bit 31 is the "busy" flag.
-            // Auto-clear it on read to simulate instant completion.
+            // 0x150: bit 31 busy flag, auto-clear on read.
             0x150 => {
                 let idx = 0x150 / 4;
                 let val = self.sysreg_store[idx];
@@ -246,91 +194,34 @@ impl MmioController {
                 val & !0x80000000
             }
             0x194 | 0x1D4 => {
-                // SerDes lane link lock status registers.
-                // Bits 1,3 = link lock indicators for sub-lanes.
-                // Return "all locked" to prevent infinite polling loops.
+                // SerDes lane link lock: force bits 1,3 (locked) to break polling loops.
                 let base = self.sysreg_store[(offset / 4) as usize];
                 base | 0x0A
             }
             0x1E0 => 0x45504F4E, // EPON signature ("EPON")
 
-            // ── HW counter result registers (stats/fifo, stats/epon, …) ──
-            //
-            // `hw_chan_latch_and_read_hw_counter` @ the decompiler 0x2000de6c writes
-            // a `(group, chan, field)` selector to base+0x8 then reads the
-            // 32-bit counter result from base+0xC. Base is
-            // `0x010015cc + group * 0x200`, so the result registers live at
-            // 0x010015D8, 0x010017D8, 0x010019D8, 0x01001BD8, 0x01001DD8,
-            // 0x01001FD8.
-            //
-            // Real HW returns 0 for every (chan, field) on a quiescent ONU
-            // (no traffic, no FIFO fill, no error counts). Our default
-            // `store_read` path leaks whatever the firmware (or init code)
-            // last wrote to the same offset, which produces nonsense values
-            // like 30 in `stats/fifo`. Returning 0 matches real HW.
+            // HW counter result regs (stride 0x200 base 0x15D8): 0 on quiescent ONU.
             o if (o & 0x1FF) == 0x1D8 && (0x15D8..=0x1FD8).contains(&o) => 0,
 
-            // ── DMA/IRQ cluster (0x13DC-0x15FF) ─────────────────────────
-            // DMA Channel Queue Drain Register: base 0x143C, stride 0x200.
-            // epon_rx_queue_wait_drain_done polls bit 8 (0x100) until set.
+            // DMA Channel Queue Drain (base 0x143C, stride 0x200): force bit 8 = drain done.
             o @ 0x1400..=0x3FFF if (o.wrapping_sub(0x143C)) % 0x200 == 0 => {
-                self.store_read(offset) | 0x100 // bit 8 = drain complete
+                self.store_read(offset) | 0x100
             }
 
-            // ── LLID interrupt status registers (W1C semantics) ─────────
-            // The polled SerDes block at +0x1404+N*0x200 contains per-LLID
-            // interrupt status. Real HW returns 0 (`mem/rm 0x1001404..0x1001E04`)
-            // because the events being tracked don't occur on a quiescent ONU.
-            // Our store-and-return default would return whatever the firmware
-            // wrote to these (e.g., 0x100), causing `epon_poll_hw_state_changes`
-            // to detect false positives and trigger `system_shutdown_and_flush`.
-            //
-            // Phase 1 minimal fix: return 0 for the 6 specific polled addresses
-            // (entries 9-14 of the descriptor table at .data 0x7ED90, reg
-            // indices 0x501/0x581/0x601/0x681/0x701/0x781).
-            //
-            // To extend in Phase 2 if other LLID intr regs need the same.
+            // LLID interrupt status: force 0 to prevent false state changes.
             0x1404 | 0x1604 | 0x1804 | 0x1A04 | 0x1C04 | 0x1E04 => 0,
 
-            // ── Fatal Error Status (0x2804) ──────────────────────────────
-            // hw_check_fatal_error_status reads base 0x010027B8 + 0x4C = offset 0x2804.
-            // Write side (error mask) shares the same address. Return 0 = no errors.
-            0x2804 => 0,
+            0x2804 => 0, // Fatal error status — quiescent ONU.
 
-            // ── MDIO Clause 22/45 Controller data register (0x0064) ─────
-            //
-            // `mdio_bus_read_reg` @ ram:20033420 writes a read command to
-            // this same register then reads back (val & 0xFFFF) as the PHY
-            // response. `mdio_bus_write_reg` @ ram:200332a8 writes the
-            // write-data variant but does not check the response.
-            //
-            // Real BCM55030 has no PHYs wired to the clause 22/45 MDIO
-            // bus when used as a standalone ONU (the Device module does
-            // not expose an external MDIO bus). `mdio/read X Y` on live
-            // hardware returns `ffff` for every (phy, reg) — the standard
-            // "no PHY pulldown" value.
-            //
-            // Preserve the command bits (so the firmware's subsequent
-            // polls of the same register read what it wrote for the
-            // trigger/ack) and force bits [15:0] to 0xFFFF so a read
-            // response returns the no-PHY pattern.
+            // MDIO data reg: force low 16 = 0xFFFF (no PHY pulldown).
             0x0064 => {
                 let val = self.store_read(offset);
                 (val & 0xFFFF_0000) | 0x0000_FFFF
             }
 
-            // ── SerDes Error Status (0x3604) ─────────────────────────────
-            // serdes_check_error_status @ 0x20011940 reads (val & 0xFFFF0).
-            // The firmware writes 0x000FFFF0 to clear errors then reads back.
-            // On real HW these bits are W1C — reading after the clear returns 0.
-            // Without this stub, our store returns the written 0xFFFF0, and
-            // `epon_llid_mka_tick_all_channels` calls the heavy
-            // `macsec_hw_session_init` every iteration (~370k insns/loop),
-            // so the cli_poll loop only runs ~5 times/second and the second
-            // command typed at the prompt gets dropped.
+            // SerDes error status — W1C, force 0 to prevent macsec_hw_session_init loop.
             0x3604 => 0,
 
-            // ── Default: read-write store with auto-clear ────────────────
             _ => {
                 self.log_unhandled_read(offset);
                 self.store_read(offset)
@@ -428,21 +319,7 @@ impl MmioController {
             _ => self.log_unhandled_write(offset, val),
         }
 
-        // ── BSC I2C state machine writes ────────────────────────────────
-        //
-        // 0x140 command/config register encoding (from
-        // `dpoe_lane_cmd_config_and_wait` @ the decompiler 0x20032c68):
-        //   bits [0-6]:   param_2 & 0x7f
-        //   bits [16-17]: (param_3 & 3) << 16  — EEPROM device select
-        //   bits [18-26]: (param_5 & 0x1ff) << 18
-        //   bits [27-31]: param_4 << 27  — command bits, auto-cleared
-        //
-        // `dpoe_get_lane_state_field_from_table` @ 0x20032ccc calls
-        // cmd_config with `param_4 = 1` and `param_5 = word_idx + 0x100`,
-        // so the trigger for "prepare read" is:
-        //   (val >> 27) & 1 = 1 and ((val >> 18) & 0x1ff) >= 0x100
-        // In that case the word index is `((val >> 18) & 0xff)` and we
-        // schedule a read of 4 SFP bytes at `base_addr + word_idx*4`.
+        // BSC I2C write 0x140: bits[18-26]=word_idx+0x100, bits[27-31]=cmd, bit 0=A0/A2 select.
         if offset == 0x140 {
             let param_5 = (val >> 18) & 0x1FF;
             let cmd_hi = (val >> 27) & 0x1F;
@@ -451,15 +328,8 @@ impl MmioController {
                 self.bsc.pending_read_off = self.bsc.base_addr.wrapping_add(word_idx * 4);
                 self.bsc.read_ready = true;
             }
-            // The CLI `inst` parameter (0 = A0h, 1 = A2h) is propagated as
-            // bit 0 of the descriptor's `desc[2:4]` field, which lands in
-            // bits[0-6] of the 0x140 write (`param_2 & 0x7f`). On this
-            // hardware bit 0 toggles between 0x50 (A0h) and 0x51 (A2h).
             self.bsc.device = (val & 0x1) as u8;
         }
-        // Writes to 0x14C set the base byte offset for subsequent reads.
-        // `dpoe_set_lane_state_field_in_table` @ the decompiler 0x20032d08 issues
-        // `st.di r4,[r1,0x54]` with `r4 = CLI addr`, then calls cmd_config.
         if offset == 0x14C {
             self.bsc.base_addr = (val & 0xFFFF) as u16;
         }
@@ -479,23 +349,7 @@ impl MmioController {
             }
         }
 
-        // ── LLID config registers (stats/epon) ───────────────────────────
-        //
-        // The LLID rx/tx config registers are at:
-        //   0x010003BC + llid * 4   (1G mode, used by hw_pon_get_llid_tx_config_1g
-        //                            @ the decompiler 0x2003e0c8) — wait, base is 0x0100043C
-        //   0x01000D00 + llid * 4   (10G mode, used by hw_pon_get_llid_rx_config_10g
-        //                            @ the decompiler 0x2003e870)
-        //
-        // The boot-time init writes 0x00017FFF (low 16 = 0x7FFF = 32767) to
-        // the registers for LLID 0 and LLID 31 (the channel-zero and
-        // channel-31 anchors); LLIDs 1-30 stay at 0. On real hardware those
-        // two registers read back with bit 0 of the low 16 cleared (0x7FFE
-        // = 32766), so the `mpcp_get_llid_rx_config_by_speed` getter prints
-        // 32766 instead of 32767. The other 30 LLIDs are unaffected.
-        //
-        // Mask bit 0 of the low 16 on write so the stored value matches
-        // what real HW returns to a subsequent read.
+        // LLID rx/tx config anchors (LLID 0/31): HW clears bit 0 on write-back.
         let val = if matches!(offset, 0x043C | 0x04B8 | 0x0D00 | 0x0D7C) {
             val & !0x0001
         } else {
@@ -505,9 +359,6 @@ impl MmioController {
         let idx = (offset / 4) as usize;
         if idx < self.sysreg_store.len() {
             self.sysreg_store[idx] = val;
-            // Mark bits 27-31 for auto-clear on next read.
-            // Hardware command registers use these bits as write-1-to-trigger that
-            // the hardware clears after processing. The firmware polls until cleared.
             let cmd_bits = val & 0xF8000000;
             if cmd_bits != 0 {
                 self.sysreg_pending_clear[idx] = cmd_bits;

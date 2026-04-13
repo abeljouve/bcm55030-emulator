@@ -3,41 +3,14 @@ use std::io::{self, Write};
 
 use crate::cpu::exception::Exception;
 
-/// BCM55030 UART controller (interrupt-driven, ring buffer architecture)
-///
-/// Hardware register map (byte-accessible, 4-byte aligned):
-///   Base pointer in bootloader: 0x00FC0FE8
-///   0x00FC1010 (base+0x28): Data register (TX write → stdout, RX read ← queue)
-///   0x00FC1014 (base+0x2C): IER/Status register
-///   0x00FC1018 (base+0x30): Baud divisor low byte
-///   0x00FC101C (base+0x34): Baud divisor high byte
-///
-/// IER/Status register bits:
-///   0: Error flag (W1C)
-///   1: TX holding register empty status
-///   2: RX IRQ enable (RXIE) — software R/W
-///   5: RX buffer empty — hardware-generated on read (1=empty, 0=data available)
-///   6: TX empty IRQ enable (TXIE) — software R/W
-///   7: TX IRQ pending — hardware-generated on read (= TXIE, since TX is always ready)
-///
-/// The bootloader's UART ISR at 0x4348 (boot_uart_rx_handler) uses this controller:
-///   - RX: reads data register when bit 5 = 0, stores in ring buffer at 0xF968
-///   - TX: reads from ring buffer at 0xFA68, writes to data register when bit 7 = 1
-///   - uart_tx_putchar (0x427C) sets TXIE (bit 6) when there's data to send
-///   - uart_rx_getchar (0x4218) sets RXIE (bit 2) after reading from ring buffer
+/// BCM55030 UART. Regs at 0x00FC1010+ (DATA, IER, BAUD_LO, BAUD_HI).
+/// IER bits: 0=err, 1=TxHold, 2=RXIE, 5=RxEmpty, 6=TXIE, 7=TxReady.
 pub struct SimpleUart {
-    /// IER/status register (software-managed bits; bits 5 and 7 are overlaid on read)
     ier: u8,
     baud_div_lo: u8,
     baud_div_hi: u8,
-    /// Pending RX data from stdin, fed into the data register
     pub rx_queue: VecDeque<u8>,
-    /// Stdin bytes that arrived during the bootloader phase (PC < firmware
-    /// base). The bootloader's UART ISR consumes the live rx_queue then
-    /// discards the bytes when no CLI prompt is active, so we hold a
-    /// parallel copy here. The `firmware_cli_poll_hook` drains this back into
-    /// rx_queue on the first call to `cli_poll_and_process_input`, once
-    /// firmware's CLI is ready to consume input.
+    /// Stdin bytes held during bootloader phase; drained by firmware_cli_poll_hook.
     pub held_pre_firmware: VecDeque<u8>,
 }
 
