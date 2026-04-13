@@ -77,29 +77,17 @@ pub fn register_hooks(hooks: &mut HookTable) {
     //
     // Firmware's `uart_putchar` enqueues bytes into a TX ring buffer at DCCM
     // 0x348 (struct at 0x7E204) and sets bit 0x40 in the UART IER. The
-    // firmware expects an ISR to drain that buffer, but our IRQ 5 vector
-    // dispatch lands at the bootloader's IVT (since AUX_INT_VECTOR_BASE
-    // stays at 0), and the bootloader's ISR drains a DIFFERENT ring
-    // buffer. Result: firmware's TX buffer fills up and `uart_putchar` loops
-    // forever in `serdes_tx_queue_enqueue`.
+    // firmware expects an ISR to drain that buffer. The bootloader's native
+    // UART ISR at 0x4348 drains a DIFFERENT ring buffer (`0xF968`), so we
+    // need a hook that handles firmware's ring specifically.
     //
-    // The IVT entry at runtime 0x320A8 contains 8 bytes that we don't yet
-    // decode/understand (`26 4a 70 00 26 4a 70 00`). Until we figure out
-    // the real mechanism (Phase 2 — could be polling, AUX vector base
-    // shift, or a custom ISR encoding), install a synthetic ISR at the
-    // bootloader's IVT entry 21 (PC 0xA8) that does the right thing for
-    // firmware only (gated on `mem.app_size.is_some()`).
+    // Hook at 0x28 = ARC 700 UART vector (IRQ 5). When in bootloader phase
+    // (app_size is None), the hook returns Continue and the flash content
+    // `J 0x4348` executes → bootloader's native UART ISR runs. When firmware is
+    // loaded, the hook runs its synthetic TX drain + RTIE logic.
     //
-    // This is NOT a firmware function bypass — there's no firmware code
-    // at this address (it's a hardware vector slot). It's filling in a
-    // missing peripheral driver.
-    hooks.insert(0xA8, Hook::Custom(firmware_uart_isr));
-
-    // Boot ROM IRQ generic handlers (formerly at offsets 0x80-0xF8): removed.
-    // The firmware installs its own ISR addresses into the IVT during init,
-    // and the IVT mirror in memory.rs (range FIRMWARE_BASE..FIRMWARE_BASE+0x100)
-    // propagates those data writes to ICCM. The CPU's check_interrupts path
-    // jumps to the installed handler natively.
+    // See tmp/ivt-re/FINDINGS.md §0 and §6c for the vector numbering.
+    hooks.insert(0x28, Hook::Custom(firmware_uart_isr));
 
     // ── Firmware init milestones (debug tracing) ─────────────────────────────
     hooks.insert(FIRMWARE_BASE + 0x0020C, Hook::Log("firmware_main_loop ENTRY"));
@@ -163,42 +151,26 @@ pub fn register_hooks(hooks: &mut HookTable) {
     hooks.insert(FIRMWARE_BASE + 0x01880, Hook::Log("llid_all_channels_init_and_deactivate"));
     hooks.insert(FIRMWARE_BASE + 0x04138, Hook::Log("fds_init_default_hw_record_if_missing"));
 
-    // ── Synthetic Timer 0 / Timer 1 ISRs at bootloader IVT entries ──────
+    // ── Synthetic Timer 1 ISR hook at ARC 700 vector 4 ──────────────────
     //
-    // The firmware configures ARC Timer 1 via
-    // `arc_irq_vector_setup(1, 1, 0x1312D0)` @ the decompiler 0x20001978 (limit
-    // 12.5 ms @ 100 MHz). When Timer 1 fires, the CPU dispatches to
-    // `IVB + vector*8`. `AUX_INT_VECTOR_BASE` stays at 0 throughout
-    // execution (confirmed by tracing SR writes), so the dispatch lands
-    // in the bootloader's IVT area at runtime 0x98 (Timer 0 = IRQ 3) and
-    // 0xA0 (Timer 1 = IRQ 4).
+    // Hook at 0x20 = ARC 700 Timer 1 vector (IRQ 4, level-2). The bootloader
+    // flash at 0x20 contains `J 0x208` which is the real HW handler — a
+    // stub that just clears STATUS32_L2.E2 and returns via `j.f ilink2`,
+    // WITHOUT advancing the firmware tick counter at `0x7E200`.
     //
-    // At runtime 0xA0, the bootloader binary happens to contain the
-    // instruction pattern `26 4A 70 00 26 4A 70 00` which Ghidra decodes
-    // as `halt_loop_set_auxreg28` — a tail-recursive halt loop from
-    // firmware's startup code that runs after `crt_main` completes. This is
-    // NOT a real Timer 1 ISR; it's a collision between the bootloader's
-    // IVT slot and firmware's post-crt_main halt loop (both start at offset
-    // 0xA0 in their respective binaries).
+    // Firmware's state machines (`mka_llid_state_machine_tick`, keepalive
+    // checks) poll that tick counter via `get_system_tick`. Until we
+    // identify the real HW path that advances it, we keep a synthetic
+    // hook that increments `0x7E200` on every Timer 1 IRQ, clears the
+    // Timer 1 IP bit, and RTIEs.
     //
-    // On real HW, the boot ROM installs trampolines at the vector slots
-    // that dispatch to per-peripheral ISRs — those ISRs update a software
-    // tick counter at runtime `0x7E200` (pointed to by
-    // `DAT_ram_20001b88`), which the firmware's state machines
-    // (`mka_llid_state_machine_tick`, keepalive checks, etc.) poll via
-    // `get_system_tick()`. We don't emulate the boot ROM trampoline
-    // mechanism, so we synthesize the two timer ISRs directly: in IRQ
-    // context, advance the firmware tick counter, clear the timer's IP
-    // bit, and RTIE.
+    // Timer 0 (IRQ 3) is never armed by the firmware (LIMIT0 stays 0)
+    // so no synthetic Timer 0 hook is needed — see FINDINGS.md §6a.
     //
-    // This is NOT a firmware function hook (CLAUDE.md "no firmware hooks"
-    // rule). Addresses `0x98` / `0xA0` are HARDWARE VECTOR SLOTS from the
-    // CPU's point of view; the fact that firmware code happens to live
-    // there is a coincidence of the shared bootloader/firmware memory layout.
-    // We model the HW + ISR as a single unit, same as `firmware_uart_isr` at
-    // `0xA8`.
-    hooks.insert(0x98, Hook::Custom(timer0_isr));
-    hooks.insert(0xA0, Hook::Custom(timer1_isr));
+    // KNOWN HW-faithfulness gap: this hook short-circuits the real
+    // 0x208 handler. Post-removal prerequisite = finding the real
+    // `0x7E200` writer. See tmp/ivt-re/FINDINGS.md §6b and §7c.
+    hooks.insert(0x20, Hook::Custom(timer1_isr));
 
     // ── Persistent alarm stubs (alm/info, alm/gpio) ─────────────────────
     //
@@ -231,12 +203,14 @@ pub fn register_hooks(hooks: &mut HookTable) {
 /// Drains firmware's TX ring buffer at DCCM 0x348 to the UART data register.
 /// Reads stdin into firmware's RX ring buffer at DCCM 0x248. Performs RTIE.
 ///
-/// Triggered by the IRQ 5 vector at PC 0xA8. Only fires when:
+/// Triggered by the IRQ 5 vector at PC 0x28 (ARC 700 vector 5). Only fires
+/// when:
 ///   1. Firmware is loaded (mem.app_size is Some)
 ///   2. The CPU is in interrupt context (flag_a1 set, set by check_interrupts)
 ///
-/// Otherwise (bootloader running, or normal code execution at PC 0xA8),
-/// returns Continue and lets the bootloader's J 0x4348 ISR run.
+/// Otherwise (bootloader running, or normal code execution at PC 0x28),
+/// returns Continue so the flash `J 0x4348` executes → native bootloader
+/// `boot_uart_rx_handler` runs.
 ///
 /// Firmware UART struct layout at DCCM 0x7E204:
 ///   +0: rx_empty flag (0 = has data)
@@ -253,7 +227,7 @@ fn firmware_uart_isr(state: &mut CpuState, mem: &mut Memory) -> Result<HookActio
         return Ok(HookAction::Continue);
     }
 
-    // Only intercept on actual IRQ entry (not when normal code happens to PC=0xA8)
+    // Only intercept on actual IRQ entry (not when normal code happens to PC=0x28)
     if !state.flag_a1 && !state.flag_a2 {
         return Ok(HookAction::Continue);
     }
@@ -390,29 +364,7 @@ fn firmware_cli_poll_hook(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
 // bus type encoded in r0 high byte and short-circuit only for the bus
 // type the SerDes block uses (which we have no peripheral for).
 
-/// Temporary trace hooks for alarm state machine investigation.
-/// Synthetic Timer 0 ISR at bootloader IVT entry offset 0x98.
-///
-/// On real HW, Timer 0 / Timer 1 fire periodically and their ISRs advance
-/// a software "system tick" counter that the firmware polls for timing.
-/// The bootloader's IVT entry happens to overlap with the `halt_loop_
-/// set_auxreg28` function from firmware's startup (runtime 0x320A0); the
-/// real boot-ROM installs trampolines at the vector slots that dispatch
-/// to the actual ISRs, but we don't emulate that mechanism. Instead, we
-/// synthesize the Timer-0 ISR directly: if we're in IRQ context, clear
-/// the pending bit and RTIE; otherwise pass through to whatever firmware
-/// code happens to live there (the halt loop).
-fn timer0_isr(state: &mut CpuState, _mem: &mut Memory) -> Result<HookAction, Exception> {
-    if !state.flag_a1 && !state.flag_a2 {
-        return Ok(HookAction::Continue);
-    }
-    // Clear Timer 0 pending IP bit (W1C on control bit 3)
-    state.aux_control0 &= !0x08;
-    do_rtie(state);
-    Ok(HookAction::Skip)
-}
-
-/// Synthetic Timer 1 ISR at bootloader IVT entry offset 0xA0.
+/// Synthetic Timer 1 ISR at ARC 700 vector 4 (PC 0x20).
 ///
 /// Increments the firmware firmware software tick counter at runtime
 /// `0x7E200` (referenced via `DAT_ram_20001b88`). The firmware's
@@ -421,9 +373,11 @@ fn timer0_isr(state: &mut CpuState, _mem: &mut Memory) -> Result<HookAction, Exc
 /// for 200-tick transitions). Without this, `alm/info` stays stuck
 /// because the LLID link-down event never fires.
 ///
-/// This models the Timer 1 ISR's net effect on firmware state without
-/// executing any firmware code (the real ISR lives in a boot-ROM
-/// trampoline we don't emulate).
+/// The real bootloader handler at flash 0x20 is `J 0x208` which
+/// jumps to a level-2 handler that only clears STATUS32_L2.E2 and
+/// returns — it does NOT advance `0x7E200`. Until we find the real
+/// HW writer of that tick counter, this hook short-circuits the
+/// real path (HW-faithfulness gap documented in FINDINGS.md §6b).
 fn timer1_isr(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
     if !state.flag_a1 && !state.flag_a2 {
         return Ok(HookAction::Continue);

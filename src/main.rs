@@ -330,36 +330,10 @@ fn boot_from_flash(cpu: &mut Cpu, entry_point: u32) {
     cpu.state.flag_e1 = true;
     cpu.state.flag_e2 = true;
 
-    // 3. Install IVT entries pointing to hook addresses.
-    // The synthetic ISR hooks (Timer0 @ 0x98, Timer1 @ 0xA0, UART @ 0xA8)
-    // need the IVT to dispatch IRQs to their hook addresses. The bootloader's
-    // native IVT uses different vectors, but the emulator's peripheral models
-    // depend on these synthetic ISRs. Install a generic IRQ handler at 0xA800
-    // and IVT entries that jump to it; the UART gets a direct vector to 0x4348.
-    {
-        let irq_handler: [u8; 20] = [
-            0x1C, 0xFC, 0xB7, 0xC8, // st.aw blink,[sp,-4]
-            0x20, 0x22, 0x0F, 0x80, // jl 0x8C80
-            0x00, 0x00, 0x8C, 0x80,
-            0x14, 0x04, 0x34, 0x1F, // ld.ab blink,[sp,4]
-            0x24, 0x6F, 0x00, 0x3F, // rtie
-        ];
-        cpu.mem.load_binary(0xA800, &irq_handler);
-
-        let j_handler: [u8; 8] = [
-            0x20, 0x20, 0x0F, 0x80, 0x00, 0x00, 0xA8, 0x00,
-        ];
-        for irq in 0..16u32 {
-            let vector_offset = (16 + irq) * 8;
-            cpu.mem.load_binary(vector_offset, &j_handler);
-        }
-
-        // UART IRQ 5: direct to bootloader's native UART ISR
-        let j_uart_isr: [u8; 8] = [
-            0x20, 0x20, 0x0F, 0x80, 0x00, 0x00, 0x43, 0x48,
-        ];
-        cpu.mem.load_binary((16 + 5) * 8, &j_uart_isr);
-    }
+    // IVT: no runtime install. Per ARC 700 convention (Table 22), Timer 0 = vec 3
+    // @ 0x18, Timer 1 = vec 4 @ 0x20, UART = vec 5 @ 0x28. The bootloader flash
+    // image already contains real `j [limm]` trampolines at those offsets
+    // (loaded by the 64 KB HW DMA from flash at reset). See tmp/ivt-re/FINDINGS.md.
 
     cpu.state.pc = entry_point;
     bcm55030_emulator::vlog!(

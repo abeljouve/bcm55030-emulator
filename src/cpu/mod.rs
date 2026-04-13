@@ -294,9 +294,7 @@ impl Cpu {
             self.state.flag_u = false;
             self.state.flag_l = true; // ISA: disable ZOL on interrupt entry
 
-            // ARC 700 fast IRQ register banking: save r0..r3 to shadow set
-            // and clear them. The bootloader's IRQ handler at 0xA800 freely
-            // clobbers r0..r3 without saving — relies on this behavior.
+            // ARC 700 fast IRQ register banking: save r0..r3 to shadow set.
             // Restored on RTIE.
             self.state.irq_shadow_r0_r3[0] = self.state.core_regs[0];
             self.state.irq_shadow_r0_r3[1] = self.state.core_regs[1];
@@ -306,7 +304,11 @@ impl Cpu {
 
         self.state.aux_irq_pending &= !(1 << irq);
 
-        let vector = 16 + irq;
+        // ARC 700 IVT: IRQ N lives at vector N (not 16+N — that's ARCv2/ARC-EM).
+        // Per Table 22 "ARC 700 Interrupt Vector Summary" in the ARCompact
+        // Programmer's Reference: IRQ 3 (Timer 0) = 0x18, IRQ 4 (Timer 1) = 0x20,
+        // IRQ 5 (UART) = 0x28, …. See tmp/ivt-re/FINDINGS.md §0.
+        let vector = irq;
         self.state.pc = self.state.aux_int_vector_base + vector * 8;
         self.state.pc_written = true;
 
