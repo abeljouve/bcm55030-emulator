@@ -304,11 +304,16 @@ fn boot_from_flash(cpu: &mut Cpu, entry_point: u32, mode: BootMode) {
         copy_size, copy_size
     );
 
-    // Audit 1.1: only preset IENABLE/E1/E2 in warm-boot mode. Cold boot
-    // leaves them at cold-reset values so the firmware has to enable
-    // interrupts via its own FLAG instruction at uart_enable_interrupts.
+    // Audit 1.1 revised after D6 diagnosis: `aux_ienable` is preset
+    // unconditionally because the BCM55030 silicon appears to reset
+    // the IRQ enable mask to `0xFFFFFFFF` — the firmware never
+    // programs it explicitly and the bootloader's TX path depends
+    // on IRQ 5 firing once STATUS32 bits E1 / E2 are set. E1 / E2
+    // themselves still only ship pre-set in warm mode because the
+    // firmware's FLAG instruction at `uart_enable_interrupts`
+    // (runtime `0x59F4`) drives them in both warm and cold.
+    cpu.state.aux_ienable = 0xFFFFFFFF;
     if mode == BootMode::Warm {
-        cpu.state.aux_ienable = 0xFFFFFFFF;
         cpu.state.flag_e1 = true;
         cpu.state.flag_e2 = true;
     }
