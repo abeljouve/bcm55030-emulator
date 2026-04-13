@@ -1,5 +1,18 @@
 //! Post-boot sysreg snapshot from live HW (firmware v3.2.9, 2026-04-10).
-//! NOT cold-reset values — pre-populates `sysreg_store` so emulator skips replaying init.
+//!
+//! These are **not** cold-reset values. Each entry is a (offset,
+//! value) pair captured from a live BCM55030 board after the
+//! bootloader + firmware finished their own initialisation sequence.
+//! Every peripheral with a `reset_warm` path iterates this list
+//! and applies the slice that falls inside its claim set
+//! (`epon_mac`, `serdes`, `macsec`, `dma`, `efuse_udr`,
+//! `fatal_filter`, `sysreg_shim` for the residual). The list is
+//! intentionally monolithic: splitting it per peripheral would
+//! churn every refactor without reducing total line count.
+//!
+//! Cold-boot parity (`BootMode::Cold`) intentionally skips this
+//! seed and forces each peripheral's real cold-reset state —
+//! tracked in the design notes deferral D6.
 
 /// (offset_from_0x01000000, init_value).
 pub const SYSREG_INIT_VALUES: &[(u32, u32)] = &[

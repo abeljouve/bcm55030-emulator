@@ -165,7 +165,14 @@ impl EponMac {
 
     #[inline]
     pub fn claims(&self, addr: u32) -> bool {
-        match addr {
+        // Word-align the address so half / byte sub-offsets (e.g.
+        // `0x01000001`) route to the same peripheral as the word.
+        // Sparse single-register claims break under byte / half
+        // access otherwise — the trait default `read_half` path
+        // passes the word-aligned base but some routing layers
+        // forward the raw address.
+        let word = addr & !0x3;
+        match word {
             REG_CHIP_ID | REG_CHIP_REV | REG_LLID_CAPTURE_MASK | REG_LLID_ACTIVE_BITMAP
             | REG_LLID_MASK_CONTROL | REG_LLID_COUNTER_MASK | REG_TX_GRANT_MASK
             | REG_RX_GRANT_MASK | REG_IRQ_MASK | REG_EPON_STATUS | REG_ACTIVE_FLAGS

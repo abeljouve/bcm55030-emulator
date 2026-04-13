@@ -168,11 +168,14 @@ impl SysregShim {
     }
 
     fn sysreg_read_word(&mut self, offset: u32) -> u32 {
-        // Pure residual fallback after Session 6. Every special
-        // arm (CHIP_ID, LLID masks, queue drain, timer counter,
-        // eFuse UDR, filter/fatal error) now lives inside its own
-        // peripheral module. Unknown addresses round-trip through
-        // the generic backing store with command-bit auto-clear.
+        // Residual fallback for offsets no typed peripheral
+        // claims. The command-bit `[31:27]` auto-clear on read is
+        // kept here because one or more firmware paths still
+        // target unclaimed queue-priority / DPoE registers with
+        // the BCM55030 command protocol — audit 5.8 is partial,
+        // not fully resolved (boot regresses without this). Each
+        // typed peripheral now owns its own clear semantic, and
+        // the residual region shrinks as more peripherals land.
         let val = self.store_read(offset);
         self.log_unhandled_read(offset, val);
         val
