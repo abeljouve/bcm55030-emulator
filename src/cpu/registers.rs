@@ -561,11 +561,8 @@ impl CpuState {
                 Ok(())
             }
             0x49 => Ok(()),  // DC_LDL / CACHE_BYPASS: ignored for now
-            // AUX 0x10 — gap dans la baseline ARCompact ISA (entre STATUS32_L2 0x0C
-            // et MULHI 0x12). Le firmware BCM55030 (hw_auxreg_trigger_write @ 0x5A50)
-            // y écrit 0 comme "trigger". Sur le vrai hardware, c'est probablement
-            // un NOP silencieux (slot réservé). Voir Q-BCR-02 dans
-            // ~/workspace/device/analysis/canonical/OPEN_QUESTIONS.md.
+            // IC_IVIC (aux 0x10): side effect handled by executor (invalidates
+            // entire I-cache on any write). No state stored here.
             0x10 => Ok(()),
             // Read-only registers — writes silently ignored on real HW
             AUX_STATUS | AUX_IDENTITY | AUX_DEBUG | AUX_PC | AUX_ECR | AUX_ICAUSE1

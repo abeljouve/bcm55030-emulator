@@ -16,7 +16,6 @@ pub mod uart;
 
 use crate::cpu::exception::Exception;
 use crate::cpu::registers::CpuState;
-use crate::cpu::registers::REG_ILINK1;
 use crate::hooks::{Hook, HookAction, HookTable};
 use crate::memory::Memory;
 use crate::soc::boot_rom::FIRMWARE_BASE;
@@ -72,22 +71,6 @@ pub fn register_hooks(hooks: &mut HookTable) {
     // 4 bytes past function entries. With the corrected load offset
     // (FIRMWARE_BASE = 0x32000), this might no longer be needed because the
     // handler addresses might now resolve correctly. To be re-validated.
-
-    // ── Firmware UART ISR (synthetic) ────────────────────────────────────────
-    //
-    // Firmware's `uart_putchar` enqueues bytes into a TX ring buffer at DCCM
-    // 0x348 (struct at 0x7E204) and sets bit 0x40 in the UART IER. The
-    // firmware expects an ISR to drain that buffer. The bootloader's native
-    // UART ISR at 0x4348 drains a DIFFERENT ring buffer (`0xF968`), so we
-    // need a hook that handles firmware's ring specifically.
-    //
-    // Hook at 0x28 = ARC 700 UART vector (IRQ 5). When in bootloader phase
-    // (app_size is None), the hook returns Continue and the flash content
-    // `J 0x4348` executes → bootloader's native UART ISR runs. When firmware is
-    // loaded, the hook runs its synthetic TX drain + RTIE logic.
-    //
-    // See tmp/ivt-re/FINDINGS.md §0 and §6c for the vector numbering.
-    hooks.insert(0x28, Hook::Custom(firmware_uart_isr));
 
     // ── Firmware init milestones (debug tracing) ─────────────────────────────
     hooks.insert(FIRMWARE_BASE + 0x0020C, Hook::Log("firmware_main_loop ENTRY"));
@@ -175,133 +158,6 @@ pub fn register_hooks(hooks: &mut HookTable) {
     // the emulator doesn't currently populate.
     hooks.insert(FIRMWARE_BASE + 0x33b2c, Hook::Custom(alm_info_pending_stub));
     hooks.insert(FIRMWARE_BASE + 0x10174, Hook::Custom(alm_gpio_chan_ctx_stub));
-}
-
-/// Synthetic UART ISR for firmware (IRQ 5).
-///
-/// Drains firmware's TX ring buffer at DCCM 0x348 to the UART data register.
-/// Reads stdin into firmware's RX ring buffer at DCCM 0x248. Performs RTIE.
-///
-/// Triggered by the IRQ 5 vector at PC 0x28 (ARC 700 vector 5). Only fires
-/// when:
-///   1. Firmware is loaded (mem.app_size is Some)
-///   2. The CPU is in interrupt context (flag_a1 set, set by check_interrupts)
-///
-/// Otherwise (bootloader running, or normal code execution at PC 0x28),
-/// returns Continue so the flash `J 0x4348` executes → native bootloader
-/// `boot_uart_rx_handler` runs.
-///
-/// Firmware UART struct layout at DCCM 0x7E204:
-///   +0: rx_empty flag (0 = has data)
-///   +1: rx_write index
-///   +2: rx_read  index
-///   +3: tx_trigger flag (set by ISR after drain to re-arm next batch)
-///   +4: tx_write index
-///   +5: tx_read  index
-///
-/// TX buffer at DCCM 0x348, RX buffer at DCCM 0x248 (256 bytes each).
-fn firmware_uart_isr(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
-    // Only intercept when firmware is loaded
-    if mem.app_size.is_none() {
-        return Ok(HookAction::Continue);
-    }
-
-    // Only intercept on actual IRQ entry (not when normal code happens to PC=0x28)
-    if !state.flag_a1 && !state.flag_a2 {
-        return Ok(HookAction::Continue);
-    }
-
-    const UART_STRUCT: u32 = 0x7E204;
-    const TX_BUF: u32 = 0x348;
-    const RX_BUF: u32 = 0x248;
-
-    // Phase 1: snapshot UART HW state and drain incoming RX queue
-    let (ier, rx_bytes) = {
-        let mut mmio = mem.mmio().unwrap();
-        let ier = mmio.uart.ier();
-        let rx: Vec<u8> = mmio.uart.rx_queue.drain(..).collect();
-        (ier, rx)
-    };
-
-    // Phase 2: TX — drain firmware's TX ring buffer to stdout (via UART HW)
-    if ier & 0x40 != 0 {
-        let tx_write = mem.read_byte(UART_STRUCT + 4)?;
-        let mut tx_read = mem.read_byte(UART_STRUCT + 5)?;
-
-        if tx_read != tx_write {
-            let stdout = std::io::stdout();
-            let mut handle = stdout.lock();
-            while tx_read != tx_write {
-                let byte = mem.read_byte(TX_BUF + tx_read as u32)?;
-                let _ = std::io::Write::write_all(&mut handle, &[byte]);
-                tx_read = tx_read.wrapping_add(1);
-            }
-            let _ = std::io::Write::flush(&mut handle);
-            mem.write_byte(UART_STRUCT + 5, tx_read)?;
-        }
-
-        // Buffer drained: clear TXIE and re-arm trigger for next batch
-        {
-            let mut mmio = mem.mmio().unwrap();
-            mmio.uart.ier_clear(0x40);
-        }
-        mem.write_byte(UART_STRUCT + 3, 1)?;
-    }
-
-    // Phase 3: RX — fill firmware's RX ring buffer from stdin
-    if !rx_bytes.is_empty() {
-        let mut pushed = 0usize;
-        for &byte in &rx_bytes {
-            let rx_write = mem.read_byte(UART_STRUCT + 1)?;
-            let rx_read = mem.read_byte(UART_STRUCT + 2)?;
-
-            if rx_write.wrapping_add(1) == rx_read {
-                break; // Ring buffer full
-            }
-
-            mem.write_byte(RX_BUF + rx_write as u32, byte)?;
-            mem.write_byte(UART_STRUCT + 1, rx_write.wrapping_add(1))?;
-            mem.write_byte(UART_STRUCT + 0, 0)?;
-            pushed += 1;
-        }
-
-        if pushed < rx_bytes.len() {
-            let mut mmio = mem.mmio().unwrap();
-            for &byte in &rx_bytes[pushed..] {
-                mmio.uart.rx_queue.push_back(byte);
-            }
-        }
-    }
-
-    // Ensure RXIE (bit 2) is set so future stdin data triggers UART IRQ
-    {
-        let mut mmio = mem.mmio().unwrap();
-        mmio.uart.ier_set(0x04);
-    }
-
-    // RTIE: restore STATUS32 and PC from saved interrupt state.
-    // For level-1 IRQ, also restore r0..r3 from the fast-IRQ shadow set
-    // saved by check_interrupts. The bootloader's IRQ handler at 0xA800
-    // (which we may bypass via this hook) freely clobbers r0..r3 — real
-    // HW shadow registers protect the firmware's GP state.
-    if state.flag_a2 {
-        let saved = state.aux_status32_l2;
-        state.set_status32(saved);
-        state.pc = state.core_regs[crate::cpu::registers::REG_ILINK2 as usize];
-        state.aux_bta = state.aux_bta_l2;
-    } else {
-        let saved = state.aux_status32_l1;
-        state.set_status32(saved);
-        state.pc = state.core_regs[REG_ILINK1 as usize];
-        state.aux_bta = state.aux_bta_l1;
-        state.core_regs[0] = state.irq_shadow_r0_r3[0];
-        state.core_regs[1] = state.irq_shadow_r0_r3[1];
-        state.core_regs[2] = state.irq_shadow_r0_r3[2];
-        state.core_regs[3] = state.irq_shadow_r0_r3[3];
-    }
-    state.pc_written = true;
-    state.instruction_count += 1;
-    Ok(HookAction::Skip)
 }
 
 /// Replay any stdin bytes that arrived during the bootloader phase, on the

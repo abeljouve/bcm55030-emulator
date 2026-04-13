@@ -167,11 +167,12 @@ pub fn execute(
                     mem.dcache_set_ram_addr(val);
                 }
                 0x10 => {
-                    // IC_IVIC: invalidate entire I-cache
-                    let val = resolve_value(*src, state)?;
-                    if val & 1 != 0 {
-                        mem.icache_invalidate_all();
-                    }
+                    // IC_IVIC: invalidate entire I-cache on any write.
+                    // Firmware `hw_auxreg_trigger_write` (ram:20042d48) writes 0
+                    // as the flush trigger, so gating on a bit value would miss
+                    // the real firmware flush path.
+                    let _ = resolve_value(*src, state)?;
+                    mem.icache_invalidate_all();
                 }
                 0x19 => {
                     // IC_IVIL: invalidate single I-cache line
