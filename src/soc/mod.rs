@@ -36,12 +36,15 @@ use crate::soc::boot_rom::FIRMWARE_BASE;
 /// installed.
 pub fn register_hooks(hooks: &mut HookTable) {
 
-    // ── Missing-hardware stubs (NOT firmware bypasses) ──────────────────
-    //
-    // `serdes_hw_ready_flag` reports "ready/link-up" for a hardware signal
-    // we don't drive at all. Returning 1 is the "quiescent ONU" answer.
-    // Removing it requires modelling the SerDes lane state machine (Phase 3).
-    hooks.insert(FIRMWARE_BASE + 0x1E6C, Hook::ReturnValue(1));
+    // `serdes_hw_ready_flag` @ firmware+0x1E6C was removed 2026-04-13. Despite the
+    // Ghidra auto-name, RE shows the function is a UART TX-idle flag getter:
+    // it returns `*(u8*)(0x7E207)` which `firmware_native_uart_isr` sets to 1
+    // when the TX ring drains and the UART status bit 0x80 is asserted.
+    // Its sole caller, `serdes_set_pon_rate_and_enable`, busy-waits on it to
+    // flush pending UART output before reconfiguring the SerDes clock. With
+    // the native UART ISR installed natively by firmware (prompt 07) and our
+    // UART model asserting bit 0x80 unconditionally, the firmware drains
+    // the ring and sets the flag naturally — no hook needed.
 
     // ── Workaround removed for re-validation 2026-04-10 ──────────────────
     //
