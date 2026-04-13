@@ -141,6 +141,12 @@ pub struct CpuState {
     pub aux_control1: u32,
     pub aux_limit1: u32,
 
+    // Timer 1 IRQ line number. ARC 700 default per Table 22 is 4, but the
+    // timer IRQ wiring is SoC-integration-level config — BCM55030 wires
+    // Timer 1 to IRQ 7 (see `hw_timer_reset_and_set_auxreg7` which installs
+    // the tick-counter handler at vec 7, and AUX_IRQ_LEV bit 7 set in HW).
+    pub timer1_irq: u32,
+
     // Exception registers
     pub aux_eret: u32,
     pub aux_erbta: u32,
@@ -221,6 +227,7 @@ impl CpuState {
             aux_count1: 0,
             aux_control1: 0,
             aux_limit1: 0,
+            timer1_irq: 4,
             aux_eret: 0,
             aux_erbta: 0,
             aux_erstatus: 0,

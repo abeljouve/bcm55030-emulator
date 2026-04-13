@@ -151,27 +151,6 @@ pub fn register_hooks(hooks: &mut HookTable) {
     hooks.insert(FIRMWARE_BASE + 0x01880, Hook::Log("llid_all_channels_init_and_deactivate"));
     hooks.insert(FIRMWARE_BASE + 0x04138, Hook::Log("fds_init_default_hw_record_if_missing"));
 
-    // ── Synthetic Timer 1 ISR hook at ARC 700 vector 4 ──────────────────
-    //
-    // Hook at 0x20 = ARC 700 Timer 1 vector (IRQ 4, level-2). The bootloader
-    // flash at 0x20 contains `J 0x208` which is the real HW handler — a
-    // stub that just clears STATUS32_L2.E2 and returns via `j.f ilink2`,
-    // WITHOUT advancing the firmware tick counter at `0x7E200`.
-    //
-    // Firmware's state machines (`mka_llid_state_machine_tick`, keepalive
-    // checks) poll that tick counter via `get_system_tick`. Until we
-    // identify the real HW path that advances it, we keep a synthetic
-    // hook that increments `0x7E200` on every Timer 1 IRQ, clears the
-    // Timer 1 IP bit, and RTIEs.
-    //
-    // Timer 0 (IRQ 3) is never armed by the firmware (LIMIT0 stays 0)
-    // so no synthetic Timer 0 hook is needed — see FINDINGS.md §6a.
-    //
-    // KNOWN HW-faithfulness gap: this hook short-circuits the real
-    // 0x208 handler. Post-removal prerequisite = finding the real
-    // `0x7E200` writer. See tmp/ivt-re/FINDINGS.md §6b and §7c.
-    hooks.insert(0x20, Hook::Custom(timer1_isr));
-
     // ── Persistent alarm stubs (alm/info, alm/gpio) ─────────────────────
     //
     // KNOWN VIOLATION of the "no firmware function hooks" rule. Kept
@@ -364,44 +343,6 @@ fn firmware_cli_poll_hook(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
 // bus type encoded in r0 high byte and short-circuit only for the bus
 // type the SerDes block uses (which we have no peripheral for).
 
-/// Synthetic Timer 1 ISR at ARC 700 vector 4 (PC 0x20).
-///
-/// Increments the firmware firmware software tick counter at runtime
-/// `0x7E200` (referenced via `DAT_ram_20001b88`). The firmware's
-/// `get_system_tick` reads this counter and MKA LLID state machines
-/// use it as a delay reference (e.g., `seq32_is_after(target, tick)`
-/// for 200-tick transitions). Without this, `alm/info` stays stuck
-/// because the LLID link-down event never fires.
-///
-/// The real bootloader handler at flash 0x20 is `J 0x208` which
-/// jumps to a level-2 handler that only clears STATUS32_L2.E2 and
-/// returns — it does NOT advance `0x7E200`. Until we find the real
-/// HW writer of that tick counter, this hook short-circuits the
-/// real path (HW-faithfulness gap documented in FINDINGS.md §6b).
-fn timer1_isr(state: &mut CpuState, mem: &mut Memory) -> Result<HookAction, Exception> {
-    if !state.flag_a1 && !state.flag_a2 {
-        return Ok(HookAction::Continue);
-    }
-    // Advance the firmware tick counter at runtime 0x7E200.
-    //
-    // Scaling factor: the emulator boots firmware to the CLI prompt in ~22M
-    // instructions (~1s of emulator wall-clock), whereas real HW takes ~5s
-    // to reach the same point. Firmware state machines that use Timer 1
-    // (e.g., MKA LLID state machine, with a 200-tick / 2.5s link-detection
-    // delay) need their clock to advance at the "real HW time" rate, not
-    // the emulator wall-clock rate. We scale the tick by 32 so that one
-    // Timer 1 IRQ (= 12.5ms HW time, = 1.25M emulator insns) corresponds
-    // With the 1.76x timer prescaler, Timer1 fires at a realistic rate.
-    // Each IRQ increments the firmware tick counter by 1 (no artificial scaling).
-    const TICK_SCALE: u32 = 1;
-    let tick = mem.read_word(0x7E200).unwrap_or(0);
-    let _ = mem.write_word(0x7E200, tick.wrapping_add(TICK_SCALE));
-    // Clear Timer 1 pending IP bit (W1C on control bit 3)
-    state.aux_control1 &= !0x08;
-    do_rtie(state);
-    Ok(HookAction::Skip)
-}
-
 /// `irq_test_pending_bit_for_opcode(opcode, bit_idx) → 0/1` stub.
 ///
 /// KNOWN VIOLATION of the "no firmware function hooks" rule. Returns 1
@@ -441,31 +382,5 @@ fn alm_gpio_chan_ctx_stub(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
     state.pc = state.core_regs[31];
     state.instruction_count += 1;
     Ok(HookAction::Skip)
-}
-
-/// Helper: perform ARC RTIE (return from interrupt) from a hook.
-/// Restores STATUS32 and PC from the appropriate save slot.
-fn do_rtie(state: &mut CpuState) {
-    if state.flag_a2 {
-        let saved = state.aux_status32_l2;
-        state.set_status32(saved);
-        state.pc = state.core_regs[crate::cpu::registers::REG_ILINK2 as usize];
-        state.pc_written = true;
-        state.aux_bta = state.aux_bta_l2;
-        state.core_regs[0] = state.irq_shadow_r0_r3[0];
-        state.core_regs[1] = state.irq_shadow_r0_r3[1];
-        state.core_regs[2] = state.irq_shadow_r0_r3[2];
-        state.core_regs[3] = state.irq_shadow_r0_r3[3];
-    } else if state.flag_a1 {
-        let saved = state.aux_status32_l1;
-        state.set_status32(saved);
-        state.pc = state.core_regs[REG_ILINK1 as usize];
-        state.pc_written = true;
-        state.aux_bta = state.aux_bta_l1;
-        state.core_regs[0] = state.irq_shadow_r0_r3[0];
-        state.core_regs[1] = state.irq_shadow_r0_r3[1];
-        state.core_regs[2] = state.irq_shadow_r0_r3[2];
-        state.core_regs[3] = state.irq_shadow_r0_r3[3];
-    }
 }
 

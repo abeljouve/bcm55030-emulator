@@ -46,8 +46,13 @@ impl Cpu {
 
     /// Create a BCM55030 CPU with unified SRAM + MMIO.
     pub fn new_bcm55030() -> Self {
+        let mut state = CpuState::new();
+        // BCM55030 wires Timer 1 to IRQ 7 (standard ARC 700 uses IRQ 4).
+        // Firmware installs a tick-counter handler at vec 7 via
+        // `hw_timer_reset_and_set_auxreg7` (ram:20001bb8).
+        state.timer1_irq = 7;
         Self {
-            state: CpuState::new(),
+            state,
             mem: Memory::new_soc(crate::memory::SRAM_SIZE),
             trace: false,
             hooks: HookTable::new(),
@@ -213,16 +218,16 @@ impl Cpu {
                 self.state.aux_count0 = 0;
             }
         }
-        // Timer 1 (IRQ 4)
+        // Timer 1 (IRQ line from state.timer1_irq — default 4 per ARC 700
+        // Table 22, BCM55030 uses 7). Count always resets to 0 on limit hit
+        // per ARCompact spec (COUNT0/1 wraps at limit, interrupt pulse fires).
         self.state.aux_count1 = self.state.aux_count1.wrapping_add(1);
         if self.state.aux_limit1 != 0 && self.state.aux_count1 >= self.state.aux_limit1 {
             self.state.aux_control1 |= 0x08; // IP bit
             if self.state.aux_control1 & 0x01 != 0 {
-                self.state.aux_irq_pending |= 1 << 4;
+                self.state.aux_irq_pending |= 1 << self.state.timer1_irq;
             }
-            if self.state.aux_control1 & 0x02 == 0 {
-                self.state.aux_count1 = 0;
-            }
+            self.state.aux_count1 = 0;
         }
     }
 
@@ -307,7 +312,9 @@ impl Cpu {
         // ARC 700 IVT: IRQ N lives at vector N (not 16+N — that's ARCv2/ARC-EM).
         // Per Table 22 "ARC 700 Interrupt Vector Summary" in the ARCompact
         // Programmer's Reference: IRQ 3 (Timer 0) = 0x18, IRQ 4 (Timer 1) = 0x20,
-        // IRQ 5 (UART) = 0x28, …. See tmp/ivt-re/FINDINGS.md §0.
+        // IRQ 5 (UART) = 0x28, …. See tmp/ivt-re/FINDINGS.md §0. Note that the
+        // timer IRQ line is SoC-integration config — BCM55030 wires Timer 1 to
+        // IRQ 7 (vec `0x38`), see `state.timer1_irq`.
         let vector = irq;
         self.state.pc = self.state.aux_int_vector_base + vector * 8;
         self.state.pc_written = true;

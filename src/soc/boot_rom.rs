@@ -149,7 +149,12 @@ pub fn boot_rom_start_app(state: &mut CpuState, mem: &mut Memory) -> Result<Hook
     // irq_setup_vector_and_enable() after installing exception handlers.
     // IENABLE is set to all-enabled: the firmware never writes IENABLE itself,
     // it expects the boot ROM to have enabled all interrupt lines.
+    //
+    // SoC-integration fields that live in CpuState (e.g. timer1_irq wiring)
+    // must survive the reset — they describe hardware, not CPU state.
+    let saved_timer1_irq = state.timer1_irq;
     *state = CpuState::new();
+    state.timer1_irq = saved_timer1_irq;
     state.core_regs[28] = 0x10800; // SP (firmware startup will overwrite to 0x32000)
     state.aux_ienable = 0xFFFFFFFF; // Boot ROM enables all interrupt lines
     state.pc = FIRMWARE_BASE;

@@ -348,8 +348,11 @@ fn boot_from_flash(cpu: &mut Cpu, entry_point: u32) {
 fn reset_cpu_for_reboot(cpu: &mut Cpu) {
     use bcm55030_emulator::cpu::registers::CpuState;
 
-    // Reset CPU state (all registers, flags, aux regs)
+    // Reset CPU state (all registers, flags, aux regs). Preserve SoC-integration
+    // fields that describe hardware wiring (timer IRQ lines).
+    let saved_timer1_irq = cpu.state.timer1_irq;
     cpu.state = CpuState::new();
+    cpu.state.timer1_irq = saved_timer1_irq;
 
     // Clear SRAM (volatile RAM)
     let sram_size = cpu.mem.sram_size();
