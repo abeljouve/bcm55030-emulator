@@ -13,7 +13,6 @@ use crate::decoder;
 use crate::executor;
 use crate::hooks::{self, HookAction, HookTable};
 use crate::memory::Memory;
-use crate::soc::alarm::AlarmModel;
 use crate::soc::bank::{BootMode, PeripheralBank, BANK_TICK_PRESCALER};
 
 /// UART interrupt number (IRQ 5, level 1 per aux_irq_lev = 0xD7 bit 5 = 0).
@@ -41,11 +40,6 @@ pub struct Cpu {
     bank: Option<Arc<RwLock<PeripheralBank>>>,
     /// Instructions elapsed since the last bank tick.
     bank_tick_accumulator: u64,
-    /// Transitional alarm model — preserved until `alarm_events.rs`
-    /// lands in Session 5 and replaces it with real event sources.
-    /// Audit 7.1 tracks the migration. Writes DCCM directly, NOT a
-    /// firmware hook (`AlarmModel::tick` only seeds SRAM state).
-    pub alarm: AlarmModel,
 }
 
 impl Cpu {
@@ -59,7 +53,6 @@ impl Cpu {
             timer_frac_acc: 0,
             bank: None,
             bank_tick_accumulator: 0,
-            alarm: AlarmModel::new(),
         }
     }
 
@@ -78,7 +71,6 @@ impl Cpu {
             timer_frac_acc: 0,
             bank,
             bank_tick_accumulator: 0,
-            alarm: AlarmModel::new(),
         }
     }
 
@@ -187,12 +179,6 @@ impl Cpu {
         self.tick_timers_and_bank();
         self.check_uart_irq();
         self.check_interrupts();
-
-        // Transitional alarm model — seeds quiescent-ONU alarm bits.
-        // Replaced by `alarm_events.rs` in Session 5.
-        if self.mem.is_soc() {
-            self.alarm.tick(&mut self.mem, self.state.instruction_count);
-        }
 
         Ok(())
     }

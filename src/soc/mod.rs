@@ -10,7 +10,7 @@
 //! stdin replay path is replaced by the mpsc channel exposed by the
 //! bank (`PeripheralBank::uart_rx_sender()`).
 
-pub mod alarm;
+pub mod alarm_events;
 pub mod bank;
 pub mod boot_rom;
 pub mod bsc_i2c;

@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 
 use crate::cpu::exception::Exception;
+use crate::soc::alarm_events::AlarmEvents;
 use crate::soc::bsc_i2c::BscI2c;
 use crate::soc::dma::DmaChannelController;
 use crate::soc::epon_mac::EponMac;
@@ -63,6 +64,7 @@ pub struct PeripheralBank {
     pub epon_mac: EponMac,
     pub macsec: Macsec,
     pub dma: DmaChannelController,
+    pub alarm_events: AlarmEvents,
 
     /// Temporary residual-plus-legacy-arms for the SYSREG range
     /// (`0x01000000..0x01003800`). Hosts every stub that has not yet been
@@ -108,6 +110,7 @@ impl PeripheralBank {
             epon_mac: EponMac::new(),
             macsec: Macsec::new(),
             dma: DmaChannelController::new(),
+            alarm_events: AlarmEvents::new(),
             sysreg: SysregShim::new(),
             uart_rx_sender: tx,
             uart_rx_receiver: rx,
@@ -155,6 +158,7 @@ impl PeripheralBank {
         self.epon_mac.tick(cpu_instructions);
         self.macsec.tick(cpu_instructions);
         self.dma.tick(cpu_instructions);
+        self.alarm_events.tick(cpu_instructions);
         self.sysreg.tick(cpu_instructions);
 
         // Aggregate IRQ pending bits. UART is the only v1 contributor
@@ -173,6 +177,7 @@ impl PeripheralBank {
         self.epon_mac.reset_cold();
         self.macsec.reset_cold();
         self.dma.reset_cold();
+        self.alarm_events.reset_cold();
         self.sysreg.reset_cold();
         self.irq_pending = 0;
         self.current_pc = 0;
@@ -189,6 +194,7 @@ impl PeripheralBank {
         self.epon_mac.reset_warm();
         self.macsec.reset_warm();
         self.dma.reset_warm();
+        self.alarm_events.reset_warm();
         self.sysreg.reset_warm();
         self.irq_pending = 0;
         self.current_pc = 0;
@@ -217,12 +223,13 @@ impl PeripheralBank {
             self.epon_mac.snapshot(),
             self.macsec.snapshot(),
             self.dma.snapshot(),
+            self.alarm_events.snapshot(),
         ]
     }
 
     /// Dispatch a UI event to the peripheral that understands it.
     pub fn inject_event(&mut self, event: &PeripheralEvent) -> bool {
-        let targets: [&mut dyn Peripheral; 7] = [
+        let targets: [&mut dyn Peripheral; 8] = [
             &mut self.uart,
             &mut self.pbc,
             &mut self.bsc_i2c,
@@ -230,6 +237,7 @@ impl PeripheralBank {
             &mut self.epon_mac,
             &mut self.macsec,
             &mut self.dma,
+            &mut self.alarm_events,
         ];
         for p in targets {
             if p.inject_event(event).is_ok() {

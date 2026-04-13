@@ -89,6 +89,23 @@ pub enum PeripheralEvent {
     Epon(EponEvent),
     Macsec(MacsecEvent),
     Dma(DmaEvent),
+    Alarm(AlarmEvent),
+}
+
+/// Alarm dispatch UI-driven mutations. Session 5 exposes these as
+/// a **test harness**, not a faithful HW path — the real alarm
+/// events on silicon arrive through EPON MAC LLID teardown,
+/// stats-counter overflow, and GPIO/PMD pin changes. Forcing an
+/// opcode manually lets the UI drive the firmware's alarm
+/// handlers without the underlying event source.
+#[derive(Clone, Debug)]
+pub enum AlarmEvent {
+    /// Raise the persistent-pending bit for an alarm opcode.
+    ForcePending(u16),
+    /// Clear the persistent-pending bit for an alarm opcode.
+    ClearPending(u16),
+    /// Drop every forced-pending opcode back to zero.
+    ClearAll,
 }
 
 #[derive(Clone, Debug)]
@@ -192,6 +209,7 @@ pub enum PeripheralSnapshot {
     EponMac(EponMacSnapshot),
     Macsec(MacsecSnapshot),
     Dma(DmaSnapshot),
+    Alarm(AlarmSnapshot),
 }
 
 impl PeripheralSnapshot {
@@ -210,6 +228,7 @@ impl PeripheralSnapshot {
             Self::EponMac(_) => "epon_mac",
             Self::Macsec(_) => "macsec",
             Self::Dma(_) => "dma",
+            Self::Alarm(_) => "alarm_events",
         }
     }
 }
@@ -222,6 +241,17 @@ pub struct MacsecSnapshot {
     pub pn_threshold_busy: bool,
     pub sa_slots_programmed: u8,
     pub pn_overflow_mask: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct AlarmSnapshot {
+    /// Opcodes currently held pending by the UI test harness. Up
+    /// to 32 distinct opcodes can be tracked.
+    pub forced_opcodes: Vec<u16>,
+    /// Opcodes pulled from upstream event sources this tick. Empty
+    /// in v1 — wiring to real source peripherals lands in a later
+    /// session (stats overflow, LLID teardown, GPIO pin change).
+    pub live_opcodes: Vec<u16>,
 }
 
 #[derive(Clone, Debug)]
