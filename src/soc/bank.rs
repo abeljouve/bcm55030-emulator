@@ -19,6 +19,7 @@ use crate::soc::pbc::Pbc;
 use crate::soc::peripheral::{
     DatapathOp, Peripheral, PeripheralEvent, PeripheralId, PeripheralSnapshot,
 };
+use crate::soc::serdes::SerDes;
 use crate::soc::sysreg_shim::SysregShim;
 use crate::soc::uart::Uart;
 
@@ -55,6 +56,7 @@ pub struct PeripheralBank {
     pub uart: Uart,
     pub pbc: Pbc,
     pub bsc_i2c: BscI2c,
+    pub serdes: SerDes,
 
     /// Temporary residual-plus-legacy-arms for the SYSREG range
     /// (`0x01000000..0x01003800`). Hosts every stub that has not yet been
@@ -96,6 +98,7 @@ impl PeripheralBank {
             uart: Uart::new(),
             pbc: Pbc::new(),
             bsc_i2c: BscI2c::new(),
+            serdes: SerDes::new(),
             sysreg: SysregShim::new(),
             uart_rx_sender: tx,
             uart_rx_receiver: rx,
@@ -139,6 +142,7 @@ impl PeripheralBank {
         self.uart.tick(cpu_instructions);
         self.pbc.tick(cpu_instructions);
         self.bsc_i2c.tick(cpu_instructions);
+        self.serdes.tick(cpu_instructions);
         self.sysreg.tick(cpu_instructions);
 
         // Aggregate IRQ pending bits. UART is the only v1 contributor
@@ -153,6 +157,7 @@ impl PeripheralBank {
         self.uart.reset_cold();
         self.pbc.reset_cold();
         self.bsc_i2c.reset_cold();
+        self.serdes.reset_cold();
         self.sysreg.reset_cold();
         self.irq_pending = 0;
         self.current_pc = 0;
@@ -165,6 +170,7 @@ impl PeripheralBank {
         self.uart.reset_warm();
         self.pbc.reset_warm();
         self.bsc_i2c.reset_warm();
+        self.serdes.reset_warm();
         self.sysreg.reset_warm();
         self.irq_pending = 0;
         self.current_pc = 0;
@@ -189,13 +195,18 @@ impl PeripheralBank {
             self.uart.snapshot(),
             self.pbc.snapshot(),
             self.bsc_i2c.snapshot(),
+            self.serdes.snapshot(),
         ]
     }
 
     /// Dispatch a UI event to the peripheral that understands it.
     pub fn inject_event(&mut self, event: &PeripheralEvent) -> bool {
-        let targets: [&mut dyn Peripheral; 3] =
-            [&mut self.uart, &mut self.pbc, &mut self.bsc_i2c];
+        let targets: [&mut dyn Peripheral; 4] = [
+            &mut self.uart,
+            &mut self.pbc,
+            &mut self.bsc_i2c,
+            &mut self.serdes,
+        ];
         for p in targets {
             if p.inject_event(event).is_ok() {
                 return true;
@@ -239,6 +250,9 @@ impl PeripheralBank {
         if self.bsc_i2c.claims(addr) {
             return self.bsc_i2c.read_word(addr);
         }
+        if self.serdes.claims(addr) {
+            return self.serdes.read_word(addr);
+        }
         if self.sysreg.claims(addr) {
             return self.sysreg.read_word(addr);
         }
@@ -253,10 +267,21 @@ impl PeripheralBank {
             return self.uart.write_word(addr, val);
         }
         if self.pbc.claims(addr) {
-            return self.pbc.write_word(addr, val);
+            self.pbc.write_word(addr, val)?;
+            // Cross-peripheral dispatch: if the write triggered a
+            // SerDes SPI slave command, route it to the SerDes now
+            // that the PBC write is complete.
+            if let Some((tx, rx_len)) = self.pbc.take_pending_spi_serdes() {
+                let rx = self.serdes.spi_command(&tx, rx_len);
+                self.pbc.complete_spi_serdes(&rx);
+            }
+            return Ok(());
         }
         if self.bsc_i2c.claims(addr) {
             return self.bsc_i2c.write_word(addr, val);
+        }
+        if self.serdes.claims(addr) {
+            return self.serdes.write_word(addr, val);
         }
         if self.sysreg.claims(addr) {
             return self.sysreg.write_word(addr, val);
@@ -277,6 +302,9 @@ impl PeripheralBank {
         if self.bsc_i2c.claims(addr) {
             return self.bsc_i2c.read_half(addr);
         }
+        if self.serdes.claims(addr) {
+            return self.serdes.read_half(addr);
+        }
         if self.sysreg.claims(addr) {
             return self.sysreg.read_half(addr);
         }
@@ -292,6 +320,9 @@ impl PeripheralBank {
         }
         if self.bsc_i2c.claims(addr) {
             return self.bsc_i2c.write_half(addr, val);
+        }
+        if self.serdes.claims(addr) {
+            return self.serdes.write_half(addr, val);
         }
         if self.sysreg.claims(addr) {
             return self.sysreg.write_half(addr, val);
@@ -309,6 +340,9 @@ impl PeripheralBank {
         if self.bsc_i2c.claims(addr) {
             return self.bsc_i2c.read_byte(addr);
         }
+        if self.serdes.claims(addr) {
+            return self.serdes.read_byte(addr);
+        }
         if self.sysreg.claims(addr) {
             return self.sysreg.read_byte(addr);
         }
@@ -324,6 +358,9 @@ impl PeripheralBank {
         }
         if self.bsc_i2c.claims(addr) {
             return self.bsc_i2c.write_byte(addr, val);
+        }
+        if self.serdes.claims(addr) {
+            return self.serdes.write_byte(addr, val);
         }
         if self.sysreg.claims(addr) {
             return self.sysreg.write_byte(addr, val);

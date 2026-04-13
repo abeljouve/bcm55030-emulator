@@ -25,15 +25,7 @@ pub const SYSREG_BASE: u32 = 0x01000000;
 pub const SYSREG_SIZE: u32 = 0x3800;
 pub const SYSREG_END: u32 = SYSREG_BASE + SYSREG_SIZE;
 
-/// SerDes lane status window — firmware scans this at startup. Session 2
-/// will claim the whole range in `src/soc/serdes.rs`.
-pub const SERDES_WINDOW_BASE: u32 = 0x224A0000;
-pub const SERDES_WINDOW_END: u32 = 0x224A0800;
-
-pub const SYSREG_RANGES: &[AddressRange] = &[
-    AddressRange::new(SYSREG_BASE, SYSREG_END),
-    AddressRange::new(SERDES_WINDOW_BASE, SERDES_WINDOW_END),
-];
+pub const SYSREG_RANGES: &[AddressRange] = &[AddressRange::new(SYSREG_BASE, SYSREG_END)];
 
 /// Aggregated trace entry for `--dump-mmio-trace` / cold-boot catalog.
 #[derive(Default, Clone, Debug)]
@@ -77,7 +69,6 @@ impl SysregShim {
     #[inline]
     pub fn claims(&self, addr: u32) -> bool {
         (SYSREG_BASE..SYSREG_END).contains(&addr)
-            || (SERDES_WINDOW_BASE..SERDES_WINDOW_END).contains(&addr)
     }
 
     #[inline]
@@ -207,10 +198,8 @@ impl SysregShim {
             }
             // BSC registers 0x140/0x14C/0x150 are NOT routed here — the
             // BscI2c peripheral claims them first in the bank router.
-            0x194 | 0x1D4 => {
-                let base = self.sysreg_store[(offset / 4) as usize];
-                base | 0x0A
-            }
+            // SerDes lane lock registers 0x194/0x1D4 likewise now route
+            // to the SerDes peripheral (Session 2, audit 5.3).
             0x1E0 => 0x45504F4E, // EPON signature ("EPON")
             o if (o & 0x1FF) == 0x1D8 && (0x15D8..=0x1FD8).contains(&o) => 0,
             o @ 0x1400..=0x3FFF if (o.wrapping_sub(0x143C)) % 0x200 == 0 => {
@@ -234,7 +223,7 @@ impl SysregShim {
     fn sysreg_write_word(&mut self, offset: u32, val: u32) {
         match offset {
             0x000 | 0x004 | 0x00C | 0x018 | 0x030 | 0x050 | 0x040 | 0x048 | 0x04C
-            | 0x194 | 0x1D4 | 0x1E0 | 0x2804 | 0x3604 | 0x1404 | 0x1604 | 0x1804
+            | 0x1E0 | 0x2804 | 0x3604 | 0x1404 | 0x1604 | 0x1804
             | 0x1A04 | 0x1C04 | 0x1E04 => {}
             o if (0x1400..=0x3FFF).contains(&o) && (o.wrapping_sub(0x143C)) % 0x200 == 0 => {}
             _ => self.log_unhandled_write(offset, val),
@@ -273,12 +262,6 @@ impl SysregShim {
     // -------- public access surface used by the bank --------
 
     pub fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
-        if (SERDES_WINDOW_BASE..SERDES_WINDOW_END).contains(&addr) {
-            if self.trace {
-                eprintln!("[MMIO] read  word  0x{:08X} → 0x00000001 (serdes stub)", addr);
-            }
-            return Ok(1);
-        }
         let off = addr - SYSREG_BASE;
         let val = self.sysreg_read_word(off);
         if self.trace {
@@ -291,12 +274,6 @@ impl SysregShim {
     }
 
     pub fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
-        if (SERDES_WINDOW_BASE..SERDES_WINDOW_END).contains(&addr) {
-            if self.trace {
-                eprintln!("[MMIO] write word  0x{:08X} = 0x{:08X} (serdes stub)", addr, val);
-            }
-            return Ok(());
-        }
         let off = addr - SYSREG_BASE;
         self.sysreg_write_word(off, val);
         if self.trace {
@@ -309,9 +286,6 @@ impl SysregShim {
     }
 
     pub fn read_half(&mut self, addr: u32) -> Result<u16, Exception> {
-        if (SERDES_WINDOW_BASE..SERDES_WINDOW_END).contains(&addr) {
-            return Ok(1);
-        }
         let off = addr - SYSREG_BASE;
         let word_off = off & !3;
         let half_idx = (off >> 1) & 1;
@@ -320,9 +294,6 @@ impl SysregShim {
     }
 
     pub fn write_half(&mut self, addr: u32, val: u16) -> Result<(), Exception> {
-        if (SERDES_WINDOW_BASE..SERDES_WINDOW_END).contains(&addr) {
-            return Ok(());
-        }
         let off = addr - SYSREG_BASE;
         let word_off = off & !3;
         let half_idx = (off >> 1) & 1;
@@ -336,9 +307,6 @@ impl SysregShim {
     }
 
     pub fn read_byte(&mut self, addr: u32) -> Result<u8, Exception> {
-        if (SERDES_WINDOW_BASE..SERDES_WINDOW_END).contains(&addr) {
-            return Ok(1);
-        }
         let off = addr - SYSREG_BASE;
         let word_off = off & !3;
         let byte_idx = off & 3;
@@ -347,9 +315,6 @@ impl SysregShim {
     }
 
     pub fn write_byte(&mut self, addr: u32, val: u8) -> Result<(), Exception> {
-        if (SERDES_WINDOW_BASE..SERDES_WINDOW_END).contains(&addr) {
-            return Ok(());
-        }
         let off = addr - SYSREG_BASE;
         let word_off = off & !3;
         let byte_idx = off & 3;

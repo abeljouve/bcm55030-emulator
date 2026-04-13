@@ -56,6 +56,14 @@ pub struct Pbc {
     /// Pending datapath operations emitted by the last MMIO write. The
     /// bank drains them after releasing the write lock.
     pending_ops: Vec<DatapathOp>,
+
+    /// Pending SerDes SPI slave command — set when `SPI_CONTROL & 0x40`
+    /// routed a FIFO command to the SerDes target. The bank dispatches
+    /// the stored `(tx, rx_len)` pair to `SerDes::spi_command` and
+    /// feeds the response back via [`Pbc::complete_spi_serdes`].
+    /// Resolves audit 5.2 — the SerDes slave path is no longer a
+    /// hardcoded `0xFF` stub inside PBC.
+    pending_spi_serdes: Option<(Vec<u8>, usize)>,
 }
 
 impl Pbc {
@@ -73,6 +81,28 @@ impl Pbc {
             dma_data_addr: 0,
             dma_busy_counter: 0,
             pending_ops: Vec::new(),
+            pending_spi_serdes: None,
+        }
+    }
+
+    /// Drain the pending SerDes SPI command (if any). Called by the
+    /// bank after every `write_word` that may have triggered a FIFO
+    /// command routed to the SerDes slave.
+    pub fn take_pending_spi_serdes(&mut self) -> Option<(Vec<u8>, usize)> {
+        self.pending_spi_serdes.take()
+    }
+
+    /// Store the SerDes slave's response bytes into the SPI read
+    /// buffer. Called by the bank after dispatching the pending
+    /// command returned by [`Pbc::take_pending_spi_serdes`].
+    pub fn complete_spi_serdes(&mut self, rx: &[u8]) {
+        self.spi_rx = [0; 2];
+        for (i, &byte) in rx.iter().enumerate() {
+            let word_idx = i / 4;
+            let byte_idx = i % 4;
+            if word_idx < 2 {
+                self.spi_rx[word_idx] |= (byte as u32) << (byte_idx * 8);
+            }
         }
     }
 
@@ -196,14 +226,14 @@ impl Pbc {
         }
 
         // SPI_CONTROL bit 6: 0 = main flash, 1 = SerDes SPI slave.
-        // Session 1: SerDes target returns 0xFF (audit 5.2). SerDes
-        // peripheral in Session 2 will replace this via cross-peripheral
-        // dispatch.
-        let rx = if self.spi_control & 0x40 != 0 {
-            vec![0xFFu8; rx_len]
-        } else {
-            self.flash.execute_fifo_command(&tx, rx_len)
-        };
+        // Flash commands execute here. SerDes commands are queued in
+        // `pending_spi_serdes` and the bank dispatches them to
+        // `SerDes::spi_command` after releasing the PBC lock.
+        if self.spi_control & 0x40 != 0 {
+            self.pending_spi_serdes = Some((tx, rx_len));
+            return;
+        }
+        let rx = self.flash.execute_fifo_command(&tx, rx_len);
 
         self.spi_rx = [0; 2];
         for (i, &byte) in rx.iter().enumerate() {
@@ -322,6 +352,7 @@ impl Peripheral for Pbc {
         self.dma_data_addr = 0;
         self.dma_busy_counter = 0;
         self.pending_ops.clear();
+        self.pending_spi_serdes = None;
         // flash data preserved — non-volatile
     }
 

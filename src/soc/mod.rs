@@ -19,6 +19,7 @@ pub mod mmio_blocks;
 pub mod mmio_init;
 pub mod pbc;
 pub mod peripheral;
+pub mod serdes;
 pub mod sfp_eeprom;
 pub mod spi_flash;
 pub mod sysreg_shim;

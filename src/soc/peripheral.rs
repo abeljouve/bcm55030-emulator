@@ -85,6 +85,24 @@ pub enum PeripheralEvent {
     Sfp(SfpEvent),
     Bsc(BscEvent),
     Pbc(PbcEvent),
+    SerDes(SerDesEvent),
+}
+
+#[derive(Clone, Debug)]
+pub enum SerDesEvent {
+    SetLaneEnabled(u8, bool),
+    SetLinkLocked(u8, bool),
+    InjectRxLos(u8, bool),
+    SetLaneSpeed(u8, LaneSpeed),
+    ClearErrorStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneSpeed {
+    OneGigabit,
+    TenGigabit,
+    Pon1G,
+    Pon10G,
 }
 
 #[derive(Clone, Debug)]
@@ -132,6 +150,7 @@ pub enum PeripheralSnapshot {
     Sfp(SfpSnapshot),
     Pbc(PbcSnapshot),
     Bsc(BscSnapshot),
+    SerDes(SerDesSnapshot),
 }
 
 impl PeripheralSnapshot {
@@ -146,8 +165,23 @@ impl PeripheralSnapshot {
             Self::Sfp(_) => "sfp",
             Self::Pbc(_) => "pbc",
             Self::Bsc(_) => "bsc_i2c",
+            Self::SerDes(_) => "serdes",
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct SerDesSnapshot {
+    pub lanes: [SerDesLaneSnapshot; 4],
+    pub error_status: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SerDesLaneSnapshot {
+    pub enabled: bool,
+    pub locked: bool,
+    pub rx_los: bool,
+    pub speed: LaneSpeed,
 }
 
 #[derive(Clone, Debug)]
