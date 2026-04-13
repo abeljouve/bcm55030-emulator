@@ -196,19 +196,10 @@ impl SysregShim {
             }
             // Filter / fatal error register at 0x3604 stays here
             // until Session 7 carves out `fatal_filter.rs`. Every
-            // EPON MAC arm in `0x1400..0x2000` (CHIP_ID, CHIP_REV,
-            // LLID masks, LLID anchors, IRQ status, queue drain,
-            // counter stats) is now owned by `epon_mac.rs`
-            // (Session 3).
+            // EPON MAC / MACsec / DMA arm is now owned by its own
+            // peripheral — Sessions 3 and 4 resolved the LLID and
+            // channel windows respectively.
             0x3604 => 0,
-            // Residual queue drain arms in the `0x2000..0x3FFF`
-            // stride range — not claimed by EPON MAC. Sessions 4–7
-            // (MACsec, DMA, fatal_filter) will carve these out.
-            // Keep the "bit 8 always set" behaviour so any polling
-            // loop that reaches the higher strides still advances.
-            o @ 0x2000..=0x3FFF if (o.wrapping_sub(0x143C)) % 0x200 == 0 => {
-                self.store_read(offset) | 0x100
-            }
             _ => {
                 let val = self.store_read(offset);
                 self.log_unhandled_read(offset, val);
@@ -220,7 +211,6 @@ impl SysregShim {
     fn sysreg_write_word(&mut self, offset: u32, val: u32) {
         match offset {
             0x050 | 0x040 | 0x048 | 0x04C | 0x3604 => {}
-            o @ 0x2000..=0x3FFF if (o.wrapping_sub(0x143C)) % 0x200 == 0 => {}
             _ => self.log_unhandled_write(offset, val),
         }
 

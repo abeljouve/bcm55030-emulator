@@ -87,6 +87,30 @@ pub enum PeripheralEvent {
     Pbc(PbcEvent),
     SerDes(SerDesEvent),
     Epon(EponEvent),
+    Macsec(MacsecEvent),
+    Dma(DmaEvent),
+}
+
+#[derive(Clone, Debug)]
+pub enum MacsecEvent {
+    /// Force a PN (packet number) overflow on an SA slot index. The
+    /// firmware reads the overflow bit during its periodic key
+    /// rotation check and expects to see it cleared after
+    /// acknowledging.
+    InjectPnOverflow(u8),
+    /// Wipe all programmed SAs — equivalent to the
+    /// `MACSEC_CHANNEL_RESET` write with `0xFFFFFFFF`.
+    ResetSaTable,
+}
+
+#[derive(Clone, Debug)]
+pub enum DmaEvent {
+    /// Force a queue-entry ready state on a specific channel. Used
+    /// by the UI "inject frame" button.
+    InjectQueueEntry(u8),
+    /// Inject a bus-error flag on a channel so the firmware fault
+    /// recovery path fires.
+    InjectBusError(u8),
 }
 
 /// EPON MAC UI-driven mutations.
@@ -166,6 +190,8 @@ pub enum PeripheralSnapshot {
     Bsc(BscSnapshot),
     SerDes(SerDesSnapshot),
     EponMac(EponMacSnapshot),
+    Macsec(MacsecSnapshot),
+    Dma(DmaSnapshot),
 }
 
 impl PeripheralSnapshot {
@@ -182,8 +208,27 @@ impl PeripheralSnapshot {
             Self::Bsc(_) => "bsc_i2c",
             Self::SerDes(_) => "serdes",
             Self::EponMac(_) => "epon_mac",
+            Self::Macsec(_) => "macsec",
+            Self::Dma(_) => "dma",
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct MacsecSnapshot {
+    pub control: u32,
+    pub enable_mode: u32,
+    pub key_engine_busy: bool,
+    pub pn_threshold_busy: bool,
+    pub sa_slots_programmed: u8,
+    pub pn_overflow_mask: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct DmaSnapshot {
+    pub channels_enabled: u32,
+    pub channels_busy: u32,
+    pub irq_pending_bitmap: u32,
 }
 
 #[derive(Clone, Debug)]

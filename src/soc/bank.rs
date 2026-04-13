@@ -15,7 +15,9 @@ use std::sync::mpsc;
 
 use crate::cpu::exception::Exception;
 use crate::soc::bsc_i2c::BscI2c;
+use crate::soc::dma::DmaChannelController;
 use crate::soc::epon_mac::EponMac;
+use crate::soc::macsec::Macsec;
 use crate::soc::pbc::Pbc;
 use crate::soc::peripheral::{
     DatapathOp, Peripheral, PeripheralEvent, PeripheralId, PeripheralSnapshot,
@@ -59,6 +61,8 @@ pub struct PeripheralBank {
     pub bsc_i2c: BscI2c,
     pub serdes: SerDes,
     pub epon_mac: EponMac,
+    pub macsec: Macsec,
+    pub dma: DmaChannelController,
 
     /// Temporary residual-plus-legacy-arms for the SYSREG range
     /// (`0x01000000..0x01003800`). Hosts every stub that has not yet been
@@ -102,6 +106,8 @@ impl PeripheralBank {
             bsc_i2c: BscI2c::new(),
             serdes: SerDes::new(),
             epon_mac: EponMac::new(),
+            macsec: Macsec::new(),
+            dma: DmaChannelController::new(),
             sysreg: SysregShim::new(),
             uart_rx_sender: tx,
             uart_rx_receiver: rx,
@@ -147,6 +153,8 @@ impl PeripheralBank {
         self.bsc_i2c.tick(cpu_instructions);
         self.serdes.tick(cpu_instructions);
         self.epon_mac.tick(cpu_instructions);
+        self.macsec.tick(cpu_instructions);
+        self.dma.tick(cpu_instructions);
         self.sysreg.tick(cpu_instructions);
 
         // Aggregate IRQ pending bits. UART is the only v1 contributor
@@ -163,6 +171,8 @@ impl PeripheralBank {
         self.bsc_i2c.reset_cold();
         self.serdes.reset_cold();
         self.epon_mac.reset_cold();
+        self.macsec.reset_cold();
+        self.dma.reset_cold();
         self.sysreg.reset_cold();
         self.irq_pending = 0;
         self.current_pc = 0;
@@ -177,6 +187,8 @@ impl PeripheralBank {
         self.bsc_i2c.reset_warm();
         self.serdes.reset_warm();
         self.epon_mac.reset_warm();
+        self.macsec.reset_warm();
+        self.dma.reset_warm();
         self.sysreg.reset_warm();
         self.irq_pending = 0;
         self.current_pc = 0;
@@ -203,17 +215,21 @@ impl PeripheralBank {
             self.bsc_i2c.snapshot(),
             self.serdes.snapshot(),
             self.epon_mac.snapshot(),
+            self.macsec.snapshot(),
+            self.dma.snapshot(),
         ]
     }
 
     /// Dispatch a UI event to the peripheral that understands it.
     pub fn inject_event(&mut self, event: &PeripheralEvent) -> bool {
-        let targets: [&mut dyn Peripheral; 5] = [
+        let targets: [&mut dyn Peripheral; 7] = [
             &mut self.uart,
             &mut self.pbc,
             &mut self.bsc_i2c,
             &mut self.serdes,
             &mut self.epon_mac,
+            &mut self.macsec,
+            &mut self.dma,
         ];
         for p in targets {
             if p.inject_event(event).is_ok() {
@@ -264,6 +280,12 @@ impl PeripheralBank {
         if self.epon_mac.claims(addr) {
             return self.epon_mac.read_word(addr);
         }
+        if self.macsec.claims(addr) {
+            return self.macsec.read_word(addr);
+        }
+        if self.dma.claims(addr) {
+            return self.dma.read_word(addr);
+        }
         if self.sysreg.claims(addr) {
             return self.sysreg.read_word(addr);
         }
@@ -297,6 +319,12 @@ impl PeripheralBank {
         if self.epon_mac.claims(addr) {
             return self.epon_mac.write_word(addr, val);
         }
+        if self.macsec.claims(addr) {
+            return self.macsec.write_word(addr, val);
+        }
+        if self.dma.claims(addr) {
+            return self.dma.write_word(addr, val);
+        }
         if self.sysreg.claims(addr) {
             return self.sysreg.write_word(addr, val);
         }
@@ -322,6 +350,12 @@ impl PeripheralBank {
         if self.epon_mac.claims(addr) {
             return self.epon_mac.read_half(addr);
         }
+        if self.macsec.claims(addr) {
+            return self.macsec.read_half(addr);
+        }
+        if self.dma.claims(addr) {
+            return self.dma.read_half(addr);
+        }
         if self.sysreg.claims(addr) {
             return self.sysreg.read_half(addr);
         }
@@ -343,6 +377,12 @@ impl PeripheralBank {
         }
         if self.epon_mac.claims(addr) {
             return self.epon_mac.write_half(addr, val);
+        }
+        if self.macsec.claims(addr) {
+            return self.macsec.write_half(addr, val);
+        }
+        if self.dma.claims(addr) {
+            return self.dma.write_half(addr, val);
         }
         if self.sysreg.claims(addr) {
             return self.sysreg.write_half(addr, val);
@@ -366,6 +406,12 @@ impl PeripheralBank {
         if self.epon_mac.claims(addr) {
             return self.epon_mac.read_byte(addr);
         }
+        if self.macsec.claims(addr) {
+            return self.macsec.read_byte(addr);
+        }
+        if self.dma.claims(addr) {
+            return self.dma.read_byte(addr);
+        }
         if self.sysreg.claims(addr) {
             return self.sysreg.read_byte(addr);
         }
@@ -387,6 +433,12 @@ impl PeripheralBank {
         }
         if self.epon_mac.claims(addr) {
             return self.epon_mac.write_byte(addr, val);
+        }
+        if self.macsec.claims(addr) {
+            return self.macsec.write_byte(addr, val);
+        }
+        if self.dma.claims(addr) {
+            return self.dma.write_byte(addr, val);
         }
         if self.sysreg.claims(addr) {
             return self.sysreg.write_byte(addr, val);

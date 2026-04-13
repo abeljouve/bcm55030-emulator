@@ -13,7 +13,10 @@
 //!
 //!   * Sparse core registers — CHIP_ID, CHIP_REV, LLID masks, active
 //!     bitmap, grant masks, IRQ mask, EPON status, active flags,
-//!     plus the `0x0064` special half-`FFFF` read arm.
+//!     plus the `0x0064` special half-`FFFF` read arm. Note: the
+//!     `0x01002804` register previously claimed here as a fatal-
+//!     error aggregator moved to `macsec.rs` in Session 4 — it sits
+//!     inside the MACsec 10G SA programming bank.
 //!   * `0x01000400..0x01000E80` — LLID grant / enable tables,
 //!     per-LLID config (anchors 0x043C, 0x04B8, 0x0D00, 0x0D7C
 //!     clear bit 0 on write — audit 5.9).
@@ -84,7 +87,6 @@ const REG_IRQ_MASK: u32 = 0x0100_0034;
 const REG_EPON_STATUS: u32 = 0x0100_0044;
 const REG_ACTIVE_FLAGS: u32 = 0x0100_0054;
 const REG_SPECIAL_0064: u32 = 0x0100_0064;
-const REG_FATAL_AGG: u32 = 0x0100_2804;
 
 /// LLID 0/31 anchor registers — the HW clears bit 0 on every write.
 /// The firmware programs the rest of the bitfields; bit 0 is the
@@ -167,7 +169,7 @@ impl EponMac {
             REG_CHIP_ID | REG_CHIP_REV | REG_LLID_CAPTURE_MASK | REG_LLID_ACTIVE_BITMAP
             | REG_LLID_MASK_CONTROL | REG_LLID_COUNTER_MASK | REG_TX_GRANT_MASK
             | REG_RX_GRANT_MASK | REG_IRQ_MASK | REG_EPON_STATUS | REG_ACTIVE_FLAGS
-            | REG_SPECIAL_0064 | REG_FATAL_AGG => true,
+            | REG_SPECIAL_0064 => true,
             _ => {
                 (EPON_TABLE_BASE..EPON_TABLE_END).contains(&addr)
                     || (EPON_LLID_BASE..EPON_LLID_TOP).contains(&addr)
@@ -204,7 +206,7 @@ impl EponMac {
 
     fn write_store_no_side_effects(&mut self, addr: u32, val: u32) {
         match addr {
-            REG_CHIP_ID | REG_CHIP_REV | REG_FATAL_AGG | REG_SPECIAL_0064 => {
+            REG_CHIP_ID | REG_CHIP_REV | REG_SPECIAL_0064 => {
                 // Fixed / read-only values — ignore warm seed.
             }
             REG_LLID_CAPTURE_MASK => self.llid_capture_mask = val,
@@ -267,7 +269,6 @@ impl Peripheral for EponMac {
                 // the warm-snapshot upper half reliably.
                 return Ok(0x5382_0000 | 0x0000_FFFF);
             }
-            REG_FATAL_AGG => return Ok(0), // audit 5.5 partial
             _ => {}
         }
 
@@ -349,7 +350,6 @@ impl Peripheral for EponMac {
                 return Ok(());
             }
             REG_SPECIAL_0064 => return Ok(()),
-            REG_FATAL_AGG => return Ok(()), // W1C — always read as 0
             _ => {}
         }
 
@@ -554,6 +554,7 @@ mod tests {
         assert!(m.claims(0x0100_0030));
         assert!(m.claims(0x0100_043C));
         assert!(m.claims(0x0100_1404));
-        assert!(m.claims(0x0100_2804));
+        // 0x0100_2804 moved to MACsec in Session 4.
+        assert!(!m.claims(0x0100_2804));
     }
 }
