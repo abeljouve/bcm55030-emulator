@@ -158,11 +158,9 @@ pub fn execute(
                     let val = resolve_value(*src, state)?;
                     mem.dcache_invalidate_line(val)?;
                 }
-                0x4B => {
-                    // DC_FLSH: flush single cache line (without invalidating)
-                    let val = resolve_value(*src, state)?;
-                    mem.dcache_flush_line(val)?;
-                }
+                // 0x4B (DC_FLSH): no handler needed — scan7b test 9 verified
+                // DC_FLSH is a no-op on real BCM55030. write_aux_reg silently
+                // absorbs the write via the default fallthrough.
                 0x58 => {
                     // DC_RAM_ADDR: set probe address for DC_TAG/DC_DATA reads
                     let val = resolve_value(*src, state)?;

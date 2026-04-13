@@ -250,17 +250,6 @@ impl DCache {
         }
     }
 
-    /// DC_FLSH (aux 0x4B): no-op on BCM55030.
-    ///
-    /// Per scan7b test 9 on real hardware, writing DC_FLSH had no observable
-    /// effect — a dirty cached line was NOT written back to SRAM, and the
-    /// cached copy remained unchanged. We model this faithfully: the call is
-    /// a no-op (no writeback, no dirty-bit clear, cache state untouched).
-    pub fn flush_line(&mut self, addr: u32) -> Option<EvictedLine> {
-        let _ = addr;
-        None
-    }
-
     /// Read DC_CTRL register value (aux 0x48).
     /// Returns the raw stored value (masked by DC_CTRL_RW_MASK on write).
     pub fn read_dc_ctrl(&self) -> u32 {
@@ -740,25 +729,6 @@ mod tests {
         ic.invalidate_all();
         assert!(ic.peek_word(addr1).is_none());
         assert!(ic.peek_word(addr2).is_none());
-    }
-
-    #[test]
-    fn test_flush_line_is_noop() {
-        // scan7b test 9 verified DC_FLSH has no effect on real BCM55030.
-        // flush_line must never evict or clear the dirty bit.
-        let mut cache = DCache::new();
-        let addr = 0x1000u32;
-
-        cache.fill_line(addr, &[0x00; LINE_SIZE]);
-        cache.write_byte(addr, 0xAB);
-
-        assert!(cache.flush_line(addr).is_none());
-        assert_eq!(cache.read_byte(addr), Some(0xAB));
-
-        // Line is still dirty: invalidate with IM=1 must still flush it.
-        let evicted = cache.invalidate_all();
-        assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0].data[0], 0xAB);
     }
 
     #[test]

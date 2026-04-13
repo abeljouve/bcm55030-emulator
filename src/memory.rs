@@ -635,20 +635,6 @@ impl Memory {
         Ok(())
     }
 
-    /// Flush a single D-cache line to SRAM without invalidating (DC_FLSH aux 0x4B).
-    /// Line stays valid in cache, dirty bit cleared.
-    pub fn dcache_flush_line(&mut self, addr: u32) -> Result<(), Exception> {
-        let evicted = if let Some(ref mut dc) = self.dcache {
-            dc.flush_line(addr)
-        } else {
-            None
-        };
-        if let Some(ev) = evicted {
-            self.writeback_line(ev.addr, &ev.data)?;
-        }
-        Ok(())
-    }
-
     /// Set DC_RAM_ADDR (aux 0x58) on the D-cache for direct probe.
     pub fn dcache_set_ram_addr(&mut self, addr: u32) {
         if let Some(ref mut dc) = self.dcache {
