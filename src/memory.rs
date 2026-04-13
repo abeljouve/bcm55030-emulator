@@ -496,13 +496,12 @@ impl Memory {
     }
 
     pub fn read_word_data(&mut self, addr: u32, cache_bypass: bool) -> Result<u32, Exception> {
-        // Audit 2.1: misaligned word reads currently fall through to
-        // byte-by-byte fixup. The ARCompact PRM says an unaligned
-        // access should raise `Exception::MisalignedAccess` unless
-        // the CPU is configured for unaligned support — we have no
-        // evidence either way on BCM55030 silicon, so we keep the
-        // fixup until a bare-metal scan (`scan7b.c` style) confirms
-        // the HW behaviour. Tracked for follow-up RE.
+        // Audit 2.1 / deferral D5 resolved 2026-04-13: bare-metal
+        // scan `tmp/hello-bare/scan_misalign.c` on a live BCM55030
+        // confirmed the CPU silently fixes up misaligned word /
+        // half reads and writes at any byte offset — no exception
+        // is raised. The byte-by-byte path below is HW-faithful,
+        // not a workaround.
         if cache_bypass || addr & 3 != 0 || !self.dcache_enabled() {
             let b0 = self.read_byte_backing(addr)? as u32;
             let b1 = self.read_byte_backing(addr.wrapping_add(1))? as u32;
