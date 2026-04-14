@@ -534,56 +534,60 @@ fn paint_branch_arcs(
         aa.abs().partial_cmp(&bb.abs()).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let stroke_w = 1.4;
+    // Loops (upward branches) use a thinner stroke so tight
+    // inner loops don't swamp the gutter; forward branches stay
+    // at the normal width.
+    const STROKE_FORWARD: f32 = 1.2;
+    const STROKE_LOOP: f32 = 0.7;
     for (idx, arc) in arcs.iter().enumerate() {
         let lane = idx % max_lanes;
         let x = gutter_right - (lane as f32 + 1.0) * lane_width;
-        let connector_len = 6.0;
+        let stroke_w = if arc.dst_above {
+            STROKE_LOOP
+        } else {
+            STROKE_FORWARD
+        };
+        let stroke = egui::Stroke::new(stroke_w, arc.color);
 
         match arc.dst_y {
             Some(dst_y) => {
-                // Horizontal nub at source.
                 painter.line_segment(
                     [egui::pos2(gutter_right, arc.src_y), egui::pos2(x, arc.src_y)],
-                    egui::Stroke::new(stroke_w, arc.color),
+                    stroke,
                 );
-                // Vertical line between source and destination.
                 painter.line_segment(
                     [egui::pos2(x, arc.src_y), egui::pos2(x, dst_y)],
-                    egui::Stroke::new(stroke_w, arc.color),
+                    stroke,
                 );
-                // Horizontal arrow at destination.
                 painter.line_segment(
                     [egui::pos2(x, dst_y), egui::pos2(gutter_right, dst_y)],
-                    egui::Stroke::new(stroke_w, arc.color),
+                    stroke,
                 );
-                // Arrowhead pointing right into the row.
                 arrow_head(
                     painter,
                     egui::pos2(gutter_right, dst_y),
                     arc.color,
+                    stroke_w,
                     4.0,
                 );
-                let _ = connector_len;
             }
             None => {
-                // Target off-screen — draw a vertical going
-                // to the panel edge with an arrow.
                 let top = row_rects.first().map(|(_, r)| r.top()).unwrap_or(0.0);
                 let bottom = row_rects.last().map(|(_, r)| r.bottom()).unwrap_or(0.0);
                 let end_y = if arc.dst_above { top } else { bottom };
                 painter.line_segment(
                     [egui::pos2(gutter_right, arc.src_y), egui::pos2(x, arc.src_y)],
-                    egui::Stroke::new(stroke_w, arc.color),
+                    stroke,
                 );
                 painter.line_segment(
                     [egui::pos2(x, arc.src_y), egui::pos2(x, end_y)],
-                    egui::Stroke::new(stroke_w, arc.color),
+                    stroke,
                 );
                 arrow_head_vertical(
                     painter,
                     egui::pos2(x, end_y),
                     arc.color,
+                    stroke_w,
                     4.0,
                     arc.dst_above,
                 );
@@ -592,8 +596,14 @@ fn paint_branch_arcs(
     }
 }
 
-fn arrow_head(painter: &egui::Painter, tip: egui::Pos2, color: egui::Color32, size: f32) {
-    let stroke = egui::Stroke::new(1.4, color);
+fn arrow_head(
+    painter: &egui::Painter,
+    tip: egui::Pos2,
+    color: egui::Color32,
+    stroke_w: f32,
+    size: f32,
+) {
+    let stroke = egui::Stroke::new(stroke_w, color);
     painter.line_segment([tip, tip + egui::vec2(-size, -size * 0.6)], stroke);
     painter.line_segment([tip, tip + egui::vec2(-size, size * 0.6)], stroke);
 }
@@ -602,10 +612,11 @@ fn arrow_head_vertical(
     painter: &egui::Painter,
     tip: egui::Pos2,
     color: egui::Color32,
+    stroke_w: f32,
     size: f32,
     pointing_up: bool,
 ) {
-    let stroke = egui::Stroke::new(1.4, color);
+    let stroke = egui::Stroke::new(stroke_w, color);
     let dy = if pointing_up { size } else { -size };
     painter.line_segment([tip, tip + egui::vec2(-size * 0.6, dy)], stroke);
     painter.line_segment([tip, tip + egui::vec2(size * 0.6, dy)], stroke);
