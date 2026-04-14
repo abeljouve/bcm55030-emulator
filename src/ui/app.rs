@@ -76,6 +76,15 @@ pub struct EmulatorApp {
     pub ips_history: std::collections::VecDeque<u32>,
     /// Last wall-clock time we pushed an IPS sample.
     pub last_ips_sample: Option<std::time::Instant>,
+
+    /// Log-scale value currently reflected by the toolbar speed
+    /// slider. Separate from the worker state so the slider feels
+    /// smooth during a drag — the actual `SetSpeed` command is
+    /// only dispatched on drag-release.
+    pub speed_slider_log10: f32,
+    /// `true` while the user holds the speed slider, used to
+    /// suppress the live re-sync from `snapshot.speed_limit`.
+    pub speed_slider_dragging: bool,
 }
 
 const SRAM_REFRESH: Duration = Duration::from_millis(100);
@@ -107,6 +116,8 @@ impl EmulatorApp {
             accents: AccentTokens::from_palette(palette),
             ips_history: std::collections::VecDeque::with_capacity(120),
             last_ips_sample: None,
+            speed_slider_log10: 8.0,
+            speed_slider_dragging: false,
         }
     }
 

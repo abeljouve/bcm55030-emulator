@@ -44,6 +44,32 @@ impl<T> OneshotReceiver<T> {
     }
 }
 
+/// Execution-speed cap applied by the CPU worker. `Unlimited`
+/// runs flat out (the default, same throughput as the headless
+/// CLI); `Ips(n)` caps the worker to roughly `n` instructions
+/// per wall-clock second via a sleep/step budget per 10 ms
+/// window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpeedLimit {
+    Unlimited,
+    Ips(u32),
+}
+
+impl SpeedLimit {
+    pub fn as_ips(self) -> Option<u32> {
+        match self {
+            SpeedLimit::Unlimited => None,
+            SpeedLimit::Ips(n) => Some(n),
+        }
+    }
+}
+
+impl Default for SpeedLimit {
+    fn default() -> Self {
+        SpeedLimit::Unlimited
+    }
+}
+
 /// Firmware loading mode passed to `CpuCommand::LoadFirmware`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FirmwareMode {
@@ -124,6 +150,12 @@ pub enum CpuCommand {
     },
     Snapshot {
         response: OneshotSender<EmulatorSnapshot>,
+    },
+    /// Apply a new execution-speed cap to the worker. Takes
+    /// effect on the next `step()` — the worker recomputes its
+    /// budget window against wall clock.
+    SetSpeed {
+        limit: SpeedLimit,
     },
     /// Shutdown signal — the worker drops its `Cpu`, sends a last
     /// snapshot (run_state=Halted) and exits.

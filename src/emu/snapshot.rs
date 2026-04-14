@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use crate::cache::DCacheLineInfo;
 use crate::cpu::registers::{CpuState, DelayState, PauseReason};
+use crate::emu::command::SpeedLimit;
 use crate::memory::Watchpoint;
 use crate::soc::bank::BootMode;
 use crate::soc::peripheral::PeripheralSnapshot;
@@ -154,6 +155,10 @@ pub struct EmulatorSnapshot {
     pub breakpoints: Vec<u32>,
     pub watchpoints: Vec<Watchpoint>,
     pub pause_reason: PauseReason,
+    /// Current execution-speed cap applied by the worker. The UI
+    /// reads this when rendering the speed slider so the widget
+    /// reflects the live worker state after a reset.
+    pub speed_limit: SpeedLimit,
     /// Wall-clock time the CPU worker published this snapshot.
     /// Used by the UI to detect stale vs fresh snapshots (e.g.
     /// to gate register-change highlighting).
@@ -175,6 +180,7 @@ impl EmulatorSnapshot {
             breakpoints: Vec::new(),
             watchpoints: Vec::new(),
             pause_reason: PauseReason::None,
+            speed_limit: SpeedLimit::Unlimited,
             timestamp: Instant::now(),
         }
     }

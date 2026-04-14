@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::cpu::registers::PauseReason;
 use crate::cpu::Cpu;
-use crate::emu::command::{CpuCommand, OneshotSender};
+use crate::emu::command::{CpuCommand, OneshotSender, SpeedLimit};
 use crate::emu::handle::EmulatorHandle;
 use crate::emu::snapshot::{
     CpuSnapshot, DcacheSnapshot, EmulatorSnapshot, RunState, SramSnapshot,
@@ -23,6 +23,11 @@ const PUBLISH_INTERVAL: Duration = Duration::from_millis(16);
 /// Cadence the worker wakes up on while paused, so the UI still
 /// gets periodic snapshots (insns/sec decay, fresh timestamps).
 const PAUSED_WAKE: Duration = Duration::from_millis(200);
+
+/// Length of a throttle "budget window". Every window the worker
+/// is allowed to execute `target_ips * THROTTLE_WINDOW_SECS`
+/// instructions before it sleeps until the window elapses.
+const THROTTLE_WINDOW: Duration = Duration::from_millis(10);
 
 /// Signature of the constructor callback the worker uses to rebuild
 /// `Cpu` on `CpuCommand::Reset`. `main.rs` supplies a closure
@@ -50,11 +55,19 @@ struct Worker {
     ips_window_start: Instant,
     ips_window_insns: u64,
     last_insns_per_sec: u32,
+
+    /// Active throttle setting. `Unlimited` means no sleeping.
+    speed_limit: SpeedLimit,
+    /// Start of the current throttle budget window.
+    throttle_window_start: Instant,
+    /// Instructions executed inside the current throttle window.
+    throttle_window_insns: u32,
 }
 
 /// Run the worker loop until a `Shutdown` command arrives or all
 /// command senders have been dropped. Blocks the calling thread.
 pub fn run(cpu: Cpu, handle: EmulatorHandle, rx: Receiver<CpuCommand>, reset_fn: ResetFn) {
+    let now = Instant::now();
     let mut w = Worker {
         cpu,
         handle,
@@ -65,10 +78,13 @@ pub fn run(cpu: Cpu, handle: EmulatorHandle, rx: Receiver<CpuCommand>, reset_fn:
         run_to: None,
         breakpoints: Vec::new(),
         step_over_target: None,
-        last_publish: Instant::now(),
-        ips_window_start: Instant::now(),
+        last_publish: now,
+        ips_window_start: now,
         ips_window_insns: 0,
         last_insns_per_sec: 0,
+        speed_limit: SpeedLimit::Unlimited,
+        throttle_window_start: now,
+        throttle_window_insns: 0,
     };
     w.publish_snapshot();
     w.main_loop();
@@ -91,6 +107,7 @@ impl Worker {
                     continue;
                 }
                 self.ips_window_insns += 1;
+                self.apply_throttle();
 
                 if let Some(n) = self.remaining_insns {
                     if n <= 1 {
@@ -303,6 +320,12 @@ impl Worker {
                 let snap = self.build_snapshot();
                 let _ = response.send(snap);
             }
+            CpuCommand::SetSpeed { limit } => {
+                self.speed_limit = limit;
+                self.throttle_window_start = Instant::now();
+                self.throttle_window_insns = 0;
+                self.publish_snapshot();
+            }
             CpuCommand::Shutdown => {
                 self.running = false;
                 self.cpu.state.halted = true;
@@ -311,6 +334,30 @@ impl Worker {
             }
         }
         true
+    }
+
+    /// Apply the active throttle: if a speed cap is set and the
+    /// current budget window has already issued its quota, sleep
+    /// until the window elapses, then rewind the window counters.
+    fn apply_throttle(&mut self) {
+        let Some(target_ips) = self.speed_limit.as_ips() else {
+            return;
+        };
+        self.throttle_window_insns += 1;
+        // Per-window budget = target * window_duration_in_seconds.
+        // We use 10 ms windows, so budget ≈ target / 100.
+        let budget = ((target_ips as u64) * (THROTTLE_WINDOW.as_micros() as u64)
+            / 1_000_000)
+            .max(1) as u32;
+        if self.throttle_window_insns < budget {
+            return;
+        }
+        let elapsed = self.throttle_window_start.elapsed();
+        if elapsed < THROTTLE_WINDOW {
+            std::thread::sleep(THROTTLE_WINDOW - elapsed);
+        }
+        self.throttle_window_start = Instant::now();
+        self.throttle_window_insns = 0;
     }
 
     /// Reset the live `Cpu` for a `Reset` or `LoadFirmware`
@@ -482,6 +529,7 @@ impl Worker {
             breakpoints: self.breakpoints.clone(),
             watchpoints,
             pause_reason: self.cpu.state.pause_reason,
+            speed_limit: self.speed_limit,
             timestamp: Instant::now(),
         }
     }

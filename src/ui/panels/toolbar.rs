@@ -5,7 +5,7 @@
 use eframe::egui;
 use egui_phosphor::regular as ph;
 
-use crate::emu::command::CpuCommand;
+use crate::emu::command::{CpuCommand, SpeedLimit};
 use crate::emu::snapshot::RunState;
 use crate::soc::bank::BootMode;
 use crate::ui::theme::Palette;
@@ -79,6 +79,11 @@ pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
                     keep_breakpoints: true,
                 });
             }
+        });
+
+        // Speed control: log-scale slider + unlimited toggle.
+        group(ui, |ui| {
+            speed_control(ui, app);
         });
 
         // Firmware + annotation group.
@@ -159,6 +164,100 @@ fn group<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) {
 fn icon_button(ui: &mut egui::Ui, glyph: &str, tooltip: &str) -> egui::Response {
     ui.add(egui::Button::new(egui::RichText::new(glyph).size(16.0)).min_size(egui::vec2(28.0, 24.0)))
         .on_hover_text(tooltip)
+}
+
+/// Execution-speed control group. Shows a log-scale slider
+/// (1 kips → 50 Mips) plus an "∞" toggle for the default
+/// `Unlimited` setting. The slider stores its live value in
+/// `EmulatorApp.speed_slider_log10` so drag-gestures stay smooth
+/// across frames; the actual dispatch to the worker happens on
+/// drag release (`drag_stopped`) or when the `∞` button flips.
+fn speed_control(ui: &mut egui::Ui, app: &mut EmulatorApp) {
+    ui.label(
+        egui::RichText::new(format!("{} Speed", ph::GAUGE))
+            .small()
+            .color(app.accents.muted),
+    );
+
+    // Sync slider log from worker state if the user hasn't been
+    // dragging this frame.
+    if !app.speed_slider_dragging {
+        app.speed_slider_log10 = match app.snapshot.speed_limit {
+            SpeedLimit::Unlimited => SPEED_LOG_MAX,
+            SpeedLimit::Ips(n) => (n.max(1) as f32).log10(),
+        };
+    }
+
+    let min = SPEED_LOG_MIN;
+    let max = SPEED_LOG_MAX;
+    let resp = ui.add(
+        egui::Slider::new(&mut app.speed_slider_log10, min..=max)
+            .show_value(false)
+            .handle_shape(egui::style::HandleShape::Circle)
+            .trailing_fill(true),
+    );
+    if resp.dragged() {
+        app.speed_slider_dragging = true;
+    }
+    if resp.drag_stopped() || resp.changed() && !resp.dragged() {
+        let target = slider_to_limit(app.speed_slider_log10);
+        let _ = app.handle.cpu_cmd.send(CpuCommand::SetSpeed { limit: target });
+        app.speed_slider_dragging = false;
+    }
+
+    // Live label: follow the slider while dragging, worker state
+    // otherwise. Keeps the readout in sync with the handle under
+    // the user's finger.
+    let label_limit = if app.speed_slider_dragging {
+        slider_to_limit(app.speed_slider_log10)
+    } else {
+        app.snapshot.speed_limit
+    };
+    ui.label(
+        egui::RichText::new(format_speed(label_limit))
+            .small()
+            .monospace()
+            .color(app.accents.muted),
+    );
+
+    let is_unlimited = matches!(app.snapshot.speed_limit, SpeedLimit::Unlimited);
+    if ui
+        .add(
+            egui::Button::new(if is_unlimited { "∞" } else { "Max" })
+                .min_size(egui::vec2(28.0, 20.0))
+                .selected(is_unlimited),
+        )
+        .on_hover_text("Remove the speed cap")
+        .clicked()
+    {
+        let _ = app
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::SetSpeed { limit: SpeedLimit::Unlimited });
+        app.speed_slider_log10 = SPEED_LOG_MAX;
+    }
+}
+
+/// Slider bounds — log10 of the desired ips. 3.0 = 1 kips,
+/// 8.0 = 100 Mips, and the top slot represents "unlimited".
+const SPEED_LOG_MIN: f32 = 3.0;
+const SPEED_LOG_MAX: f32 = 8.0;
+
+fn slider_to_limit(log10: f32) -> SpeedLimit {
+    if log10 >= SPEED_LOG_MAX - 0.05 {
+        return SpeedLimit::Unlimited;
+    }
+    let ips = 10f32.powf(log10).round() as u32;
+    SpeedLimit::Ips(ips.max(1))
+}
+
+fn format_speed(limit: SpeedLimit) -> String {
+    match limit {
+        SpeedLimit::Unlimited => "∞ ips".to_string(),
+        SpeedLimit::Ips(n) if n >= 1_000_000 => format!("{:.1} Mips", n as f32 / 1e6),
+        SpeedLimit::Ips(n) if n >= 1_000 => format!("{:.1} kips", n as f32 / 1e3),
+        SpeedLimit::Ips(n) => format!("{n} ips"),
+    }
 }
 
 fn palette_selector(ui: &mut egui::Ui, app: &mut EmulatorApp) {
