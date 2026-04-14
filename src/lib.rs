@@ -8,6 +8,8 @@ pub mod hooks;
 pub mod mcp;
 pub mod memory;
 pub mod soc;
+#[cfg(feature = "ui")]
+pub mod ui;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

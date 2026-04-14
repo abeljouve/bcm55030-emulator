@@ -26,10 +26,10 @@ parking_lot = "0.12"
 # --- optional deps for the `ui` feature --------------------------------
 # Versions are conservative placeholders — Phase 6 pins them when the
 # GUI code lands. The default build has none of these compiled.
-eframe       = { version = "0.28", optional = true, default-features = false, features = ["default_fonts", "glow", "persistence"] }
-egui         = { version = "0.28", optional = true }
-egui_extras  = { version = "0.28", optional = true, features = ["all_loaders"] }
-rfd          = { version = "0.14", optional = true }
+eframe       = { version = "0.34", optional = true, default-features = false, features = ["default_fonts", "glow", "persistence"] }
+egui         = { version = "0.34", optional = true }
+egui_extras  = { version = "0.34", optional = true, features = ["all_loaders"] }
+rfd          = { version = "0.17", optional = true }
 tokio        = { version = "1",    optional = true, features = ["rt-multi-thread", "macros", "sync", "net"] }
 axum         = { version = "0.8",  optional = true }
 schemars     = { version = "1",    optional = true }
