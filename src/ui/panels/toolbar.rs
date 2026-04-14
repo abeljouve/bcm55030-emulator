@@ -238,9 +238,9 @@ fn speed_control(ui: &mut egui::Ui, app: &mut EmulatorApp) {
     }
 }
 
-/// Slider bounds — log10 of the desired ips. 3.0 = 1 kips,
+/// Slider bounds — log10 of the desired ips. 0.0 = 1 ips,
 /// 8.0 = 100 Mips, and the top slot represents "unlimited".
-const SPEED_LOG_MIN: f32 = 3.0;
+const SPEED_LOG_MIN: f32 = 0.0;
 const SPEED_LOG_MAX: f32 = 8.0;
 
 fn slider_to_limit(log10: f32) -> SpeedLimit {

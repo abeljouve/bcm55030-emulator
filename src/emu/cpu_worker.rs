@@ -339,22 +339,35 @@ impl Worker {
     /// Apply the active throttle: if a speed cap is set and the
     /// current budget window has already issued its quota, sleep
     /// until the window elapses, then rewind the window counters.
+    ///
+    /// Fenêtres dynamiques: pour ≥ 100 ips on utilise des
+    /// fenêtres fixes de `THROTTLE_WINDOW` (10 ms) et on laisse
+    /// tourner plusieurs instructions par fenêtre. Pour < 100
+    /// ips, une fenêtre 10 ms est trop courte (1 insn / 10 ms =
+    /// 100 ips minimum), donc on étire la fenêtre à
+    /// `1s / target_ips` et on n'exécute qu'une seule insn par
+    /// fenêtre — ce qui descend naturellement jusqu'à 1 ips.
     fn apply_throttle(&mut self) {
         let Some(target_ips) = self.speed_limit.as_ips() else {
             return;
         };
         self.throttle_window_insns += 1;
-        // Per-window budget = target * window_duration_in_seconds.
-        // We use 10 ms windows, so budget ≈ target / 100.
-        let budget = ((target_ips as u64) * (THROTTLE_WINDOW.as_micros() as u64)
-            / 1_000_000)
-            .max(1) as u32;
+        let (window, budget) = if target_ips >= 100 {
+            let budget = ((target_ips as u64)
+                * (THROTTLE_WINDOW.as_micros() as u64)
+                / 1_000_000)
+                .max(1) as u32;
+            (THROTTLE_WINDOW, budget)
+        } else {
+            let micros = (1_000_000u64 / target_ips.max(1) as u64).max(1);
+            (Duration::from_micros(micros), 1u32)
+        };
         if self.throttle_window_insns < budget {
             return;
         }
         let elapsed = self.throttle_window_start.elapsed();
-        if elapsed < THROTTLE_WINDOW {
-            std::thread::sleep(THROTTLE_WINDOW - elapsed);
+        if elapsed < window {
+            std::thread::sleep(window - elapsed);
         }
         self.throttle_window_start = Instant::now();
         self.throttle_window_insns = 0;
