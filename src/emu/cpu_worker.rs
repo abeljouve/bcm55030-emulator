@@ -236,11 +236,18 @@ impl Worker {
                 self.remaining_insns = None;
                 self.publish_snapshot();
             }
-            CpuCommand::LoadFirmware { response, .. } => {
-                // Phase 5 wires the actual firmware-loading path.
-                let _ = response.send(Err(
-                    "load_firmware not yet implemented (wired in Phase 5)".to_string(),
-                ));
+            CpuCommand::LoadFirmware {
+                path,
+                mode: _,
+                boot_mode,
+                flash_path: _,
+                entry_point,
+                keep_breakpoints,
+                response,
+            } => {
+                let result = self.load_firmware(path, boot_mode, entry_point, keep_breakpoints);
+                let _ = response.send(result);
+                self.publish_snapshot();
             }
             CpuCommand::SetBreakpoint { address, response } => {
                 if !self.breakpoints.contains(&address) {
@@ -304,6 +311,99 @@ impl Worker {
             }
         }
         true
+    }
+
+    /// Implement `CpuCommand::LoadFirmware`: rebuild a fresh
+    /// `Cpu`, copy the file into the PBC SPI flash backing store,
+    /// perform the 64 KB boot DMA into SRAM, and set the entry
+    /// point. Mirrors the sequence `src/bin/arc700.rs` uses for
+    /// the CLI path.
+    fn load_firmware(
+        &mut self,
+        path: std::path::PathBuf,
+        boot_mode: BootMode,
+        entry_point: u32,
+        keep_breakpoints: bool,
+    ) -> Result<crate::emu::command::LoadFirmwareResult, String> {
+        let data = std::fs::read(&path)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+
+        let saved_bps = if keep_breakpoints {
+            self.breakpoints.clone()
+        } else {
+            Vec::new()
+        };
+
+        self.cpu = (self.reset_fn)(boot_mode);
+        self.breakpoints.clear();
+        for addr in saved_bps {
+            self.cpu.hooks.insert(addr, Hook::Breakpoint);
+            self.breakpoints.push(addr);
+        }
+
+        let (copy_len, flash_bytes) = {
+            let bank_arc = match self.cpu.bank() {
+                Some(b) => b.clone(),
+                None => {
+                    return Err(
+                        "load_firmware requires SoC mode (bank is None in flat mode)".into(),
+                    )
+                }
+            };
+            let mut bank = bank_arc.write();
+            let flash_size = bank.pbc.flash.data.len();
+            let copy_len = data.len().min(flash_size);
+            bank.pbc.flash.data[..copy_len].copy_from_slice(&data[..copy_len]);
+            (copy_len, flash_size)
+        };
+
+        // 64 KB DMA flash → SRAM, same as the CLI binary does via
+        // `boot_from_flash`.
+        const BOOT_DMA_SIZE: usize = 64 * 1024;
+        let dma_len = {
+            let bank = self.cpu.bank().unwrap().read();
+            bank.pbc.flash.data.len().min(BOOT_DMA_SIZE)
+        };
+        let dma_bytes = {
+            let bank = self.cpu.bank().unwrap().read();
+            bank.pbc.flash.data[..dma_len].to_vec()
+        };
+        self.cpu.mem.load_binary(0, &dma_bytes);
+
+        // See `src/bin/arc700.rs` for the IRQ-mask/flag handling
+        // that this mirrors. The silicon resets `IENABLE` to all-
+        // ones; the `E1`/`E2` presets only apply in warm mode.
+        self.cpu.state.aux_ienable = 0xFFFFFFFF;
+        if boot_mode == BootMode::Warm {
+            self.cpu.state.flag_e1 = true;
+            self.cpu.state.flag_e2 = true;
+        }
+        self.cpu.state.pc = entry_point;
+
+        self.cpu.state.paused = true;
+        self.cpu.state.pause_reason = PauseReason::UserPause;
+        self.running = false;
+        self.remaining_insns = None;
+        self.run_to = None;
+        self.step_over_target = None;
+
+        // Publish firmware metadata for the status bar / MCP
+        // `get_firmware_info` tool.
+        *self.handle.firmware_info.lock() =
+            Some(crate::emu::handle::FirmwareInfo {
+                path,
+                mode: crate::emu::command::FirmwareMode::Soc,
+                boot_mode,
+                entry_point,
+                flash_size: flash_bytes,
+                flash_loaded: true,
+            });
+
+        Ok(crate::emu::command::LoadFirmwareResult {
+            loaded_bytes: copy_len,
+            entry_point,
+            flash_bytes,
+        })
     }
 
     fn finalize_step_over_if_hit(&mut self) {

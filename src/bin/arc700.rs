@@ -27,10 +27,10 @@ fn usage(prog: &str) {
     eprintln!("  --warm-boot                 Start with SYSREG_INIT_VALUES (default)");
     eprintln!("  --dump-mmio-trace-cold <F>  Cold-boot + dump MMIO trace catalog to <F>");
     eprintln!("  --unmapped-exception        Trap unclaimed MMIO as MemoryError (audit 2.2)");
-    eprintln!("  --gui                       Launch egui/eframe GUI (requires `ui` feature)");
-    eprintln!("  --mcp                       Start integrated MCP server (requires `mcp` feature)");
-    eprintln!("  --no-mcp                    Disable MCP server even when --gui is set");
-    eprintln!("  --mcp-port <PORT>           TCP port for MCP server (default: 3000, 0=random)");
+    eprintln!();
+    eprintln!("This is the headless CLI binary. For the egui GUI with integrated MCP");
+    eprintln!("server, build and run the `arc700-gui` binary instead:");
+    eprintln!("  cargo run --release --features ui,mcp --bin arc700-gui");
 }
 
 struct Config {
@@ -50,15 +50,6 @@ struct Config {
     /// `MemoryError` exceptions instead of returning zero.
     unmapped_exception: bool,
     boot_mode: BootMode,
-    /// Launch the egui/eframe GUI (phase 6). Requires `ui`
-    /// feature; hard error when set in a build without it.
-    gui: bool,
-    /// Spawn the integrated MCP server on `mcp_port`. Requires
-    /// `mcp` feature. Default: disabled.
-    mcp_enabled: bool,
-    /// TCP port for the MCP server. `0` picks an ephemeral
-    /// port from the OS (test harness default).
-    mcp_port: u16,
 }
 
 fn parse_hex(s: &str) -> Option<u32> {
@@ -85,9 +76,6 @@ fn parse_args() -> Config {
         dump_mmio_trace: None,
         unmapped_exception: false,
         boot_mode: BootMode::Warm,
-        gui: false,
-        mcp_enabled: false,
-        mcp_port: 3000,
     };
 
     let mut i = 1;
@@ -180,20 +168,6 @@ fn parse_args() -> Config {
             "--unmapped-exception" => cfg.unmapped_exception = true,
             "--cold-boot" => cfg.boot_mode = BootMode::Cold,
             "--warm-boot" => cfg.boot_mode = BootMode::Warm,
-            "--gui" => cfg.gui = true,
-            "--mcp" => cfg.mcp_enabled = true,
-            "--no-mcp" => cfg.mcp_enabled = false,
-            "--mcp-port" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("Error: --mcp-port requires a number");
-                    process::exit(1);
-                }
-                cfg.mcp_port = args[i].parse().unwrap_or_else(|_| {
-                    eprintln!("Error: invalid port: {}", args[i]);
-                    process::exit(1);
-                });
-            }
             "--help" | "-h" => {
                 usage(prog);
                 process::exit(0);
@@ -448,27 +422,6 @@ fn main() {
         bcm55030_emulator::vlog!("[BCM55030] Unmapped-access policy = Exception (audit 2.2)");
     }
 
-    // --- GUI / MCP threaded mode --------------------------------------
-    //
-    // `--gui` launches the egui/eframe UI. `--mcp` (currently
-    // only valid with `--gui`) spawns the integrated HTTP MCP
-    // server. Both paths rebuild the `Cpu` inside a worker
-    // thread; the main thread drives the UI event loop.
-    if cfg.gui || cfg.mcp_enabled {
-        #[cfg(feature = "ui")]
-        {
-            run_gui(cpu, cfg);
-            return;
-        }
-        #[cfg(not(feature = "ui"))]
-        {
-            eprintln!(
-                "Error: --gui / --mcp require the `ui` cargo feature (also enable `mcp` for the server). Rebuild with: cargo build --release --features ui,mcp"
-            );
-            process::exit(1);
-        }
-    }
-
     let orig_termios = setup_raw_terminal();
 
     // Safety rail: infinite-loop firmware gets N chances before we give
@@ -614,81 +567,3 @@ fn main() {
     }
 }
 
-/// Phase 6 threaded entry point: builds an `EmulatorHandle`,
-/// spawns the CPU worker thread (taking ownership of `cpu`),
-/// optionally spawns the MCP server, and blocks on
-/// `eframe::run_native`. Cleans up on window close.
-#[cfg(feature = "ui")]
-fn run_gui(cpu: Cpu, cfg: Config) {
-    use std::sync::mpsc;
-    use std::sync::Arc;
-    use std::thread;
-
-    use parking_lot::{Mutex, RwLock};
-
-    use bcm55030_emulator::emu::command::CpuCommand;
-    use bcm55030_emulator::emu::{
-        cpu_worker, Annotations, EmulatorHandle, EmulatorSnapshot, EventLog, McpStatus,
-    };
-
-    let bank = match cpu.bank() {
-        Some(b) => b.clone(),
-        None => {
-            eprintln!("[ui] --gui requires SoC mode (bank is None in flat mode)");
-            process::exit(1);
-        }
-    };
-    let (cmd_tx, cmd_rx) = mpsc::channel::<CpuCommand>();
-    let uart_tx = bank.read().uart_rx_sender();
-    let peripherals = bank.read().snapshot_all();
-    let mut snap = EmulatorSnapshot::placeholder(cfg.boot_mode);
-    snap.peripherals = peripherals;
-
-    let handle = EmulatorHandle {
-        bank,
-        snapshot: Arc::new(Mutex::new(snap)),
-        cpu_cmd: cmd_tx,
-        uart_tx,
-        annotations: Arc::new(RwLock::new(Annotations::new())),
-        event_log: Arc::new(Mutex::new(EventLog::default())),
-        mcp_status: Arc::new(Mutex::new(McpStatus::default())),
-        firmware_info: Arc::new(Mutex::new(None)),
-    };
-
-    let handle_for_worker = handle.clone();
-    let boot_mode = cfg.boot_mode;
-    let worker = thread::Builder::new()
-        .name("arc700-cpu-worker".to_string())
-        .spawn(move || {
-            cpu_worker::run(
-                cpu,
-                handle_for_worker,
-                cmd_rx,
-                Box::new(move |_| Cpu::new_bcm55030(boot_mode)),
-            );
-        })
-        .expect("spawn cpu worker");
-
-    #[cfg(feature = "mcp")]
-    let _mcp_thread = if cfg.mcp_enabled {
-        Some(bcm55030_emulator::mcp::spawn_server(
-            handle.clone(),
-            cfg.mcp_port,
-        ))
-    } else {
-        None
-    };
-    #[cfg(not(feature = "mcp"))]
-    {
-        if cfg.mcp_enabled {
-            eprintln!("[ui] --mcp requires the `mcp` cargo feature; ignoring");
-        }
-    }
-
-    if let Err(e) = bcm55030_emulator::ui::run(handle.clone()) {
-        eprintln!("[ui] eframe error: {}", e);
-    }
-
-    let _ = handle.cpu_cmd.send(CpuCommand::Shutdown);
-    let _ = worker.join();
-}

@@ -3,6 +3,16 @@ name = "arc700-emulator"
 version = "0.1.0"
 edition = "2021"
 description = "ARC 700 ARCompact big-endian CPU emulator"
+default-run = "arc700"
+
+[[bin]]
+name = "arc700"
+path = "src/bin/arc700.rs"
+
+[[bin]]
+name = "arc700-gui"
+path = "src/bin/arc700-gui.rs"
+required-features = ["ui", "mcp"]
 
 [features]
 default = []

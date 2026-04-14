@@ -46,6 +46,40 @@ pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
 
         ui.separator();
 
+        if ui.button("📂 Load firmware…").clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("BCM55030 flash", &["bin"])
+                .pick_file()
+            {
+                let (tx, rx) = crate::emu::command::oneshot();
+                let cmd = CpuCommand::LoadFirmware {
+                    path,
+                    mode: crate::emu::command::FirmwareMode::Soc,
+                    boot_mode: app.snapshot.boot_mode,
+                    flash_path: None,
+                    entry_point: 0,
+                    keep_breakpoints: true,
+                    response: tx,
+                };
+                if app.handle.cpu_cmd.send(cmd).is_ok() {
+                    // Block briefly — load_firmware does a file read
+                    // plus a 64 KB SRAM copy, well under 500 ms in
+                    // practice. The UI thread parks on rx while the
+                    // worker rebuilds its Cpu.
+                    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                        Ok(Ok(r)) => eprintln!(
+                            "[ui] loaded firmware: {} bytes into {}-byte flash, entry 0x{:08X}",
+                            r.loaded_bytes, r.flash_bytes, r.entry_point
+                        ),
+                        Ok(Err(e)) => eprintln!("[ui] load_firmware failed: {e}"),
+                        Err(_) => eprintln!("[ui] load_firmware timed out"),
+                    }
+                }
+            }
+        }
+
+        ui.separator();
+
         // Boot mode radio: stateful — Reset sends whichever is selected.
         let mut mode = app.snapshot.boot_mode;
         if ui
