@@ -1,6 +1,7 @@
 pub mod decode16;
 pub mod decode32;
 pub mod fields;
+pub mod format;
 pub mod instruction;
 
 use crate::cpu::exception::Exception;
