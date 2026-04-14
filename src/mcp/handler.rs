@@ -249,6 +249,27 @@ pub struct CpuResetParams {
     pub keep_breakpoints: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LoadFirmwareParams {
+    /// Host-side path to the flash image (bootloader or full dump).
+    pub path: String,
+    /// `"cold"` or `"warm"` (default).
+    pub boot_mode: Option<String>,
+    /// Reset vector / PC after load. Defaults to `0x0`.
+    pub entry_point: Option<u32>,
+    #[serde(default = "default_true")]
+    pub keep_breakpoints: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LoadFirmwareResponse {
+    pub ok: bool,
+    pub loaded_bytes: usize,
+    pub entry_point: u32,
+    pub flash_bytes: usize,
+    pub error: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -835,6 +856,77 @@ impl EmulatorHandler {
     }
 
     #[tool(
+        name = "load_firmware",
+        description = "Load a flash image (bootloader or full SPI dump) into the PBC SPI flash, perform the 64 KB boot DMA flash → SRAM, and reset the CPU at the given entry point. Mirrors the `src/bin/arc700.rs` CLI boot flow and the UI drag-and-drop path. Requires SoC mode (not flat). `boot_mode` is `cold` or `warm` (default). `entry_point` defaults to 0."
+    )]
+    async fn load_firmware(
+        &self,
+        Parameters(params): Parameters<LoadFirmwareParams>,
+    ) -> Json<LoadFirmwareResponse> {
+        let mode = match params
+            .boot_mode
+            .as_deref()
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("cold") => BootMode::Cold,
+            _ => BootMode::Warm,
+        };
+        let entry_point = params.entry_point.unwrap_or(0);
+        let (tx, rx) = oneshot::<Result<crate::emu::command::LoadFirmwareResult, String>>();
+        if self
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::LoadFirmware {
+                path: params.path.into(),
+                mode: crate::emu::command::FirmwareMode::Soc,
+                boot_mode: mode,
+                flash_path: None,
+                entry_point,
+                keep_breakpoints: params.keep_breakpoints,
+                response: tx,
+            })
+            .is_err()
+        {
+            return Json(LoadFirmwareResponse {
+                ok: false,
+                loaded_bytes: 0,
+                entry_point,
+                flash_bytes: 0,
+                error: Some("cpu_cmd channel closed".into()),
+            });
+        }
+        let result = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(Duration::from_secs(10))
+        })
+        .await
+        .unwrap_or(Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        match result {
+            Ok(Ok(r)) => Json(LoadFirmwareResponse {
+                ok: true,
+                loaded_bytes: r.loaded_bytes,
+                entry_point: r.entry_point,
+                flash_bytes: r.flash_bytes,
+                error: None,
+            }),
+            Ok(Err(e)) => Json(LoadFirmwareResponse {
+                ok: false,
+                loaded_bytes: 0,
+                entry_point,
+                flash_bytes: 0,
+                error: Some(e),
+            }),
+            Err(_) => Json(LoadFirmwareResponse {
+                ok: false,
+                loaded_bytes: 0,
+                entry_point,
+                flash_bytes: 0,
+                error: Some("timeout waiting for worker".into()),
+            }),
+        }
+    }
+
+    #[tool(
         name = "set_breakpoint",
         description = "Install a CPU breakpoint at `address`. The worker inserts a `Hook::Breakpoint` entry and pauses before executing that PC. Returns the 0-based index in the breakpoint list."
     )]
@@ -1087,9 +1179,131 @@ impl ServerHandler for EmulatorHandler {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2025_06_18)
             .with_instructions(
-                "ARC700 / BCM55030 emulator — read-only MCP tools. Mutation tools land in phase 5.",
+                "ARC700 / BCM55030 emulator — full MCP tool surface (read + mutation).",
             )
     }
+
+    /// Custom `call_tool` override. `#[tool_handler]` only
+    /// injects a default implementation when one is not already
+    /// present, so providing our own keeps the macro happy while
+    /// letting us tee every request / response pair into the
+    /// `handle.event_log` ring — which powers the GUI's
+    /// "MCP Activity" panel.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let tool_name = request.name.to_string();
+        let is_mutation = is_mutation_tool(&tool_name);
+        let params_summary = request
+            .arguments
+            .as_ref()
+            .map(|a| truncate(&serde_json::Value::Object(a.clone()).to_string(), 240))
+            .unwrap_or_default();
+        self.push_log_request(&tool_name, &params_summary, is_mutation);
+
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let result = Self::tool_router().call(tcc).await;
+
+        let result_summary = match &result {
+            Ok(r) => summarise_result(r),
+            Err(e) => format!("error: {e:?}"),
+        };
+        self.push_log_response(&tool_name, &result_summary, is_mutation);
+        result
+    }
+}
+
+impl EmulatorHandler {
+    fn push_log_request(&self, tool: &str, params: &str, is_mutation: bool) {
+        use crate::emu::event_log::{Direction, EventEntry};
+        use std::time::SystemTime;
+        let mut log = self.handle.event_log.lock();
+        log.in_flight = log.in_flight.saturating_add(1);
+        log.push(EventEntry {
+            timestamp: SystemTime::now(),
+            direction: Direction::Request,
+            tool: tool.to_string(),
+            params: params.to_string(),
+            result: String::new(),
+            is_mutation,
+        });
+    }
+
+    fn push_log_response(&self, tool: &str, result: &str, is_mutation: bool) {
+        use crate::emu::event_log::{Direction, EventEntry};
+        use std::time::SystemTime;
+        let mut log = self.handle.event_log.lock();
+        log.in_flight = log.in_flight.saturating_sub(1);
+        log.push(EventEntry {
+            timestamp: SystemTime::now(),
+            direction: Direction::Response,
+            tool: tool.to_string(),
+            params: String::new(),
+            result: result.to_string(),
+            is_mutation,
+        });
+    }
+}
+
+/// Short-form summary of a `CallToolResult` for the activity
+/// log. Prefers `structured_content` when present; falls back to
+/// the first text content. Truncated to keep the ring lean.
+fn summarise_result(r: &rmcp::model::CallToolResult) -> String {
+    if let Some(v) = r.structured_content.as_ref() {
+        return truncate(&v.to_string(), 240);
+    }
+    if let Some(first) = r.content.first() {
+        if let Some(text) = first.as_text() {
+            return truncate(&text.text, 240);
+        }
+    }
+    if matches!(r.is_error, Some(true)) {
+        "error".to_string()
+    } else {
+        "ok".to_string()
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let mut out = s[..max].to_string();
+        out.push('…');
+        out
+    }
+}
+
+/// Whitelist of tools that mutate emulator state. Drives the
+/// warning-coloured row style in the GUI activity log.
+fn is_mutation_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "load_firmware"
+            | "cpu_run"
+            | "cpu_pause"
+            | "cpu_step"
+            | "cpu_step_over"
+            | "cpu_run_to"
+            | "cpu_reset"
+            | "write_register"
+            | "write_memory"
+            | "write_mmio"
+            | "read_mmio"
+            | "set_breakpoint"
+            | "remove_breakpoint"
+            | "set_watchpoint"
+            | "remove_watchpoint"
+            | "inject_peripheral_event"
+            | "send_uart_input"
+            | "write_flash"
+            | "load_flash_from_file"
+            | "dump_flash_to_file"
+            | "add_symbol"
+            | "add_comment"
+    )
 }
 
 // ---------- Helpers -------------------------------------------------------
