@@ -12,7 +12,8 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc;
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
 
 use crate::cpu::exception::Exception;
 use crate::soc::alarm_events::AlarmEvents;
@@ -86,12 +87,14 @@ pub struct PeripheralBank {
     pub sysreg: SysregShim,
 
     uart_rx_sender: mpsc::Sender<u8>,
-    /// Wrapped in `Mutex` so `PeripheralBank` is `Sync`. `mpsc::
-    /// Receiver` is `Send` but not `Sync`, which would prevent
-    /// `Arc<RwLock<PeripheralBank>>` from crossing thread
-    /// boundaries in the UI / MCP workers. Contention is zero —
-    /// only the bank's own `tick()` drains it, always while the
-    /// bank is write-locked.
+    /// Wrapped in `parking_lot::Mutex` so `PeripheralBank` is
+    /// `Sync`. `mpsc::Receiver` is `Send` but not `Sync`, which
+    /// would prevent `Arc<RwLock<PeripheralBank>>` from crossing
+    /// thread boundaries in the UI / MCP workers. Contention is
+    /// zero — only the bank's own `tick()` drains it, always
+    /// while the bank is write-locked — so the mutex acquisition
+    /// stays in parking_lot's fast path (no syscall, no
+    /// poisoning).
     uart_rx_receiver: Mutex<mpsc::Receiver<u8>>,
 
     /// Current CPU context for trace entries and watchpoint messages.
@@ -172,12 +175,7 @@ impl PeripheralBank {
     /// [`tick`] before other peripherals tick, so UART IRQ bits that
     /// arise from newly-received bytes are visible in the same pass.
     fn drain_uart_channel(&mut self) {
-        while let Ok(b) = self
-            .uart_rx_receiver
-            .lock()
-            .expect("uart_rx_receiver mutex")
-            .try_recv()
-        {
+        while let Ok(b) = self.uart_rx_receiver.lock().try_recv() {
             self.uart.push_rx_byte(b);
         }
     }
