@@ -13,6 +13,12 @@ pub enum HookAction {
     Skip,
     /// Continue normal execution (hook was informational)
     Continue,
+    /// Pause the CPU before executing the instruction at this PC.
+    /// The step loop sets `state.paused = true` and returns without
+    /// advancing PC — the next `cpu.step()` call will still see the
+    /// breakpoint PC. A UI / MCP `CpuCommand::StepOne` clears `paused`
+    /// before calling `step()`, stepping through the breakpoint.
+    Pause,
 }
 
 /// Function signature for custom hooks.
@@ -29,6 +35,11 @@ pub enum Hook {
     Log(&'static str),
     /// Custom function. Gets full access to CPU state and memory.
     Custom(HookFn),
+    /// UI / MCP breakpoint: pause before executing the instruction.
+    /// Installed by `CpuCommand::SetBreakpoint` and removed by
+    /// `RemoveBreakpoint`. Address-generic — the hook itself carries
+    /// no firmware knowledge (the contributor guide).
+    Breakpoint,
 }
 
 pub type HookTable = HashMap<u32, Hook>;
@@ -57,5 +68,6 @@ pub fn execute_hook(
             Ok(HookAction::Continue)
         }
         Hook::Custom(f) => f(state, mem),
+        Hook::Breakpoint => Ok(HookAction::Pause),
     }
 }

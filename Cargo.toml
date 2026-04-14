@@ -4,6 +4,39 @@ version = "0.1.0"
 edition = "2021"
 description = "ARC 700 ARCompact big-endian CPU emulator"
 
+[features]
+default = []
+# Enable the egui/eframe GUI layer. Pulls in native windowing.
+ui  = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd"]
+# Enable the integrated MCP server (rmcp + axum HTTP transport).
+mcp = [
+    "dep:rmcp",
+    "dep:tokio",
+    "dep:axum",
+    "dep:schemars",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tracing",
+]
+
 [dependencies]
 libc = "0.2"
 parking_lot = "0.12"
+
+# --- optional deps for the `ui` feature --------------------------------
+# Versions are conservative placeholders — Phase 6 pins them when the
+# GUI code lands. The default build has none of these compiled.
+eframe       = { version = "0.28", optional = true, default-features = false, features = ["default_fonts", "glow", "persistence"] }
+egui         = { version = "0.28", optional = true }
+egui_extras  = { version = "0.28", optional = true, features = ["all_loaders"] }
+rfd          = { version = "0.14", optional = true }
+
+# --- optional deps for the `mcp` feature -------------------------------
+# rmcp is pre-1.0: feature names verified in Phase 4 before coding.
+rmcp         = { version = "0.1",  optional = true }
+tokio        = { version = "1",    optional = true, features = ["rt-multi-thread", "macros", "sync", "net"] }
+axum         = { version = "0.7",  optional = true }
+schemars     = { version = "0.8",  optional = true }
+serde        = { version = "1",    optional = true, features = ["derive"] }
+serde_json   = { version = "1",    optional = true }
+tracing      = { version = "0.1",  optional = true }

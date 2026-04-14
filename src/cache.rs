@@ -32,6 +32,21 @@ pub struct EvictedLine {
     pub data: [u8; LINE_SIZE],
 }
 
+/// Clone-struct describing one physical D-cache line, exposed so the
+/// UI can render cache state without touching the private `CacheLine`
+/// type. One entry per (set, way) slot — 128 total for the BCM55030
+/// 2-way × 64-set geometry.
+#[derive(Clone, Debug)]
+pub struct DCacheLineInfo {
+    pub set: usize,
+    pub way: usize,
+    pub valid: bool,
+    pub dirty: bool,
+    pub tag: u32,
+    pub base_addr: u32,
+    pub data: [u8; LINE_SIZE],
+}
+
 /// R/W bit mask for DC_CTRL verified on real BCM55030 hardware via scan7b.
 /// = bits 0 (DC), 1 (reserved but writable), 2 (SB), 5 (AT), 6 (IM), 7 (LM)
 pub const DC_CTRL_RW_MASK: u32 = 0xE7;
@@ -71,6 +86,29 @@ impl DCache {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Snapshot every physical cache line into a flat vec. Used by
+    /// the UI memory-viewer "D-cache state" sub-tab. Always returns
+    /// `NUM_SETS * NUM_WAYS = 128` entries. Invalid lines are
+    /// reported as `valid: false` so the UI can grey them out.
+    pub fn snapshot_lines(&self) -> Vec<DCacheLineInfo> {
+        let mut out = Vec::with_capacity(NUM_SETS * NUM_WAYS);
+        for set in 0..NUM_SETS {
+            for way in 0..NUM_WAYS {
+                let line = &self.lines[set][way];
+                out.push(DCacheLineInfo {
+                    set,
+                    way,
+                    valid: line.valid,
+                    dirty: line.dirty,
+                    tag: line.tag,
+                    base_addr: Self::base_addr(line.tag, set),
+                    data: line.data,
+                });
+            }
+        }
+        out
     }
 
     /// Decompose address into (tag, set_index, byte_offset).

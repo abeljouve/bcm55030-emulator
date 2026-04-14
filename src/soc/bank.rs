@@ -257,6 +257,7 @@ impl PeripheralBank {
             self.uart.snapshot(),
             self.pbc.snapshot(),
             self.bsc_i2c.snapshot(),
+            self.bsc_i2c.sfp_snapshot(),
             self.serdes.snapshot(),
             self.epon_mac.snapshot(),
             self.macsec.snapshot(),

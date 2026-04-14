@@ -2,13 +2,13 @@ use crate::cpu::condition::ConditionCode;
 use crate::cpu::exception::Exception;
 use crate::decoder::fields::*;
 use crate::decoder::instruction::*;
-use crate::memory::Memory;
+use crate::decoder::InstructionFetch;
 
 /// Decode a 32-bit instruction word
 pub fn decode_32bit(
     word: u32,
     pc: u32,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<DecodedInstruction, Exception> {
     let major = extract_bits(word, 31, 27) as u8;
     match major {
@@ -28,7 +28,7 @@ fn resolve_limm(
     c_reg: u8,
     pc: u32,
     insn_size: u8,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<(Option<u32>, bool), Exception> {
     let needs_limm = b_reg == 62 || c_reg == 62;
     if needs_limm {
@@ -110,7 +110,7 @@ fn decode_branch(word: u32, pc: u32) -> Result<DecodedInstruction, Exception> {
 fn decode_branch_link_or_compare(
     word: u32,
     pc: u32,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<DecodedInstruction, Exception> {
     let bit17 = (word >> 17) & 1;
     let bit16 = (word >> 16) & 1;
@@ -176,7 +176,7 @@ fn decode_branch_link_or_compare(
 fn decode_branch_compare(
     word: u32,
     pc: u32,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<DecodedInstruction, Exception> {
     let b_reg = extract_b_reg(word);
     let n = extract_n_bit(word);
@@ -233,7 +233,7 @@ fn decode_branch_compare(
 fn decode_load(
     word: u32,
     pc: u32,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<DecodedInstruction, Exception> {
     let b_reg = extract_b_reg(word);
     let a_reg = extract_a_reg(word);
@@ -317,7 +317,7 @@ fn decode_load(
 fn decode_store(
     word: u32,
     pc: u32,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<DecodedInstruction, Exception> {
     let b_reg = extract_b_reg(word);
     let c_reg = extract_c_reg(word);
@@ -379,7 +379,7 @@ fn decode_store(
 fn decode_general_ops(
     word: u32,
     pc: u32,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<DecodedInstruction, Exception> {
     let p = extract_p_field(word);
     let sub = extract_subopcode_04(word);
@@ -413,7 +413,7 @@ fn decode_alu_op(
     pc: u32,
     p: u8,
     op: AluOp,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<DecodedInstruction, Exception> {
     let b_reg = extract_b_reg(word);
     let f = extract_f_bit(word);
@@ -623,7 +623,7 @@ fn decode_single_op(
     word: u32,
     pc: u32,
     p: u8,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<DecodedInstruction, Exception> {
     // P=10 is invalid for single-op
     if p == 0b10 {
@@ -774,7 +774,7 @@ fn decode_special_ops(
     word: u32,
     pc: u32,
     sub: u8,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<DecodedInstruction, Exception> {
     match sub {
         // J/JL: 0x20-0x23
@@ -797,7 +797,7 @@ fn decode_jump(
     word: u32,
     pc: u32,
     sub: u8,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<DecodedInstruction, Exception> {
     let p = extract_p_field(word);
     let f = extract_f_bit(word);
@@ -981,7 +981,7 @@ fn decode_loop(word: u32, pc: u32) -> Result<DecodedInstruction, Exception> {
 fn decode_flag(
     word: u32,
     pc: u32,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<DecodedInstruction, Exception> {
     let p = extract_p_field(word);
 
@@ -1050,7 +1050,7 @@ fn decode_flag(
 fn decode_lr(
     word: u32,
     pc: u32,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<DecodedInstruction, Exception> {
     let b_reg = extract_b_reg(word);
     let p = extract_p_field(word);
@@ -1105,7 +1105,7 @@ fn decode_lr(
 fn decode_sr(
     word: u32,
     pc: u32,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<DecodedInstruction, Exception> {
     let b_reg = extract_b_reg(word);
     let p = extract_p_field(word);
@@ -1167,7 +1167,7 @@ fn decode_sr(
 fn decode_load_reg_reg(
     word: u32,
     pc: u32,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<DecodedInstruction, Exception> {
     let b_reg = extract_b_reg(word);
     let c_reg = extract_c_reg(word);
@@ -1236,7 +1236,7 @@ fn decode_load_reg_reg(
 fn decode_extension_ops(
     word: u32,
     pc: u32,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<DecodedInstruction, Exception> {
     let sub = extract_subopcode_04(word);
     let p = extract_p_field(word);

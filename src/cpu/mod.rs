@@ -81,7 +81,7 @@ impl Cpu {
     }
 
     pub fn step(&mut self) -> Result<(), Exception> {
-        if self.state.halted {
+        if self.state.halted || self.state.paused {
             return Ok(());
         }
 
@@ -92,6 +92,12 @@ impl Cpu {
                 match hooks::execute_hook(hook, &mut self.state, &mut self.mem)? {
                     HookAction::Skip => return Ok(()),
                     HookAction::Continue => {}
+                    HookAction::Pause => {
+                        self.state.paused = true;
+                        self.state.pause_reason =
+                            crate::cpu::registers::PauseReason::Breakpoint(self.state.pc);
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -174,6 +180,15 @@ impl Cpu {
         }
 
         self.state.instruction_count += 1;
+
+        // Watchpoint trap — if any read/write during executor set a
+        // hit, pause the CPU. The next step() runs past the
+        // watchpoint only after the UI clears `paused`.
+        if let Some((wp_addr, wp_mode)) = self.mem.watchpoints.take_hit() {
+            self.state.paused = true;
+            self.state.pause_reason =
+                crate::cpu::registers::PauseReason::Watch(wp_addr, wp_mode);
+        }
 
         // Timers + peripheral bank
         self.tick_timers_and_bank();
