@@ -12,6 +12,7 @@
 //! is user-loaded at runtime.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -22,7 +23,10 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::emu::command::{oneshot, CpuCommand};
 use crate::emu::{EmulatorHandle, RunState};
+use crate::memory::WatchMode;
+use crate::soc::bank::BootMode;
 use crate::soc::peripheral::{
     AlarmEvent, FatalFilterEvent, PbcEvent, PeripheralEvent, PeripheralSnapshot, SerDesEvent,
     UartEvent,
@@ -214,6 +218,95 @@ pub struct MmioTraceEntryJson {
 pub struct DumpMmioTraceResult {
     pub enabled: bool,
     pub entries: Vec<MmioTraceEntryJson>,
+}
+
+// ---------- Phase 5b CpuCommand DTOs -------------------------------------
+
+#[derive(Debug, Clone, Deserialize, JsonSchema, Default)]
+pub struct CpuRunParams {
+    /// Optional hard cap on the number of instructions to
+    /// execute before the worker auto-pauses with
+    /// `PauseReason::UserPause`. `None` = unbounded run.
+    pub max_insns: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema, Default)]
+pub struct CpuStepParams {
+    /// Defaults to 1 when absent.
+    pub count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CpuRunToParams {
+    pub address: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct CpuResetParams {
+    /// `"cold"` or `"warm"` (default).
+    pub boot_mode: Option<String>,
+    #[serde(default = "default_true")]
+    pub keep_breakpoints: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SetBreakpointParams {
+    pub address: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RemoveBreakpointParams {
+    pub address: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SetWatchpointParams {
+    pub address: u32,
+    pub size: u32,
+    /// `"read"`, `"write"`, or `"rw"`.
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RemoveWatchpointParams {
+    pub index: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct WriteRegisterParams {
+    pub name: String,
+    pub value: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct WriteMemoryParams {
+    pub address: u32,
+    /// Hex-encoded bytes.
+    pub hex: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReadMemoryParams {
+    pub address: u32,
+    pub length: u32,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReadMemoryResult {
+    pub address: u32,
+    pub length: u32,
+    pub hex: String,
+    pub ascii: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReadMmioParams {
+    pub address: u32,
+    pub width: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -642,6 +735,347 @@ impl EmulatorHandler {
                 })
             }
         }
+    }
+
+    // ---------- Phase 5b CpuCommand-backed tools ------------------------
+
+    #[tool(
+        name = "cpu_run",
+        description = "Start continuous CPU execution. `max_insns` caps the run length and auto-pauses via `PauseReason::UserPause` when reached. Fire-and-forget: poll `get_cpu_state` for completion."
+    )]
+    async fn cpu_run(
+        &self,
+        Parameters(params): Parameters<CpuRunParams>,
+    ) -> Json<OkResult> {
+        let ok = self
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::Run {
+                max_insns: params.max_insns,
+            })
+            .is_ok();
+        Json(OkResult { ok })
+    }
+
+    #[tool(
+        name = "cpu_pause",
+        description = "Pause a running CPU. The worker publishes a Paused snapshot within one instruction."
+    )]
+    async fn cpu_pause(&self) -> Json<OkResult> {
+        let ok = self.handle.cpu_cmd.send(CpuCommand::Pause).is_ok();
+        Json(OkResult { ok })
+    }
+
+    #[tool(
+        name = "cpu_step",
+        description = "Execute `count` instructions (default 1) and auto-pause. Poll `get_cpu_state` for completion."
+    )]
+    async fn cpu_step(
+        &self,
+        Parameters(params): Parameters<CpuStepParams>,
+    ) -> Json<OkResult> {
+        let n = params.count.unwrap_or(1);
+        let ok = self.handle.cpu_cmd.send(CpuCommand::StepN(n)).is_ok();
+        Json(OkResult { ok })
+    }
+
+    #[tool(
+        name = "cpu_step_over",
+        description = "Execute until the instruction at the current `blink` is reached (skip through BL/JL function calls). Implemented by installing a temporary breakpoint at blink and running."
+    )]
+    async fn cpu_step_over(&self) -> Json<OkResult> {
+        let ok = self.handle.cpu_cmd.send(CpuCommand::StepOver).is_ok();
+        Json(OkResult { ok })
+    }
+
+    #[tool(
+        name = "cpu_run_to",
+        description = "Run until the CPU reaches `address`, then auto-pause with `PauseReason::UserPause`."
+    )]
+    async fn cpu_run_to(
+        &self,
+        Parameters(params): Parameters<CpuRunToParams>,
+    ) -> Json<OkResult> {
+        let ok = self
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::RunTo {
+                address: params.address,
+            })
+            .is_ok();
+        Json(OkResult { ok })
+    }
+
+    #[tool(
+        name = "cpu_reset",
+        description = "Rebuild the CPU via the worker's reset callback. `boot_mode` is `cold` or `warm` (default). `keep_breakpoints=true` re-installs every current breakpoint on the fresh CPU."
+    )]
+    async fn cpu_reset(
+        &self,
+        Parameters(params): Parameters<CpuResetParams>,
+    ) -> Json<OkResult> {
+        let mode = match params
+            .boot_mode
+            .as_deref()
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("cold") => BootMode::Cold,
+            _ => BootMode::Warm,
+        };
+        let ok = self
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::Reset {
+                boot_mode: mode,
+                keep_breakpoints: params.keep_breakpoints,
+            })
+            .is_ok();
+        Json(OkResult { ok })
+    }
+
+    #[tool(
+        name = "set_breakpoint",
+        description = "Install a CPU breakpoint at `address`. The worker inserts a `Hook::Breakpoint` entry and pauses before executing that PC. Returns the 0-based index in the breakpoint list."
+    )]
+    async fn set_breakpoint(
+        &self,
+        Parameters(params): Parameters<SetBreakpointParams>,
+    ) -> Json<OkResult> {
+        let (tx, rx) = oneshot::<usize>();
+        if self
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::SetBreakpoint {
+                address: params.address,
+                response: tx,
+            })
+            .is_err()
+        {
+            return Json(OkResult { ok: false });
+        }
+        let ok = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(Duration::from_secs(2)).is_ok()
+        })
+        .await
+        .unwrap_or(false);
+        Json(OkResult { ok })
+    }
+
+    #[tool(
+        name = "remove_breakpoint",
+        description = "Remove a CPU breakpoint by address. No-op if none is installed there."
+    )]
+    async fn remove_breakpoint(
+        &self,
+        Parameters(params): Parameters<RemoveBreakpointParams>,
+    ) -> Json<OkResult> {
+        let ok = self
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::RemoveBreakpoint {
+                address: params.address,
+            })
+            .is_ok();
+        Json(OkResult { ok })
+    }
+
+    #[tool(
+        name = "set_watchpoint",
+        description = "Trap on memory access. `mode` is `read` / `write` / `rw`. The worker pauses with `PauseReason::Watch` on hit."
+    )]
+    async fn set_watchpoint(
+        &self,
+        Parameters(params): Parameters<SetWatchpointParams>,
+    ) -> Json<OkResult> {
+        let mode = match params.mode.to_ascii_lowercase().as_str() {
+            "read" => WatchMode::Read,
+            "write" => WatchMode::Write,
+            _ => WatchMode::ReadWrite,
+        };
+        let (tx, rx) = oneshot::<usize>();
+        if self
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::SetWatchpoint {
+                addr: params.address,
+                size: params.size,
+                mode,
+                response: tx,
+            })
+            .is_err()
+        {
+            return Json(OkResult { ok: false });
+        }
+        let ok = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(Duration::from_secs(2)).is_ok()
+        })
+        .await
+        .unwrap_or(false);
+        Json(OkResult { ok })
+    }
+
+    #[tool(
+        name = "remove_watchpoint",
+        description = "Remove a watchpoint by index into the installed-watchpoint list."
+    )]
+    async fn remove_watchpoint(
+        &self,
+        Parameters(params): Parameters<RemoveWatchpointParams>,
+    ) -> Json<OkResult> {
+        let ok = self
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::RemoveWatchpoint {
+                index: params.index as usize,
+            })
+            .is_ok();
+        Json(OkResult { ok })
+    }
+
+    #[tool(
+        name = "write_register",
+        description = "Write a CPU register by name. Supports r0..r63, pc, sp, fp, gp, blink, lp_count, status32, ilink1, ilink2."
+    )]
+    async fn write_register(
+        &self,
+        Parameters(params): Parameters<WriteRegisterParams>,
+    ) -> Json<OkResult> {
+        let (tx, rx) = oneshot::<Result<(), String>>();
+        if self
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::WriteRegister {
+                name: params.name,
+                value: params.value,
+                response: tx,
+            })
+            .is_err()
+        {
+            return Json(OkResult { ok: false });
+        }
+        let ok = tokio::task::spawn_blocking(move || {
+            matches!(rx.recv_timeout(Duration::from_secs(2)), Ok(Ok(())))
+        })
+        .await
+        .unwrap_or(false);
+        Json(OkResult { ok })
+    }
+
+    #[tool(
+        name = "write_memory",
+        description = "Write bytes to SRAM via the worker. Hex-encoded payload. Routes through `CpuCommand::WriteSram` so the CPU thread stays exclusive over `Memory`."
+    )]
+    async fn write_memory(
+        &self,
+        Parameters(params): Parameters<WriteMemoryParams>,
+    ) -> Json<OkResult> {
+        let bytes = match decode_hex(&params.hex) {
+            Ok(b) => b,
+            Err(_) => return Json(OkResult { ok: false }),
+        };
+        let (tx, rx) = oneshot::<Result<(), String>>();
+        if self
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::WriteSram {
+                addr: params.address,
+                bytes,
+                response: tx,
+            })
+            .is_err()
+        {
+            return Json(OkResult { ok: false });
+        }
+        let ok = tokio::task::spawn_blocking(move || {
+            matches!(rx.recv_timeout(Duration::from_secs(2)), Ok(Ok(())))
+        })
+        .await
+        .unwrap_or(false);
+        Json(OkResult { ok })
+    }
+
+    #[tool(
+        name = "read_memory",
+        description = "Read `length` bytes from SRAM via the worker's `RequestSram` round-trip. Returns hex + ASCII."
+    )]
+    async fn read_memory(
+        &self,
+        Parameters(params): Parameters<ReadMemoryParams>,
+    ) -> Json<ReadMemoryResult> {
+        let (tx, rx) = oneshot::<crate::emu::SramSnapshot>();
+        if self
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::RequestSram { response: tx })
+            .is_err()
+        {
+            return Json(ReadMemoryResult {
+                address: params.address,
+                length: 0,
+                hex: String::new(),
+                ascii: String::new(),
+            });
+        }
+        let snap = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(Duration::from_secs(5)).ok()
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(snap) = snap else {
+            return Json(ReadMemoryResult {
+                address: params.address,
+                length: 0,
+                hex: String::new(),
+                ascii: String::new(),
+            });
+        };
+        let start = params.address as usize;
+        let end = start
+            .saturating_add(params.length as usize)
+            .min(snap.bytes.len());
+        let slice = if start < snap.bytes.len() {
+            &snap.bytes[start..end]
+        } else {
+            &[][..]
+        };
+        let hex = slice.iter().map(|b| format!("{:02X}", b)).collect::<String>();
+        let ascii = slice
+            .iter()
+            .map(|b| if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' })
+            .collect::<String>();
+        Json(ReadMemoryResult {
+            address: params.address,
+            length: slice.len() as u32,
+            hex,
+            ascii,
+        })
+    }
+
+    #[tool(
+        name = "read_mmio",
+        description = "Side-effectful MMIO read. Unlike `peek_mmio` this triggers FIFO pops, IRQ latch clears, and busy-bit transitions. Use `peek_mmio` for the inspector."
+    )]
+    async fn read_mmio(
+        &self,
+        Parameters(params): Parameters<ReadMmioParams>,
+    ) -> Json<PeekMmioResult> {
+        let mut guard = self.handle.bank.write();
+        let width = params
+            .width
+            .as_deref()
+            .unwrap_or("word")
+            .to_ascii_lowercase();
+        let value = match width.as_str() {
+            "byte" => guard.read_byte(params.address).unwrap_or(0) as u32,
+            "half" => guard.read_half(params.address).unwrap_or(0) as u32,
+            _ => guard.read_word(params.address).unwrap_or(0),
+        };
+        Json(PeekMmioResult {
+            address: params.address,
+            value,
+        })
     }
 }
 

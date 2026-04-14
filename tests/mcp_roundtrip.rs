@@ -10,13 +10,15 @@
 
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 
+use bcm55030_emulator::cpu::Cpu;
 use bcm55030_emulator::emu::command::CpuCommand;
 use bcm55030_emulator::emu::{
-    Annotations, EmulatorHandle, EmulatorSnapshot, EventLog, McpStatus,
+    cpu_worker, Annotations, EmulatorHandle, EmulatorSnapshot, EventLog, McpStatus,
 };
 use bcm55030_emulator::mcp;
 use bcm55030_emulator::soc::bank::{BootMode, PeripheralBank};
@@ -284,6 +286,234 @@ async fn mcp_roundtrip_read_only_tools() {
     );
 
     client.cancel().await.ok();
+}
+
+// ---------- Phase 5b worker-backed tools --------------------------------
+
+const NOP_S: [u8; 2] = [0x78, 0xE0];
+
+fn flat_cpu_with_nops(n: usize) -> Cpu {
+    let mut cpu = Cpu::new(64 * 1024);
+    let mut blob = Vec::with_capacity(n * 2);
+    for _ in 0..n {
+        blob.extend_from_slice(&NOP_S);
+    }
+    cpu.mem.load_binary(0, &blob);
+    cpu.state.pc = 0;
+    cpu
+}
+
+/// Build a handle + spawn a live CPU worker thread. Returns the
+/// worker `JoinHandle` so the test can join it on shutdown.
+fn build_handle_with_worker() -> (EmulatorHandle, thread::JoinHandle<()>) {
+    let bank = Arc::new(RwLock::new(PeripheralBank::new(BootMode::Cold)));
+    let snap = EmulatorSnapshot::placeholder(BootMode::Cold);
+    let (cmd_tx, cmd_rx) = mpsc::channel::<CpuCommand>();
+    let uart_tx = bank.read().uart_rx_sender();
+    let handle = EmulatorHandle {
+        bank,
+        snapshot: Arc::new(Mutex::new(snap)),
+        cpu_cmd: cmd_tx,
+        uart_tx,
+        annotations: Arc::new(RwLock::new(Annotations::new())),
+        event_log: Arc::new(Mutex::new(EventLog::default())),
+        mcp_status: Arc::new(Mutex::new(McpStatus::default())),
+        firmware_info: Arc::new(Mutex::new(None)),
+    };
+    let handle_for_worker = handle.clone();
+    let worker = thread::spawn(move || {
+        let cpu = flat_cpu_with_nops(64);
+        cpu_worker::run(
+            cpu,
+            handle_for_worker,
+            cmd_rx,
+            Box::new(|_| flat_cpu_with_nops(64)),
+        );
+    });
+    (handle, worker)
+}
+
+/// Second test — exercises every phase-5b tool against a live
+/// CPU worker. set_breakpoint + cpu_run round-trip proves the
+/// spawn_blocking oneshot bridge works end-to-end; cpu_step and
+/// write_register verify the fire-and-forget path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_roundtrip_cpu_command_tools() {
+    let (handle, worker) = build_handle_with_worker();
+    let _server = mcp::spawn_server(handle.clone(), 0);
+    let addr = wait_for_server(&handle).await;
+    let uri = format!("http://{}/mcp", addr);
+    let transport = StreamableHttpClientTransport::from_uri(uri.as_str());
+    let client = ()
+        .serve(transport)
+        .await
+        .expect("rmcp client initialize");
+
+    // 1. set_breakpoint at PC=8 (after 4 NOP_S).
+    let bp_args = serde_json::json!({ "address": 8u32 })
+        .as_object()
+        .unwrap()
+        .clone();
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("set_breakpoint").with_arguments(bp_args),
+        )
+        .await
+        .expect("set_breakpoint");
+    let text = render_result(&res);
+    assert!(text.contains("\"ok\":true"), "set_breakpoint: {}", text);
+
+    // 2. cpu_run — unbounded, must hit the breakpoint.
+    client
+        .call_tool(CallToolRequestParams::new("cpu_run"))
+        .await
+        .expect("cpu_run");
+
+    // 3. Poll get_cpu_state until run_state transitions to Breakpoint.
+    let start = Instant::now();
+    loop {
+        if start.elapsed() > Duration::from_secs(2) {
+            panic!("cpu never hit breakpoint");
+        }
+        let res = client
+            .call_tool(CallToolRequestParams::new("get_cpu_state"))
+            .await
+            .expect("get_cpu_state");
+        let text = render_result(&res);
+        if text.contains("\"pc\":8") && text.contains("Breakpoint") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // 4. read_registers names=["pc"] → pc == 8 (4 NOP_S executed).
+    let args = serde_json::json!({ "names": ["pc"] })
+        .as_object()
+        .unwrap()
+        .clone();
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("read_registers").with_arguments(args),
+        )
+        .await
+        .expect("read_registers");
+    let text = render_result(&res);
+    assert!(text.contains("\"pc\":8"), "read_registers: {}", text);
+
+    // 5. write_register r0=0xDEADBEEF, then read it back.
+    let args = serde_json::json!({ "name": "r0", "value": 0xDEADBEEFu32 })
+        .as_object()
+        .unwrap()
+        .clone();
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("write_register").with_arguments(args),
+        )
+        .await
+        .expect("write_register");
+    let text = render_result(&res);
+    assert!(text.contains("\"ok\":true"), "write_register: {}", text);
+
+    // write_register forces an immediate snapshot publish, so
+    // the next read_registers sees the new value.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let args = serde_json::json!({ "names": ["r0"] })
+        .as_object()
+        .unwrap()
+        .clone();
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("read_registers").with_arguments(args),
+        )
+        .await
+        .expect("read_registers r0");
+    let text = render_result(&res);
+    // u32::from(0xDEADBEEF) = 3_735_928_559 as JSON number.
+    assert!(
+        text.contains("3735928559"),
+        "r0 after write_register: {}",
+        text
+    );
+
+    // 6. remove_breakpoint + cpu_step(2) → pc advances to 12.
+    let args = serde_json::json!({ "address": 8u32 })
+        .as_object()
+        .unwrap()
+        .clone();
+    client
+        .call_tool(
+            CallToolRequestParams::new("remove_breakpoint").with_arguments(args),
+        )
+        .await
+        .expect("remove_breakpoint");
+
+    // Clear the paused state so the next step runs.
+    client
+        .call_tool(CallToolRequestParams::new("cpu_pause"))
+        .await
+        .ok();
+    let step_args = serde_json::json!({ "count": 2u32 })
+        .as_object()
+        .unwrap()
+        .clone();
+    client
+        .call_tool(
+            CallToolRequestParams::new("cpu_step").with_arguments(step_args),
+        )
+        .await
+        .expect("cpu_step");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let res = client
+        .call_tool(CallToolRequestParams::new("get_cpu_state"))
+        .await
+        .expect("get_cpu_state");
+    let text = render_result(&res);
+    // After clearing paused and stepping 2, pc moves from 8 to 12.
+    assert!(text.contains("\"pc\":12"), "after step 2: {}", text);
+
+    // 7. read_memory @ 0 → first 4 bytes = 78E0 78E0 (two NOP_S).
+    let args = serde_json::json!({ "address": 0u32, "length": 4u32 })
+        .as_object()
+        .unwrap()
+        .clone();
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("read_memory").with_arguments(args),
+        )
+        .await
+        .expect("read_memory");
+    let text = render_result(&res);
+    assert!(
+        text.contains("78E078E0"),
+        "read_memory first 4 bytes: {}",
+        text
+    );
+
+    // 8. cpu_reset brings the fresh Cpu back to pc=0 with
+    //    breakpoints cleared.
+    let args = serde_json::json!({ "keep_breakpoints": false })
+        .as_object()
+        .unwrap()
+        .clone();
+    client
+        .call_tool(CallToolRequestParams::new("cpu_reset").with_arguments(args))
+        .await
+        .expect("cpu_reset");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let res = client
+        .call_tool(CallToolRequestParams::new("get_cpu_state"))
+        .await
+        .expect("get_cpu_state post-reset");
+    let text = render_result(&res);
+    assert!(text.contains("\"pc\":0"), "reset pc: {}", text);
+
+    // Clean shutdown.
+    client.cancel().await.ok();
+    handle
+        .cpu_cmd
+        .send(CpuCommand::Shutdown)
+        .expect("shutdown cmd");
+    worker.join().expect("worker join");
 }
 
 /// rmcp's `CallToolResult.content` is a vec of tagged content
