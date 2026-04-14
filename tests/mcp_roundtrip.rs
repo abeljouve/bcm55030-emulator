@@ -34,7 +34,11 @@ fn build_handle() -> EmulatorHandle {
     let mut snap = EmulatorSnapshot::placeholder(BootMode::Warm);
     snap.peripherals = peripherals;
     let (cmd_tx, _cmd_rx) = mpsc::channel::<CpuCommand>();
-    let (uart_tx, _uart_rx) = mpsc::channel::<u8>();
+    // Use the bank's own UART RX mpsc sender — its receiver
+    // lives inside the bank, so bytes pushed by the MCP
+    // `send_uart_input` tool have a consumer for the full
+    // duration of the test (the bank outlives the handle).
+    let uart_tx = bank.read().uart_rx_sender();
 
     EmulatorHandle {
         bank,
@@ -152,6 +156,132 @@ async fn mcp_roundtrip_read_only_tools() {
         .expect("read_flash");
     let text = render_result(&res);
     assert!(text.contains("\"length\":16"), "read_flash: {}", text);
+
+    // ---------- Phase 5a mutation tools ----------------------------------
+
+    // 7. add_symbol → list_symbols reflects it.
+    let sym_args = serde_json::json!({
+        "address": 0x0150u32,
+        "name": "boot_main"
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    client
+        .call_tool(CallToolRequestParams::new("add_symbol").with_arguments(sym_args))
+        .await
+        .expect("add_symbol");
+    let res = client
+        .call_tool(CallToolRequestParams::new("list_symbols"))
+        .await
+        .expect("list_symbols");
+    let text = render_result(&res);
+    assert!(
+        text.contains("boot_main"),
+        "add_symbol round-trip: {}",
+        text
+    );
+
+    // 8. write_flash → read_flash round-trip.
+    let write_args = serde_json::json!({
+        "offset": 0x1000u32,
+        "hex": "DEADBEEFCAFEBABE"
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    client
+        .call_tool(CallToolRequestParams::new("write_flash").with_arguments(write_args))
+        .await
+        .expect("write_flash");
+    let read_args = serde_json::json!({ "offset": 0x1000u32, "length": 8u32 })
+        .as_object()
+        .unwrap()
+        .clone();
+    let res = client
+        .call_tool(CallToolRequestParams::new("read_flash").with_arguments(read_args))
+        .await
+        .expect("read_flash after write");
+    let text = render_result(&res);
+    assert!(
+        text.contains("DEADBEEFCAFEBABE"),
+        "write/read_flash round-trip: {}",
+        text
+    );
+
+    // 9. send_uart_input — reports byte count.
+    let uart_args = serde_json::json!({ "data": "hi\r\n" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("send_uart_input").with_arguments(uart_args),
+        )
+        .await
+        .expect("send_uart_input");
+    let text = render_result(&res);
+    assert!(
+        text.contains("\"bytes_sent\":4"),
+        "send_uart_input: {}",
+        text
+    );
+
+    // 10. inject_peripheral_event alarm/ForcePending — handler
+    //     returns ok:true (the bank's alarm_events peripheral
+    //     accepts the event).
+    let inject_args = serde_json::json!({
+        "peripheral": "alarm",
+        "event": "ForcePending",
+        "params": { "opcode": 0x1234u32 }
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let res = client
+        .call_tool(
+            CallToolRequestParams::new("inject_peripheral_event").with_arguments(inject_args),
+        )
+        .await
+        .expect("inject_peripheral_event");
+    let text = render_result(&res);
+    assert!(text.contains("\"ok\":true"), "inject alarm: {}", text);
+
+    // 11. write_mmio: directly set bsc_i2c raw_store[0x144] via
+    //     the bank, then verify it was actually written by
+    //     re-reading the bank's register store. Use peek_mmio
+    //     for round-trip — bsc_i2c doesn't override peek_word
+    //     yet so it returns 0; instead check the change landed
+    //     via the `read_mmio`-equivalent path (side-effectful
+    //     read_word on bsc_i2c register 0x144).
+    let write_args = serde_json::json!({
+        "address": 0x0100_0144u32,
+        "value": 0x0000_00FFu32,
+        "width": "word"
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    client
+        .call_tool(CallToolRequestParams::new("write_mmio").with_arguments(write_args))
+        .await
+        .expect("write_mmio");
+    // bsc_i2c uses a backing store for 0x144 — read via the
+    // direct bank handle to confirm it landed.
+    let stored = handle.bank.write().read_word(0x0100_0144).unwrap();
+    assert_eq!(stored & 0xFF, 0xFF, "write_mmio round-trip via bank");
+
+    // 12. dump_mmio_trace: tracing disabled (no --dump-mmio-trace).
+    let res = client
+        .call_tool(CallToolRequestParams::new("dump_mmio_trace"))
+        .await
+        .expect("dump_mmio_trace");
+    let text = render_result(&res);
+    assert!(
+        text.contains("\"enabled\":false"),
+        "dump_mmio_trace: {}",
+        text
+    );
 
     client.cancel().await.ok();
 }

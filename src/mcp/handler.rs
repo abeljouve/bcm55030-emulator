@@ -1,13 +1,11 @@
-//! MCP tool handler for the ARC700 emulator. All tools here are
-//! read-only — phase 4 surface. Mutations land in phase 5.
+//! MCP tool handler for the ARC700 emulator. Read-only (phase 4)
+//! plus bank-side mutations (phase 5a). CpuCommand-backed
+//! mutations (cpu_run, set_breakpoint, write_register, ...)
+//! land in phase 5b.
 //!
 //! Tools follow the the design spec §MCP Server §Tools categories:
 //! firmware / cpu / memory / disassembly / peripherals / flash /
-//! annotations / breakpoints. Phase 4 implements the subset that
-//! can be answered directly from `EmulatorHandle` fields without
-//! round-tripping through the CPU worker; the rest (read_memory,
-//! disassemble, search_memory) lands once the worker-blocking
-//! path is wired in phase 5.
+//! annotations / breakpoints.
 //!
 //! the contributor guide: nothing in this module carries firmware-specific
 //! constants. Symbols are fetched from `handle.annotations` which
@@ -25,7 +23,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::emu::{EmulatorHandle, RunState};
-use crate::soc::peripheral::PeripheralSnapshot;
+use crate::soc::peripheral::{
+    AlarmEvent, FatalFilterEvent, PbcEvent, PeripheralEvent, PeripheralSnapshot, SerDesEvent,
+    UartEvent,
+};
 
 /// Tool handler — one instance is cheap (all state lives behind
 /// `Arc`s on the `EmulatorHandle`). `StreamableHttpService` clones
@@ -116,6 +117,103 @@ pub struct PeekMmioResult {
 pub struct ReadFlashParams {
     pub offset: u32,
     pub length: u32,
+}
+
+// ---------- Phase 5a mutation DTOs ---------------------------------------
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct WriteMmioParams {
+    pub address: u32,
+    pub value: u32,
+    /// Access width: `"byte"`, `"half"`, or `"word"` (default).
+    pub width: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OkResult {
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SendUartInputParams {
+    /// UTF-8 text. Each byte is pushed through the bank's mpsc
+    /// UART RX channel — the same path the headless stdin loop
+    /// uses.
+    pub data: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SendUartInputResult {
+    pub bytes_sent: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct WriteFlashParams {
+    pub offset: u32,
+    /// Hex string of bytes to write (no separators, upper- or
+    /// lower-case). Byte count = hex string length / 2.
+    pub hex: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct WriteFlashResult {
+    pub bytes_written: usize,
+    pub offset: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct FlashPathParams {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AddSymbolParams {
+    pub address: u32,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AddCommentParams {
+    pub address: u32,
+    pub comment: String,
+}
+
+/// Dispatcher-style tagged union for `inject_peripheral_event`.
+/// Phase 5a covers the variants the test harness needs; the full
+/// `PeripheralEvent` surface is wired in phase 7 as the inspector
+/// tabs land.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct InjectPeripheralEventParams {
+    /// Peripheral to target. One of: `uart`, `alarm`, `serdes`,
+    /// `fatal_filter`, `pbc`.
+    pub peripheral: String,
+    /// Event variant name, matching `PeripheralEvent` sub-enums
+    /// (e.g. `ForcePending`, `InjectRxLos`, `ClearTxLog`).
+    pub event: String,
+    /// Variant-specific parameters encoded as a free-form JSON
+    /// object. Fields consumed per (peripheral, event) pair —
+    /// see the error message on a bad call for supported keys.
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct MmioTraceEntryJson {
+    pub address: u32,
+    pub peripheral: String,
+    pub reads: u64,
+    pub writes: u64,
+    pub last_read_value: u32,
+    pub last_write_value: u32,
+    pub first_pc: u32,
+    pub first_insn: u64,
+    pub access_widths: u8,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DumpMmioTraceResult {
+    pub enabled: bool,
+    pub entries: Vec<MmioTraceEntryJson>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -367,6 +465,184 @@ impl EmulatorHandler {
             hex,
         })
     }
+
+    // ---------- Phase 5a mutation tools ----------------------------------
+
+    #[tool(
+        name = "write_mmio",
+        description = "Side-effectful MMIO write. Goes through the normal peripheral routing path — FIFO pushes, command-bit auto-clears, DMA triggers all fire. `width` is `byte` / `half` / `word` (default)."
+    )]
+    async fn write_mmio(
+        &self,
+        Parameters(params): Parameters<WriteMmioParams>,
+    ) -> Json<OkResult> {
+        let mut guard = self.handle.bank.write();
+        let width = params
+            .width
+            .as_deref()
+            .unwrap_or("word")
+            .to_ascii_lowercase();
+        let _ = match width.as_str() {
+            "byte" => guard.write_byte(params.address, params.value as u8),
+            "half" => guard.write_half(params.address, params.value as u16),
+            _ => guard.write_word(params.address, params.value),
+        };
+        Json(OkResult { ok: true })
+    }
+
+    #[tool(
+        name = "send_uart_input",
+        description = "Push bytes into the bank's UART RX mpsc channel — the same path stdin uses in the headless entry point. Each code point is sent byte-by-byte so the CPU's UART IRQ path sees them as normal RX traffic."
+    )]
+    async fn send_uart_input(
+        &self,
+        Parameters(params): Parameters<SendUartInputParams>,
+    ) -> Json<SendUartInputResult> {
+        let mut sent = 0usize;
+        for b in params.data.bytes() {
+            if self.handle.uart_tx.send(b).is_ok() {
+                sent += 1;
+            } else {
+                break;
+            }
+        }
+        Json(SendUartInputResult { bytes_sent: sent })
+    }
+
+    #[tool(
+        name = "write_flash",
+        description = "Directly write raw bytes into the PBC flash backing store. Bypasses the SPI controller — intended for test harness use. Input is a hex string (no separators)."
+    )]
+    async fn write_flash(
+        &self,
+        Parameters(params): Parameters<WriteFlashParams>,
+    ) -> Json<WriteFlashResult> {
+        let bytes = match decode_hex(&params.hex) {
+            Ok(b) => b,
+            Err(_) => {
+                return Json(WriteFlashResult {
+                    bytes_written: 0,
+                    offset: params.offset,
+                });
+            }
+        };
+        let mut guard = self.handle.bank.write();
+        let flash = &mut guard.pbc.flash.data;
+        let start = params.offset as usize;
+        let end = (start + bytes.len()).min(flash.len());
+        let written = end.saturating_sub(start);
+        if written > 0 {
+            flash[start..end].copy_from_slice(&bytes[..written]);
+            guard.pbc.flash.dirty = true;
+        }
+        Json(WriteFlashResult {
+            bytes_written: written,
+            offset: params.offset,
+        })
+    }
+
+    #[tool(
+        name = "load_flash_from_file",
+        description = "Replace the PBC flash image with the contents of a host-side file. Convenience wrapper around `PbcEvent::LoadFlashFromFile`."
+    )]
+    async fn load_flash_from_file(
+        &self,
+        Parameters(params): Parameters<FlashPathParams>,
+    ) -> Json<OkResult> {
+        let event = PeripheralEvent::Pbc(PbcEvent::LoadFlashFromFile(params.path.into()));
+        let ok = self.handle.bank.write().inject_event(&event);
+        Json(OkResult { ok })
+    }
+
+    #[tool(
+        name = "dump_flash_to_file",
+        description = "Write the current PBC flash image out to a host-side file. Convenience wrapper around `PbcEvent::DumpFlashToFile`."
+    )]
+    async fn dump_flash_to_file(
+        &self,
+        Parameters(params): Parameters<FlashPathParams>,
+    ) -> Json<OkResult> {
+        let event = PeripheralEvent::Pbc(PbcEvent::DumpFlashToFile(params.path.into()));
+        let ok = self.handle.bank.write().inject_event(&event);
+        Json(OkResult { ok })
+    }
+
+    #[tool(
+        name = "add_symbol",
+        description = "Add an address → name binding to the user symbol table. The emulator ships empty; this is the only way symbols get into the disassembly output."
+    )]
+    async fn add_symbol(
+        &self,
+        Parameters(params): Parameters<AddSymbolParams>,
+    ) -> Json<OkResult> {
+        let mut ann = self.handle.annotations.write();
+        ann.symbols.insert(params.address, params.name);
+        Json(OkResult { ok: true })
+    }
+
+    #[tool(
+        name = "add_comment",
+        description = "Attach a free-form comment to an address. Rendered as a trailing `; comment` in the disassembly panel (phase 6)."
+    )]
+    async fn add_comment(
+        &self,
+        Parameters(params): Parameters<AddCommentParams>,
+    ) -> Json<OkResult> {
+        let mut ann = self.handle.annotations.write();
+        ann.comments.insert(params.address, params.comment);
+        Json(OkResult { ok: true })
+    }
+
+    #[tool(
+        name = "inject_peripheral_event",
+        description = "Dispatch a typed `PeripheralEvent` through `bank.inject_event()`. Supports a phase-5a subset covering common test-harness paths: alarm/ForcePending, serdes/InjectRxLos, uart/ClearTxLog, fatal_filter/InjectFatal. Phase 7 expands to every variant."
+    )]
+    async fn inject_peripheral_event(
+        &self,
+        Parameters(params): Parameters<InjectPeripheralEventParams>,
+    ) -> Json<OkResult> {
+        let event = match build_peripheral_event(&params) {
+            Some(ev) => ev,
+            None => return Json(OkResult { ok: false }),
+        };
+        let ok = self.handle.bank.write().inject_event(&event);
+        Json(OkResult { ok })
+    }
+
+    #[tool(
+        name = "dump_mmio_trace",
+        description = "Return the aggregated MMIO trace catalog. Only populated when the emulator was started with `--dump-mmio-trace`; otherwise `enabled=false` and an empty entries array."
+    )]
+    async fn dump_mmio_trace(&self) -> Json<DumpMmioTraceResult> {
+        let guard = self.handle.bank.read();
+        match guard.mmio_trace.as_ref() {
+            None => Json(DumpMmioTraceResult {
+                enabled: false,
+                entries: Vec::new(),
+            }),
+            Some(map) => {
+                let mut entries: Vec<_> = map
+                    .iter()
+                    .map(|(addr, e)| MmioTraceEntryJson {
+                        address: *addr,
+                        peripheral: e.peripheral.to_string(),
+                        reads: e.reads,
+                        writes: e.writes,
+                        last_read_value: e.last_read_value,
+                        last_write_value: e.last_write_value,
+                        first_pc: e.first_pc,
+                        first_insn: e.first_insn,
+                        access_widths: e.access_widths,
+                    })
+                    .collect();
+                entries.sort_by_key(|e| e.address);
+                Json(DumpMmioTraceResult {
+                    enabled: true,
+                    entries,
+                })
+            }
+        }
+    }
 }
 
 // ---------- ServerHandler impl -------------------------------------------
@@ -425,4 +701,73 @@ fn _run_state_guard(r: RunState) {
 #[allow(dead_code)]
 fn _peripheral_guard(p: PeripheralSnapshot) {
     let _ = p;
+}
+
+fn decode_hex(s: &str) -> Result<Vec<u8>, ()> {
+    let clean: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    if clean.len() % 2 != 0 {
+        return Err(());
+    }
+    let mut out = Vec::with_capacity(clean.len() / 2);
+    for chunk in clean.as_bytes().chunks(2) {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(c: u8) -> Result<u8, ()> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(()),
+    }
+}
+
+/// Translate the flat JSON envelope into a real `PeripheralEvent`.
+/// Phase 5a supports the minimum set the test harness drives;
+/// phase 7 expands to every variant as UI inspector tabs land.
+fn build_peripheral_event(p: &InjectPeripheralEventParams) -> Option<PeripheralEvent> {
+    let obj = p.params.as_object();
+    match (p.peripheral.as_str(), p.event.as_str()) {
+        ("alarm", "ForcePending") => {
+            let opcode = obj
+                .and_then(|m| m.get("opcode"))
+                .and_then(|v| v.as_u64())?;
+            Some(PeripheralEvent::Alarm(AlarmEvent::ForcePending(
+                opcode as u16,
+            )))
+        }
+        ("alarm", "ClearPending") => {
+            let opcode = obj
+                .and_then(|m| m.get("opcode"))
+                .and_then(|v| v.as_u64())?;
+            Some(PeripheralEvent::Alarm(AlarmEvent::ClearPending(
+                opcode as u16,
+            )))
+        }
+        ("alarm", "ClearAll") => Some(PeripheralEvent::Alarm(AlarmEvent::ClearAll)),
+        ("serdes", "InjectRxLos") => {
+            let lane = obj.and_then(|m| m.get("lane")).and_then(|v| v.as_u64())?;
+            let state = obj
+                .and_then(|m| m.get("state"))
+                .and_then(|v| v.as_bool())?;
+            Some(PeripheralEvent::SerDes(SerDesEvent::InjectRxLos(
+                lane as u8, state,
+            )))
+        }
+        ("uart", "ClearTxLog") => Some(PeripheralEvent::Uart(UartEvent::ClearTxLog)),
+        ("fatal_filter", "InjectFatal") => {
+            let mask = obj.and_then(|m| m.get("mask")).and_then(|v| v.as_u64())?;
+            Some(PeripheralEvent::FatalFilter(FatalFilterEvent::InjectFatal(
+                mask as u32,
+            )))
+        }
+        ("fatal_filter", "ClearFatal") => {
+            Some(PeripheralEvent::FatalFilter(FatalFilterEvent::ClearFatal))
+        }
+        _ => None,
+    }
 }
