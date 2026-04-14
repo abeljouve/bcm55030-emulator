@@ -86,15 +86,71 @@ pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
             speed_control(ui, app);
         });
 
-        // Firmware + annotation group.
+        // Firmware group.
         group(ui, |ui| {
             if ui
-                .button(format!("{} Firmware…", ph::FILE_ARROW_UP))
+                .button(format!("{} Load", ph::FILE_ARROW_UP))
                 .on_hover_text("Load a flash image into the PBC SPI flash peripheral")
                 .clicked()
             {
                 load_firmware(app);
             }
+
+            let (has_fw, is_dirty, dirty_bytes) = {
+                let fi = app.handle.firmware_info.lock();
+                let (d, cnt) = {
+                    let guard = app.handle.bank.read();
+                    let flash = &guard.pbc.flash;
+                    let count = match flash.baseline.as_ref() {
+                        Some(base) => flash
+                            .data
+                            .iter()
+                            .zip(base.iter())
+                            .filter(|(a, b)| a != b)
+                            .count(),
+                        None => 0,
+                    };
+                    (flash.dirty || count > 0, count)
+                };
+                (fi.is_some(), d, cnt)
+            };
+
+            let persist_label = if is_dirty {
+                format!("{} Persist*", ph::FLOPPY_DISK)
+            } else {
+                format!("{} Persist", ph::FLOPPY_DISK)
+            };
+            let persist_btn = ui
+                .add_enabled(has_fw, egui::Button::new(persist_label))
+                .on_hover_text(
+                    "Write the modified flash to <firmware>.persist next \
+                     to the loaded image (same as the CLI --persist-flash flag)",
+                );
+            if persist_btn.clicked() {
+                persist_flash(app);
+            }
+            if ui
+                .add_enabled(
+                    has_fw,
+                    egui::Button::new(format!("{} Save as…", ph::EXPORT)),
+                )
+                .on_hover_text("Save the current flash to a file of your choosing")
+                .clicked()
+            {
+                save_flash_as(app);
+            }
+
+            if is_dirty {
+                ui.label(
+                    egui::RichText::new(format!("{dirty_bytes} B dirty"))
+                        .small()
+                        .color(app.accents.warning),
+                );
+            }
+        });
+
+        // Annotations group.
+        group(ui, |ui| {
             if ui
                 .button(format!("{} Load annot.", ph::BOOKMARKS))
                 .on_hover_text("Load user annotations JSON")
@@ -302,6 +358,66 @@ fn load_firmware(app: &mut EmulatorApp) {
             Ok(Err(e)) => eprintln!("[ui] load_firmware failed: {e}"),
             Err(_) => eprintln!("[ui] load_firmware timed out"),
         }
+    }
+}
+
+/// Write the current flash contents to `<firmware>.persist`
+/// alongside the originally-loaded image. Mirrors the CLI
+/// `--persist-flash` on-exit path. Refreshes the in-memory
+/// baseline so follow-up writes are measured from the persisted
+/// image.
+fn persist_flash(app: &EmulatorApp) {
+    let Some(info) = app.handle.firmware_info.lock().clone() else {
+        eprintln!("[ui] persist_flash: no firmware loaded");
+        return;
+    };
+    let mut path = info.path.clone();
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    let mut persist_name = file_name;
+    persist_name.push(".persist");
+    path.set_file_name(persist_name);
+
+    let data = {
+        let mut guard = app.handle.bank.write();
+        let snapshot = guard.pbc.flash.data.clone();
+        // Update the baseline so the memory viewer clears its
+        // highlights after the save.
+        guard.pbc.flash.baseline = Some(snapshot.clone());
+        guard.pbc.flash.dirty = false;
+        snapshot
+    };
+    match std::fs::write(&path, &data) {
+        Ok(_) => eprintln!(
+            "[ui] flash persisted to {} ({} bytes)",
+            path.display(),
+            data.len()
+        ),
+        Err(e) => eprintln!("[ui] persist_flash failed: {e}"),
+    }
+}
+
+/// Save the current flash to a user-chosen file via rfd. Does
+/// not touch the baseline — use "Persist" for the drop-in
+/// roundtrip that CLI users expect.
+fn save_flash_as(app: &EmulatorApp) {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("BCM55030 flash", &["bin"])
+        .set_file_name("flash.bin")
+        .save_file()
+    else {
+        return;
+    };
+    let data = app.handle.bank.read().pbc.flash.data.clone();
+    match std::fs::write(&path, &data) {
+        Ok(_) => eprintln!(
+            "[ui] flash saved to {} ({} bytes)",
+            path.display(),
+            data.len()
+        ),
+        Err(e) => eprintln!("[ui] save_flash_as failed: {e}"),
     }
 }
 

@@ -57,20 +57,51 @@ fn draw_sram(ui: &mut egui::Ui, app: &EmulatorApp) {
         return;
     };
     let start = (app.memory_cursor as usize) & !(BYTES_PER_ROW - 1);
-    draw_hex_grid(ui, app, &sram.bytes, start, "sram");
+    draw_hex_grid(ui, app, &sram.bytes, None, start, "sram");
 }
 
 fn draw_flash(ui: &mut egui::Ui, app: &EmulatorApp) {
-    let guard = app.handle.bank.read();
-    let flash = &guard.pbc.flash.data;
+    // Clone the flash + baseline under a short read lock so we
+    // don't hold it across the scroll-area draw (which can
+    // allocate and trigger repaint requests).
+    let (flash, baseline) = {
+        let guard = app.handle.bank.read();
+        (
+            guard.pbc.flash.data.clone(),
+            guard.pbc.flash.baseline.clone(),
+        )
+    };
+    if let Some(ref base) = baseline {
+        let dirty_bytes = flash
+            .iter()
+            .zip(base.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} bytes modified since load",
+                    dirty_bytes
+                ))
+                .small()
+                .color(if dirty_bytes == 0 {
+                    app.accents.muted
+                } else {
+                    app.accents.warning
+                }),
+            );
+        });
+        ui.separator();
+    }
     let start = (app.memory_cursor as usize) & !(BYTES_PER_ROW - 1);
-    draw_hex_grid(ui, app, flash, start, "flash");
+    draw_hex_grid(ui, app, &flash, baseline.as_deref(), start, "flash");
 }
 
 fn draw_hex_grid(
     ui: &mut egui::Ui,
     app: &EmulatorApp,
     bytes: &[u8],
+    baseline: Option<&[u8]>,
     start: usize,
     id: &str,
 ) {
@@ -101,24 +132,34 @@ fn draw_hex_grid(
                     );
                     ui.add_space(10.0);
 
-                    // Hex bytes with hover ID per byte.
+                    // Hex bytes with hover ID per byte. Bytes
+                    // that differ from the baseline (flash only)
+                    // get a warm accent tint + coloured background.
                     let mut hover_idx: Option<usize> = None;
                     for (i, b) in slice.iter().enumerate() {
-                        let color = if *b == 0 {
+                        let abs = off + i;
+                        let modified = baseline
+                            .map(|base| abs < base.len() && *b != base[abs])
+                            .unwrap_or(false);
+                        let color = if modified {
+                            accents.warning
+                        } else if *b == 0 {
                             zero_color
                         } else if b.is_ascii_graphic() || *b == b' ' {
                             ascii_color
                         } else {
                             text_color
                         };
-                        let resp = ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(format!("{:02X}", b))
-                                    .monospace()
-                                    .color(color),
-                            )
-                            .sense(egui::Sense::hover()),
-                        );
+                        let mut rich = egui::RichText::new(format!("{:02X}", b))
+                            .monospace()
+                            .color(color);
+                        if modified {
+                            rich = rich
+                                .strong()
+                                .background_color(accents.warning.gamma_multiply(0.22));
+                        }
+                        let resp = ui
+                            .add(egui::Label::new(rich).sense(egui::Sense::hover()));
                         if resp.hovered() {
                             hover_idx = Some(i);
                         }

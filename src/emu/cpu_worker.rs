@@ -428,6 +428,10 @@ impl Worker {
             let flash_size = bank.pbc.flash.data.len();
             let copy_len = data.len().min(flash_size);
             bank.pbc.flash.data[..copy_len].copy_from_slice(&data[..copy_len]);
+            // Capture a baseline after the load so the memory
+            // viewer can tint any later write relative to the
+            // freshly-loaded image.
+            bank.pbc.flash.capture_baseline();
             (copy_len, flash_size)
         };
 

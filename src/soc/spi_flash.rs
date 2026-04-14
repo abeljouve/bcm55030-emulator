@@ -34,6 +34,14 @@ pub struct SpiFlash {
     /// Set when flash contents are modified (PP, SE, BE, CE, DMA write).
     /// Used to decide whether to persist flash to disk on exit.
     pub dirty: bool,
+    /// Snapshot of `data` at firmware-load time. Used by the GUI
+    /// memory viewer to highlight bytes that have been modified
+    /// since the firmware was loaded, and by the persistence path
+    /// to show the user whether anything needs saving.
+    ///
+    /// `None` until a firmware is loaded (fresh boot with no
+    /// image → nothing to diff against).
+    pub baseline: Option<Vec<u8>>,
 }
 
 impl SpiFlash {
@@ -42,6 +50,30 @@ impl SpiFlash {
             data: vec![0xFF; FLASH_SIZE],
             status: 0x00, // not busy, write disabled
             dirty: false,
+            baseline: None,
+        }
+    }
+
+    /// Capture the current `data` contents as the baseline for
+    /// future diffs. Called after a firmware load so the memory
+    /// viewer can highlight writes as they happen. Clears
+    /// `dirty` because the on-disk image is now the same as the
+    /// in-memory image.
+    pub fn capture_baseline(&mut self) {
+        self.baseline = Some(self.data.clone());
+        self.dirty = false;
+    }
+
+    /// `true` when the byte at `offset` differs from the
+    /// captured baseline. Returns `false` when no baseline has
+    /// been captured yet.
+    #[inline]
+    pub fn is_byte_modified(&self, offset: usize) -> bool {
+        match self.baseline.as_ref() {
+            Some(b) => {
+                offset < b.len() && offset < self.data.len() && self.data[offset] != b[offset]
+            }
+            None => false,
         }
     }
 
