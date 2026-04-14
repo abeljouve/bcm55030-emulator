@@ -272,6 +272,55 @@ impl Peripheral for EponMac {
         RANGES
     }
 
+    fn peek_word(&self, addr: u32) -> Result<u32, Exception> {
+        // Side-effect-free probe — same match arms as `read_word`
+        // minus the MPCP-command-latch auto-clear. Anything not
+        // listed falls back to `Ok(0)` so callers see a pure
+        // zero rather than triggering a mutation.
+        match addr {
+            REG_CHIP_ID => return Ok(CHIP_ID_VALUE),
+            REG_CHIP_REV => return Ok(CHIP_REV_VALUE),
+            REG_LLID_CAPTURE_MASK => return Ok(self.llid_capture_mask),
+            REG_MPCP_CMD_LATCH => return Ok(self.mpcp_cmd_latch),
+            REG_LLID_ACTIVE_BITMAP => return Ok(self.llid_active_bitmap),
+            REG_LLID_MASK_CONTROL => return Ok(self.llid_mask_control),
+            REG_LLID_COUNTER_MASK => return Ok(self.llid_counter_mask),
+            REG_TX_GRANT_MASK => return Ok(self.tx_grant_mask),
+            REG_RX_GRANT_MASK => return Ok(self.rx_grant_mask),
+            REG_IRQ_MASK => return Ok(self.irq_mask),
+            REG_EPON_STATUS => return Ok(self.epon_status),
+            REG_ACTIVE_FLAGS => return Ok(self.active_flags),
+            REG_SPECIAL_0064 => return Ok(0x5382_0000 | 0x0000_FFFF),
+            _ => {}
+        }
+        if (EPON_LLID_BASE..EPON_LLID_TOP).contains(&addr) {
+            let (slot, within) = Self::llid_slot(addr);
+            if slot < LLID_SLOT_COUNT {
+                match within {
+                    0x04 => return Ok(self.llid_irq_pending[slot]),
+                    0x3C => {
+                        let idx = Self::llid_idx(addr);
+                        let base = self.llid_store[idx] & !0x100;
+                        let set = if self.llid_drain_flag[slot] { 0x100 } else { 0 };
+                        return Ok(base | set);
+                    }
+                    0x1D8 => return Ok(0),
+                    _ => {
+                        let idx = Self::llid_idx(addr);
+                        return Ok(self.llid_store[idx]);
+                    }
+                }
+            }
+            let idx = Self::llid_idx(addr);
+            return Ok(self.llid_store[idx]);
+        }
+        if (EPON_TABLE_BASE..EPON_TABLE_END).contains(&addr) {
+            let idx = Self::table_idx(addr);
+            return Ok(self.table_store[idx]);
+        }
+        Ok(0)
+    }
+
     fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
         // Sparse core first.
         match addr {

@@ -329,6 +329,52 @@ impl PeripheralBank {
 
     // -------- MMIO routing --------
 
+    /// Side-effect-free probe of `addr`, used by the MCP
+    /// `peek_mmio` tool and by the future peripheral inspector's
+    /// continuous polling. Falls back to the peripheral trait's
+    /// default (`Ok(0)`) when no override exists — each peripheral
+    /// adds real peek support incrementally.
+    pub fn peek_word(&self, addr: u32) -> Result<u32, Exception> {
+        if self.uart.claims(addr) {
+            return self.uart.peek_word(addr);
+        }
+        if self.pbc.claims(addr) {
+            return self.pbc.peek_word(addr);
+        }
+        if self.bsc_i2c.claims(addr) {
+            return self.bsc_i2c.peek_word(addr);
+        }
+        if self.serdes.claims(addr) {
+            return self.serdes.peek_word(addr);
+        }
+        if self.epon_mac.claims(addr) {
+            return self.epon_mac.peek_word(addr);
+        }
+        if self.macsec.claims(addr) {
+            return self.macsec.peek_word(addr);
+        }
+        if self.dma.claims(addr) {
+            return self.dma.peek_word(addr);
+        }
+        if self.timer.claims(addr) {
+            return self.timer.peek_word(addr);
+        }
+        if self.efuse_udr.claims(addr) {
+            return self.efuse_udr.peek_word(addr);
+        }
+        if self.fatal_filter.claims(addr) {
+            return self.fatal_filter.peek_word(addr);
+        }
+        if self.mpcp.claims(addr) {
+            return self.mpcp.peek_word(addr);
+        }
+        if self.nco.claims(addr) {
+            return self.nco.peek_word(addr);
+        }
+        // SysregShim residual has no peek path yet.
+        Ok(0)
+    }
+
     pub fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
         if self.uart.claims(addr) {
             return self.uart.read_word(addr);

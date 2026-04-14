@@ -1,0 +1,428 @@
+//! MCP tool handler for the ARC700 emulator. All tools here are
+//! read-only — phase 4 surface. Mutations land in phase 5.
+//!
+//! Tools follow the the design spec §MCP Server §Tools categories:
+//! firmware / cpu / memory / disassembly / peripherals / flash /
+//! annotations / breakpoints. Phase 4 implements the subset that
+//! can be answered directly from `EmulatorHandle` fields without
+//! round-tripping through the CPU worker; the rest (read_memory,
+//! disassemble, search_memory) lands once the worker-blocking
+//! path is wired in phase 5.
+//!
+//! the contributor guide: nothing in this module carries firmware-specific
+//! constants. Symbols are fetched from `handle.annotations` which
+//! is user-loaded at runtime.
+
+use std::collections::HashMap;
+
+use rmcp::handler::server::tool::ToolRouter;
+use rmcp::handler::server::wrapper::{Json, Parameters};
+use rmcp::model::{
+    ProtocolVersion, ServerCapabilities, ServerInfo,
+};
+use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::emu::{EmulatorHandle, RunState};
+use crate::soc::peripheral::PeripheralSnapshot;
+
+/// Tool handler — one instance is cheap (all state lives behind
+/// `Arc`s on the `EmulatorHandle`). `StreamableHttpService` clones
+/// this per session via the factory closure in `server.rs`.
+#[derive(Clone)]
+pub struct EmulatorHandler {
+    handle: EmulatorHandle,
+    // Consumed by the `#[tool_handler]` macro expansion; the
+    // compiler can't see that through the macro hygiene
+    // boundary, so silence the false-positive `dead_code`.
+    #[allow(dead_code)]
+    tool_router: ToolRouter<Self>,
+}
+
+impl EmulatorHandler {
+    pub fn new(handle: EmulatorHandle) -> Self {
+        Self {
+            handle,
+            tool_router: Self::tool_router(),
+        }
+    }
+}
+
+// ---------- Tool request / response DTOs ---------------------------------
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct ReadRegistersParams {
+    /// Optional list of register names. Each name may be a core
+    /// register (r0..r31, sp, fp, gp, blink, lp_count, ilink1,
+    /// ilink2), pc, or status32. When absent, returns every core
+    /// register + pc + status32 + selected aux registers.
+    pub names: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReadRegistersResult {
+    pub values: HashMap<String, u32>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FlagsResult {
+    pub z: bool,
+    pub n: bool,
+    pub c: bool,
+    pub v: bool,
+    pub e1: bool,
+    pub e2: bool,
+    pub u: bool,
+    pub h: bool,
+    pub l: bool,
+    pub de: bool,
+    pub status32: u32,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CpuStateResult {
+    pub pc: u32,
+    pub halted: bool,
+    pub sleeping: bool,
+    pub paused: bool,
+    pub instruction_count: u64,
+    pub run_state: String,
+    pub pause_reason: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema, Default)]
+pub struct FirmwareInfoResult {
+    pub loaded: bool,
+    pub path: Option<String>,
+    pub boot_mode: Option<String>,
+    pub entry_point: Option<u32>,
+    pub flash_size: Option<usize>,
+    pub flash_loaded: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct PeekMmioParams {
+    pub address: u32,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PeekMmioResult {
+    pub address: u32,
+    pub value: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReadFlashParams {
+    pub offset: u32,
+    pub length: u32,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReadFlashResult {
+    pub offset: u32,
+    pub length: u32,
+    /// Hex-encoded bytes. Upper-case, no separators.
+    pub hex: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PeripheralEntry {
+    pub index: usize,
+    pub name: String,
+    /// Debug-format dump of the peripheral snapshot. Phase 4
+    /// ships this as a single string because `PeripheralSnapshot`
+    /// does not yet derive `Serialize`; phases 5+ wire proper
+    /// JSON projection as peripherals get their inspector tabs.
+    pub debug: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ListPeripheralsResult {
+    pub peripherals: Vec<PeripheralEntry>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct UartBufferResult {
+    pub bytes_len: usize,
+    pub ascii: String,
+    pub hex: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BreakpointsResult {
+    pub breakpoints: Vec<u32>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SymbolsResult {
+    pub symbols: HashMap<String, String>,
+}
+
+// ---------- Tool implementations -----------------------------------------
+
+#[tool_router]
+impl EmulatorHandler {
+    #[tool(
+        name = "get_firmware_info",
+        description = "Return metadata about the currently loaded firmware, or `loaded=false` if nothing has been loaded yet."
+    )]
+    async fn get_firmware_info(&self) -> Json<FirmwareInfoResult> {
+        let guard = self.handle.firmware_info.lock();
+        let out = match guard.as_ref() {
+            None => FirmwareInfoResult::default(),
+            Some(info) => FirmwareInfoResult {
+                loaded: true,
+                path: Some(info.path.display().to_string()),
+                boot_mode: Some(format!("{:?}", info.boot_mode)),
+                entry_point: Some(info.entry_point),
+                flash_size: Some(info.flash_size),
+                flash_loaded: Some(info.flash_loaded),
+            },
+        };
+        Json(out)
+    }
+
+    #[tool(
+        name = "read_registers",
+        description = "Read one or more CPU registers from the latest emulator snapshot. Supports r0..r63, pc, sp, fp, gp, blink, lp_count, ilink1, ilink2, status32."
+    )]
+    async fn read_registers(
+        &self,
+        Parameters(params): Parameters<ReadRegistersParams>,
+    ) -> Json<ReadRegistersResult> {
+        let snap = self.handle.snapshot.lock().clone();
+        let mut out = HashMap::new();
+        match params.names {
+            Some(names) => {
+                for n in names {
+                    if let Some(v) = reg_by_name(&snap.cpu, &n) {
+                        out.insert(n, v);
+                    }
+                }
+            }
+            None => {
+                for i in 0..32usize {
+                    out.insert(format!("r{}", i), snap.cpu.core_regs[i]);
+                }
+                out.insert("pc".into(), snap.cpu.pc);
+                out.insert("sp".into(), snap.cpu.core_regs[28]);
+                out.insert("fp".into(), snap.cpu.core_regs[27]);
+                out.insert("gp".into(), snap.cpu.core_regs[26]);
+                out.insert("blink".into(), snap.cpu.core_regs[31]);
+                out.insert("lp_count".into(), snap.cpu.core_regs[60]);
+                out.insert("status32".into(), snap.cpu.flags.status32);
+                out.insert("ienable".into(), snap.cpu.aux.ienable);
+                out.insert("ipending".into(), snap.cpu.aux.ipending);
+            }
+        }
+        Json(ReadRegistersResult { values: out })
+    }
+
+    #[tool(
+        name = "read_flags",
+        description = "Return the decomposed STATUS32 flag set (Z, N, C, V, E1, E2, U, H, L, DE) plus the raw status32 value."
+    )]
+    async fn read_flags(&self) -> Json<FlagsResult> {
+        let snap = self.handle.snapshot.lock();
+        let f = snap.cpu.flags;
+        Json(FlagsResult {
+            z: f.z,
+            n: f.n,
+            c: f.c,
+            v: f.v,
+            e1: f.e1,
+            e2: f.e2,
+            u: f.u,
+            h: f.h,
+            l: f.l,
+            de: f.de,
+            status32: f.status32,
+        })
+    }
+
+    #[tool(
+        name = "get_cpu_state",
+        description = "Return the headline CPU state: PC, run state, pause reason, instruction counter, halted / sleeping / paused flags."
+    )]
+    async fn get_cpu_state(&self) -> Json<CpuStateResult> {
+        let snap = self.handle.snapshot.lock();
+        Json(CpuStateResult {
+            pc: snap.cpu.pc,
+            halted: snap.cpu.halted,
+            sleeping: snap.cpu.sleeping,
+            paused: snap.cpu.paused,
+            instruction_count: snap.cpu.instruction_count,
+            run_state: format!("{:?}", snap.run_state),
+            pause_reason: format!("{:?}", snap.pause_reason),
+        })
+    }
+
+    #[tool(
+        name = "list_peripherals",
+        description = "Return every peripheral snapshot published in the most recent emulator frame. Debug-format string per entry in phase 4; proper JSON projections land in phases 5+."
+    )]
+    async fn list_peripherals(&self) -> Json<ListPeripheralsResult> {
+        let snap = self.handle.snapshot.lock();
+        let peripherals = snap
+            .peripherals
+            .iter()
+            .enumerate()
+            .map(|(index, p)| PeripheralEntry {
+                index,
+                name: p.name().to_string(),
+                debug: format!("{:?}", p),
+            })
+            .collect();
+        Json(ListPeripheralsResult { peripherals })
+    }
+
+    #[tool(
+        name = "peek_mmio",
+        description = "Side-effect-free MMIO word probe. Returns the current value of an MMIO register without triggering FIFO pops, IRQ latch clears, or busy-bit transitions. Use `read_mmio` (phase 5) for side-effectful reads."
+    )]
+    async fn peek_mmio(
+        &self,
+        Parameters(params): Parameters<PeekMmioParams>,
+    ) -> Json<PeekMmioResult> {
+        let value = self
+            .handle
+            .bank
+            .read()
+            .peek_word(params.address)
+            .unwrap_or(0);
+        Json(PeekMmioResult {
+            address: params.address,
+            value,
+        })
+    }
+
+    #[tool(
+        name = "list_breakpoints",
+        description = "Return every active CPU breakpoint address installed via `set_breakpoint` (phase 5)."
+    )]
+    async fn list_breakpoints(&self) -> Json<BreakpointsResult> {
+        let snap = self.handle.snapshot.lock();
+        Json(BreakpointsResult {
+            breakpoints: snap.breakpoints.clone(),
+        })
+    }
+
+    #[tool(
+        name = "list_symbols",
+        description = "Return the user-loaded symbol map (address → name). The emulator ships empty; symbols are loaded at runtime via `add_symbol` (phase 5)."
+    )]
+    async fn list_symbols(&self) -> Json<SymbolsResult> {
+        let ann = self.handle.annotations.read();
+        let symbols = ann
+            .symbols
+            .iter()
+            .map(|(addr, name)| (format!("0x{:08X}", addr), name.clone()))
+            .collect();
+        Json(SymbolsResult { symbols })
+    }
+
+    #[tool(
+        name = "get_uart_buffer",
+        description = "Return the UART TX log (everything the firmware has printed since boot). Decoded as lossy UTF-8 plus a hex dump."
+    )]
+    async fn get_uart_buffer(&self) -> Json<UartBufferResult> {
+        let bytes = self.handle.bank.read().uart.tx_log_bytes();
+        let ascii = String::from_utf8_lossy(&bytes).to_string();
+        let hex = bytes
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect::<String>();
+        Json(UartBufferResult {
+            bytes_len: bytes.len(),
+            ascii,
+            hex,
+        })
+    }
+
+    #[tool(
+        name = "read_flash",
+        description = "Read `length` bytes from offset `offset` of the 4 MB SPI flash image. Returns a hex-encoded dump."
+    )]
+    async fn read_flash(
+        &self,
+        Parameters(params): Parameters<ReadFlashParams>,
+    ) -> Json<ReadFlashResult> {
+        let guard = self.handle.bank.read();
+        let flash = &guard.pbc.flash.data;
+        let start = params.offset as usize;
+        let end = start.saturating_add(params.length as usize).min(flash.len());
+        let slice = if start < flash.len() {
+            &flash[start..end]
+        } else {
+            &[][..]
+        };
+        let hex = slice
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect::<String>();
+        Json(ReadFlashResult {
+            offset: params.offset,
+            length: slice.len() as u32,
+            hex,
+        })
+    }
+}
+
+// ---------- ServerHandler impl -------------------------------------------
+
+#[tool_handler]
+impl ServerHandler for EmulatorHandler {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2025_06_18)
+            .with_instructions(
+                "ARC700 / BCM55030 emulator — read-only MCP tools. Mutation tools land in phase 5.",
+            )
+    }
+}
+
+// ---------- Helpers -------------------------------------------------------
+
+fn reg_by_name(cpu: &crate::emu::snapshot::CpuSnapshot, name: &str) -> Option<u32> {
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        "pc" => Some(cpu.pc),
+        "status32" => Some(cpu.flags.status32),
+        "sp" => Some(cpu.core_regs[28]),
+        "fp" => Some(cpu.core_regs[27]),
+        "gp" => Some(cpu.core_regs[26]),
+        "blink" => Some(cpu.core_regs[31]),
+        "lp_count" | "lpcount" => Some(cpu.core_regs[60]),
+        "ilink1" => Some(cpu.core_regs[29]),
+        "ilink2" => Some(cpu.core_regs[30]),
+        "ienable" => Some(cpu.aux.ienable),
+        "ipending" => Some(cpu.aux.ipending),
+        "identity" => Some(cpu.aux.identity),
+        _ => {
+            if let Some(rest) = lower.strip_prefix('r') {
+                if let Ok(idx) = rest.parse::<usize>() {
+                    if idx < 64 {
+                        return Some(cpu.core_regs[idx]);
+                    }
+                }
+            }
+            None
+        }
+    }
+}
+
+// Keep the import live — the formatter uses `RunState` via
+// `format!("{:?}", …)` above, but the explicit use ensures the
+// re-export path in the emu module stays exercised.
+#[allow(dead_code)]
+fn _run_state_guard(r: RunState) {
+    let _ = r;
+}
+
+// Suppress false-positive unused if `PeripheralSnapshot` ever
+// gains explicit imports here.
+#[allow(dead_code)]
+fn _peripheral_guard(p: PeripheralSnapshot) {
+    let _ = p;
+}
