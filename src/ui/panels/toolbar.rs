@@ -60,6 +60,34 @@ pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
 
         ui.separator();
 
+        if ui.button("Load annotations…").clicked() {
+            if let Some(path) = rfd::FileDialog::new().add_filter("json", &["json"]).pick_file() {
+                match std::fs::read_to_string(&path) {
+                    Ok(body) => match crate::emu::annotations::Annotations::from_json_str(&body) {
+                        Ok(parsed) => {
+                            *app.handle.annotations.write() = parsed;
+                        }
+                        Err(e) => eprintln!("[UI] annotations parse failed: {e}"),
+                    },
+                    Err(e) => eprintln!("[UI] annotations read failed: {e}"),
+                }
+            }
+        }
+        if ui.button("Save annotations…").clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("json", &["json"])
+                .set_file_name("annotations.json")
+                .save_file()
+            {
+                let body = app.handle.annotations.read().to_json_string();
+                if let Err(e) = std::fs::write(&path, body) {
+                    eprintln!("[UI] annotations write failed: {e}");
+                }
+            }
+        }
+
+        ui.separator();
+
         ui.label(format!(
             "PC 0x{:08X}  insn {}  bank={}/64",
             app.snapshot.cpu.pc,

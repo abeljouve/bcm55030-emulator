@@ -50,6 +50,18 @@ pub struct EmulatorApp {
     pub registers_tab: panels::registers::Tab,
     pub uart_input: String,
 
+    /// Central pane tab selection: memory viewer vs peripheral
+    /// inspector. Switched via a small horizontal selector at the
+    /// top of the central panel.
+    pub central_tab: panels::CentralTab,
+    /// Currently-selected peripheral in the inspector.
+    pub peripheral_tab: panels::peripherals::PeripheralTab,
+    /// Bottom-left panel tab selection: UART terminal vs MCP
+    /// activity log.
+    pub bottom_tab: panels::BottomTab,
+    /// Scratch buffers for peripheral inspector input widgets.
+    pub periph_scratch: panels::peripherals::PeripheralScratch,
+
     /// Debounce flag: set to true on the very first frame so
     /// the app can perform one-shot initialisation (turning
     /// off `uart.stdout_passthrough`, etc.).
@@ -76,6 +88,10 @@ impl EmulatorApp {
             memory_tab: panels::memory::Tab::Sram,
             registers_tab: panels::registers::Tab::Core,
             uart_input: String::new(),
+            central_tab: panels::CentralTab::Memory,
+            peripheral_tab: panels::peripherals::PeripheralTab::Uart,
+            bottom_tab: panels::BottomTab::Uart,
+            periph_scratch: panels::peripherals::PeripheralScratch::default(),
             first_frame: true,
         }
     }
@@ -136,10 +152,28 @@ impl eframe::App for EmulatorApp {
         egui::Panel::bottom("status_bar")
             .exact_size(22.0)
             .show_inside(ui, |ui| panels::status_bar::draw(ui, self));
-        egui::Panel::bottom("uart_terminal")
+        egui::Panel::bottom("bottom_tabs")
             .resizable(true)
-            .default_size(180.0)
-            .show_inside(ui, |ui| panels::uart_terminal::draw(ui, self));
+            .default_size(200.0)
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.bottom_tab,
+                        panels::BottomTab::Uart,
+                        "UART",
+                    );
+                    ui.selectable_value(
+                        &mut self.bottom_tab,
+                        panels::BottomTab::McpLog,
+                        "MCP Activity",
+                    );
+                });
+                ui.separator();
+                match self.bottom_tab {
+                    panels::BottomTab::Uart => panels::uart_terminal::draw(ui, self),
+                    panels::BottomTab::McpLog => panels::mcp_log::draw(ui, self),
+                }
+            });
         egui::Panel::left("disassembly")
             .resizable(true)
             .default_size(420.0)
@@ -148,8 +182,25 @@ impl eframe::App for EmulatorApp {
             .resizable(true)
             .default_size(320.0)
             .show_inside(ui, |ui| panels::registers::draw(ui, self));
-        egui::CentralPanel::default()
-            .show_inside(ui, |ui| panels::memory::draw(ui, self));
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(
+                    &mut self.central_tab,
+                    panels::CentralTab::Memory,
+                    "Memory",
+                );
+                ui.selectable_value(
+                    &mut self.central_tab,
+                    panels::CentralTab::Peripherals,
+                    "Peripherals",
+                );
+            });
+            ui.separator();
+            match self.central_tab {
+                panels::CentralTab::Memory => panels::memory::draw(ui, self),
+                panels::CentralTab::Peripherals => panels::peripherals::draw(ui, self),
+            }
+        });
 
         ui.ctx().request_repaint_after(Duration::from_millis(16));
     }

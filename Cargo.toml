@@ -7,7 +7,7 @@ description = "ARC 700 ARCompact big-endian CPU emulator"
 [features]
 default = []
 # Enable the egui/eframe GUI layer. Pulls in native windowing.
-ui  = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd"]
+ui  = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd", "dep:serde", "dep:serde_json"]
 # Enable the integrated MCP server (rmcp + axum HTTP transport).
 mcp = [
     "dep:rmcp",
