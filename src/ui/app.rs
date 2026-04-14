@@ -47,6 +47,20 @@ pub struct EmulatorApp {
 
     // Per-panel UI state.
     pub disasm_cursor: u32,
+    /// Top-of-view address for the disassembly panel. Separate
+    /// from `disasm_cursor` (which tracks the user's click
+    /// selection) and from the CPU PC — it is the *viewport* the
+    /// panel renders around. Updated by the `Follow PC` mode, by
+    /// scroll events, by Page Up/Down, and by the goto box.
+    pub disasm_view_base: u32,
+    /// When true, the panel snaps `disasm_view_base` to the CPU
+    /// PC every frame. Cleared on any user-driven scroll or
+    /// navigation; restored by clicking the "Follow PC" button.
+    pub disasm_follow_pc: bool,
+    /// Number of visible rows in the disassembly panel, computed
+    /// per frame from the available height. Cached here so
+    /// keyboard navigation (Page Up/Down) can reuse it.
+    pub disasm_visible_rows: u32,
     pub memory_cursor: u32,
     pub memory_tab: panels::memory::Tab,
     pub registers_tab: panels::registers::Tab,
@@ -104,6 +118,9 @@ impl EmulatorApp {
             last_sram_fetch: None,
             dcache: None,
             disasm_cursor,
+            disasm_view_base: disasm_cursor,
+            disasm_follow_pc: true,
+            disasm_visible_rows: 64,
             memory_cursor: 0,
             memory_tab: panels::memory::Tab::Sram,
             registers_tab: panels::registers::Tab::Core,
