@@ -103,6 +103,26 @@ pub struct EmulatorApp {
     /// `true` while the user holds the speed slider, used to
     /// suppress the live re-sync from `snapshot.speed_limit`.
     pub speed_slider_dragging: bool,
+
+    /// Sub-tab of the bottom Debug panel.
+    pub debug_tab: panels::debug_panel::DebugTab,
+    /// Scratch input state for the Debug panel (bp addr, wp
+    /// addr/size/mode).
+    pub debug_scratch: panels::debug_panel::DebugScratch,
+
+    /// Most-recently-loaded firmware paths. Used by the toolbar
+    /// "Recent" dropdown and persisted across sessions through
+    /// eframe storage.
+    pub recent_firmwares: Vec<std::path::PathBuf>,
+
+    /// Active UART tee sink. When set, the panel mirrors every
+    /// new TX byte to the file so the user can tail the log
+    /// from another shell.
+    pub uart_log_file: Option<std::fs::File>,
+    pub uart_log_path: Option<std::path::PathBuf>,
+    /// Number of bytes already written to `uart_log_file` — used
+    /// to detect new trailing bytes each frame.
+    pub uart_log_written: usize,
 }
 
 const SRAM_REFRESH: Duration = Duration::from_millis(100);
@@ -140,6 +160,12 @@ impl EmulatorApp {
             last_ips_sample: None,
             speed_slider_log10: 8.0,
             speed_slider_dragging: false,
+            debug_tab: panels::debug_panel::DebugTab::Breakpoints,
+            debug_scratch: panels::debug_panel::DebugScratch::default(),
+            recent_firmwares: Vec::new(),
+            uart_log_file: None,
+            uart_log_path: None,
+            uart_log_written: 0,
         }
     }
 
@@ -167,6 +193,159 @@ impl EmulatorApp {
         self.palette = palette;
         self.accents = AccentTokens::from_palette(palette);
         ctx.set_visuals(crate::ui::theme::visuals_for(palette));
+    }
+
+    /// Dispatch a firmware load via `CpuCommand::LoadFirmware`
+    /// and — on success — prepend the path to the recent list.
+    /// Called from the toolbar button, drag & drop, and the
+    /// recent-firmwares menu.
+    pub fn load_firmware_path(&mut self, path: std::path::PathBuf) {
+        let (tx, rx) = crate::emu::command::oneshot();
+        let cmd = crate::emu::command::CpuCommand::LoadFirmware {
+            path: path.clone(),
+            mode: crate::emu::command::FirmwareMode::Soc,
+            boot_mode: self.snapshot.boot_mode,
+            flash_path: None,
+            entry_point: 0,
+            keep_breakpoints: true,
+            response: tx,
+        };
+        if self.handle.cpu_cmd.send(cmd).is_ok() {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ok(r)) => {
+                    eprintln!(
+                        "[ui] loaded firmware: {} bytes, entry 0x{:08X}",
+                        r.loaded_bytes, r.entry_point
+                    );
+                    self.push_recent_firmware(path);
+                }
+                Ok(Err(e)) => eprintln!("[ui] load_firmware failed: {e}"),
+                Err(_) => eprintln!("[ui] load_firmware timed out"),
+            }
+        }
+    }
+
+    /// Prepend a firmware path to `recent_firmwares`, dedupe and
+    /// cap at 8 entries.
+    pub fn push_recent_firmware(&mut self, path: std::path::PathBuf) {
+        self.recent_firmwares.retain(|p| p != &path);
+        self.recent_firmwares.insert(0, path);
+        self.recent_firmwares.truncate(8);
+    }
+
+    /// Consume any files the user dropped on the window this
+    /// frame. The first `.bin` is loaded as a firmware.
+    fn handle_drag_and_drop(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        for file in dropped {
+            if let Some(path) = file.path {
+                self.load_firmware_path(path);
+                break;
+            }
+        }
+    }
+
+    /// Global keyboard shortcuts. Consumed at the top of `ui()`
+    /// so a pressed key only fires one action per frame.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        use crate::emu::command::CpuCommand;
+        use eframe::egui::{Key, Modifiers};
+
+        let mut run_toggle = false;
+        let mut step_one = false;
+        let mut step_over = false;
+        let mut toggle_bp = false;
+        let mut reset_cpu = false;
+        let mut open_firmware = false;
+        let mut pause = false;
+
+        ctx.input_mut(|i| {
+            if i.consume_key(Modifiers::NONE, Key::F5) {
+                run_toggle = true;
+            }
+            if i.consume_key(Modifiers::NONE, Key::F9) {
+                toggle_bp = true;
+            }
+            if i.consume_key(Modifiers::NONE, Key::F10) {
+                step_over = true;
+            }
+            if i.consume_key(Modifiers::NONE, Key::F11) {
+                step_one = true;
+            }
+            if i.consume_key(Modifiers::NONE, Key::Escape) {
+                pause = true;
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::R) {
+                reset_cpu = true;
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::L) {
+                open_firmware = true;
+            }
+        });
+
+        if run_toggle {
+            let cmd = if matches!(
+                self.snapshot.run_state,
+                crate::emu::snapshot::RunState::Running
+            ) {
+                CpuCommand::Pause
+            } else {
+                CpuCommand::Run { max_insns: None }
+            };
+            let _ = self.handle.cpu_cmd.send(cmd);
+        }
+        if pause {
+            let _ = self.handle.cpu_cmd.send(CpuCommand::Pause);
+        }
+        if step_one {
+            let _ = self.handle.cpu_cmd.send(CpuCommand::StepOne);
+        }
+        if step_over {
+            let _ = self.handle.cpu_cmd.send(CpuCommand::StepOver);
+        }
+        if toggle_bp {
+            let addr = self.disasm_cursor;
+            let already = self.snapshot.breakpoints.contains(&addr);
+            let cmd = if already {
+                CpuCommand::RemoveBreakpoint { address: addr }
+            } else {
+                let (tx, _rx) = crate::emu::command::oneshot::<usize>();
+                CpuCommand::SetBreakpoint { address: addr, response: tx }
+            };
+            let _ = self.handle.cpu_cmd.send(cmd);
+        }
+        if reset_cpu {
+            let _ = self.handle.cpu_cmd.send(CpuCommand::Reset {
+                boot_mode: self.snapshot.boot_mode,
+                keep_breakpoints: true,
+            });
+        }
+        if open_firmware {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("BCM55030 flash", &["bin"])
+                .pick_file()
+            {
+                self.load_firmware_path(path);
+            }
+        }
+    }
+
+    /// Tee any new UART TX bytes to the configured log file.
+    /// Called every frame from the UART panel.
+    pub fn flush_uart_log(&mut self) {
+        let Some(file) = self.uart_log_file.as_mut() else {
+            return;
+        };
+        use std::io::Write;
+        let bytes = self.handle.bank.read().uart.tx_log_bytes();
+        if bytes.len() <= self.uart_log_written {
+            return;
+        }
+        let new = &bytes[self.uart_log_written..];
+        if file.write_all(new).is_ok() {
+            let _ = file.flush();
+            self.uart_log_written = bytes.len();
+        }
     }
 
     fn refresh_snapshot(&mut self) {
@@ -211,6 +390,9 @@ impl eframe::App for EmulatorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.refresh_snapshot();
         self.maybe_refresh_sram();
+        self.handle_drag_and_drop(ui.ctx());
+        self.handle_shortcuts(ui.ctx());
+        self.flush_uart_log();
 
         // One-shot fade-in covering the entire window on first
         // display. `animate_value_with_time` drives a 0→1 linear
@@ -230,7 +412,7 @@ impl eframe::App for EmulatorApp {
             .show_inside(ui, |ui| panels::status_bar::draw(ui, self));
         egui::Panel::bottom("bottom_tabs")
             .resizable(true)
-            .default_size(200.0)
+            .default_size(220.0)
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(
@@ -243,11 +425,17 @@ impl eframe::App for EmulatorApp {
                         panels::BottomTab::McpLog,
                         format!("{} MCP Activity", egui_phosphor::regular::PLUGS_CONNECTED),
                     );
+                    ui.selectable_value(
+                        &mut self.bottom_tab,
+                        panels::BottomTab::Debug,
+                        format!("{} Debug", egui_phosphor::regular::BUG),
+                    );
                 });
                 ui.separator();
                 match self.bottom_tab {
                     panels::BottomTab::Uart => panels::uart_terminal::draw(ui, self),
                     panels::BottomTab::McpLog => panels::mcp_log::draw(ui, self),
+                    panels::BottomTab::Debug => panels::debug_panel::draw(ui, self),
                 }
             });
         egui::Panel::left("disassembly")
@@ -283,8 +471,19 @@ impl eframe::App for EmulatorApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string(STORAGE_PALETTE_KEY, self.palette.as_str().to_string());
+        let recents_json = serde_json::to_string(
+            &self
+                .recent_firmwares
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| "[]".to_string());
+        storage.set_string(STORAGE_RECENTS_KEY, recents_json);
     }
 }
+
+const STORAGE_RECENTS_KEY: &str = "ui.recent_firmwares";
 
 /// Load a Palette from eframe storage, defaulting to Mocha.
 fn load_palette(cc: &eframe::CreationContext<'_>) -> Palette {
@@ -292,6 +491,15 @@ fn load_palette(cc: &eframe::CreationContext<'_>) -> Palette {
         .and_then(|s| s.get_string(STORAGE_PALETTE_KEY))
         .and_then(|s| Palette::from_str(&s))
         .unwrap_or(Palette::Mocha)
+}
+
+/// Load the "recent firmwares" list from eframe storage, if any.
+fn load_recent_firmwares(cc: &eframe::CreationContext<'_>) -> Vec<std::path::PathBuf> {
+    cc.storage
+        .and_then(|s| s.get_string(STORAGE_RECENTS_KEY))
+        .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+        .map(|v| v.into_iter().map(std::path::PathBuf::from).collect())
+        .unwrap_or_default()
 }
 
 /// Install JetBrains Mono as the primary monospace font and add
@@ -333,10 +541,13 @@ pub fn run(handle: EmulatorHandle) -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             let palette = load_palette(cc);
+            let recents = load_recent_firmwares(cc);
             install_fonts(&cc.egui_ctx);
             cc.egui_ctx.set_visuals(crate::ui::theme::visuals_for(palette));
             cc.egui_ctx.all_styles_mut(|s| crate::ui::theme::configure_style(s));
-            Ok(Box::new(EmulatorApp::new(handle, palette)))
+            let mut app = EmulatorApp::new(handle, palette);
+            app.recent_firmwares = recents;
+            Ok(Box::new(app))
         }),
     )
 }

@@ -1,5 +1,6 @@
 //! UI panel submodules. Each file owns one egui panel.
 
+pub mod debug_panel;
 pub mod disassembly;
 pub mod mcp_log;
 pub mod memory;
@@ -17,10 +18,11 @@ pub enum CentralTab {
     Peripherals,
 }
 
-/// Bottom-left panel tab selection: UART terminal vs MCP activity
-/// log. Phase 8 added the MCP log next to the existing UART.
+/// Bottom panel tab selection: UART terminal, MCP activity log,
+/// or the Debug panel (breakpoints + watchpoints + call stack).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BottomTab {
     Uart,
     McpLog,
+    Debug,
 }

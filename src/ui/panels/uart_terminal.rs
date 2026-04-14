@@ -13,6 +13,48 @@ pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
         if ui.button("Clear").clicked() {
             let event = PeripheralEvent::Uart(UartEvent::ClearTxLog);
             app.handle.bank.write().inject_event(&event);
+            app.uart_log_written = 0;
+        }
+        ui.separator();
+        let logging = app.uart_log_file.is_some();
+        let label = if logging {
+            format!(
+                "📝 Logging → {}",
+                app.uart_log_path
+                    .as_ref()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| "?".to_string())
+            )
+        } else {
+            "📝 Log to file…".to_string()
+        };
+        if ui
+            .button(label)
+            .on_hover_text("Tee every UART TX byte to a file on disk")
+            .clicked()
+        {
+            if logging {
+                app.uart_log_file = None;
+                app.uart_log_path = None;
+                app.uart_log_written = 0;
+            } else if let Some(path) = rfd::FileDialog::new()
+                .add_filter("log", &["log", "txt"])
+                .set_file_name("uart.log")
+                .save_file()
+            {
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    Ok(f) => {
+                        app.uart_log_file = Some(f);
+                        app.uart_log_path = Some(path);
+                        app.uart_log_written = 0;
+                    }
+                    Err(e) => eprintln!("[ui] uart log open failed: {e}"),
+                }
+            }
         }
         ui.separator();
         let ienable = app.snapshot.cpu.aux.ienable;

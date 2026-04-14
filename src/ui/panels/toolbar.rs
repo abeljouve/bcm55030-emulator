@@ -90,11 +90,12 @@ pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
         group(ui, |ui| {
             if ui
                 .button(format!("{} Load", ph::FILE_ARROW_UP))
-                .on_hover_text("Load a flash image into the PBC SPI flash peripheral")
+                .on_hover_text("Load a flash image into the PBC SPI flash peripheral (Ctrl-L)")
                 .clicked()
             {
                 load_firmware(app);
             }
+            recent_firmwares_menu(ui, app);
 
             let (has_fw, is_dirty, dirty_bytes) = {
                 let fi = app.handle.firmware_info.lock();
@@ -333,32 +334,38 @@ fn palette_selector(ui: &mut egui::Ui, app: &mut EmulatorApp) {
 }
 
 fn load_firmware(app: &mut EmulatorApp) {
-    let Some(path) = rfd::FileDialog::new()
+    if let Some(path) = rfd::FileDialog::new()
         .add_filter("BCM55030 flash", &["bin"])
         .pick_file()
-    else {
-        return;
-    };
-    let (tx, rx) = crate::emu::command::oneshot();
-    let cmd = CpuCommand::LoadFirmware {
-        path,
-        mode: crate::emu::command::FirmwareMode::Soc,
-        boot_mode: app.snapshot.boot_mode,
-        flash_path: None,
-        entry_point: 0,
-        keep_breakpoints: true,
-        response: tx,
-    };
-    if app.handle.cpu_cmd.send(cmd).is_ok() {
-        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(Ok(r)) => eprintln!(
-                "[ui] loaded firmware: {} bytes into {}-byte flash, entry 0x{:08X}",
-                r.loaded_bytes, r.flash_bytes, r.entry_point
-            ),
-            Ok(Err(e)) => eprintln!("[ui] load_firmware failed: {e}"),
-            Err(_) => eprintln!("[ui] load_firmware timed out"),
-        }
+    {
+        app.load_firmware_path(path);
     }
+}
+
+/// Dropdown menu showing up to 8 recently loaded firmwares.
+/// Disabled when the list is empty.
+fn recent_firmwares_menu(ui: &mut egui::Ui, app: &mut EmulatorApp) {
+    let recents = app.recent_firmwares.clone();
+    let empty = recents.is_empty();
+    let label = format!("{}", ph::CLOCK_COUNTER_CLOCKWISE);
+    ui.add_enabled_ui(!empty, |ui| {
+        egui::ComboBox::from_id_salt("recent_firmwares")
+            .selected_text(label)
+            .width(28.0)
+            .show_ui(ui, |ui| {
+                for path in recents {
+                    let display = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                    if ui.selectable_label(false, display).clicked() {
+                        app.load_firmware_path(path);
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Recently loaded firmwares");
+    });
 }
 
 /// Write the current flash contents to `<firmware>.persist`
