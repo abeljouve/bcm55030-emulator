@@ -157,6 +157,15 @@ pub enum CpuCommand {
     SetSpeed {
         limit: SpeedLimit,
     },
+    /// Request a sparse copy of the current coverage map
+    /// (address → hit count, skipping zero entries). Called by
+    /// the UI at ~2 Hz while the coverage overlay is on.
+    RequestCoverage {
+        response: OneshotSender<Vec<(u32, u32)>>,
+    },
+    /// Reset the coverage map to zero. Called from the UI
+    /// overlay toggle.
+    ClearCoverage,
     /// Shutdown signal — the worker drops its `Cpu`, sends a last
     /// snapshot (run_state=Halted) and exits.
     Shutdown,

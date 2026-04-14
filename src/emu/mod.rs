@@ -22,6 +22,8 @@ pub mod command;
 pub mod cpu_worker;
 pub mod event_log;
 pub mod handle;
+#[cfg(feature = "ui")]
+pub mod session;
 pub mod snapshot;
 
 pub use annotations::Annotations;

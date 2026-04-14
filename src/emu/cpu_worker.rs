@@ -62,6 +62,11 @@ struct Worker {
     throttle_window_start: Instant,
     /// Instructions executed inside the current throttle window.
     throttle_window_insns: u32,
+
+    /// Dense coverage histogram indexed by `pc / 2`. Each entry
+    /// saturates at `u32::MAX`. 512 KB SRAM / 2 = 256 Ki slots
+    /// = 1 MB of u32s; small enough to carry on the worker.
+    coverage: Vec<u32>,
 }
 
 /// Run the worker loop until a `Shutdown` command arrives or all
@@ -85,6 +90,7 @@ pub fn run(cpu: Cpu, handle: EmulatorHandle, rx: Receiver<CpuCommand>, reset_fn:
         speed_limit: SpeedLimit::Unlimited,
         throttle_window_start: now,
         throttle_window_insns: 0,
+        coverage: vec![0u32; crate::memory::SRAM_SIZE / 2],
     };
     w.publish_snapshot();
     w.main_loop();
@@ -98,6 +104,7 @@ impl Worker {
             }
 
             if self.should_step() {
+                let pc_before = self.cpu.state.pc;
                 if let Err(e) = self.cpu.step() {
                     eprintln!("[cpu_worker] step error: {:?}", e);
                     self.running = false;
@@ -107,6 +114,10 @@ impl Worker {
                     continue;
                 }
                 self.ips_window_insns += 1;
+                let slot = (pc_before >> 1) as usize;
+                if slot < self.coverage.len() {
+                    self.coverage[slot] = self.coverage[slot].saturating_add(1);
+                }
                 self.apply_throttle();
 
                 if let Some(n) = self.remaining_insns {
@@ -326,6 +337,26 @@ impl Worker {
                 self.throttle_window_insns = 0;
                 self.publish_snapshot();
             }
+            CpuCommand::RequestCoverage { response } => {
+                let sparse: Vec<(u32, u32)> = self
+                    .coverage
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, &count)| {
+                        if count > 0 {
+                            Some(((slot as u32) << 1, count))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let _ = response.send(sparse);
+            }
+            CpuCommand::ClearCoverage => {
+                for entry in self.coverage.iter_mut() {
+                    *entry = 0;
+                }
+            }
             CpuCommand::Shutdown => {
                 self.running = false;
                 self.cpu.state.halted = true;
@@ -384,6 +415,9 @@ impl Worker {
             self.cpu.reset_soc_in_place(boot_mode);
         } else {
             self.cpu = (self.reset_fn)(boot_mode);
+        }
+        for entry in self.coverage.iter_mut() {
+            *entry = 0;
         }
     }
 

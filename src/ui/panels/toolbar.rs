@@ -150,7 +150,7 @@ pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
             }
         });
 
-        // Annotations group.
+        // Annotations + session group.
         group(ui, |ui| {
             if ui
                 .button(format!("{} Load annot.", ph::BOOKMARKS))
@@ -165,6 +165,24 @@ pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
                 .clicked()
             {
                 save_annotations(app);
+            }
+            ui.separator();
+            if ui
+                .button(format!("{} Load session", ph::FOLDER_OPEN))
+                .on_hover_text(
+                    "Restore breakpoints, watchpoints, annotations, \
+                     view state and palette from a .arc700-session.json",
+                )
+                .clicked()
+            {
+                load_session(app);
+            }
+            if ui
+                .button(format!("{} Save session", ph::FLOPPY_DISK_BACK))
+                .on_hover_text("Save the current session to a JSON file")
+                .clicked()
+            {
+                save_session(app);
             }
         });
 
@@ -442,6 +460,135 @@ fn load_annotations(app: &EmulatorApp) {
         },
         Err(e) => eprintln!("[UI] annotations read failed: {e}"),
     }
+}
+
+/// Collect the current app state into a `Session` and write it
+/// through a save dialog. Watchpoints come from the live
+/// snapshot; annotations from `handle.annotations`.
+fn save_session(app: &EmulatorApp) {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("json", &["json"])
+        .set_file_name("session.arc700.json")
+        .save_file()
+    else {
+        return;
+    };
+
+    let firmware_path = app
+        .handle
+        .firmware_info
+        .lock()
+        .as_ref()
+        .map(|f| f.path.clone());
+    let annotations = app.handle.annotations.read().clone();
+
+    let session = crate::emu::session::Session {
+        firmware_path,
+        palette: Some(app.palette.as_str().to_string()),
+        breakpoints: app.snapshot.breakpoints.clone(),
+        watchpoints: app.snapshot.watchpoints.clone(),
+        symbols: annotations.symbols.clone(),
+        comments: annotations.comments.clone(),
+        regions: annotations.regions.clone(),
+        disasm_view_base: Some(app.disasm_view_base),
+        disasm_follow_pc: Some(app.disasm_follow_pc),
+        memory_cursor: Some(app.memory_cursor),
+    };
+
+    match std::fs::write(&path, session.to_json_string()) {
+        Ok(_) => eprintln!("[ui] session saved to {}", path.display()),
+        Err(e) => eprintln!("[ui] session save failed: {e}"),
+    }
+}
+
+/// Read a session JSON and replay it through `cpu_cmd`s and the
+/// handle's annotations. Loads the firmware first (if the path
+/// still exists), then applies breakpoints, watchpoints, and
+/// finally view state.
+fn load_session(app: &mut EmulatorApp) {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("json", &["json"])
+        .pick_file()
+    else {
+        return;
+    };
+    let body = match std::fs::read_to_string(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[ui] session read failed: {e}");
+            return;
+        }
+    };
+    let session = match crate::emu::session::Session::from_json_str(&body) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[ui] session parse failed: {e}");
+            return;
+        }
+    };
+
+    // Firmware first — the worker rebuilds its Cpu which also
+    // wipes the breakpoint table.
+    if let Some(fw_path) = session.firmware_path.clone() {
+        if fw_path.exists() {
+            app.load_firmware_path(fw_path);
+        } else {
+            eprintln!(
+                "[ui] session firmware not found: {}",
+                fw_path.display()
+            );
+        }
+    }
+
+    // Palette.
+    if let Some(palette_name) = session.palette.as_deref() {
+        if let Some(p) = crate::ui::theme::Palette::from_str(palette_name) {
+            app.palette = p;
+            app.accents = crate::ui::theme::AccentTokens::from_palette(p);
+        }
+    }
+
+    // Annotations — replace wholesale.
+    {
+        let mut guard = app.handle.annotations.write();
+        guard.symbols = session.symbols.clone();
+        guard.comments = session.comments.clone();
+        guard.regions = session.regions.clone();
+    }
+
+    // Breakpoints.
+    for addr in &session.breakpoints {
+        let (tx, _rx) = crate::emu::command::oneshot::<usize>();
+        let _ = app
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::SetBreakpoint { address: *addr, response: tx });
+    }
+
+    // Watchpoints.
+    for wp in &session.watchpoints {
+        let (tx, _rx) = crate::emu::command::oneshot::<usize>();
+        let _ = app.handle.cpu_cmd.send(CpuCommand::SetWatchpoint {
+            addr: wp.addr,
+            size: wp.size,
+            mode: wp.mode,
+            response: tx,
+        });
+    }
+
+    // View state.
+    if let Some(base) = session.disasm_view_base {
+        app.disasm_view_base = base;
+    }
+    if let Some(follow) = session.disasm_follow_pc {
+        app.disasm_follow_pc = follow;
+    }
+    if let Some(cursor) = session.memory_cursor {
+        app.memory_cursor = cursor;
+        app.memory_cursor_dirty = true;
+    }
+
+    eprintln!("[ui] session loaded from {}", path.display());
 }
 
 fn save_annotations(app: &EmulatorApp) {

@@ -69,6 +69,7 @@ pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
     let symbols = &annotations.symbols;
     let comments = &annotations.comments;
     let accents = app.accents;
+    let coverage = app.coverage.as_ref();
 
     let mut toggle_bp: Option<(u32, bool)> = None;
     let mut cursor_to: Option<u32> = None;
@@ -201,6 +202,16 @@ pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
                                     .color(accents.muted),
                             );
                         }
+                        if let Some(cov) = coverage {
+                            if let Some(count) = cov.get(&line.address) {
+                                ui.label(
+                                    egui::RichText::new(format!("×{count}"))
+                                        .small()
+                                        .monospace()
+                                        .color(accents.warning),
+                                );
+                            }
+                        }
                     },
                 );
 
@@ -256,6 +267,28 @@ fn header(ui: &mut egui::Ui, app: &mut EmulatorApp) {
         {
             app.disasm_view_base = app.snapshot.cpu.pc;
             app.disasm_follow_pc = true;
+        }
+
+        ui.separator();
+        let overlay = app.coverage_overlay;
+        if ui
+            .add(egui::Button::new(format!("{} Coverage", ph::CHART_BAR)).selected(overlay))
+            .on_hover_text("Overlay a per-instruction hit counter")
+            .clicked()
+        {
+            app.coverage_overlay = !overlay;
+        }
+        if overlay
+            && ui
+                .small_button(format!("{} Clear", ph::ERASER))
+                .on_hover_text("Reset the coverage histogram")
+                .clicked()
+        {
+            let _ = app
+                .handle
+                .cpu_cmd
+                .send(crate::emu::command::CpuCommand::ClearCoverage);
+            app.coverage = None;
         }
 
         ui.separator();

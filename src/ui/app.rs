@@ -123,6 +123,44 @@ pub struct EmulatorApp {
     /// Number of bytes already written to `uart_log_file` — used
     /// to detect new trailing bytes each frame.
     pub uart_log_written: usize,
+
+    /// Whether the disassembly panel should overlay coverage
+    /// hit-counts on each row. Toggled from the disasm header.
+    pub coverage_overlay: bool,
+    /// Sparse coverage snapshot (addr → hit count) refreshed at
+    /// ~2 Hz while the overlay is active. Absent when disabled.
+    pub coverage: Option<std::collections::HashMap<u32, u32>>,
+    /// Last wall-clock time we fetched a coverage snapshot.
+    pub last_coverage_fetch: Option<std::time::Instant>,
+
+    /// Scratch state for the Strings panel: filter text, min
+    /// length, optionally the extracted list.
+    pub strings_filter: String,
+    pub strings_min_len: usize,
+    pub strings_tab: StringsSource,
+    pub strings_cache: Option<StringsCache>,
+}
+
+/// Source region for the strings extractor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StringsSource {
+    Sram,
+    Flash,
+}
+
+/// Cached strings list for the currently-selected source. Keyed
+/// by a coarse stamp so we rebuild on tab switch / reset / flash
+/// reload.
+pub struct StringsCache {
+    pub source: StringsSource,
+    pub min_len: usize,
+    pub entries: Vec<StringHit>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StringHit {
+    pub addr: u32,
+    pub content: String,
 }
 
 const SRAM_REFRESH: Duration = Duration::from_millis(100);
@@ -166,6 +204,13 @@ impl EmulatorApp {
             uart_log_file: None,
             uart_log_path: None,
             uart_log_written: 0,
+            coverage_overlay: false,
+            coverage: None,
+            last_coverage_fetch: None,
+            strings_filter: String::new(),
+            strings_min_len: 4,
+            strings_tab: StringsSource::Sram,
+            strings_cache: None,
         }
     }
 
@@ -330,6 +375,38 @@ impl EmulatorApp {
         }
     }
 
+    /// Poll `RequestCoverage` at ~2 Hz while the overlay is
+    /// enabled. The worker answers with a sparse map of
+    /// (address, hit count) pairs; we rehydrate it into a
+    /// `HashMap` for O(1) lookup in the disassembly panel.
+    fn maybe_refresh_coverage(&mut self) {
+        if !self.coverage_overlay {
+            self.coverage = None;
+            self.last_coverage_fetch = None;
+            return;
+        }
+        let now = std::time::Instant::now();
+        let should = match self.last_coverage_fetch {
+            None => true,
+            Some(prev) => now.duration_since(prev) >= Duration::from_millis(500),
+        };
+        if !should {
+            return;
+        }
+        self.last_coverage_fetch = Some(now);
+        let (tx, rx) = crate::emu::command::oneshot::<Vec<(u32, u32)>>();
+        if self
+            .handle
+            .cpu_cmd
+            .send(crate::emu::command::CpuCommand::RequestCoverage { response: tx })
+            .is_ok()
+        {
+            if let Ok(sparse) = rx.recv_timeout(Duration::from_millis(5)) {
+                self.coverage = Some(sparse.into_iter().collect());
+            }
+        }
+    }
+
     /// Tee any new UART TX bytes to the configured log file.
     /// Called every frame from the UART panel.
     pub fn flush_uart_log(&mut self) {
@@ -390,6 +467,7 @@ impl eframe::App for EmulatorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.refresh_snapshot();
         self.maybe_refresh_sram();
+        self.maybe_refresh_coverage();
         self.handle_drag_and_drop(ui.ctx());
         self.handle_shortcuts(ui.ctx());
         self.flush_uart_log();
@@ -458,11 +536,17 @@ impl eframe::App for EmulatorApp {
                     panels::CentralTab::Peripherals,
                     format!("{} Peripherals", egui_phosphor::regular::CIRCUITRY),
                 );
+                ui.selectable_value(
+                    &mut self.central_tab,
+                    panels::CentralTab::Strings,
+                    format!("{} Strings", egui_phosphor::regular::TEXT_AA),
+                );
             });
             ui.separator();
             match self.central_tab {
                 panels::CentralTab::Memory => panels::memory::draw(ui, self),
                 panels::CentralTab::Peripherals => panels::peripherals::draw(ui, self),
+                panels::CentralTab::Strings => panels::strings::draw(ui, self),
             }
         });
 
