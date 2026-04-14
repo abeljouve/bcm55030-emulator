@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod cpu;
 pub mod decoder;
+pub mod emu;
 pub mod executor;
 pub mod hooks;
 pub mod memory;

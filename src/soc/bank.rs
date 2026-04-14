@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc;
+use std::sync::Mutex;
 
 use crate::cpu::exception::Exception;
 use crate::soc::alarm_events::AlarmEvents;
@@ -85,7 +86,13 @@ pub struct PeripheralBank {
     pub sysreg: SysregShim,
 
     uart_rx_sender: mpsc::Sender<u8>,
-    uart_rx_receiver: mpsc::Receiver<u8>,
+    /// Wrapped in `Mutex` so `PeripheralBank` is `Sync`. `mpsc::
+    /// Receiver` is `Send` but not `Sync`, which would prevent
+    /// `Arc<RwLock<PeripheralBank>>` from crossing thread
+    /// boundaries in the UI / MCP workers. Contention is zero —
+    /// only the bank's own `tick()` drains it, always while the
+    /// bank is write-locked.
+    uart_rx_receiver: Mutex<mpsc::Receiver<u8>>,
 
     /// Current CPU context for trace entries and watchpoint messages.
     pub current_pc: u32,
@@ -135,7 +142,7 @@ impl PeripheralBank {
             nco: Nco::new(),
             sysreg: SysregShim::new(),
             uart_rx_sender: tx,
-            uart_rx_receiver: rx,
+            uart_rx_receiver: Mutex::new(rx),
             current_pc: 0,
             current_blink: 0,
             current_insn: 0,
@@ -165,7 +172,12 @@ impl PeripheralBank {
     /// [`tick`] before other peripherals tick, so UART IRQ bits that
     /// arise from newly-received bytes are visible in the same pass.
     fn drain_uart_channel(&mut self) {
-        while let Ok(b) = self.uart_rx_receiver.try_recv() {
+        while let Ok(b) = self
+            .uart_rx_receiver
+            .lock()
+            .expect("uart_rx_receiver mutex")
+            .try_recv()
+        {
             self.uart.push_rx_byte(b);
         }
     }
