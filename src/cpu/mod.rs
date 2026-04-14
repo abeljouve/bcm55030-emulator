@@ -80,6 +80,30 @@ impl Cpu {
         self.bank.as_ref()
     }
 
+    /// Reset CPU state, SRAM, and peripheral bank **in place**
+    /// without creating a new bank `Arc`. Used by the GUI CPU
+    /// worker so clones of the bank handle held by the UI and
+    /// MCP threads stay valid across a reset. The peripheral
+    /// bank's non-volatile state (SPI flash contents, SFP EEPROM,
+    /// eFuse snapshot) is preserved.
+    pub fn reset_soc_in_place(&mut self, boot_mode: BootMode) {
+        let saved_timer1_irq = self.state.timer1_irq;
+        self.state = CpuState::new();
+        self.state.timer1_irq = saved_timer1_irq;
+
+        let sram_size = self.mem.sram_size();
+        let zeros = vec![0u8; sram_size];
+        self.mem.load_binary(0, &zeros);
+
+        if let Some(bank) = self.bank.as_ref() {
+            let mut guard = bank.write();
+            match boot_mode {
+                BootMode::Warm => guard.reset_warm(),
+                BootMode::Cold => guard.reset_cold(),
+            }
+        }
+    }
+
     pub fn step(&mut self) -> Result<(), Exception> {
         if self.state.halted || self.state.paused {
             return Ok(());

@@ -61,11 +61,6 @@ pub struct EmulatorApp {
     pub bottom_tab: panels::BottomTab,
     /// Scratch buffers for peripheral inspector input widgets.
     pub periph_scratch: panels::peripherals::PeripheralScratch,
-
-    /// Debounce flag: set to true on the very first frame so
-    /// the app can perform one-shot initialisation (turning
-    /// off `uart.stdout_passthrough`, etc.).
-    pub first_frame: bool,
 }
 
 const SRAM_REFRESH: Duration = Duration::from_millis(100);
@@ -92,7 +87,6 @@ impl EmulatorApp {
             peripheral_tab: panels::peripherals::PeripheralTab::Uart,
             bottom_tab: panels::BottomTab::Uart,
             periph_scratch: panels::peripherals::PeripheralScratch::default(),
-            first_frame: true,
         }
     }
 
@@ -139,10 +133,6 @@ impl EmulatorApp {
 
 impl eframe::App for EmulatorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if self.first_frame {
-            self.handle.bank.write().uart.stdout_passthrough = false;
-            self.first_frame = false;
-        }
         self.refresh_snapshot();
         self.maybe_refresh_sram();
 

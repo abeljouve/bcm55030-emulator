@@ -93,6 +93,13 @@ fn main() {
         .cloned()
         .expect("BCM55030 Cpu must have a peripheral bank");
 
+    // The GUI owns the UART terminal panel, so the worker must
+    // not mirror the TX log to the host stdout. Disable the
+    // passthrough up-front; `reset_soc_in_place` preserves the
+    // bank Arc so this setting survives across reset /
+    // load_firmware.
+    bank.write().uart.stdout_passthrough = false;
+
     let (cmd_tx, cmd_rx) = mpsc::channel::<CpuCommand>();
     let uart_tx = bank.read().uart_rx_sender();
     let peripherals = bank.read().snapshot_all();

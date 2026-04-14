@@ -224,7 +224,7 @@ impl Worker {
                 } else {
                     Vec::new()
                 };
-                self.cpu = (self.reset_fn)(boot_mode);
+                self.reset_cpu(boot_mode);
                 self.breakpoints.clear();
                 for addr in saved {
                     self.cpu.hooks.insert(addr, Hook::Breakpoint);
@@ -313,6 +313,20 @@ impl Worker {
         true
     }
 
+    /// Reset the live `Cpu` for a `Reset` or `LoadFirmware`
+    /// command. In SoC mode (bank is Some) we reset **in place**
+    /// via `Cpu::reset_soc_in_place` so the bank `Arc` shared with
+    /// the UI and MCP threads through `EmulatorHandle` stays
+    /// valid. In flat mode (tests) we fall back to the
+    /// constructor closure supplied at worker-spawn time.
+    fn reset_cpu(&mut self, boot_mode: BootMode) {
+        if self.cpu.bank().is_some() {
+            self.cpu.reset_soc_in_place(boot_mode);
+        } else {
+            self.cpu = (self.reset_fn)(boot_mode);
+        }
+    }
+
     /// Implement `CpuCommand::LoadFirmware`: rebuild a fresh
     /// `Cpu`, copy the file into the PBC SPI flash backing store,
     /// perform the 64 KB boot DMA into SRAM, and set the entry
@@ -334,7 +348,7 @@ impl Worker {
             Vec::new()
         };
 
-        self.cpu = (self.reset_fn)(boot_mode);
+        self.reset_cpu(boot_mode);
         self.breakpoints.clear();
         for addr in saved_bps {
             self.cpu.hooks.insert(addr, Hook::Breakpoint);
