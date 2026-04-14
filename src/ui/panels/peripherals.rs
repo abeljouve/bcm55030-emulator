@@ -6,13 +6,13 @@
 //! typed snapshot (mpcp, nco) fall back to `peek_word` hex dumps.
 
 use eframe::egui;
+use egui_phosphor::regular as ph;
 
 use crate::soc::peripheral::{
     AlarmEvent, BscEvent, DmaEvent, EfuseEvent, EponEvent, FatalFilterEvent,
     LaneSpeed, MacsecEvent, PbcEvent, PeripheralEvent, PeripheralSnapshot,
     SerDesEvent, SfpEvent, TimerEvent, UartEvent,
 };
-use crate::ui::theme;
 use crate::ui::EmulatorApp;
 
 /// Selected peripheral tab inside the inspector.
@@ -55,49 +55,90 @@ pub struct PeripheralScratch {
 }
 
 pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
-    ui.horizontal_wrapped(|ui| {
-        for (tab, label) in TABS {
-            ui.selectable_value(&mut app.peripheral_tab, *tab, *label);
-        }
-    });
-    ui.separator();
+    egui::Panel::left("peripheral_sidebar")
+        .resizable(false)
+        .exact_size(160.0)
+        .frame(
+            egui::Frame::default()
+                .fill(ui.visuals().extreme_bg_color.gamma_multiply(0.4))
+                .inner_margin(egui::Margin::same(6)),
+        )
+        .show_inside(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Peripherals")
+                    .small()
+                    .color(app.accents.muted),
+            );
+            ui.add_space(4.0);
+            for (tab, icon, label) in TABS {
+                let selected = app.peripheral_tab == *tab;
+                let text = egui::RichText::new(format!("{icon}  {label}"))
+                    .monospace()
+                    .size(13.0);
+                let resp = ui.add_sized(
+                    [ui.available_width(), 24.0],
+                    egui::Button::selectable(selected, text),
+                );
+                if resp.clicked() {
+                    app.peripheral_tab = *tab;
+                }
+            }
+        });
 
-    egui::ScrollArea::vertical()
-        .id_salt("peripheral_inspector")
-        .show(ui, |ui| match app.peripheral_tab {
-            PeripheralTab::Uart => draw_uart(ui, app),
-            PeripheralTab::Pbc => draw_pbc(ui, app),
-            PeripheralTab::Bsc => draw_bsc(ui, app),
-            PeripheralTab::Sfp => draw_sfp(ui, app),
-            PeripheralTab::SerDes => draw_serdes(ui, app),
-            PeripheralTab::Epon => draw_epon(ui, app),
-            PeripheralTab::Macsec => draw_macsec(ui, app),
-            PeripheralTab::Dma => draw_dma(ui, app),
-            PeripheralTab::Alarm => draw_alarm(ui, app),
-            PeripheralTab::Timer => draw_timer(ui, app),
-            PeripheralTab::Efuse => draw_efuse(ui, app),
-            PeripheralTab::Fatal => draw_fatal(ui, app),
-            PeripheralTab::Mpcp => draw_mpcp(ui, app),
-            PeripheralTab::Nco => draw_nco(ui, app),
+    egui::CentralPanel::default()
+        .frame(egui::Frame::default().inner_margin(egui::Margin::same(10)))
+        .show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (icon, title) = header_for(app.peripheral_tab);
+                ui.strong(format!("{icon}  {title}"));
+            });
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .id_salt("peripheral_inspector")
+                .show(ui, |ui| match app.peripheral_tab {
+                    PeripheralTab::Uart => draw_uart(ui, app),
+                    PeripheralTab::Pbc => draw_pbc(ui, app),
+                    PeripheralTab::Bsc => draw_bsc(ui, app),
+                    PeripheralTab::Sfp => draw_sfp(ui, app),
+                    PeripheralTab::SerDes => draw_serdes(ui, app),
+                    PeripheralTab::Epon => draw_epon(ui, app),
+                    PeripheralTab::Macsec => draw_macsec(ui, app),
+                    PeripheralTab::Dma => draw_dma(ui, app),
+                    PeripheralTab::Alarm => draw_alarm(ui, app),
+                    PeripheralTab::Timer => draw_timer(ui, app),
+                    PeripheralTab::Efuse => draw_efuse(ui, app),
+                    PeripheralTab::Fatal => draw_fatal(ui, app),
+                    PeripheralTab::Mpcp => draw_mpcp(ui, app),
+                    PeripheralTab::Nco => draw_nco(ui, app),
+                });
         });
 }
 
-const TABS: &[(PeripheralTab, &str)] = &[
-    (PeripheralTab::Uart, "UART"),
-    (PeripheralTab::Pbc, "PBC"),
-    (PeripheralTab::Bsc, "BSC/I2C"),
-    (PeripheralTab::Sfp, "SFP"),
-    (PeripheralTab::SerDes, "SerDes"),
-    (PeripheralTab::Epon, "EPON"),
-    (PeripheralTab::Macsec, "MACsec"),
-    (PeripheralTab::Dma, "DMA"),
-    (PeripheralTab::Alarm, "Alarm"),
-    (PeripheralTab::Timer, "Timer"),
-    (PeripheralTab::Efuse, "eFuse"),
-    (PeripheralTab::Fatal, "Fatal"),
-    (PeripheralTab::Mpcp, "MPCP"),
-    (PeripheralTab::Nco, "NCO"),
+const TABS: &[(PeripheralTab, &str, &str)] = &[
+    (PeripheralTab::Uart, ph::TERMINAL, "UART"),
+    (PeripheralTab::Pbc, ph::HARD_DRIVES, "PBC"),
+    (PeripheralTab::Bsc, ph::PLUGS, "BSC/I2C"),
+    (PeripheralTab::Sfp, ph::LIGHTNING, "SFP"),
+    (PeripheralTab::SerDes, ph::WAVEFORM, "SerDes"),
+    (PeripheralTab::Epon, ph::NETWORK, "EPON"),
+    (PeripheralTab::Macsec, ph::LOCK_KEY, "MACsec"),
+    (PeripheralTab::Dma, ph::ARROWS_LEFT_RIGHT, "DMA"),
+    (PeripheralTab::Alarm, ph::BELL, "Alarm"),
+    (PeripheralTab::Timer, ph::CLOCK, "Timer"),
+    (PeripheralTab::Efuse, ph::FINGERPRINT, "eFuse"),
+    (PeripheralTab::Fatal, ph::WARNING, "Fatal"),
+    (PeripheralTab::Mpcp, ph::TREE_STRUCTURE, "MPCP"),
+    (PeripheralTab::Nco, ph::WAVE_SINE, "NCO"),
 ];
+
+fn header_for(tab: PeripheralTab) -> (&'static str, &'static str) {
+    for (t, icon, label) in TABS {
+        if *t == tab {
+            return (icon, label);
+        }
+    }
+    ("", "Peripheral")
+}
 
 fn find_snapshot<'a>(
     app: &'a EmulatorApp,
@@ -110,8 +151,11 @@ fn inject(app: &EmulatorApp, event: PeripheralEvent) {
     app.handle.bank.write().inject_event(&event);
 }
 
-fn missing(ui: &mut egui::Ui, what: &str) {
-    ui.colored_label(theme::MUTED, format!("{what}: snapshot not available yet."));
+fn missing(ui: &mut egui::Ui, _app: &EmulatorApp, what: &str) {
+    ui.colored_label(
+        ui.visuals().weak_text_color(),
+        format!("{what}: snapshot not available yet."),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +166,7 @@ fn draw_uart(ui: &mut egui::Ui, app: &EmulatorApp) {
     let Some(PeripheralSnapshot::Uart(snap)) =
         find_snapshot(app, |p| matches!(p, PeripheralSnapshot::Uart(_)))
     else {
-        missing(ui, "UART");
+        missing(ui, app, "UART");
         return;
     };
     kv(ui, "IER (IRQ enable)", format!("0x{:02X}", snap.ier));
@@ -146,7 +190,7 @@ fn draw_pbc(ui: &mut egui::Ui, app: &EmulatorApp) {
     let Some(PeripheralSnapshot::Pbc(snap)) =
         find_snapshot(app, |p| matches!(p, PeripheralSnapshot::Pbc(_)))
     else {
-        missing(ui, "PBC");
+        missing(ui, app, "PBC");
         return;
     };
     kv(ui, "Flash size", format!("{} bytes", snap.flash_size));
@@ -179,7 +223,7 @@ fn draw_bsc(ui: &mut egui::Ui, app: &EmulatorApp) {
     let Some(PeripheralSnapshot::Bsc(snap)) =
         find_snapshot(app, |p| matches!(p, PeripheralSnapshot::Bsc(_)))
     else {
-        missing(ui, "BSC/I2C");
+        missing(ui, app, "BSC/I2C");
         return;
     };
     kv(ui, "Busy", if snap.busy { "yes" } else { "no" }.to_string());
@@ -210,7 +254,7 @@ fn draw_sfp(ui: &mut egui::Ui, app: &mut EmulatorApp) {
     let snap = match find_snapshot(app, |p| matches!(p, PeripheralSnapshot::Sfp(_))) {
         Some(PeripheralSnapshot::Sfp(snap)) => snap.clone(),
         _ => {
-            missing(ui, "SFP");
+            missing(ui, app, "SFP");
             return;
         }
     };
@@ -277,7 +321,7 @@ fn draw_serdes(ui: &mut egui::Ui, app: &EmulatorApp) {
     let Some(PeripheralSnapshot::SerDes(snap)) =
         find_snapshot(app, |p| matches!(p, PeripheralSnapshot::SerDes(_)))
     else {
-        missing(ui, "SerDes");
+        missing(ui, app, "SerDes");
         return;
     };
     kv(ui, "Error status", format!("0x{:08X}", snap.error_status));
@@ -335,7 +379,7 @@ fn draw_epon(ui: &mut egui::Ui, app: &mut EmulatorApp) {
     let snap = match find_snapshot(app, |p| matches!(p, PeripheralSnapshot::EponMac(_))) {
         Some(PeripheralSnapshot::EponMac(snap)) => snap.clone(),
         _ => {
-            missing(ui, "EPON MAC");
+            missing(ui, app, "EPON MAC");
             return;
         }
     };
@@ -381,7 +425,7 @@ fn draw_macsec(ui: &mut egui::Ui, app: &mut EmulatorApp) {
     let Some(PeripheralSnapshot::Macsec(snap)) =
         find_snapshot(app, |p| matches!(p, PeripheralSnapshot::Macsec(_)))
     else {
-        missing(ui, "MACsec");
+        missing(ui, app, "MACsec");
         return;
     };
     let snap = snap.clone();
@@ -421,7 +465,7 @@ fn draw_dma(ui: &mut egui::Ui, app: &mut EmulatorApp) {
     let Some(PeripheralSnapshot::Dma(snap)) =
         find_snapshot(app, |p| matches!(p, PeripheralSnapshot::Dma(_)))
     else {
-        missing(ui, "DMA");
+        missing(ui, app, "DMA");
         return;
     };
     let snap = snap.clone();
@@ -459,7 +503,7 @@ fn draw_alarm(ui: &mut egui::Ui, app: &mut EmulatorApp) {
     let Some(PeripheralSnapshot::Alarm(snap)) =
         find_snapshot(app, |p| matches!(p, PeripheralSnapshot::Alarm(_)))
     else {
-        missing(ui, "Alarm");
+        missing(ui, app, "Alarm");
         return;
     };
     let snap = snap.clone();
@@ -512,7 +556,7 @@ fn draw_timer(ui: &mut egui::Ui, app: &mut EmulatorApp) {
     let Some(PeripheralSnapshot::Timer(snap)) =
         find_snapshot(app, |p| matches!(p, PeripheralSnapshot::Timer(_)))
     else {
-        missing(ui, "Timer");
+        missing(ui, app, "Timer");
         return;
     };
     let snap = snap.clone();
@@ -554,7 +598,7 @@ fn draw_efuse(ui: &mut egui::Ui, app: &EmulatorApp) {
     let Some(PeripheralSnapshot::Efuse(snap)) =
         find_snapshot(app, |p| matches!(p, PeripheralSnapshot::Efuse(_)))
     else {
-        missing(ui, "eFuse/UDR");
+        missing(ui, app, "eFuse/UDR");
         return;
     };
     kv(ui, "UDR status", format!("0x{:08X}", snap.udr_status));
@@ -577,7 +621,7 @@ fn draw_fatal(ui: &mut egui::Ui, app: &mut EmulatorApp) {
     let Some(PeripheralSnapshot::FatalFilter(snap)) =
         find_snapshot(app, |p| matches!(p, PeripheralSnapshot::FatalFilter(_)))
     else {
-        missing(ui, "Fatal filter");
+        missing(ui, app, "Fatal filter");
         return;
     };
     let snap = snap.clone();

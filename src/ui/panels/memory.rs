@@ -1,10 +1,11 @@
 //! Memory viewer: hex + ASCII grid with SRAM / Flash / D-cache
-//! sub-tabs. Reads from the on-demand `SramSnapshot` (disassembly
-//! panel drives the refresh) and from `handle.bank` for flash.
+//! sub-tabs. Bytes are coloured by value (zeroes muted, printable
+//! ASCII tinted green) and hex ↔ ASCII hover is synchronised so a
+//! pointer over one column highlights the other.
 
 use eframe::egui;
+use egui_phosphor::regular as ph;
 
-use crate::ui::theme;
 use crate::ui::EmulatorApp;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,18 +16,24 @@ pub enum Tab {
 }
 
 const BYTES_PER_ROW: usize = 16;
-const ROWS_VISIBLE: usize = 32;
+const ROWS_VISIBLE: usize = 40;
 
 pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
     ui.horizontal(|ui| {
+        ui.strong(format!("{} Memory", ph::MEMORY));
+        ui.separator();
         ui.selectable_value(&mut app.memory_tab, Tab::Sram, "SRAM");
         ui.selectable_value(&mut app.memory_tab, Tab::Flash, "Flash");
         ui.selectable_value(&mut app.memory_tab, Tab::Dcache, "D-cache");
         ui.separator();
-        ui.label("Go to:");
+        ui.label(
+            egui::RichText::new("Go to")
+                .small()
+                .color(app.accents.muted),
+        );
         let mut buf = format!("0x{:08X}", app.memory_cursor);
         if ui
-            .add(egui::TextEdit::singleline(&mut buf).desired_width(120.0))
+            .add(egui::TextEdit::singleline(&mut buf).desired_width(110.0))
             .changed()
         {
             let trimmed = buf.trim_start_matches("0x").trim_start_matches("0X");
@@ -46,25 +53,37 @@ pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
 
 fn draw_sram(ui: &mut egui::Ui, app: &EmulatorApp) {
     let Some(sram) = app.sram.as_ref() else {
-        ui.colored_label(theme::MUTED, "Waiting for SRAM snapshot…");
+        ui.colored_label(app.accents.muted, "Waiting for SRAM snapshot…");
         return;
     };
     let start = (app.memory_cursor as usize) & !(BYTES_PER_ROW - 1);
-    draw_hex_grid(ui, &sram.bytes, start, "sram");
+    draw_hex_grid(ui, app, &sram.bytes, start, "sram");
 }
 
 fn draw_flash(ui: &mut egui::Ui, app: &EmulatorApp) {
     let guard = app.handle.bank.read();
     let flash = &guard.pbc.flash.data;
     let start = (app.memory_cursor as usize) & !(BYTES_PER_ROW - 1);
-    draw_hex_grid(ui, flash, start, "flash");
+    draw_hex_grid(ui, app, flash, start, "flash");
 }
 
-fn draw_hex_grid(ui: &mut egui::Ui, bytes: &[u8], start: usize, id: &str) {
+fn draw_hex_grid(
+    ui: &mut egui::Ui,
+    app: &EmulatorApp,
+    bytes: &[u8],
+    start: usize,
+    id: &str,
+) {
+    let accents = app.accents;
+    let zero_color = accents.muted.gamma_multiply(0.4);
+    let ascii_color = accents.success;
+    let text_color = ui.visuals().text_color();
+
     egui::ScrollArea::vertical()
         .id_salt(id)
         .max_height(ui.available_height())
         .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
             for row in 0..ROWS_VISIBLE {
                 let off = start + row * BYTES_PER_ROW;
                 if off >= bytes.len() {
@@ -72,25 +91,66 @@ fn draw_hex_grid(ui: &mut egui::Ui, bytes: &[u8], start: usize, id: &str) {
                 }
                 let row_end = (off + BYTES_PER_ROW).min(bytes.len());
                 let slice = &bytes[off..row_end];
-                let hex = slice
-                    .iter()
-                    .map(|b| format!("{:02X}", b))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let ascii = slice
-                    .iter()
-                    .map(|b| {
-                        if b.is_ascii_graphic() || *b == b' ' {
+
+                ui.horizontal(|ui| {
+                    // Offset.
+                    ui.label(
+                        egui::RichText::new(format!("{:08X}", off))
+                            .monospace()
+                            .color(accents.muted),
+                    );
+                    ui.add_space(10.0);
+
+                    // Hex bytes with hover ID per byte.
+                    let mut hover_idx: Option<usize> = None;
+                    for (i, b) in slice.iter().enumerate() {
+                        let color = if *b == 0 {
+                            zero_color
+                        } else if b.is_ascii_graphic() || *b == b' ' {
+                            ascii_color
+                        } else {
+                            text_color
+                        };
+                        let resp = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("{:02X}", b))
+                                    .monospace()
+                                    .color(color),
+                            )
+                            .sense(egui::Sense::hover()),
+                        );
+                        if resp.hovered() {
+                            hover_idx = Some(i);
+                        }
+                        if i == 7 {
+                            ui.add_space(4.0);
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("│").monospace().color(accents.muted),
+                    );
+
+                    // ASCII column — highlight the hovered index.
+                    for (i, b) in slice.iter().enumerate() {
+                        let ch = if b.is_ascii_graphic() || *b == b' ' {
                             *b as char
                         } else {
                             '.'
-                        }
-                    })
-                    .collect::<String>();
-                ui.monospace(format!(
-                    "{:08X}  {:<47}  |{}|",
-                    off, hex, ascii
-                ));
+                        };
+                        let mut rich = egui::RichText::new(ch.to_string()).monospace();
+                        rich = if Some(i) == hover_idx {
+                            rich.background_color(accents.accent.gamma_multiply(0.35))
+                                .color(ui.visuals().text_color())
+                        } else if *b == 0 {
+                            rich.color(zero_color)
+                        } else {
+                            rich.color(ascii_color)
+                        };
+                        ui.label(rich);
+                    }
+                });
             }
         });
 }
@@ -98,12 +158,16 @@ fn draw_hex_grid(ui: &mut egui::Ui, bytes: &[u8], start: usize, id: &str) {
 fn draw_dcache(ui: &mut egui::Ui, app: &EmulatorApp) {
     let Some(dc) = app.dcache.as_ref() else {
         ui.colored_label(
-            theme::MUTED,
-            "D-cache snapshot not requested yet (phase 6 refresh path pending).",
+            app.accents.muted,
+            "D-cache snapshot not requested yet.",
         );
         return;
     };
-    ui.label(format!("DC_CTRL raw: 0x{:08X}", dc.ctrl_raw));
+    ui.label(
+        egui::RichText::new(format!("DC_CTRL 0x{:08X}", dc.ctrl_raw))
+            .monospace()
+            .color(app.accents.muted),
+    );
     ui.separator();
     egui::ScrollArea::vertical()
         .id_salt("dcache")
@@ -113,14 +177,23 @@ fn draw_dcache(ui: &mut egui::Ui, app: &EmulatorApp) {
                 if !line.valid {
                     continue;
                 }
-                ui.monospace(format!(
-                    "set {:02} way {}  tag 0x{:08X}  base 0x{:08X} {}",
-                    line.set,
-                    line.way,
-                    line.tag,
-                    line.base_addr,
-                    if line.dirty { "[dirty]" } else { "" },
-                ));
+                let color = if line.dirty {
+                    app.accents.warning
+                } else {
+                    ui.visuals().text_color()
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "set {:02} way {}  tag 0x{:08X}  base 0x{:08X} {}",
+                        line.set,
+                        line.way,
+                        line.tag,
+                        line.base_addr,
+                        if line.dirty { "[dirty]" } else { "" },
+                    ))
+                    .monospace()
+                    .color(color),
+                );
             }
         });
 }

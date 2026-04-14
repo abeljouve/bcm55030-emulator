@@ -7,6 +7,7 @@
 //! `PeripheralEvent`s through `handle.bank.write().inject_event`
 //! — the UI never touches `Cpu` directly.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui;
@@ -14,6 +15,7 @@ use eframe::egui;
 use crate::emu::snapshot::{DcacheSnapshot, SramSnapshot};
 use crate::emu::{EmulatorHandle, EmulatorSnapshot};
 use crate::ui::panels;
+use crate::ui::theme::{AccentTokens, Palette};
 
 /// Shared UI state. Cheap to clone (everything lives behind
 /// `Arc`s or is plain data).
@@ -61,12 +63,26 @@ pub struct EmulatorApp {
     pub bottom_tab: panels::BottomTab,
     /// Scratch buffers for peripheral inspector input widgets.
     pub periph_scratch: panels::peripherals::PeripheralScratch,
+
+    /// Active Catppuccin flavour. Persisted via eframe storage.
+    pub palette: Palette,
+    /// Accent tokens derived from `palette`. Rebuilt whenever the
+    /// palette changes.
+    pub accents: AccentTokens,
+
+    /// Ring buffer of recent instructions-per-second samples.
+    /// Feeds the status-bar sparkline. Capacity = 120 samples ≈
+    /// two minutes at 1 Hz sampling.
+    pub ips_history: std::collections::VecDeque<u32>,
+    /// Last wall-clock time we pushed an IPS sample.
+    pub last_ips_sample: Option<std::time::Instant>,
 }
 
 const SRAM_REFRESH: Duration = Duration::from_millis(100);
+const STORAGE_PALETTE_KEY: &str = "ui.palette";
 
 impl EmulatorApp {
-    pub fn new(handle: EmulatorHandle) -> Self {
+    pub fn new(handle: EmulatorHandle, palette: Palette) -> Self {
         let snapshot = handle.snapshot.lock().clone();
         let prev_core_regs = snapshot.cpu.core_regs;
         let disasm_cursor = snapshot.cpu.pc;
@@ -87,7 +103,37 @@ impl EmulatorApp {
             peripheral_tab: panels::peripherals::PeripheralTab::Uart,
             bottom_tab: panels::BottomTab::Uart,
             periph_scratch: panels::peripherals::PeripheralScratch::default(),
+            palette,
+            accents: AccentTokens::from_palette(palette),
+            ips_history: std::collections::VecDeque::with_capacity(120),
+            last_ips_sample: None,
         }
+    }
+
+    /// Push an IPS sample if at least a second has elapsed since
+    /// the previous one. Called once per frame from `refresh_snapshot`.
+    fn push_ips_sample(&mut self) {
+        let now = std::time::Instant::now();
+        let should = match self.last_ips_sample {
+            None => true,
+            Some(prev) => now.duration_since(prev) >= Duration::from_millis(500),
+        };
+        if !should {
+            return;
+        }
+        self.last_ips_sample = Some(now);
+        if self.ips_history.len() == 120 {
+            self.ips_history.pop_front();
+        }
+        self.ips_history.push_back(self.snapshot.insns_per_sec);
+    }
+
+    /// Swap the active palette, rebuilding accents and pushing
+    /// the new visuals into the egui context.
+    pub fn set_palette(&mut self, ctx: &egui::Context, palette: Palette) {
+        self.palette = palette;
+        self.accents = AccentTokens::from_palette(palette);
+        ctx.set_visuals(crate::ui::theme::visuals_for(palette));
     }
 
     fn refresh_snapshot(&mut self) {
@@ -100,6 +146,7 @@ impl EmulatorApp {
         }
         self.prev_core_regs = fresh.cpu.core_regs;
         self.snapshot = fresh;
+        self.push_ips_sample();
     }
 
     /// Fire an SRAM request if one hasn't landed within the
@@ -120,10 +167,6 @@ impl EmulatorApp {
             .send(crate::emu::command::CpuCommand::RequestSram { response: tx })
             .is_ok()
         {
-            // Block briefly (≤ 5 ms) — worker responds on its
-            // next scheduling opportunity. If it's deep in a
-            // hot loop the first attempt may time out; the
-            // next frame retries.
             if let Ok(snap) = rx.recv_timeout(Duration::from_millis(5)) {
                 self.sram = Some(snap);
             }
@@ -136,11 +179,21 @@ impl eframe::App for EmulatorApp {
         self.refresh_snapshot();
         self.maybe_refresh_sram();
 
+        // One-shot fade-in covering the entire window on first
+        // display. `animate_value_with_time` drives a 0→1 linear
+        // ramp across the first ~500 ms. We use the resulting
+        // alpha to gamma-multiply the whole UI via a global
+        // opacity override.
+        let fade = ui
+            .ctx()
+            .animate_value_with_time(egui::Id::new("app.fade_in"), 1.0, 0.5);
+        ui.set_opacity(fade.clamp(0.0, 1.0));
+
         egui::Panel::top("toolbar")
-            .exact_size(36.0)
+            .exact_size(40.0)
             .show_inside(ui, |ui| panels::toolbar::draw(ui, self));
         egui::Panel::bottom("status_bar")
-            .exact_size(22.0)
+            .exact_size(24.0)
             .show_inside(ui, |ui| panels::status_bar::draw(ui, self));
         egui::Panel::bottom("bottom_tabs")
             .resizable(true)
@@ -150,12 +203,12 @@ impl eframe::App for EmulatorApp {
                     ui.selectable_value(
                         &mut self.bottom_tab,
                         panels::BottomTab::Uart,
-                        "UART",
+                        format!("{} UART", egui_phosphor::regular::TERMINAL),
                     );
                     ui.selectable_value(
                         &mut self.bottom_tab,
                         panels::BottomTab::McpLog,
-                        "MCP Activity",
+                        format!("{} MCP Activity", egui_phosphor::regular::PLUGS_CONNECTED),
                     );
                 });
                 ui.separator();
@@ -166,23 +219,23 @@ impl eframe::App for EmulatorApp {
             });
         egui::Panel::left("disassembly")
             .resizable(true)
-            .default_size(420.0)
+            .default_size(460.0)
             .show_inside(ui, |ui| panels::disassembly::draw(ui, self));
         egui::Panel::right("registers")
             .resizable(true)
-            .default_size(320.0)
+            .default_size(340.0)
             .show_inside(ui, |ui| panels::registers::draw(ui, self));
         egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(
                     &mut self.central_tab,
                     panels::CentralTab::Memory,
-                    "Memory",
+                    format!("{} Memory", egui_phosphor::regular::MEMORY),
                 );
                 ui.selectable_value(
                     &mut self.central_tab,
                     panels::CentralTab::Peripherals,
-                    "Peripherals",
+                    format!("{} Peripherals", egui_phosphor::regular::CIRCUITRY),
                 );
             });
             ui.separator();
@@ -194,11 +247,46 @@ impl eframe::App for EmulatorApp {
 
         ui.ctx().request_repaint_after(Duration::from_millis(16));
     }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(STORAGE_PALETTE_KEY, self.palette.as_str().to_string());
+    }
 }
 
-/// Entry point invoked from `main.rs`. Blocks the calling thread
-/// on `eframe::run_native` — callers should spawn the CPU worker
-/// and the MCP server thread *before* calling `run`.
+/// Load a Palette from eframe storage, defaulting to Mocha.
+fn load_palette(cc: &eframe::CreationContext<'_>) -> Palette {
+    cc.storage
+        .and_then(|s| s.get_string(STORAGE_PALETTE_KEY))
+        .and_then(|s| Palette::from_str(&s))
+        .unwrap_or(Palette::Mocha)
+}
+
+/// Install JetBrains Mono as the primary monospace font and add
+/// the Phosphor icon set to both families so we can drop icon
+/// glyphs into any label.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    // Vendored JetBrains Mono Regular (OFL). Becomes the first
+    // choice for the monospace family; Hack / Ubuntu stay as
+    // fallbacks for glyphs JetBrains Mono does not cover.
+    const JETBRAINS_MONO: &[u8] =
+        include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf");
+    fonts.font_data.insert(
+        "jetbrains_mono".to_owned(),
+        Arc::new(egui::FontData::from_static(JETBRAINS_MONO)),
+    );
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+        family.insert(0, "jetbrains_mono".to_owned());
+    }
+
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    ctx.set_fonts(fonts);
+}
+
+/// Entry point invoked from the GUI binary. Blocks the calling
+/// thread on `eframe::run_native` — callers should spawn the CPU
+/// worker and the MCP server thread *before* calling `run`.
 pub fn run(handle: EmulatorHandle) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -210,6 +298,12 @@ pub fn run(handle: EmulatorHandle) -> eframe::Result<()> {
     eframe::run_native(
         "arc700-emulator",
         options,
-        Box::new(move |_cc| Ok(Box::new(EmulatorApp::new(handle)))),
+        Box::new(move |cc| {
+            let palette = load_palette(cc);
+            install_fonts(&cc.egui_ctx);
+            cc.egui_ctx.set_visuals(crate::ui::theme::visuals_for(palette));
+            cc.egui_ctx.all_styles_mut(|s| crate::ui::theme::configure_style(s));
+            Ok(Box::new(EmulatorApp::new(handle, palette)))
+        }),
     )
 }

@@ -17,7 +17,7 @@ required-features = ["ui", "mcp"]
 [features]
 default = []
 # Enable the egui/eframe GUI layer. Pulls in native windowing.
-ui  = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd", "dep:serde", "dep:serde_json"]
+ui  = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:egui-phosphor", "dep:rfd", "dep:serde", "dep:serde_json"]
 # Enable the integrated MCP server (rmcp + axum HTTP transport).
 mcp = [
     "dep:rmcp",
@@ -39,6 +39,7 @@ parking_lot = "0.12"
 eframe       = { version = "0.34", optional = true, default-features = false, features = ["default_fonts", "glow", "persistence"] }
 egui         = { version = "0.34", optional = true }
 egui_extras  = { version = "0.34", optional = true, features = ["all_loaders"] }
+egui-phosphor = { version = "0.12", optional = true, default-features = false, features = ["regular"] }
 rfd          = { version = "0.17", optional = true }
 tokio        = { version = "1",    optional = true, features = ["rt-multi-thread", "macros", "sync", "net"] }
 axum         = { version = "0.8",  optional = true }
