@@ -16,7 +16,6 @@ pub enum Tab {
 }
 
 const BYTES_PER_ROW: usize = 16;
-const ROWS_VISIBLE: usize = 40;
 
 pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
     ui.horizontal(|ui| {
@@ -39,6 +38,7 @@ pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
             let trimmed = buf.trim_start_matches("0x").trim_start_matches("0X");
             if let Ok(addr) = u32::from_str_radix(trimmed, 16) {
                 app.memory_cursor = addr;
+                app.memory_cursor_dirty = true;
             }
         }
     });
@@ -51,19 +51,17 @@ pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
     }
 }
 
-fn draw_sram(ui: &mut egui::Ui, app: &EmulatorApp) {
-    let Some(sram) = app.sram.as_ref() else {
+fn draw_sram(ui: &mut egui::Ui, app: &mut EmulatorApp) {
+    let Some(sram) = app.sram.clone() else {
         ui.colored_label(app.accents.muted, "Waiting for SRAM snapshot…");
         return;
     };
-    let start = (app.memory_cursor as usize) & !(BYTES_PER_ROW - 1);
-    draw_hex_grid(ui, app, &sram.bytes, None, start, "sram");
+    draw_hex_grid(ui, app, &sram.bytes, None, "sram");
 }
 
-fn draw_flash(ui: &mut egui::Ui, app: &EmulatorApp) {
+fn draw_flash(ui: &mut egui::Ui, app: &mut EmulatorApp) {
     // Clone the flash + baseline under a short read lock so we
-    // don't hold it across the scroll-area draw (which can
-    // allocate and trigger repaint requests).
+    // don't hold it across the scroll-area draw.
     let (flash, baseline) = {
         let guard = app.handle.bank.read();
         (
@@ -93,16 +91,14 @@ fn draw_flash(ui: &mut egui::Ui, app: &EmulatorApp) {
         });
         ui.separator();
     }
-    let start = (app.memory_cursor as usize) & !(BYTES_PER_ROW - 1);
-    draw_hex_grid(ui, app, &flash, baseline.as_deref(), start, "flash");
+    draw_hex_grid(ui, app, &flash, baseline.as_deref(), "flash");
 }
 
 fn draw_hex_grid(
     ui: &mut egui::Ui,
-    app: &EmulatorApp,
+    app: &mut EmulatorApp,
     bytes: &[u8],
     baseline: Option<&[u8]>,
-    start: usize,
     id: &str,
 ) {
     let accents = app.accents;
@@ -110,18 +106,33 @@ fn draw_hex_grid(
     let ascii_color = accents.success;
     let text_color = ui.visuals().text_color();
 
-    egui::ScrollArea::vertical()
+    let total_rows = (bytes.len() + BYTES_PER_ROW - 1) / BYTES_PER_ROW;
+    let row_height =
+        egui::TextStyle::Monospace.resolve(ui.style()).size + 3.0;
+
+    // Row index currently pointed to by `memory_cursor` — used
+    // to scroll the viewport to the user's goto address.
+    let cursor_row = (app.memory_cursor as usize) / BYTES_PER_ROW;
+    let jumped_this_frame = app.memory_cursor_dirty;
+    app.memory_cursor_dirty = false;
+
+    let mut scroll_area = egui::ScrollArea::vertical()
         .id_salt(id)
-        .max_height(ui.available_height())
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 1.0;
-            for row in 0..ROWS_VISIBLE {
-                let off = start + row * BYTES_PER_ROW;
-                if off >= bytes.len() {
-                    break;
-                }
-                let row_end = (off + BYTES_PER_ROW).min(bytes.len());
-                let slice = &bytes[off..row_end];
+        .auto_shrink([false, false])
+        .max_height(ui.available_height());
+    if jumped_this_frame {
+        scroll_area = scroll_area
+            .vertical_scroll_offset(cursor_row as f32 * row_height);
+    }
+    scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
+        ui.spacing_mut().item_spacing.y = 1.0;
+        for row in row_range {
+            let off = row * BYTES_PER_ROW;
+            if off >= bytes.len() {
+                break;
+            }
+            let row_end = (off + BYTES_PER_ROW).min(bytes.len());
+            let slice = &bytes[off..row_end];
 
                 ui.horizontal(|ui| {
                     // Offset.

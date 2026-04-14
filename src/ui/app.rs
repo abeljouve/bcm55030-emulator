@@ -62,6 +62,10 @@ pub struct EmulatorApp {
     /// keyboard navigation (Page Up/Down) can reuse it.
     pub disasm_visible_rows: u32,
     pub memory_cursor: u32,
+    /// One-shot flag set when the user types a new address in
+    /// the memory viewer "Go to" box. The next frame's scroll
+    /// area snaps to the corresponding row and clears the flag.
+    pub memory_cursor_dirty: bool,
     pub memory_tab: panels::memory::Tab,
     pub registers_tab: panels::registers::Tab,
     pub uart_input: String,
@@ -122,6 +126,7 @@ impl EmulatorApp {
             disasm_follow_pc: true,
             disasm_visible_rows: 64,
             memory_cursor: 0,
+            memory_cursor_dirty: false,
             memory_tab: panels::memory::Tab::Sram,
             registers_tab: panels::registers::Tab::Core,
             uart_input: String::new(),
