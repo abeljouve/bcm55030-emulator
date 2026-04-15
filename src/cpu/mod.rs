@@ -9,6 +9,7 @@ use parking_lot::RwLock;
 use exception::Exception;
 use registers::{CpuState, DelayState, REG_BLINK, REG_ILINK1, REG_ILINK2, REG_LP_COUNT};
 
+use crate::debug_info::DebugInfo;
 use crate::decoder;
 use crate::executor;
 use crate::hooks::{self, HookAction, HookTable};
@@ -26,6 +27,11 @@ pub struct Cpu {
     pub mem: Memory,
     /// Log every instruction to stderr
     pub trace: bool,
+    /// DWARF-based PC → source-location lookup, loaded from a
+    /// separate ELF via the `--debug-elf` flag. When set, the trace
+    /// output and the UI disassembly panel annotate each instruction
+    /// with its corresponding Rust source line.
+    pub debug_info: Option<DebugInfo>,
     /// PC address hooks for breakpoints / watchpoints / run-to-cursor.
     /// Empty by default on `develop` — all 35 SoC-specific entries from
     /// the old `register_hooks()` were deleted per the contributor guide. The
@@ -49,6 +55,7 @@ impl Cpu {
             state: CpuState::new(),
             mem: Memory::new(mem_size),
             trace: false,
+            debug_info: None,
             hooks: HookTable::new(),
             timer_frac_acc: 0,
             bank: None,
@@ -67,6 +74,7 @@ impl Cpu {
             state,
             mem,
             trace: false,
+            debug_info: None,
             hooks: HookTable::new(),
             timer_frac_acc: 0,
             bank,
@@ -163,16 +171,35 @@ impl Cpu {
         let next_pc = self.state.pc + decoded.total_size();
 
         if self.trace {
-            eprintln!(
-                "[TRACE] PC=0x{:08X} size={} Z={} N={} C={} V={} {:?}",
-                self.state.pc,
-                decoded.total_size(),
-                self.state.flag_z as u8,
-                self.state.flag_n as u8,
-                self.state.flag_c as u8,
-                self.state.flag_v as u8,
-                decoded.inst
-            );
+            let src = self
+                .debug_info
+                .as_ref()
+                .and_then(|di| di.lookup(self.state.pc));
+            if let Some(loc) = src {
+                eprintln!(
+                    "[TRACE] PC=0x{:08X} size={} Z={} N={} C={} V={} {:?} @{}:{}",
+                    self.state.pc,
+                    decoded.total_size(),
+                    self.state.flag_z as u8,
+                    self.state.flag_n as u8,
+                    self.state.flag_c as u8,
+                    self.state.flag_v as u8,
+                    decoded.inst,
+                    loc.file,
+                    loc.line
+                );
+            } else {
+                eprintln!(
+                    "[TRACE] PC=0x{:08X} size={} Z={} N={} C={} V={} {:?}",
+                    self.state.pc,
+                    decoded.total_size(),
+                    self.state.flag_z as u8,
+                    self.state.flag_n as u8,
+                    self.state.flag_c as u8,
+                    self.state.flag_v as u8,
+                    decoded.inst
+                );
+            }
         }
 
         // For BL.D/JL.D: set blink to address AFTER the delay slot

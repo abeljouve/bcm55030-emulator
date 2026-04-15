@@ -32,6 +32,11 @@ mcp = [
 [dependencies]
 libc = "0.2"
 parking_lot = "0.12"
+# DWARF parsing for `--debug-elf` source-line overlay. Both are
+# no-std friendly but we pull the std feature because the host-side
+# tool runs with std enabled.
+gimli = { version = "0.32", default-features = false, features = ["read", "std"] }
+object = { version = "0.38", default-features = false, features = ["read", "elf", "std"] }
 
 # --- optional deps for the `ui` feature --------------------------------
 # Versions are conservative placeholders — Phase 6 pins them when the

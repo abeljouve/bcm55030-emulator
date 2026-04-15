@@ -50,6 +50,9 @@ struct Config {
     /// `MemoryError` exceptions instead of returning zero.
     unmapped_exception: bool,
     boot_mode: BootMode,
+    /// Path to an ELF file carrying DWARF debug info. Used to
+    /// annotate `--trace` output with source file / line.
+    debug_elf: Option<String>,
 }
 
 fn parse_hex(s: &str) -> Option<u32> {
@@ -76,6 +79,7 @@ fn parse_args() -> Config {
         dump_mmio_trace: None,
         unmapped_exception: false,
         boot_mode: BootMode::Warm,
+        debug_elf: None,
     };
 
     let mut i = 1;
@@ -168,6 +172,14 @@ fn parse_args() -> Config {
             "--unmapped-exception" => cfg.unmapped_exception = true,
             "--cold-boot" => cfg.boot_mode = BootMode::Cold,
             "--warm-boot" => cfg.boot_mode = BootMode::Warm,
+            "--debug-elf" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --debug-elf requires a file path");
+                    process::exit(1);
+                }
+                cfg.debug_elf = Some(args[i].clone());
+            }
             "--help" | "-h" => {
                 usage(prog);
                 process::exit(0);
@@ -407,6 +419,22 @@ fn main() {
 
     cpu.trace = cfg.trace;
     cpu.mem.dccm_watchpoint = cfg.watch_dccm;
+    if let Some(ref path) = cfg.debug_elf {
+        match bcm55030_emulator::debug_info::DebugInfo::load(path) {
+            Ok(di) => {
+                bcm55030_emulator::vlog!(
+                    "[BCM55030] DWARF debug info loaded: {} entries from {}",
+                    di.len(),
+                    path
+                );
+                cpu.debug_info = Some(di);
+            }
+            Err(e) => {
+                eprintln!("Error loading --debug-elf {}: {}", path, e);
+                process::exit(1);
+            }
+        }
+    }
     if cfg.trace_mmio {
         let mut bank = cpu.bank().unwrap().write();
         bank.trace = true;
