@@ -695,14 +695,6 @@ impl Memory {
         dc.write_byte(addr + 1, (val >> 16) as u8);
         dc.write_byte(addr + 2, (val >> 8) as u8);
         dc.write_byte(addr + 3, val as u8);
-        if let Some(off) = self.sram_offset(addr) {
-            if off + 3 < self.data.len() {
-                self.data[off] = (val >> 24) as u8;
-                self.data[off + 1] = (val >> 16) as u8;
-                self.data[off + 2] = (val >> 8) as u8;
-                self.data[off + 3] = val as u8;
-            }
-        }
         Ok(())
     }
 
@@ -918,13 +910,86 @@ mod tests {
         assert_eq!(mem.read_word(0).unwrap(), 0xAABBCCDD);
     }
 
+    // Cached writes are write-back: the dirty value lives in the D-cache
+    // and SRAM stays stale until a flush. Cached reads (`read_word_data`
+    // with `cache_bypass=false`) and cache-peek reads (`read_word`) see
+    // the new value. Uncached reads (`read_word_data` with
+    // `cache_bypass=true`) reach SRAM directly and therefore see the
+    // pre-write contents — scan7b test 7 on real HW confirms `.di` loads
+    // never consult the cache.
     #[test]
-    fn test_dcache_sram_write_through() {
+    fn test_dcache_writes_are_write_back() {
         let mut mem = Memory::new_soc(4096, BootMode::Warm);
         mem.write_word_data(0x100, 0xDEADBEEF, false).unwrap();
+
+        // Cached and cache-peek paths see the new value.
         assert_eq!(mem.read_word_data(0x100, false).unwrap(), 0xDEADBEEF);
+        assert_eq!(mem.read_word(0x100).unwrap(), 0xDEADBEEF);
+
+        // Uncached read bypasses the cache → sees pre-write SRAM (0).
+        assert_eq!(mem.read_word_data(0x100, true).unwrap(), 0);
+
+        // Invalidate with IM=1 flushes dirty → SRAM now has the value.
+        mem.dcache_invalidate_all().unwrap();
         assert_eq!(mem.read_word_data(0x100, true).unwrap(), 0xDEADBEEF);
         assert_eq!(mem.read_word(0x100).unwrap(), 0xDEADBEEF);
+    }
+
+    // Direct Memory-API repro of the alleged coherence bug from
+    // the design notes. The TODO note
+    // claimed a cached write of `0xDEADBEEF` to addr X followed by
+    // a cached write to addr X+4 (same 32 B line) would make a
+    // subsequent cached read of X return X+4's value instead of the
+    // seed. These probes force each of the interesting configurations
+    // and assert that the cached read of X is always the seed.
+    #[test]
+    fn test_dcache_adjacent_words_no_alias() {
+        let mut mem = Memory::new_soc(16 * 1024, BootMode::Warm);
+        let canary: u32 = 0x3A30;
+        let ticks: u32 = 0x3A34;
+        assert_eq!(canary & !0x1F, ticks & !0x1F, "must share one 32 B line");
+
+        // 1. Pre-warmed line: BSS-style zero, then seed, then adjacent.
+        for a in (0x3A20u32..0x3A40).step_by(4) {
+            mem.write_word_data(a, 0, false).unwrap();
+        }
+        mem.write_word_data(canary, 0xDEADBEEF, false).unwrap();
+        mem.write_word_data(ticks, 0xAA, false).unwrap();
+        assert_eq!(mem.read_word_data(canary, false).unwrap(), 0xDEADBEEF);
+        assert_eq!(mem.read_word_data(ticks, false).unwrap(), 0xAA);
+
+        // 2. Cold line: line isn't touched before the seed.
+        let mut mem = Memory::new_soc(16 * 1024, BootMode::Warm);
+        mem.write_word_data(canary, 0xDEADBEEF, false).unwrap();
+        mem.write_word_data(ticks, 0xAA, false).unwrap();
+        assert_eq!(mem.read_word_data(canary, false).unwrap(), 0xDEADBEEF);
+
+        // 3. Byte-level seed then word-level adjacent write. Exercises
+        //    the mix of write_byte_data / write_word_data that firmware
+        //    compilers emit when packing structs.
+        let mut mem = Memory::new_soc(16 * 1024, BootMode::Warm);
+        for (i, b) in [0xDE, 0xAD, 0xBE, 0xEF].iter().enumerate() {
+            mem.write_byte_data(canary + i as u32, *b, false).unwrap();
+        }
+        mem.write_word_data(ticks, 0xAA, false).unwrap();
+        assert_eq!(mem.read_word_data(canary, false).unwrap(), 0xDEADBEEF);
+
+        // 4. Force an eviction of the canary line between the seed
+        //    and the adjacent write by hammering the same set with
+        //    three other tags. RR replacement guarantees the victim
+        //    cycles and the canary line gets flushed to SRAM.
+        let mut mem = Memory::new_soc(128 * 1024, BootMode::Warm);
+        mem.write_word_data(canary, 0xDEADBEEF, false).unwrap();
+        let stride: u32 = 64 * 32;
+        for k in 1..=3 {
+            mem.write_word_data(canary + k * stride, 0x1111_0000 | k, false)
+                .unwrap();
+        }
+        // Cached read must refill from SRAM (evicted line was flushed).
+        assert_eq!(mem.read_word_data(canary, false).unwrap(), 0xDEADBEEF);
+        mem.write_word_data(ticks, 0xAA, false).unwrap();
+        assert_eq!(mem.read_word_data(canary, false).unwrap(), 0xDEADBEEF);
+        assert_eq!(mem.read_word_data(ticks, false).unwrap(), 0xAA);
     }
 
     #[test]
