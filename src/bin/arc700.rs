@@ -27,6 +27,8 @@ fn usage(prog: &str) {
     eprintln!("  --warm-boot                 Start with SYSREG_INIT_VALUES (default)");
     eprintln!("  --dump-mmio-trace-cold <F>  Cold-boot + dump MMIO trace catalog to <F>");
     eprintln!("  --unmapped-exception        Trap unclaimed MMIO as MemoryError (audit 2.2)");
+    eprintln!("  --trace-mmio-seq <FILE>     Write per-access MMIO trace as JSON Lines to FILE");
+    eprintln!("  --trace-mmio-range S:E      Restrict --trace-mmio-seq to [S,E) (hex, repeatable)");
     eprintln!();
     eprintln!("This is the headless CLI binary. For the egui GUI with integrated MCP");
     eprintln!("server, build and run the `arc700-gui` binary instead:");
@@ -53,6 +55,13 @@ struct Config {
     /// Path to an ELF file carrying DWARF debug info. Used to
     /// annotate `--trace` output with source file / line.
     debug_elf: Option<String>,
+    /// `--trace-mmio-seq <file>`: per-access sequential MMIO trace
+    /// written as JSON Lines to this path.
+    trace_mmio_seq: Option<String>,
+    /// `--trace-mmio-range start:end`: restrict `--trace-mmio-seq`
+    /// recording to accesses where `start <= addr < end`. Multiple
+    /// flags OR together.
+    trace_mmio_ranges: Vec<(u32, u32)>,
 }
 
 fn parse_hex(s: &str) -> Option<u32> {
@@ -80,6 +89,8 @@ fn parse_args() -> Config {
         unmapped_exception: false,
         boot_mode: BootMode::Warm,
         debug_elf: None,
+        trace_mmio_seq: None,
+        trace_mmio_ranges: Vec::new(),
     };
 
     let mut i = 1;
@@ -179,6 +190,36 @@ fn parse_args() -> Config {
                     process::exit(1);
                 }
                 cfg.debug_elf = Some(args[i].clone());
+            }
+            "--trace-mmio-seq" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --trace-mmio-seq requires a file path");
+                    process::exit(1);
+                }
+                cfg.trace_mmio_seq = Some(args[i].clone());
+            }
+            "--trace-mmio-range" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --trace-mmio-range requires start:end (hex)");
+                    process::exit(1);
+                }
+                let spec = &args[i];
+                let parts: Vec<&str> = spec.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    eprintln!("Error: --trace-mmio-range: expected start:end, got {:?}", spec);
+                    process::exit(1);
+                }
+                let start = parse_hex(parts[0]).unwrap_or_else(|| {
+                    eprintln!("Error: --trace-mmio-range: invalid start address {:?}", parts[0]);
+                    process::exit(1);
+                });
+                let end = parse_hex(parts[1]).unwrap_or_else(|| {
+                    eprintln!("Error: --trace-mmio-range: invalid end address {:?}", parts[1]);
+                    process::exit(1);
+                });
+                cfg.trace_mmio_ranges.push((start, end));
             }
             "--help" | "-h" => {
                 usage(prog);
@@ -449,6 +490,30 @@ fn main() {
         cpu.bank().unwrap().write().unmapped_exception = true;
         bcm55030_emulator::vlog!("[BCM55030] Unmapped-access policy = Exception (audit 2.2)");
     }
+    if let Some(ref path) = cfg.trace_mmio_seq {
+        match bcm55030_emulator::soc::bank::SeqTrace::open(path, cfg.trace_mmio_ranges.clone()) {
+            Ok(st) => {
+                cpu.bank().unwrap().write().seq_trace = Some(st);
+                bcm55030_emulator::vlog!(
+                    "[BCM55030] Sequential MMIO trace → {} (ranges: {})",
+                    path,
+                    if cfg.trace_mmio_ranges.is_empty() {
+                        "all".to_string()
+                    } else {
+                        cfg.trace_mmio_ranges
+                            .iter()
+                            .map(|(s, e)| format!("0x{:X}..0x{:X}", s, e))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                );
+            }
+            Err(e) => {
+                eprintln!("Error opening --trace-mmio-seq {}: {}", path, e);
+                process::exit(1);
+            }
+        }
+    }
 
     let orig_termios = setup_raw_terminal();
 
@@ -543,6 +608,20 @@ fn main() {
         }
         if let Err(e) = fs::write(path, &buf) {
             eprintln!("Error writing DCCM dump: {}", e);
+        }
+    }
+
+    // Flush the sequential MMIO trace before any other I/O. BufWriter does
+    // NOT flush on drop when the process exits, so we must do it explicitly.
+    if cfg.trace_mmio_seq.is_some() {
+        if let Some(bank) = cpu.bank() {
+            let mut b = bank.write();
+            if let Some(ref mut st) = b.seq_trace {
+                st.flush();
+            }
+        }
+        if let Some(ref path) = cfg.trace_mmio_seq {
+            eprintln!("[BCM55030] Sequential MMIO trace flushed → {}", path);
         }
     }
 
