@@ -109,7 +109,7 @@ impl VlanLue {
         Ok(match off {
             OFF_VLAN_CTRL => self.vlan_ctrl,
             OFF_CUSTOM_ETHERTYPE => self.custom_ethertype,
-            OFF_CMD => self.cmd & !0x8000_0000,
+            OFF_CMD => self.cmd & !0xC000_0000,
             OFF_DATA2 => self.data2,
             OFF_DATA1 => self.data1,
             OFF_DATA0 => self.data0,
@@ -126,23 +126,22 @@ impl VlanLue {
             OFF_CUSTOM_ETHERTYPE => self.custom_ethertype = val,
             OFF_CMD => {
                 let index = (val & 0xFF) as usize;
+                let is_read = (val & 0x8000_0000) != 0;
                 let is_write = (val & 0x4000_0000) != 0;
 
-                if is_write {
-                    if index < TABLE_SIZE {
-                        self.table[index] = TableEntry {
-                            data2: self.data2,
-                            data1: self.data1,
-                            data0: self.data0,
-                        };
-                    }
-                } else if index < TABLE_SIZE {
+                if is_write && index < TABLE_SIZE {
+                    self.table[index] = TableEntry {
+                        data2: self.data2,
+                        data1: self.data1,
+                        data0: self.data0,
+                    };
+                } else if is_read && index < TABLE_SIZE {
                     let entry = self.table[index];
                     self.data2 = entry.data2;
                     self.data1 = entry.data1;
                     self.data0 = entry.data0;
                 }
-                self.cmd = val & !0x8000_0000;
+                self.cmd = val & !0xC000_0000;
             }
             OFF_DATA2 => self.data2 = val,
             OFF_DATA1 => self.data1 = val,
@@ -191,7 +190,7 @@ impl VlanLue {
         Ok(match off {
             OFF_VLAN_CTRL => self.vlan_ctrl,
             OFF_CUSTOM_ETHERTYPE => self.custom_ethertype,
-            OFF_CMD => self.cmd & !0x8000_0000,
+            OFF_CMD => self.cmd & !0xC000_0000,
             OFF_DATA2 => self.data2,
             OFF_DATA1 => self.data1,
             OFF_DATA0 => self.data0,
@@ -212,15 +211,14 @@ mod tests {
         v.write_word(BASE + OFF_DATA2, 0xAAAA_BBBB).unwrap();
         v.write_word(BASE + OFF_DATA1, 0xCCCC_DDDD).unwrap();
         v.write_word(BASE + OFF_DATA0, 0xEEEE_FFFF).unwrap();
-        // Write to index 5 (bit 30 set = write, bit 31 set = busy)
-        v.write_word(BASE + OFF_CMD, 0xC000_0005).unwrap();
+        // Write to index 5: bit 30 = write command
+        v.write_word(BASE + OFF_CMD, 0x4000_0005).unwrap();
 
-        // Clear data registers
         v.write_word(BASE + OFF_DATA2, 0).unwrap();
         v.write_word(BASE + OFF_DATA1, 0).unwrap();
         v.write_word(BASE + OFF_DATA0, 0).unwrap();
 
-        // Read from index 5 (bit 30 clear = read, bit 31 set = busy)
+        // Read from index 5: bit 31 = read command
         v.write_word(BASE + OFF_CMD, 0x8000_0005).unwrap();
 
         assert_eq!(v.read_word(BASE + OFF_DATA2).unwrap(), 0xAAAA_BBBB);
@@ -229,11 +227,11 @@ mod tests {
     }
 
     #[test]
-    fn busy_bit_clears_immediately() {
+    fn cmd_bits_clear_immediately() {
         let mut v = VlanLue::new();
         v.write_word(BASE + OFF_CMD, 0x8000_0000).unwrap();
         let cmd = v.read_word(BASE + OFF_CMD).unwrap();
-        assert_eq!(cmd & 0x8000_0000, 0);
+        assert_eq!(cmd & 0xC000_0000, 0);
     }
 
     #[test]
@@ -241,10 +239,10 @@ mod tests {
         let mut v = VlanLue::new();
 
         v.write_word(BASE + OFF_DATA0, 0x1111).unwrap();
-        v.write_word(BASE + OFF_CMD, 0xC000_000A).unwrap();
+        v.write_word(BASE + OFF_CMD, 0x4000_000A).unwrap();
 
         v.write_word(BASE + OFF_DATA0, 0x2222).unwrap();
-        v.write_word(BASE + OFF_CMD, 0xC000_000B).unwrap();
+        v.write_word(BASE + OFF_CMD, 0x4000_000B).unwrap();
 
         v.write_word(BASE + OFF_CMD, 0x8000_000A).unwrap();
         assert_eq!(v.read_word(BASE + OFF_DATA0).unwrap(), 0x1111);
