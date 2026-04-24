@@ -34,6 +34,7 @@ use crate::soc::serdes::SerDes;
 use crate::soc::sysreg_shim::SysregShim;
 use crate::soc::timer::EponTimer;
 use crate::soc::uart::Uart;
+use crate::soc::vlan_lue::VlanLue;
 
 /// CPU instruction ticks between bank tick invocations. Higher = less
 /// contention but coarser peripheral advancement. The EPON free-running
@@ -124,6 +125,7 @@ pub struct PeripheralBank {
     pub fatal_filter: FatalFilter,
     pub mpcp: Mpcp,
     pub nco: Nco,
+    pub vlan_lue: VlanLue,
 
     /// Temporary residual-plus-legacy-arms for the SYSREG range
     /// (`0x01000000..0x01003800`). Hosts every stub that has not yet been
@@ -195,6 +197,7 @@ impl PeripheralBank {
             fatal_filter: FatalFilter::new(),
             mpcp: Mpcp::new(),
             nco: Nco::new(),
+            vlan_lue: VlanLue::new(),
             sysreg: SysregShim::new(),
             uart_rx_sender: tx,
             uart_rx_receiver: Mutex::new(rx),
@@ -250,6 +253,7 @@ impl PeripheralBank {
         self.fatal_filter.tick(cpu_instructions);
         self.mpcp.tick(cpu_instructions);
         self.nco.tick(cpu_instructions);
+        self.vlan_lue.tick(cpu_instructions);
         self.sysreg.tick(cpu_instructions);
 
         // Aggregate IRQ pending bits. UART is the only v1 contributor
@@ -274,6 +278,7 @@ impl PeripheralBank {
         self.fatal_filter.reset_cold();
         self.mpcp.reset_cold();
         self.nco.reset_cold();
+        self.vlan_lue.reset_cold();
         self.sysreg.reset_cold();
         self.irq_pending = 0;
         self.current_pc = 0;
@@ -296,6 +301,7 @@ impl PeripheralBank {
         self.fatal_filter.reset_warm();
         self.mpcp.reset_warm();
         self.nco.reset_warm();
+        self.vlan_lue.reset_warm();
         self.sysreg.reset_warm();
         self.irq_pending = 0;
         self.current_pc = 0;
@@ -436,6 +442,9 @@ impl PeripheralBank {
         if self.nco.claims(addr) {
             return self.nco.peek_word(addr);
         }
+        if self.vlan_lue.claims(addr) {
+            return self.vlan_lue.peek_word(addr);
+        }
         // SysregShim residual has no peek path yet.
         Ok(0)
     }
@@ -460,6 +469,11 @@ impl PeripheralBank {
         if self.fatal_filter.claims(addr) { dispatch_rw!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_rw!(self.mpcp, "mpcp"); }
         if self.nco.claims(addr) { dispatch_rw!(self.nco, "nco"); }
+        if self.vlan_lue.claims(addr) {
+            let v = self.vlan_lue.read_word(addr)?;
+            self.seq_emit(addr, v, "r", "word", "vlan_lue");
+            return Ok(v);
+        }
         if self.sysreg.claims(addr) { dispatch_rw!(self.sysreg, "sysreg"); }
         if self.trace {
             eprintln!("[MMIO] read  word  0x{:08X} → 0x00000000 (unmapped)", addr);
@@ -502,6 +516,11 @@ impl PeripheralBank {
         if self.fatal_filter.claims(addr) { dispatch_ww!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_ww!(self.mpcp, "mpcp"); }
         if self.nco.claims(addr) { dispatch_ww!(self.nco, "nco"); }
+        if self.vlan_lue.claims(addr) {
+            self.vlan_lue.write_word(addr, val)?;
+            self.seq_emit(addr, val, "w", "word", "vlan_lue");
+            return Ok(());
+        }
         if self.sysreg.claims(addr) { dispatch_ww!(self.sysreg, "sysreg"); }
         if self.trace {
             eprintln!("[MMIO] write word  0x{:08X} = 0x{:08X} (unmapped)", addr, val);
@@ -533,6 +552,11 @@ impl PeripheralBank {
         if self.fatal_filter.claims(addr) { dispatch_rh!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_rh!(self.mpcp, "mpcp"); }
         if self.nco.claims(addr) { dispatch_rh!(self.nco, "nco"); }
+        if self.vlan_lue.claims(addr) {
+            let v = self.vlan_lue.read_half(addr)?;
+            self.seq_emit(addr, v as u32, "r", "half", "vlan_lue");
+            return Ok(v);
+        }
         if self.sysreg.claims(addr) { dispatch_rh!(self.sysreg, "sysreg"); }
         self.seq_emit(addr, 0, "r", "half", "unmapped");
         if self.unmapped_exception {
@@ -561,6 +585,11 @@ impl PeripheralBank {
         if self.fatal_filter.claims(addr) { dispatch_wh!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_wh!(self.mpcp, "mpcp"); }
         if self.nco.claims(addr) { dispatch_wh!(self.nco, "nco"); }
+        if self.vlan_lue.claims(addr) {
+            self.vlan_lue.write_half(addr, val)?;
+            self.seq_emit(addr, val as u32, "w", "half", "vlan_lue");
+            return Ok(());
+        }
         if self.sysreg.claims(addr) { dispatch_wh!(self.sysreg, "sysreg"); }
         self.seq_emit(addr, val as u32, "w", "half", "unmapped");
         if self.unmapped_exception {
@@ -589,6 +618,11 @@ impl PeripheralBank {
         if self.fatal_filter.claims(addr) { dispatch_rb!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_rb!(self.mpcp, "mpcp"); }
         if self.nco.claims(addr) { dispatch_rb!(self.nco, "nco"); }
+        if self.vlan_lue.claims(addr) {
+            let v = self.vlan_lue.read_byte(addr)?;
+            self.seq_emit(addr, v as u32, "r", "byte", "vlan_lue");
+            return Ok(v);
+        }
         if self.sysreg.claims(addr) { dispatch_rb!(self.sysreg, "sysreg"); }
         self.seq_emit(addr, 0, "r", "byte", "unmapped");
         if self.unmapped_exception {
@@ -617,6 +651,11 @@ impl PeripheralBank {
         if self.fatal_filter.claims(addr) { dispatch_wb!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_wb!(self.mpcp, "mpcp"); }
         if self.nco.claims(addr) { dispatch_wb!(self.nco, "nco"); }
+        if self.vlan_lue.claims(addr) {
+            self.vlan_lue.write_byte(addr, val)?;
+            self.seq_emit(addr, val as u32, "w", "byte", "vlan_lue");
+            return Ok(());
+        }
         if self.sysreg.claims(addr) { dispatch_wb!(self.sysreg, "sysreg"); }
         self.seq_emit(addr, val as u32, "w", "byte", "unmapped");
         if self.unmapped_exception {

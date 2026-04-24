@@ -59,6 +59,7 @@ pub const DMA_END: u32 = 0x0100_4000;
 /// it stays in `sysreg_shim` with a hardcoded `=> 0` arm.
 const MACSEC_CARVEOUTS: &[(u32, u32)] = &[
     (0x0100_2400, 0x0100_2D40),
+    (0x0100_3000, 0x0100_3020),
     (0x0100_3500, 0x0100_3540),
     (0x0100_3600, 0x0100_3614),
 ];

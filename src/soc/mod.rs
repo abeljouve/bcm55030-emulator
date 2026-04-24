@@ -32,3 +32,4 @@ pub mod spi_flash;
 pub mod sysreg_shim;
 pub mod timer;
 pub mod uart;
+pub mod vlan_lue;
