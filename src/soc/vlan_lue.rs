@@ -13,12 +13,9 @@
 //! rules during init and reads them back via `lue/print`.
 
 use crate::cpu::exception::Exception;
-use crate::soc::peripheral::AddressRange;
 
 const BASE: u32 = 0x0100_3000;
 const END: u32 = 0x0100_3020;
-const RANGES: &[AddressRange] = &[AddressRange::new(BASE, END)];
-
 const OFF_VLAN_CTRL: u32 = 0x00;
 const OFF_CUSTOM_ETHERTYPE: u32 = 0x0C;
 const OFF_CMD: u32 = 0x10;
