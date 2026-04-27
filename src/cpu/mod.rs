@@ -151,6 +151,31 @@ impl Cpu {
         }
     }
 
+    /// Warm reboot from the current flash content — models the
+    /// BCM55030 watchdog reset. Reads the first 64 KB from the PBC
+    /// SPI flash (which may have been modified by FDS writes), resets
+    /// CPU + peripherals, re-DMAs the bootloader into SRAM, and
+    /// resumes from PC=0 with interrupts enabled.
+    pub fn warm_reboot_from_flash(&mut self) {
+        let dma_bytes = if let Some(bank) = self.bank.as_ref() {
+            let guard = bank.read();
+            let len = guard.pbc.flash.data.len().min(64 * 1024);
+            guard.pbc.flash.data[..len].to_vec()
+        } else {
+            return;
+        };
+
+        self.reset_soc_in_place(BootMode::Warm);
+        self.mem.load_binary(0, &dma_bytes);
+        self.mem.dcache_invalidate_all().ok();
+        self.mem.icache_invalidate_all();
+
+        self.state.aux_ienable = 0xFFFFFFFF;
+        self.state.flag_e1 = true;
+        self.state.flag_e2 = true;
+        self.shadow_call_stack.clear();
+    }
+
     pub fn step(&mut self) -> Result<(), Exception> {
         if self.state.halted || self.state.paused {
             return Ok(());
@@ -288,13 +313,10 @@ impl Cpu {
                 self.tight_loop_count += 1;
                 if self.tight_loop_count >= TIGHT_LOOP_THRESHOLD {
                     eprintln!(
-                        "[BCM55030] Tight loop detected at PC=0x{:08X} ({} iterations) — \
-                         watchdog reset (warm reboot)",
+                        "[BCM55030] Tight loop at PC=0x{:08X} ({} iters) — watchdog warm reboot",
                         self.state.pc, self.tight_loop_count
                     );
-                    self.tight_loop_count = 0;
-                    self.tight_loop_last_pc = u32::MAX;
-                    self.state.halted = true;
+                    self.warm_reboot_from_flash();
                     return Ok(());
                 }
             } else {
