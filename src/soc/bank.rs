@@ -736,6 +736,16 @@ impl PeripheralBank {
     }
 
     pub fn read_half(&mut self, addr: u32) -> Result<u16, Exception> {
+        if !self.scenario.overrides.is_empty() {
+            let aligned = addr & !3;
+            if let Some(word) = self.scenario.overrides.try_read(aligned) {
+                let shift = (2 - (addr & 2)) * 8;
+                let v = ((word >> shift) & 0xFFFF) as u16;
+                self.record_history(addr, v as u32, "read", "half", "override");
+                self.seq_emit(addr, v as u32, "r", "half", "override");
+                return Ok(v);
+            }
+        }
         macro_rules! dispatch_rh {
             ($periph:expr, $name:expr) => {{
                 let v = $periph.read_half(addr)?;
@@ -802,6 +812,16 @@ impl PeripheralBank {
     }
 
     pub fn read_byte(&mut self, addr: u32) -> Result<u8, Exception> {
+        if !self.scenario.overrides.is_empty() {
+            let aligned = addr & !3;
+            if let Some(word) = self.scenario.overrides.try_read(aligned) {
+                let shift = (3 - (addr & 3)) * 8;
+                let v = ((word >> shift) & 0xFF) as u8;
+                self.record_history(addr, v as u32, "read", "byte", "override");
+                self.seq_emit(addr, v as u32, "r", "byte", "override");
+                return Ok(v);
+            }
+        }
         macro_rules! dispatch_rb {
             ($periph:expr, $name:expr) => {{
                 let v = $periph.read_byte(addr)?;
