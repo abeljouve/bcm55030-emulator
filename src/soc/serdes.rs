@@ -63,6 +63,12 @@ pub const SERDES_MAIN_END: u32 = 0x0100_01F8;
 pub const SERDES_LANE_BASE: u32 = 0x0100_2400;
 pub const SERDES_LANE_END: u32 = 0x0100_2A00;
 
+/// Fatal Error Status / Mask — split register at the same address.
+/// Write = FATAL_ERROR_MASK (bits to mask out of fatal detection).
+/// Read  = FATAL_ERROR_STATUS (current fatal error state, 0 = none).
+/// hwregs block 62 (mask, W) + block 5601 (status, R).
+const REG_FATAL_ERROR_STATUS_MASK: u32 = 0x0100_2804;
+
 /// Lane Mode Controller window.
 pub const SERDES_MODE_BASE: u32 = 0x0100_2D00;
 pub const SERDES_MODE_END: u32 = 0x0100_2D40;
@@ -288,6 +294,9 @@ impl Peripheral for SerDes {
             return Ok((b0 << 24) | (b1 << 16) | (b2 << 8) | b3);
         }
         if (SERDES_LANE_BASE..SERDES_LANE_END).contains(&addr) {
+            if addr == REG_FATAL_ERROR_STATUS_MASK {
+                return Ok(0);
+            }
             let idx = Self::lane_idx(addr);
             let mut val = self.lane_store[idx];
             if self.cmd_pending_clear.remove(&addr) {
@@ -316,6 +325,9 @@ impl Peripheral for SerDes {
             return Ok(());
         }
         if (SERDES_LANE_BASE..SERDES_LANE_END).contains(&addr) {
+            if addr == REG_FATAL_ERROR_STATUS_MASK {
+                return Ok(());
+            }
             let idx = Self::lane_idx(addr);
             self.lane_store[idx] = val;
             if Self::is_cmd_bit_register(addr) && (val & 0x8000_0000) != 0 {
