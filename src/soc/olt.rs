@@ -264,7 +264,7 @@ pub struct Olt {
     pub mailbox_fifo: VecDeque<u32>,
     /// Frames waiting to be loaded into the mailbox when the firmware
     /// issues a read command. Each entry: (word_index, encoded words).
-    mailbox_pending: VecDeque<(u8, Vec<u32>)>,
+    pub mailbox_pending: VecDeque<(u8, Vec<u32>)>,
 
     pub trace: bool,
 }
@@ -430,22 +430,18 @@ impl Olt {
         let offset = addr.wrapping_sub(CMD_STATUS_BASE);
         if offset % MAILBOX_STRIDE != 0 { return false; }
         if val & 0x400000 != 0 {
-            // Read command — load the next pending frame into the FIFO
-            let wi = (offset / MAILBOX_STRIDE) as u8;
-            if let Some(pos) = self.mailbox_pending.iter().position(|(w, _)| *w == wi) {
-                let (_, words) = self.mailbox_pending.remove(pos).unwrap();
+            // Read command — load the next pending frame into the FIFO.
+            // Accept from ANY word_index since we broadcast the bitmap.
+            if let Some((_, words)) = self.mailbox_pending.pop_front() {
                 self.mailbox_fifo.clear();
                 self.mailbox_fifo.extend(words);
-                // Clear bitmap bit if no more pending frames for this word_index
-                if !self.mailbox_pending.iter().any(|(w, _)| *w == wi) {
-                    let wiu = wi as usize;
-                    if wiu < self.mailbox_bitmap.len() {
-                        self.mailbox_bitmap[wiu] = 0;
-                    }
+                // Clear all bitmaps if no more pending frames
+                if self.mailbox_pending.is_empty() {
+                    self.mailbox_bitmap = [0; 8];
                 }
                 if self.trace {
-                    eprintln!("[OLT] mailbox: loaded {} words for word_index {}",
-                        self.mailbox_fifo.len(), wi);
+                    eprintln!("[OLT] mailbox: loaded {} words (cmd @ +0x{:X})",
+                        self.mailbox_fifo.len(), offset);
                 }
                 return true;
             }

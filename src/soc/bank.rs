@@ -304,18 +304,23 @@ impl PeripheralBank {
         self.nco.tick(cpu_instructions);
         self.vlan_lue.tick(cpu_instructions);
         self.olt.tick(cpu_instructions);
-        // Drain OLT RX frames into the mailbox engine (word_index=1 is
-        // the primary RX queue based on Phase 2b fuzzer results).
-        self.olt.load_frames_into_mailbox(1);
-        // Sync the OLT bitmap into the epon_mac LLID backing store so
-        // the firmware's epon_llid_bitmap_check sees the frames. The
-        // bitmap lives at BITMAP_BASE + word_idx * 0x200 which falls
-        // inside the epon_mac's LLID address range.
-        for wi in 0..8u32 {
-            let bmp = self.olt.mailbox_bitmap[wi as usize];
-            let addr = 0x0100_1438 + wi * 0x200;
-            if addr < 0x0100_2000 {
-                self.epon_mac.poke_llid_store(addr, bmp);
+        // Drain OLT RX frames into the mailbox engine. We load into
+        // word_index=0 (bitmap at 0x01001438) since that's the most
+        // common queue. The frames are also available from any
+        // word_index via the CMD/STATUS FIFO intercept.
+        self.olt.load_frames_into_mailbox(0);
+        // Sync OLT bitmaps into the epon_mac LLID backing store.
+        // Also broadcast the bitmap across ALL word_indices so the
+        // firmware sees frames regardless of which queue pin it uses.
+        if self.olt.config.enabled {
+            let has_frames = !self.olt.mailbox_pending.is_empty()
+                || !self.olt.mailbox_fifo.is_empty();
+            let bmp = if has_frames { 0xFFFF_FFFFu32 } else { 0 };
+            for wi in 0..6u32 {
+                let addr = 0x0100_1438 + wi * 0x200;
+                if addr < 0x0100_2000 {
+                    self.epon_mac.poke_llid_store(addr, bmp);
+                }
             }
         }
         self.sysreg.tick(cpu_instructions);
