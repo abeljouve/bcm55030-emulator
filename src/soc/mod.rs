@@ -26,6 +26,7 @@ pub mod mpcp;
 pub mod nco;
 pub mod pbc;
 pub mod peripheral;
+pub mod scenario;
 pub mod serdes;
 pub mod sfp_eeprom;
 pub mod spi_flash;

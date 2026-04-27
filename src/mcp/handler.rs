@@ -220,6 +220,53 @@ pub struct DumpMmioTraceResult {
     pub entries: Vec<MmioTraceEntryJson>,
 }
 
+// ---------- Scenario override DTOs (Phase 1) -----------------------------
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SetMmioOverrideParams {
+    /// MMIO address (word-aligned).
+    pub address: u32,
+    /// Value to return on read (for `static` / `oneshot` modes) or
+    /// bitmask of bits to suppress on write (`mask` mode).
+    pub value: u32,
+    /// `"static"` (default), `"oneshot"`, or `"mask"`.
+    #[serde(default = "default_override_mode")]
+    pub mode: String,
+    /// For `oneshot` mode: number of reads before the override expires.
+    #[serde(default = "default_oneshot_count")]
+    pub count: u32,
+    /// Optional human-readable label shown in `list_mmio_overrides`.
+    pub label: Option<String>,
+}
+
+fn default_override_mode() -> String {
+    "static".to_string()
+}
+
+fn default_oneshot_count() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RemoveMmioOverrideParams {
+    pub address: u32,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct MmioOverrideEntry {
+    pub address: u32,
+    pub mode: String,
+    pub value: u32,
+    pub remaining: Option<u32>,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ListMmioOverridesResult {
+    pub count: usize,
+    pub overrides: Vec<MmioOverrideEntry>,
+}
+
 // ---------- Phase 5b CpuCommand DTOs -------------------------------------
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Default)]
@@ -722,6 +769,78 @@ impl EmulatorHandler {
         let ok = self.handle.bank.write().inject_event(&event);
         Json(OkResult { ok })
     }
+
+    // ---------- Scenario override tools (Phase 1) -----------------------
+
+    #[tool(
+        name = "set_mmio_override",
+        description = "Install an MMIO read/write override. Models external HW stimulus (e.g. 'the PHY drove this value on the bus'). Modes: 'static' (return `value` on every read), 'oneshot' (return `value` for `count` reads then expire), 'mask' (zero out `value` bits on writes). Override is checked BEFORE peripheral dispatch."
+    )]
+    async fn set_mmio_override(
+        &self,
+        Parameters(params): Parameters<SetMmioOverrideParams>,
+    ) -> Json<OkResult> {
+        use crate::soc::scenario::OverrideSpec;
+        let spec = match params.mode.as_str() {
+            "static" => OverrideSpec::StaticRead { value: params.value },
+            "oneshot" => OverrideSpec::OneShotRead {
+                value: params.value,
+                remaining: params.count,
+            },
+            "mask" => OverrideSpec::MaskedWriteIgnore { mask: params.value },
+            _ => return Json(OkResult { ok: false }),
+        };
+        self.handle.bank.write().overrides.set(params.address, spec, params.label);
+        Json(OkResult { ok: true })
+    }
+
+    #[tool(
+        name = "remove_mmio_override",
+        description = "Remove a previously installed MMIO override by address."
+    )]
+    async fn remove_mmio_override(
+        &self,
+        Parameters(params): Parameters<RemoveMmioOverrideParams>,
+    ) -> Json<OkResult> {
+        let ok = self.handle.bank.write().overrides.remove(params.address);
+        Json(OkResult { ok })
+    }
+
+    #[tool(
+        name = "list_mmio_overrides",
+        description = "List all active MMIO overrides."
+    )]
+    async fn list_mmio_overrides(&self) -> Json<ListMmioOverridesResult> {
+        let guard = self.handle.bank.read();
+        let mut overrides: Vec<MmioOverrideEntry> = guard
+            .overrides
+            .iter()
+            .map(|(addr, ov)| {
+                use crate::soc::scenario::OverrideSpec;
+                let (mode, value, remaining) = match &ov.spec {
+                    OverrideSpec::StaticRead { value } => ("static", *value, None),
+                    OverrideSpec::OneShotRead { value, remaining } => {
+                        ("oneshot", *value, Some(*remaining))
+                    }
+                    OverrideSpec::MaskedWriteIgnore { mask } => ("mask", *mask, None),
+                };
+                MmioOverrideEntry {
+                    address: addr,
+                    mode: mode.to_string(),
+                    value,
+                    remaining,
+                    label: ov.label.clone(),
+                }
+            })
+            .collect();
+        overrides.sort_by_key(|e| e.address);
+        Json(ListMmioOverridesResult {
+            count: overrides.len(),
+            overrides,
+        })
+    }
+
+    // ---------- MMIO trace tools -----------------------------------------
 
     #[tool(
         name = "dump_mmio_trace",
@@ -1303,6 +1422,8 @@ fn is_mutation_tool(name: &str) -> bool {
             | "dump_flash_to_file"
             | "add_symbol"
             | "add_comment"
+            | "set_mmio_override"
+            | "remove_mmio_override"
     )
 }
 

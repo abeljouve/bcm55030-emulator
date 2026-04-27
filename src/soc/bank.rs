@@ -30,6 +30,7 @@ use crate::soc::pbc::Pbc;
 use crate::soc::peripheral::{
     DatapathOp, Peripheral, PeripheralEvent, PeripheralId, PeripheralSnapshot,
 };
+use crate::soc::scenario::MmioOverrideRegistry;
 use crate::soc::serdes::SerDes;
 use crate::soc::sysreg_shim::SysregShim;
 use crate::soc::timer::EponTimer;
@@ -127,6 +128,11 @@ pub struct PeripheralBank {
     pub nco: Nco,
     pub vlan_lue: VlanLue,
 
+    /// MMIO override registry for scenario programming.  Overrides are
+    /// checked BEFORE the peripheral dispatch chain — they model external
+    /// HW stimulus, not firmware hooks.
+    pub overrides: MmioOverrideRegistry,
+
     /// Temporary residual-plus-legacy-arms for the SYSREG range
     /// (`0x01000000..0x01003800`). Hosts every stub that has not yet been
     /// carved into its own peripheral file — CHIP_ID, LLID IRQ forced 0,
@@ -198,6 +204,7 @@ impl PeripheralBank {
             mpcp: Mpcp::new(),
             nco: Nco::new(),
             vlan_lue: VlanLue::new(),
+            overrides: MmioOverrideRegistry::new(),
             sysreg: SysregShim::new(),
             uart_rx_sender: tx,
             uart_rx_receiver: Mutex::new(rx),
@@ -406,6 +413,11 @@ impl PeripheralBank {
     /// default (`Ok(0)`) when no override exists — each peripheral
     /// adds real peek support incrementally.
     pub fn peek_word(&self, addr: u32) -> Result<u32, Exception> {
+        if !self.overrides.is_empty() {
+            if let Some(v) = self.overrides.peek_read(addr) {
+                return Ok(v);
+            }
+        }
         if self.uart.claims(addr) {
             return self.uart.peek_word(addr);
         }
@@ -450,6 +462,12 @@ impl PeripheralBank {
     }
 
     pub fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
+        if !self.overrides.is_empty() {
+            if let Some(v) = self.overrides.try_read(addr) {
+                self.seq_emit(addr, v, "r", "word", "override");
+                return Ok(v);
+            }
+        }
         macro_rules! dispatch_rw {
             ($periph:expr, $name:expr) => {{
                 let v = $periph.read_word(addr)?;
@@ -486,6 +504,16 @@ impl PeripheralBank {
     }
 
     pub fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
+        let val = if !self.overrides.is_empty() {
+            if let Some(masked) = self.overrides.filter_write(addr, val) {
+                self.seq_emit(addr, masked, "w", "word", "override-mask");
+                masked
+            } else {
+                val
+            }
+        } else {
+            val
+        };
         macro_rules! dispatch_ww {
             ($periph:expr, $name:expr) => {{
                 $periph.write_word(addr, val)?;
