@@ -2,11 +2,7 @@
 //!
 //! Spawns the integrated rmcp + axum server on an ephemeral port,
 //! connects an in-process rmcp client to it, and drives every
-//! read-only tool shipped in phase 4. Gated behind the `mcp`
-//! cargo feature so the default build stays free of the rmcp /
-//! axum / tokio dep tree.
-
-#![cfg(feature = "mcp")]
+//! read-only tool shipped in phase 4.
 
 use std::sync::mpsc;
 use std::sync::Arc;
