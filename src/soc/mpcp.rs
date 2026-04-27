@@ -66,6 +66,7 @@ const MPCP_RANGES: &[AddressRange] = &[
     AddressRange::new(0x0100_1268, 0x0100_1390),
 ];
 
+#[derive(Clone)]
 pub struct Mpcp {
     stores: [Vec<u32>; REGION_COUNT],
     pub trace: bool,

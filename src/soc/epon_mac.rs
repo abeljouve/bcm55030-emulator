@@ -120,6 +120,7 @@ const LLID_ANCHOR_ADDRS: [u32; 4] = [
 /// The sparse core claim set is narrow by construction, so nothing
 /// needs excluding there either.
 
+#[derive(Clone)]
 pub struct EponMac {
     /// Backing store for every EPON-owned word. Indexed by
     /// `store_index(addr)` — sparse registers get a dedicated slot,

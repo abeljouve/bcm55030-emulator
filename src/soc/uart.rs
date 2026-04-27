@@ -37,6 +37,7 @@ const TX_LOG_CAPACITY: usize = 16 * 1024;
 
 const UART_RANGES: &[AddressRange] = &[AddressRange::new(UART_RANGE_START, UART_RANGE_END)];
 
+#[derive(Clone)]
 pub struct Uart {
     ier: u8,
     baud_div_lo: u8,

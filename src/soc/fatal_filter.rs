@@ -37,6 +37,7 @@ const REG_FILTER_IRQ: u32 = 0x0100_3610;
 const FATAL_FILTER_RANGES: &[AddressRange] =
     &[AddressRange::new(FATAL_FILTER_BASE, FATAL_FILTER_END)];
 
+#[derive(Clone)]
 pub struct FatalFilter {
     fatal_status: u32,
     filter_status: u32,

@@ -74,6 +74,7 @@ const CMD_BIT_MASK: u32 = 0xF800_0000;
 
 const DMA_RANGES: &[AddressRange] = &[AddressRange::new(DMA_BASE, DMA_END)];
 
+#[derive(Clone)]
 pub struct DmaChannelController {
     store: Vec<u32>,
     pending_clear: Vec<u32>,

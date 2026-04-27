@@ -788,6 +788,64 @@ pub struct SymbolsResult {
     pub symbols: HashMap<String, String>,
 }
 
+// ── Named snapshot DTOs ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SaveSnapshotParams {
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SaveSnapshotResult {
+    pub ok: bool,
+    pub name: String,
+    pub instruction_count: u64,
+    pub pc: HexValue,
+    pub timestamp: String,
+    pub size_bytes: usize,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RestoreSnapshotParams {
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RestoreSnapshotResult {
+    pub ok: bool,
+    pub name: String,
+    pub instruction_count: u64,
+    pub pc: HexValue,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SnapshotInfoJson {
+    pub name: String,
+    pub instruction_count: u64,
+    pub pc: HexValue,
+    pub timestamp: String,
+    pub size_bytes: usize,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ListSnapshotsResult {
+    pub count: usize,
+    pub snapshots: Vec<SnapshotInfoJson>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DeleteSnapshotParams {
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DeleteSnapshotResult {
+    pub ok: bool,
+    pub name: String,
+}
+
 // ---------- Tool implementations -----------------------------------------
 
 #[tool_router]
@@ -2072,6 +2130,202 @@ impl EmulatorHandler {
         })
     }
 
+    // ── Named snapshots ──────────────────────────────────────────────
+
+    #[tool(
+        name = "save_snapshot",
+        description = "Save a named snapshot of the entire emulator state (CPU, SRAM, caches, peripherals, scenario). Can be restored later via `restore_snapshot`."
+    )]
+    async fn save_snapshot(
+        &self,
+        Parameters(params): Parameters<SaveSnapshotParams>,
+    ) -> Json<SaveSnapshotResult> {
+        let (tx, rx) = oneshot();
+        if self
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::SaveSnapshot {
+                name: params.name.clone(),
+                response: tx,
+            })
+            .is_err()
+        {
+            return Json(SaveSnapshotResult {
+                ok: false,
+                name: params.name,
+                instruction_count: 0,
+                pc: HexValue(0),
+                timestamp: String::new(),
+                size_bytes: 0,
+                error: Some("cpu_cmd channel closed".into()),
+            });
+        }
+        let result = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(Duration::from_secs(10))
+        })
+        .await
+        .unwrap_or(Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        match result {
+            Ok(Ok(info)) => Json(SaveSnapshotResult {
+                ok: true,
+                name: info.name,
+                instruction_count: info.instruction_count,
+                pc: HexValue(info.pc),
+                timestamp: info.timestamp,
+                size_bytes: info.size_bytes,
+                error: None,
+            }),
+            Ok(Err(e)) => Json(SaveSnapshotResult {
+                ok: false,
+                name: params.name,
+                instruction_count: 0,
+                pc: HexValue(0),
+                timestamp: String::new(),
+                size_bytes: 0,
+                error: Some(e),
+            }),
+            Err(_) => Json(SaveSnapshotResult {
+                ok: false,
+                name: params.name,
+                instruction_count: 0,
+                pc: HexValue(0),
+                timestamp: String::new(),
+                size_bytes: 0,
+                error: Some("timeout".into()),
+            }),
+        }
+    }
+
+    #[tool(
+        name = "restore_snapshot",
+        description = "Restore a previously saved named snapshot. CPU is paused after restore. SRAM, peripheral registers, and scenario state are rolled back."
+    )]
+    async fn restore_snapshot(
+        &self,
+        Parameters(params): Parameters<RestoreSnapshotParams>,
+    ) -> Json<RestoreSnapshotResult> {
+        let (tx, rx) = oneshot();
+        if self
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::RestoreSnapshot {
+                name: params.name.clone(),
+                response: tx,
+            })
+            .is_err()
+        {
+            return Json(RestoreSnapshotResult {
+                ok: false,
+                name: params.name,
+                instruction_count: 0,
+                pc: HexValue(0),
+                error: Some("cpu_cmd channel closed".into()),
+            });
+        }
+        let result = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(Duration::from_secs(10))
+        })
+        .await
+        .unwrap_or(Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        match result {
+            Ok(Ok(info)) => Json(RestoreSnapshotResult {
+                ok: true,
+                name: info.name,
+                instruction_count: info.instruction_count,
+                pc: HexValue(info.pc),
+                error: None,
+            }),
+            Ok(Err(e)) => Json(RestoreSnapshotResult {
+                ok: false,
+                name: params.name,
+                instruction_count: 0,
+                pc: HexValue(0),
+                error: Some(e),
+            }),
+            Err(_) => Json(RestoreSnapshotResult {
+                ok: false,
+                name: params.name,
+                instruction_count: 0,
+                pc: HexValue(0),
+                error: Some("timeout".into()),
+            }),
+        }
+    }
+
+    #[tool(
+        name = "list_snapshots",
+        description = "List all named snapshots currently held in memory."
+    )]
+    async fn list_snapshots(&self) -> Json<ListSnapshotsResult> {
+        let (tx, rx) = oneshot();
+        if self
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::ListSnapshots { response: tx })
+            .is_err()
+        {
+            return Json(ListSnapshotsResult {
+                count: 0,
+                snapshots: Vec::new(),
+            });
+        }
+        let list = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(Duration::from_secs(5))
+        })
+        .await
+        .unwrap_or(Err(std::sync::mpsc::RecvTimeoutError::Timeout))
+        .unwrap_or_default();
+        let mapped: Vec<SnapshotInfoJson> = list
+            .into_iter()
+            .map(|s| SnapshotInfoJson {
+                name: s.name,
+                instruction_count: s.instruction_count,
+                pc: HexValue(s.pc),
+                timestamp: s.timestamp,
+                size_bytes: s.size_bytes,
+            })
+            .collect();
+        Json(ListSnapshotsResult {
+            count: mapped.len(),
+            snapshots: mapped,
+        })
+    }
+
+    #[tool(
+        name = "delete_snapshot",
+        description = "Delete a named snapshot from memory."
+    )]
+    async fn delete_snapshot(
+        &self,
+        Parameters(params): Parameters<DeleteSnapshotParams>,
+    ) -> Json<DeleteSnapshotResult> {
+        let (tx, rx) = oneshot();
+        if self
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::DeleteSnapshot {
+                name: params.name.clone(),
+                response: tx,
+            })
+            .is_err()
+        {
+            return Json(DeleteSnapshotResult {
+                ok: false,
+                name: params.name,
+            });
+        }
+        let existed = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(Duration::from_secs(5))
+        })
+        .await
+        .unwrap_or(Err(std::sync::mpsc::RecvTimeoutError::Timeout))
+        .unwrap_or(false);
+        Json(DeleteSnapshotResult {
+            ok: existed,
+            name: params.name,
+        })
+    }
+
     #[tool(
         name = "read_mmio",
         description = "Side-effectful MMIO read. Unlike `peek_mmio` this triggers FIFO pops, IRQ latch clears, and busy-bit transitions. Use `peek_mmio` for the inspector."
@@ -2245,6 +2499,9 @@ fn is_mutation_tool(name: &str) -> bool {
             | "clear_mmio_history"
             | "reset_coverage"
             | "set_profiling"
+            | "save_snapshot"
+            | "restore_snapshot"
+            | "delete_snapshot"
     )
 }
 

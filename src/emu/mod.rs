@@ -22,6 +22,7 @@ pub mod command;
 pub mod cpu_worker;
 pub mod event_log;
 pub mod handle;
+pub mod named_snapshot;
 #[cfg(feature = "ui")]
 pub mod session;
 pub mod snapshot;

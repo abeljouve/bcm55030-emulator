@@ -511,6 +511,50 @@ impl PeripheralBank {
         None
     }
 
+    pub fn capture_for_snapshot(&self) -> crate::emu::named_snapshot::PeripheralBankSaveState {
+        crate::emu::named_snapshot::PeripheralBankSaveState {
+            uart: self.uart.clone(),
+            pbc: self.pbc.clone(),
+            bsc_i2c: self.bsc_i2c.clone(),
+            serdes: self.serdes.clone(),
+            epon_mac: self.epon_mac.clone(),
+            macsec: self.macsec.clone(),
+            dma: self.dma.clone(),
+            alarm_events: self.alarm_events.clone(),
+            timer: self.timer.clone(),
+            efuse_udr: self.efuse_udr.clone(),
+            fatal_filter: self.fatal_filter.clone(),
+            mpcp: self.mpcp.clone(),
+            nco: self.nco.clone(),
+            vlan_lue: self.vlan_lue.clone(),
+            scenario: self.scenario.clone(),
+            sysreg: self.sysreg.clone(),
+        }
+    }
+
+    pub fn restore_from_snapshot(&mut self, state: crate::emu::named_snapshot::PeripheralBankSaveState) {
+        self.uart = state.uart;
+        self.pbc = state.pbc;
+        self.bsc_i2c = state.bsc_i2c;
+        self.serdes = state.serdes;
+        self.epon_mac = state.epon_mac;
+        self.macsec = state.macsec;
+        self.dma = state.dma;
+        self.alarm_events = state.alarm_events;
+        self.timer = state.timer;
+        self.efuse_udr = state.efuse_udr;
+        self.fatal_filter = state.fatal_filter;
+        self.mpcp = state.mpcp;
+        self.nco = state.nco;
+        self.vlan_lue = state.vlan_lue;
+        self.scenario = state.scenario;
+        self.sysreg = state.sysreg;
+        self.irq_pending = 0;
+        self.current_pc = 0;
+        self.current_blink = 0;
+        self.current_insn = 0;
+    }
+
     // -------- MMIO routing --------
 
     /// Side-effect-free probe of `addr`, used by the MCP

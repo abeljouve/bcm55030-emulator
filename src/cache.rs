@@ -70,6 +70,16 @@ pub struct DCache {
     ram_addr: u32,
 }
 
+pub struct DcacheSaveState {
+    lines: Box<[[CacheLine; NUM_WAYS]; NUM_SETS]>,
+    next_way: Box<[u8; NUM_SETS]>,
+    enabled: bool,
+    im: bool,
+    lm: bool,
+    ctrl_raw: u32,
+    ram_addr: u32,
+}
+
 impl DCache {
     /// Create a new D-cache matching BCM55030 reset state (DC_CTRL = 0xC2).
     pub fn new() -> Self {
@@ -311,6 +321,28 @@ impl DCache {
             0
         }
     }
+
+    pub fn save_state(&self) -> DcacheSaveState {
+        DcacheSaveState {
+            lines: self.lines.clone(),
+            next_way: self.next_way.clone(),
+            enabled: self.enabled,
+            im: self.im,
+            lm: self.lm,
+            ctrl_raw: self.ctrl_raw,
+            ram_addr: self.ram_addr,
+        }
+    }
+
+    pub fn restore_state(&mut self, state: DcacheSaveState) {
+        self.lines = state.lines;
+        self.next_way = state.next_way;
+        self.enabled = state.enabled;
+        self.im = state.im;
+        self.lm = state.lm;
+        self.ctrl_raw = state.ctrl_raw;
+        self.ram_addr = state.ram_addr;
+    }
 }
 
 // BCM55030 I-cache: 4 KB, 1-way direct, 128 sets, 32 B lines.
@@ -341,6 +373,11 @@ impl ICacheLine {
 
 pub struct ICache {
     // 4 KB: 128 sets × 1 way. Box to keep the struct off the stack.
+    lines: Box<[ICacheLine; IC_NUM_SETS]>,
+    enabled: bool,
+}
+
+pub struct IcacheSaveState {
     lines: Box<[ICacheLine; IC_NUM_SETS]>,
     enabled: bool,
 }
@@ -425,6 +462,18 @@ impl ICache {
     /// so we model it as a no-op to match hardware.
     pub fn invalidate_line(&mut self, addr: u32) {
         let _ = addr;
+    }
+
+    pub fn save_state(&self) -> IcacheSaveState {
+        IcacheSaveState {
+            lines: self.lines.clone(),
+            enabled: self.enabled,
+        }
+    }
+
+    pub fn restore_state(&mut self, state: IcacheSaveState) {
+        self.lines = state.lines;
+        self.enabled = state.enabled;
     }
 }
 

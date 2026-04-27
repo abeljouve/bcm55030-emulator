@@ -45,6 +45,7 @@ enum BusState {
     Done,
 }
 
+#[derive(Clone)]
 pub struct BscI2c {
     pub sfp: SfpEeprom,
     state: BusState,

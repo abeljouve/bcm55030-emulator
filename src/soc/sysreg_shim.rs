@@ -38,6 +38,7 @@ pub struct ShimTraceEntry {
     pub first_insn: u64,
 }
 
+#[derive(Clone)]
 pub struct SysregShim {
     pub trace: bool,
     sysreg_store: Vec<u32>,

@@ -75,6 +75,7 @@ const MACSEC_SA_RANGES: &[AddressRange] = &[
     AddressRange::new(MACSEC_KEY_TAIL_BASE, MACSEC_KEY_TAIL_END),
 ];
 
+#[derive(Clone)]
 pub struct Macsec {
     sa_store: Vec<u32>,
     sa_pending_clear: Vec<u32>,

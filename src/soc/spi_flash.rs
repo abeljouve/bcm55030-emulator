@@ -28,6 +28,7 @@ const JEDEC_MEMORY_TYPE: u8 = 0x20;
 const JEDEC_CAPACITY: u8 = 0x16;
 const DEVICE_ID: u8 = 0x15;
 
+#[derive(Clone)]
 pub struct SpiFlash {
     pub data: Vec<u8>,
     status: u8,

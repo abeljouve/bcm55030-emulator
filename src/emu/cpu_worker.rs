@@ -3,12 +3,14 @@
 //! three triggers: 16 ms wall-clock elapsed, state transitions, or
 //! explicit `Snapshot` / request commands.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use crate::cpu::registers::PauseReason;
 use crate::cpu::Cpu;
 use crate::emu::command::{CpuCommand, OneshotSender, SpeedLimit};
+use crate::emu::named_snapshot::{NamedSnapshot, SnapshotInfo};
 use crate::emu::handle::EmulatorHandle;
 use crate::emu::snapshot::{
     CpuSnapshot, DcacheSnapshot, EmulatorSnapshot, RunState, SramSnapshot,
@@ -67,6 +69,8 @@ struct Worker {
     /// saturates at `u32::MAX`. 512 KB SRAM / 2 = 256 Ki slots
     /// = 1 MB of u32s; small enough to carry on the worker.
     coverage: Vec<u32>,
+
+    snapshots: HashMap<String, NamedSnapshot>,
 }
 
 /// Run the worker loop until a `Shutdown` command arrives or all
@@ -91,6 +95,7 @@ pub fn run(cpu: Cpu, handle: EmulatorHandle, rx: Receiver<CpuCommand>, reset_fn:
         throttle_window_start: now,
         throttle_window_insns: 0,
         coverage: vec![0u32; crate::memory::SRAM_SIZE / 2],
+        snapshots: HashMap::new(),
     };
     w.publish_snapshot();
     w.main_loop();
@@ -371,6 +376,35 @@ impl Worker {
                     self.cpu.function_profile.clear();
                 }
             }
+            CpuCommand::SaveSnapshot { name, response } => {
+                let result = self.save_named_snapshot(&name);
+                let _ = response.send(result);
+            }
+            CpuCommand::RestoreSnapshot { name, response } => {
+                let result = self.restore_named_snapshot(&name);
+                if result.is_ok() {
+                    self.publish_snapshot();
+                }
+                let _ = response.send(result);
+            }
+            CpuCommand::ListSnapshots { response } => {
+                let list: Vec<SnapshotInfo> = self
+                    .snapshots
+                    .values()
+                    .map(|s| SnapshotInfo {
+                        name: s.name.clone(),
+                        instruction_count: s.instruction_count,
+                        pc: s.pc,
+                        timestamp: s.timestamp.clone(),
+                        size_bytes: s.size_bytes(),
+                    })
+                    .collect();
+                let _ = response.send(list);
+            }
+            CpuCommand::DeleteSnapshot { name, response } => {
+                let existed = self.snapshots.remove(&name).is_some();
+                let _ = response.send(existed);
+            }
             CpuCommand::Shutdown => {
                 self.running = false;
                 self.cpu.state.halted = true;
@@ -606,6 +640,91 @@ impl Worker {
         let snap = self.build_snapshot();
         *self.handle.snapshot.lock() = snap;
         self.last_publish = Instant::now();
+    }
+
+    fn save_named_snapshot(&mut self, name: &str) -> Result<SnapshotInfo, String> {
+        let sram = self.cpu.mem.sram_snapshot();
+        let (dcache, icache) = self.cpu.mem.save_cache_state();
+        let bank_state = self
+            .cpu
+            .bank()
+            .map(|b| b.read().capture_for_snapshot());
+        let now = {
+            let d = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            format!("{}s", d.as_secs())
+        };
+
+        let snap = NamedSnapshot {
+            name: name.to_string(),
+            timestamp: now.clone(),
+            instruction_count: self.cpu.state.instruction_count,
+            pc: self.cpu.state.pc,
+            cpu_state: self.cpu.state.clone(),
+            sram,
+            dcache,
+            icache,
+            bank_state,
+            timer_frac_acc: self.cpu.timer_frac_acc,
+            bank_tick_accumulator: self.cpu.bank_tick_accumulator,
+            shadow_call_stack: self.cpu.shadow_call_stack.clone(),
+            function_profile: self.cpu.function_profile.clone(),
+            profiling_enabled: self.cpu.profiling_enabled,
+        };
+
+        let info = SnapshotInfo {
+            name: name.to_string(),
+            instruction_count: snap.instruction_count,
+            pc: snap.pc,
+            timestamp: now,
+            size_bytes: snap.size_bytes(),
+        };
+
+        self.snapshots.insert(name.to_string(), snap);
+        Ok(info)
+    }
+
+    fn restore_named_snapshot(&mut self, name: &str) -> Result<SnapshotInfo, String> {
+        let snap = self
+            .snapshots
+            .get(name)
+            .ok_or_else(|| format!("snapshot '{}' not found", name))?;
+
+        let info = SnapshotInfo {
+            name: name.to_string(),
+            instruction_count: snap.instruction_count,
+            pc: snap.pc,
+            timestamp: snap.timestamp.clone(),
+            size_bytes: snap.size_bytes(),
+        };
+
+        self.cpu.state = snap.cpu_state.clone();
+        self.cpu.mem.restore_sram(&snap.sram);
+
+        // Invalidate both caches — SRAM already has correct data, the
+        // firmware re-warms caches naturally. Avoids cloning boxed cache
+        // arrays through private fields.
+        let _ = self.cpu.mem.dcache_invalidate_all();
+        self.cpu.mem.icache_invalidate_all();
+
+        if let Some(ref bank_state) = snap.bank_state {
+            if let Some(bank) = self.cpu.bank() {
+                bank.write().restore_from_snapshot(bank_state.clone());
+            }
+        }
+
+        self.cpu.timer_frac_acc = snap.timer_frac_acc;
+        self.cpu.bank_tick_accumulator = snap.bank_tick_accumulator;
+        self.cpu.shadow_call_stack = snap.shadow_call_stack.clone();
+        self.cpu.function_profile = snap.function_profile.clone();
+        self.cpu.profiling_enabled = snap.profiling_enabled;
+
+        self.running = false;
+        self.cpu.state.paused = true;
+        self.cpu.state.pause_reason = PauseReason::UserPause;
+
+        Ok(info)
     }
 }
 

@@ -25,6 +25,7 @@ pub const REG_NCO_TX_MODE: u32 = 0x0100_0F80;
 const NCO_RANGES: &[AddressRange] =
     &[AddressRange::new(REG_NCO_TX_MODE, REG_NCO_TX_MODE + 4)];
 
+#[derive(Clone)]
 pub struct Nco {
     tx_mode: u32,
     pub trace: bool,

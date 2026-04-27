@@ -26,6 +26,7 @@ const TIMER_RANGES: &[AddressRange] = &[AddressRange::new(
     REG_EPON_FREE_COUNTER + 4,
 )];
 
+#[derive(Clone)]
 pub struct EponTimer {
     counter: u32,
     tick_accumulator: u32,

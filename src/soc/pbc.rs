@@ -38,6 +38,7 @@ const PBC_RANGES: &[AddressRange] = &[AddressRange::new(PBC_BASE, PBC_END)];
 /// firmware polling loop must see `busy=1` at least once.
 const SPI_BUSY_TICKS: u8 = 2;
 
+#[derive(Clone)]
 pub struct Pbc {
     pub flash: SpiFlash,
     pub trace: bool,

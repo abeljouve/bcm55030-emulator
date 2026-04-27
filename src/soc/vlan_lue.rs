@@ -34,6 +34,7 @@ struct TableEntry {
     data0: u32,
 }
 
+#[derive(Clone)]
 pub struct VlanLue {
     vlan_ctrl: u32,
     custom_ethertype: u32,

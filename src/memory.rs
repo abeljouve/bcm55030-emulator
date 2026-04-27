@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::cache::{DCache, DCacheLineInfo, ICache, IC_LINE_SIZE};
+use crate::cache::{DCache, DCacheLineInfo, DcacheSaveState, ICache, IcacheSaveState, IC_LINE_SIZE};
 use crate::cpu::exception::Exception;
 use crate::soc::bank::{BootMode, PeripheralBank};
 use crate::soc::peripheral::DatapathOp;
@@ -215,6 +215,30 @@ impl Memory {
     /// disassembly-panel SRAM view on demand.
     pub fn sram_snapshot(&self) -> Vec<u8> {
         self.data.clone()
+    }
+
+    pub fn restore_sram(&mut self, data: &[u8]) {
+        let len = data.len().min(self.data.len());
+        self.data[..len].copy_from_slice(&data[..len]);
+    }
+
+    pub fn save_cache_state(&self) -> (Option<DcacheSaveState>, Option<IcacheSaveState>) {
+        let dc = self.dcache.as_ref().map(|dc| dc.save_state());
+        let ic = self.icache.as_ref().map(|ic| ic.borrow().save_state());
+        (dc, ic)
+    }
+
+    pub fn restore_cache_state(
+        &mut self,
+        dc: Option<DcacheSaveState>,
+        ic: Option<IcacheSaveState>,
+    ) {
+        if let (Some(ref mut cache), Some(state)) = (&mut self.dcache, dc) {
+            cache.restore_state(state);
+        }
+        if let (Some(ref cache_cell), Some(state)) = (&self.icache, ic) {
+            cache_cell.borrow_mut().restore_state(state);
+        }
     }
 
     /// Borrow a slice of the backing buffer without cloning. Returns

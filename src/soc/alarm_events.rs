@@ -44,6 +44,7 @@ use crate::soc::peripheral::{
 /// working set without wasting snapshot bandwidth.
 pub const FORCED_OPCODE_CAPACITY: usize = 64;
 
+#[derive(Clone)]
 pub struct AlarmEvents {
     forced: Vec<u16>,
     pub trace: bool,

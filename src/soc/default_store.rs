@@ -31,6 +31,7 @@ pub struct ResidualTraceEntry {
 
 /// Dumb register store for an MMIO range. Used as the default fallback
 /// when no peripheral claims an address inside its covered window.
+#[derive(Clone)]
 pub struct DefaultRegisterStore {
     /// Covered range. All accesses must fall inside; the bank guarantees
     /// this by only routing unclaimed addresses here.

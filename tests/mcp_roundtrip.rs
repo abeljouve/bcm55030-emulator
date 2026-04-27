@@ -604,6 +604,98 @@ async fn mcp_roundtrip_cpu_command_tools() {
     let text = render_result(&res);
     assert!(text.contains("\"ok\":true"), "reset_coverage: {}", text);
 
+    // 13. Named snapshots: save, modify, restore, verify rollback.
+    // Set r0 to a known value before saving.
+    let args = serde_json::json!({ "name": "r0", "value": 0xDEADBEEFu32 })
+        .as_object()
+        .unwrap()
+        .clone();
+    client
+        .call_tool(CallToolRequestParams::new("write_register").with_arguments(args))
+        .await
+        .expect("write_register pre-save");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let args = serde_json::json!({ "name": "test-snap" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let res = client
+        .call_tool(CallToolRequestParams::new("save_snapshot").with_arguments(args))
+        .await
+        .expect("save_snapshot");
+    let text = render_result(&res);
+    assert!(text.contains("\"ok\":true"), "save_snapshot: {}", text);
+    assert!(text.contains("\"name\":\"test-snap\""), "save_snapshot name: {}", text);
+
+    // Mutate r0 after saving.
+    let args = serde_json::json!({ "name": "r0", "value": 0x11111111u32 })
+        .as_object()
+        .unwrap()
+        .clone();
+    client
+        .call_tool(CallToolRequestParams::new("write_register").with_arguments(args))
+        .await
+        .expect("write_register");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // list_snapshots shows our snapshot.
+    let res = client
+        .call_tool(CallToolRequestParams::new("list_snapshots"))
+        .await
+        .expect("list_snapshots");
+    let text = render_result(&res);
+    assert!(text.contains("\"count\":1"), "list_snapshots: {}", text);
+    assert!(text.contains("test-snap"), "list_snapshots name: {}", text);
+
+    // Restore — r0 should go back to 0xDEADBEEF.
+    let args = serde_json::json!({ "name": "test-snap" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let res = client
+        .call_tool(CallToolRequestParams::new("restore_snapshot").with_arguments(args))
+        .await
+        .expect("restore_snapshot");
+    let text = render_result(&res);
+    assert!(text.contains("\"ok\":true"), "restore_snapshot: {}", text);
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let args = serde_json::json!({ "names": ["r0"] })
+        .as_object()
+        .unwrap()
+        .clone();
+    let res = client
+        .call_tool(CallToolRequestParams::new("read_registers").with_arguments(args))
+        .await
+        .expect("read_registers r0 after restore");
+    let text = render_result(&res);
+    assert!(
+        text.contains("0xDEADBEEF"),
+        "r0 after restore should be 0xDEADBEEF: {}",
+        text
+    );
+
+    // Delete snapshot.
+    let args = serde_json::json!({ "name": "test-snap" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let res = client
+        .call_tool(CallToolRequestParams::new("delete_snapshot").with_arguments(args))
+        .await
+        .expect("delete_snapshot");
+    let text = render_result(&res);
+    assert!(text.contains("\"ok\":true"), "delete_snapshot: {}", text);
+
+    // list_snapshots now empty.
+    let res = client
+        .call_tool(CallToolRequestParams::new("list_snapshots"))
+        .await
+        .expect("list_snapshots after delete");
+    let text = render_result(&res);
+    assert!(text.contains("\"count\":0"), "list_snapshots empty: {}", text);
+
     // Clean shutdown.
     client.cancel().await.ok();
     handle

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvError, RecvTimeoutError, SendError, SyncSender};
 use std::time::Duration;
 
+use crate::emu::named_snapshot::SnapshotInfo;
 use crate::emu::snapshot::{DcacheSnapshot, EmulatorSnapshot, SramSnapshot};
 use crate::memory::WatchMode;
 use crate::soc::bank::BootMode;
@@ -174,6 +175,21 @@ pub enum CpuCommand {
     },
     SetProfiling {
         enabled: bool,
+    },
+    SaveSnapshot {
+        name: String,
+        response: OneshotSender<Result<SnapshotInfo, String>>,
+    },
+    RestoreSnapshot {
+        name: String,
+        response: OneshotSender<Result<SnapshotInfo, String>>,
+    },
+    ListSnapshots {
+        response: OneshotSender<Vec<SnapshotInfo>>,
+    },
+    DeleteSnapshot {
+        name: String,
+        response: OneshotSender<bool>,
     },
     /// Shutdown signal — the worker drops its `Cpu`, sends a last
     /// snapshot (run_state=Halted) and exits.

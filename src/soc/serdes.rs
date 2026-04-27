@@ -137,6 +137,7 @@ impl LaneState {
 /// real HW EPON timer delay of ~1024 ticks during bring-up).
 const LANE_LOCK_DELAY_TICKS: u64 = 16;
 
+#[derive(Clone)]
 pub struct SerDes {
     /// Backing store for the main MMIO window.
     raw_store: [u32; SERDES_MAIN_WORDS],

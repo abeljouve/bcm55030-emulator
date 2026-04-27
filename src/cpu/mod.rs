@@ -47,13 +47,13 @@ pub struct Cpu {
     pub profiling_enabled: bool,
     /// Fractional accumulator for ARC Timer0/1 tick rate.
     /// 156.25 MHz clock, ~1.76 cycles/instruction average.
-    timer_frac_acc: u32,
+    pub(crate) timer_frac_acc: u32,
     /// Shared peripheral bank (cloned from `mem.bank()`). Cpu holds an
     /// additional `Arc` clone so it can tick the bank without going
     /// through `Memory`'s hot path.
     bank: Option<Arc<RwLock<PeripheralBank>>>,
     /// Instructions elapsed since the last bank tick.
-    bank_tick_accumulator: u64,
+    pub(crate) bank_tick_accumulator: u64,
 }
 
 impl Cpu {

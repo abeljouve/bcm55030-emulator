@@ -44,6 +44,7 @@ const EFUSE_RANGES: &[AddressRange] = &[AddressRange::new(0x0100_0040, 0x0100_00
 /// peripheral owns its own clear semantic.
 const CMD_BIT_MASK: u32 = 0xF800_0000;
 
+#[derive(Clone)]
 pub struct EfuseUdr {
     reg_clk_reset: u32,
     reg_sda: u32,
