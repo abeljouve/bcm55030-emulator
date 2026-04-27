@@ -7,6 +7,13 @@ use std::sync::mpsc::Sender;
 use bcm55030_emulator::cpu::Cpu;
 use bcm55030_emulator::soc::bank::BootMode;
 
+#[cfg(feature = "mcp")]
+use std::sync::Arc;
+#[cfg(feature = "mcp")]
+use std::sync::mpsc;
+#[cfg(feature = "mcp")]
+use parking_lot::{Mutex, RwLock};
+
 fn usage(prog: &str) {
     eprintln!("BCM55030 ARC 700 Emulator");
     eprintln!();
@@ -27,6 +34,19 @@ fn usage(prog: &str) {
     eprintln!("  --warm-boot                 Start with SYSREG_INIT_VALUES (default)");
     eprintln!("  --dump-mmio-trace-cold <F>  Cold-boot + dump MMIO trace catalog to <F>");
     eprintln!("  --unmapped-exception        Trap unclaimed MMIO as MemoryError (audit 2.2)");
+    eprintln!("  --trace-mmio-seq <FILE>     Write per-access MMIO trace as JSON Lines to FILE");
+    eprintln!("  --trace-mmio-range S:E      Restrict --trace-mmio-seq to [S,E) (hex, repeatable)");
+    eprintln!("  --scenario <FILE>           Load a JSON scenario file at startup");
+    #[cfg(feature = "mcp")]
+    eprintln!("  --mcp-port <PORT>           Start MCP server on PORT (enables worker mode)");
+    eprintln!();
+    #[cfg(not(feature = "mcp"))]
+    {
+    eprintln!("This is the headless CLI binary. For the egui GUI with integrated MCP");
+    eprintln!("server, build and run the `arc700-gui` binary instead:");
+    eprintln!("  cargo run --release --features ui,mcp --bin arc700-gui");
+    eprintln!("Or rebuild with --features mcp for headless MCP: --mcp-port <PORT>");
+    }
 }
 
 struct Config {
@@ -46,6 +66,19 @@ struct Config {
     /// `MemoryError` exceptions instead of returning zero.
     unmapped_exception: bool,
     boot_mode: BootMode,
+    /// Path to an ELF file carrying DWARF debug info. Used to
+    /// annotate `--trace` output with source file / line.
+    debug_elf: Option<String>,
+    /// `--trace-mmio-seq <file>`: per-access sequential MMIO trace
+    /// written as JSON Lines to this path.
+    trace_mmio_seq: Option<String>,
+    /// `--trace-mmio-range start:end`: restrict `--trace-mmio-seq`
+    /// recording to accesses where `start <= addr < end`. Multiple
+    /// flags OR together.
+    trace_mmio_ranges: Vec<(u32, u32)>,
+    scenario_path: Option<String>,
+    #[cfg(feature = "mcp")]
+    mcp_port: Option<u16>,
 }
 
 fn parse_hex(s: &str) -> Option<u32> {
@@ -72,6 +105,12 @@ fn parse_args() -> Config {
         dump_mmio_trace: None,
         unmapped_exception: false,
         boot_mode: BootMode::Warm,
+        debug_elf: None,
+        trace_mmio_seq: None,
+        trace_mmio_ranges: Vec::new(),
+        scenario_path: None,
+        #[cfg(feature = "mcp")]
+        mcp_port: None,
     };
 
     let mut i = 1;
@@ -164,6 +203,64 @@ fn parse_args() -> Config {
             "--unmapped-exception" => cfg.unmapped_exception = true,
             "--cold-boot" => cfg.boot_mode = BootMode::Cold,
             "--warm-boot" => cfg.boot_mode = BootMode::Warm,
+            "--debug-elf" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --debug-elf requires a file path");
+                    process::exit(1);
+                }
+                cfg.debug_elf = Some(args[i].clone());
+            }
+            "--trace-mmio-seq" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --trace-mmio-seq requires a file path");
+                    process::exit(1);
+                }
+                cfg.trace_mmio_seq = Some(args[i].clone());
+            }
+            "--trace-mmio-range" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --trace-mmio-range requires start:end (hex)");
+                    process::exit(1);
+                }
+                let spec = &args[i];
+                let parts: Vec<&str> = spec.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    eprintln!("Error: --trace-mmio-range: expected start:end, got {:?}", spec);
+                    process::exit(1);
+                }
+                let start = parse_hex(parts[0]).unwrap_or_else(|| {
+                    eprintln!("Error: --trace-mmio-range: invalid start address {:?}", parts[0]);
+                    process::exit(1);
+                });
+                let end = parse_hex(parts[1]).unwrap_or_else(|| {
+                    eprintln!("Error: --trace-mmio-range: invalid end address {:?}", parts[1]);
+                    process::exit(1);
+                });
+                cfg.trace_mmio_ranges.push((start, end));
+            }
+            "--scenario" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --scenario requires a file path");
+                    process::exit(1);
+                }
+                cfg.scenario_path = Some(args[i].clone());
+            }
+            #[cfg(feature = "mcp")]
+            "--mcp-port" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --mcp-port requires a number");
+                    process::exit(1);
+                }
+                cfg.mcp_port = Some(args[i].parse().unwrap_or_else(|_| {
+                    eprintln!("Error: invalid port: {}", args[i]);
+                    process::exit(1);
+                }));
+            }
             "--help" | "-h" => {
                 usage(prog);
                 process::exit(0);
@@ -345,6 +442,82 @@ fn reset_cpu_for_reboot(cpu: &mut Cpu) {
     }
 }
 
+#[cfg(feature = "mcp")]
+fn run_with_mcp(cpu: Cpu, cfg: &Config, port: u16) {
+    use bcm55030_emulator::emu::command::CpuCommand;
+    use bcm55030_emulator::emu::{
+        Annotations, EmulatorHandle, EmulatorSnapshot, EventLog, McpStatus,
+    };
+
+    let bank = cpu
+        .bank()
+        .cloned()
+        .expect("BCM55030 Cpu must have a peripheral bank");
+
+    let (cmd_tx, cmd_rx) = mpsc::channel::<CpuCommand>();
+    let uart_tx = bank.read().uart_rx_sender();
+    let peripherals = bank.read().snapshot_all();
+
+    let mut snap = EmulatorSnapshot::placeholder(cfg.boot_mode);
+    snap.peripherals = peripherals;
+
+    let handle = EmulatorHandle {
+        bank,
+        snapshot: Arc::new(Mutex::new(snap)),
+        cpu_cmd: cmd_tx,
+        uart_tx: uart_tx.clone(),
+        annotations: Arc::new(RwLock::new(Annotations::new())),
+        event_log: Arc::new(Mutex::new(EventLog::default())),
+        mcp_status: Arc::new(Mutex::new(McpStatus::default())),
+        firmware_info: Arc::new(Mutex::new(None)),
+    };
+
+    let handle_for_worker = handle.clone();
+    let boot_mode = cfg.boot_mode;
+    let worker = std::thread::Builder::new()
+        .name("arc700-cpu-worker".to_string())
+        .spawn(move || {
+            bcm55030_emulator::emu::cpu_worker::run(
+                cpu,
+                handle_for_worker,
+                cmd_rx,
+                Box::new(move |_| Cpu::new_bcm55030(boot_mode)),
+            );
+        })
+        .expect("spawn cpu worker");
+
+    let _mcp_thread = bcm55030_emulator::mcp::spawn_server(handle.clone(), port);
+
+    if let Some(bp) = cfg.breakpoint {
+        let (tx, _rx) = bcm55030_emulator::emu::command::oneshot();
+        let _ = handle.cpu_cmd.send(CpuCommand::SetBreakpoint { address: bp, response: tx });
+    }
+
+    let max = if cfg.max_cycles == u64::MAX { None } else { Some(cfg.max_cycles) };
+    let _ = handle.cpu_cmd.send(CpuCommand::Run { max_insns: max });
+
+    eprintln!("[arc700] MCP server on port {port}, worker running");
+    eprintln!("[arc700] Press Ctrl-C to stop");
+
+    let orig_termios = setup_raw_terminal();
+
+    loop {
+        while let Some(byte) = try_read_stdin() {
+            if byte == 3 {
+                eprintln!("\n[arc700] Ctrl-C, shutting down");
+                let _ = handle.cpu_cmd.send(CpuCommand::Shutdown);
+                let _ = worker.join();
+                if let Some(ref orig) = orig_termios {
+                    restore_terminal(orig);
+                }
+                return;
+            }
+            let _ = uart_tx.send(byte);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 fn main() {
     let cfg = parse_args();
     bcm55030_emulator::set_verbose(cfg.verbose);
@@ -403,6 +576,22 @@ fn main() {
 
     cpu.trace = cfg.trace;
     cpu.mem.dccm_watchpoint = cfg.watch_dccm;
+    if let Some(ref path) = cfg.debug_elf {
+        match bcm55030_emulator::debug_info::DebugInfo::load(path) {
+            Ok(di) => {
+                bcm55030_emulator::vlog!(
+                    "[BCM55030] DWARF debug info loaded: {} entries from {}",
+                    di.len(),
+                    path
+                );
+                cpu.debug_info = Some(di);
+            }
+            Err(e) => {
+                eprintln!("Error loading --debug-elf {}: {}", path, e);
+                process::exit(1);
+            }
+        }
+    }
     if cfg.trace_mmio {
         let mut bank = cpu.bank().unwrap().write();
         bank.trace = true;
@@ -416,6 +605,47 @@ fn main() {
     if cfg.unmapped_exception {
         cpu.bank().unwrap().write().unmapped_exception = true;
         bcm55030_emulator::vlog!("[BCM55030] Unmapped-access policy = Exception (audit 2.2)");
+    }
+    if let Some(ref path) = cfg.trace_mmio_seq {
+        match bcm55030_emulator::soc::bank::SeqTrace::open(path, cfg.trace_mmio_ranges.clone()) {
+            Ok(st) => {
+                cpu.bank().unwrap().write().seq_trace = Some(st);
+                bcm55030_emulator::vlog!(
+                    "[BCM55030] Sequential MMIO trace → {} (ranges: {})",
+                    path,
+                    if cfg.trace_mmio_ranges.is_empty() {
+                        "all".to_string()
+                    } else {
+                        cfg.trace_mmio_ranges
+                            .iter()
+                            .map(|(s, e)| format!("0x{:X}..0x{:X}", s, e))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                );
+            }
+            Err(e) => {
+                eprintln!("Error opening --trace-mmio-seq {}: {}", path, e);
+                process::exit(1);
+            }
+        }
+    }
+
+    if let Some(ref path) = cfg.scenario_path {
+        let mut bank = cpu.bank().unwrap().write();
+        match bank.scenario.load_file(std::path::Path::new(path)) {
+            Ok(n) => eprintln!("[scenario] loaded {} entries from {}", n, path),
+            Err(e) => {
+                eprintln!("Error loading --scenario {}: {}", path, e);
+                process::exit(1);
+            }
+        }
+    }
+
+    #[cfg(feature = "mcp")]
+    if let Some(port) = cfg.mcp_port {
+        run_with_mcp(cpu, &cfg, port);
+        return;
     }
 
     let orig_termios = setup_raw_terminal();
@@ -514,6 +744,20 @@ fn main() {
         }
     }
 
+    // Flush the sequential MMIO trace before any other I/O. BufWriter does
+    // NOT flush on drop when the process exits, so we must do it explicitly.
+    if cfg.trace_mmio_seq.is_some() {
+        if let Some(bank) = cpu.bank() {
+            let mut b = bank.write();
+            if let Some(ref mut st) = b.seq_trace {
+                st.flush();
+            }
+        }
+        if let Some(ref path) = cfg.trace_mmio_seq {
+            eprintln!("[BCM55030] Sequential MMIO trace flushed → {}", path);
+        }
+    }
+
     if let Some(ref path) = cfg.dump_mmio_trace {
         let trace = {
             let mut bank = cpu.bank().unwrap().write();
@@ -562,3 +806,4 @@ fn main() {
         }
     }
 }
+

@@ -1,10 +1,16 @@
 pub mod cache;
 pub mod cpu;
+pub mod debug_info;
 pub mod decoder;
+pub mod emu;
 pub mod executor;
 pub mod hooks;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod memory;
 pub mod soc;
+#[cfg(feature = "ui")]
+pub mod ui;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

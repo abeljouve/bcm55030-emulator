@@ -95,6 +95,21 @@ pub enum DelayState {
     DelaySlot { target: u32, is_link: bool },
 }
 
+/// Why the CPU last paused. Populated by the step loop when the
+/// `paused` flag is raised and consumed by the UI / MCP worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseReason {
+    None,
+    /// PC matched a `Hook::Breakpoint` entry.
+    Breakpoint(u32),
+    /// Memory access matched a watchpoint entry.
+    Watch(u32, crate::memory::WatchMode),
+    /// User-initiated pause via `CpuCommand::Pause`.
+    UserPause,
+    /// `state.halted` was observed (CPU reached SLEEP / FLAG 1 etc.).
+    Halted,
+}
+
 #[derive(Debug)]
 pub struct CpuState {
     // Core registers r0-r59, r60 (LP_COUNT)
@@ -171,6 +186,15 @@ pub struct CpuState {
     pub halted: bool,
     pub sleeping: bool,
 
+    /// UI / MCP worker pause flag. Set by `Hook::Breakpoint`, watchpoint
+    /// hits, or an explicit `CpuCommand::Pause`. The step loop treats
+    /// `paused` like `halted`: it returns early without advancing PC.
+    pub paused: bool,
+
+    /// Populated when `paused` transitions to `true`. The UI reads this
+    /// to display why the CPU stopped.
+    pub pause_reason: PauseReason,
+
     // Instruction counter
     pub instruction_count: u64,
 
@@ -241,6 +265,8 @@ impl CpuState {
             delay_state: DelayState::None,
             halted: false,
             sleeping: false,
+            paused: false,
+            pause_reason: PauseReason::None,
             instruction_count: 0,
             pc_written: false,
             irq_shadow_r0_r3: [0u32; 4],

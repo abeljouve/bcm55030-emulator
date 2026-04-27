@@ -22,7 +22,7 @@
 use crate::cpu::exception::Exception;
 use crate::soc::peripheral::{
     AddressRange, BscEvent, BscSnapshot, Peripheral, PeripheralError, PeripheralEvent,
-    PeripheralSnapshot,
+    PeripheralSnapshot, SfpSnapshot,
 };
 use crate::soc::sfp_eeprom::SfpEeprom;
 
@@ -89,6 +89,22 @@ impl BscI2c {
         } else {
             None
         }
+    }
+
+    /// Build a snapshot of the owned SFP EEPROM's display state. The
+    /// bank exposes this as a separate peripheral row so the UI can
+    /// render an "SFP DDM" tab without reaching into BSC internals.
+    pub fn sfp_snapshot(&self) -> PeripheralSnapshot {
+        PeripheralSnapshot::Sfp(SfpSnapshot {
+            vendor: self.sfp.vendor_name(),
+            serial: self.sfp.serial_number(),
+            part_number: self.sfp.part_number(),
+            temperature_c256: self.sfp.ddm.temperature_c256,
+            vcc_uv: (self.sfp.ddm.vcc_100uv as u32) * 100,
+            tx_bias_ua: (self.sfp.ddm.tx_bias_2ua as u32) * 2,
+            tx_power_uw: (self.sfp.ddm.tx_power_01uw as u32) / 10,
+            rx_power_uw: (self.sfp.ddm.rx_power_01uw as u32) / 10,
+        })
     }
 
     fn issue_command(&mut self, val: u32) {

@@ -86,6 +86,8 @@ const REG_RX_GRANT_MASK: u32 = 0x0100_0030;
 const REG_IRQ_MASK: u32 = 0x0100_0034;
 const REG_EPON_STATUS: u32 = 0x0100_0044;
 const REG_ACTIVE_FLAGS: u32 = 0x0100_0054;
+const REG_MDIO_COMMAND: u32 = 0x0100_0060;
+const REG_HW_STATE_STATUS: u32 = 0x0100_0E04;
 const REG_SPECIAL_0064: u32 = 0x0100_0064;
 /// MPCP-adjacent command latch. The firmware writes a value with
 /// bits `[31:27]` set (command opcode) and polls the register for
@@ -152,6 +154,7 @@ pub struct EponMac {
     irq_mask: u32,
     epon_status: u32,
     active_flags: u32,
+    hw_state_status: u32,
 
     pub trace: bool,
 }
@@ -176,6 +179,7 @@ impl EponMac {
             irq_mask: 0,
             epon_status: 0,
             active_flags: 0,
+            hw_state_status: 0,
             trace: false,
         }
     }
@@ -193,7 +197,8 @@ impl EponMac {
             REG_CHIP_ID | REG_CHIP_REV | REG_LLID_CAPTURE_MASK | REG_LLID_ACTIVE_BITMAP
             | REG_LLID_MASK_CONTROL | REG_LLID_COUNTER_MASK | REG_TX_GRANT_MASK
             | REG_RX_GRANT_MASK | REG_IRQ_MASK | REG_EPON_STATUS | REG_ACTIVE_FLAGS
-            | REG_SPECIAL_0064 | REG_MPCP_CMD_LATCH => true,
+            | REG_MDIO_COMMAND | REG_SPECIAL_0064 | REG_MPCP_CMD_LATCH
+            | REG_HW_STATE_STATUS => true,
             _ => {
                 (EPON_TABLE_BASE..EPON_TABLE_END).contains(&addr)
                     || (EPON_LLID_BASE..EPON_LLID_TOP).contains(&addr)
@@ -230,7 +235,8 @@ impl EponMac {
 
     fn write_store_no_side_effects(&mut self, addr: u32, val: u32) {
         match addr {
-            REG_CHIP_ID | REG_CHIP_REV | REG_SPECIAL_0064 => {
+            REG_CHIP_ID | REG_CHIP_REV | REG_MDIO_COMMAND | REG_SPECIAL_0064
+            | REG_HW_STATE_STATUS => {
                 // Fixed / read-only values — ignore warm seed.
             }
             REG_MPCP_CMD_LATCH => self.mpcp_cmd_latch = val,
@@ -272,6 +278,57 @@ impl Peripheral for EponMac {
         RANGES
     }
 
+    fn peek_word(&self, addr: u32) -> Result<u32, Exception> {
+        // Side-effect-free probe — same match arms as `read_word`
+        // minus the MPCP-command-latch auto-clear. Anything not
+        // listed falls back to `Ok(0)` so callers see a pure
+        // zero rather than triggering a mutation.
+        match addr {
+            REG_CHIP_ID => return Ok(CHIP_ID_VALUE),
+            REG_CHIP_REV => return Ok(CHIP_REV_VALUE),
+            REG_LLID_CAPTURE_MASK => return Ok(self.llid_capture_mask),
+            REG_MPCP_CMD_LATCH => return Ok(self.mpcp_cmd_latch),
+            REG_LLID_ACTIVE_BITMAP => return Ok(self.llid_active_bitmap),
+            REG_LLID_MASK_CONTROL => return Ok(self.llid_mask_control),
+            REG_LLID_COUNTER_MASK => return Ok(self.llid_counter_mask),
+            REG_TX_GRANT_MASK => return Ok(self.tx_grant_mask),
+            REG_RX_GRANT_MASK => return Ok(self.rx_grant_mask),
+            REG_IRQ_MASK => return Ok(self.irq_mask),
+            REG_EPON_STATUS => return Ok(self.epon_status),
+            REG_ACTIVE_FLAGS => return Ok(self.active_flags),
+            REG_MDIO_COMMAND => return Ok(0),
+            REG_SPECIAL_0064 => return Ok(0x5382_0000 | 0x0000_FFFF),
+            REG_HW_STATE_STATUS => return Ok(self.hw_state_status),
+            _ => {}
+        }
+        if (EPON_LLID_BASE..EPON_LLID_TOP).contains(&addr) {
+            let (slot, within) = Self::llid_slot(addr);
+            if slot < LLID_SLOT_COUNT {
+                match within {
+                    0x04 => return Ok(self.llid_irq_pending[slot]),
+                    0x3C => {
+                        let idx = Self::llid_idx(addr);
+                        let base = self.llid_store[idx] & !0x100;
+                        let set = if self.llid_drain_flag[slot] { 0x100 } else { 0 };
+                        return Ok(base | set);
+                    }
+                    0x1D8 => return Ok(0),
+                    _ => {
+                        let idx = Self::llid_idx(addr);
+                        return Ok(self.llid_store[idx]);
+                    }
+                }
+            }
+            let idx = Self::llid_idx(addr);
+            return Ok(self.llid_store[idx]);
+        }
+        if (EPON_TABLE_BASE..EPON_TABLE_END).contains(&addr) {
+            let idx = Self::table_idx(addr);
+            return Ok(self.table_store[idx]);
+        }
+        Ok(0)
+    }
+
     fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
         // Sparse core first.
         match addr {
@@ -294,6 +351,8 @@ impl Peripheral for EponMac {
             REG_IRQ_MASK => return Ok(self.irq_mask),
             REG_EPON_STATUS => return Ok(self.epon_status),
             REG_ACTIVE_FLAGS => return Ok(self.active_flags),
+            REG_MDIO_COMMAND => return Ok(0),
+            REG_HW_STATE_STATUS => return Ok(self.hw_state_status),
             REG_SPECIAL_0064 => {
                 // Audit 5.12: shim returned (stored & 0xFFFF0000) | 0xFFFF.
                 // We now back this from the table-less store: upper half
@@ -390,6 +449,11 @@ impl Peripheral for EponMac {
                 self.active_flags = val;
                 return Ok(());
             }
+            REG_MDIO_COMMAND => return Ok(()),
+            REG_HW_STATE_STATUS => {
+                self.hw_state_status = val;
+                return Ok(());
+            }
             REG_SPECIAL_0064 => return Ok(()),
             _ => {}
         }
@@ -460,6 +524,7 @@ impl Peripheral for EponMac {
         self.irq_mask = 0;
         self.epon_status = 0;
         self.active_flags = 0;
+        self.hw_state_status = 0;
     }
 
     fn reset_warm(&mut self) {

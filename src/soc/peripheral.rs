@@ -395,6 +395,16 @@ pub trait Peripheral: Send + Sync {
     /// Word-granular read with side effects. `addr` is absolute.
     fn read_word(&mut self, addr: u32) -> Result<u32, Exception>;
 
+    /// Side-effect-free probe of a word at `addr`. Used by the UI
+    /// peripheral inspector (continuous polling every frame) and by
+    /// the MCP `peek_mmio` tool. Default returns `0` — peripherals
+    /// whose `read_word` has FIFO-pop / IRQ-latch / busy-bit side
+    /// effects (UART, EPON MAC, MACsec, …) must override to expose
+    /// the same visible state without mutating anything.
+    fn peek_word(&self, _addr: u32) -> Result<u32, Exception> {
+        Ok(0)
+    }
+
     /// Word-granular write with side effects.
     fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception>;
 

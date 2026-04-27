@@ -19,6 +19,7 @@
 //!    `sysreg_shim` instead of the intended peripheral.
 
 use bcm55030_emulator::soc::bank::{BootMode, PeripheralBank};
+use bcm55030_emulator::soc::peripheral::PeripheralSnapshot;
 
 /// Residual sysreg addresses are a plain backing store — writes
 /// round-trip unmodified. The bits `[31:27]` command-bit auto-
@@ -127,4 +128,23 @@ fn bank_routes_known_peripherals_without_sysreg_fallback() {
     // SerDes: lane config register at 0x010001AC.
     bank.write_word(0x0100_01AC, 0xCAFE_BABE).unwrap();
     assert_eq!(bank.read_word(0x0100_01AC).unwrap(), 0xCAFE_BABE);
+}
+
+/// the design spec Phase 1: SFP orphan fix. `snapshot_all()` must include a
+/// dedicated `PeripheralSnapshot::Sfp` row so the UI can render a
+/// per-peripheral tab without reaching into BSC internals.
+#[test]
+fn snapshot_all_exposes_sfp_row() {
+    let bank = PeripheralBank::new(BootMode::Warm);
+    let rows = bank.snapshot_all();
+    assert_eq!(rows.len(), 12, "12 peripheral rows expected after SFP fix");
+    assert!(
+        matches!(rows[3], PeripheralSnapshot::Sfp(_)),
+        "row 3 should be PeripheralSnapshot::Sfp, got {:?}",
+        rows[3].name()
+    );
+    if let PeripheralSnapshot::Sfp(ref sfp) = rows[3] {
+        assert!(!sfp.vendor.is_empty(), "SFP vendor should be populated");
+        assert!(!sfp.part_number.is_empty(), "SFP part_number should be populated");
+    }
 }

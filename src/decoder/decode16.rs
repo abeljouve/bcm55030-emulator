@@ -3,13 +3,13 @@ use crate::cpu::exception::Exception;
 use crate::cpu::registers::{REG_BLINK, REG_GP, REG_SP};
 use crate::decoder::fields::*;
 use crate::decoder::instruction::*;
-use crate::memory::Memory;
+use crate::decoder::InstructionFetch;
 
 /// Decode a 16-bit instruction
 pub fn decode_16bit(
     half: u16,
     pc: u32,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<DecodedInstruction, Exception> {
     let major = major_opcode(half);
     match major {
@@ -104,7 +104,7 @@ fn decode_0d_add_sub_shift_imm(half: u16, pc: u32) -> Result<DecodedInstruction,
 fn decode_0e_mov_cmp_add_high(
     half: u16,
     pc: u32,
-    mem: &Memory,
+    mem: &dyn InstructionFetch,
 ) -> Result<DecodedInstruction, Exception> {
     let b = map_16bit_reg(((half >> 8) & 7) as u8);
     let h = extract_h_reg_16(half);

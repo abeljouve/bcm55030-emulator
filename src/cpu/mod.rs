@@ -9,6 +9,7 @@ use parking_lot::RwLock;
 use exception::Exception;
 use registers::{CpuState, DelayState, REG_BLINK, REG_ILINK1, REG_ILINK2, REG_LP_COUNT};
 
+use crate::debug_info::DebugInfo;
 use crate::decoder;
 use crate::executor;
 use crate::hooks::{self, HookAction, HookTable};
@@ -26,6 +27,11 @@ pub struct Cpu {
     pub mem: Memory,
     /// Log every instruction to stderr
     pub trace: bool,
+    /// DWARF-based PC → source-location lookup, loaded from a
+    /// separate ELF via the `--debug-elf` flag. When set, the trace
+    /// output and the UI disassembly panel annotate each instruction
+    /// with its corresponding Rust source line.
+    pub debug_info: Option<DebugInfo>,
     /// PC address hooks for breakpoints / watchpoints / run-to-cursor.
     /// Empty by default on `develop` — all 35 SoC-specific entries from
     /// the old `register_hooks()` were deleted per the contributor guide. The
@@ -49,6 +55,7 @@ impl Cpu {
             state: CpuState::new(),
             mem: Memory::new(mem_size),
             trace: false,
+            debug_info: None,
             hooks: HookTable::new(),
             timer_frac_acc: 0,
             bank: None,
@@ -67,6 +74,7 @@ impl Cpu {
             state,
             mem,
             trace: false,
+            debug_info: None,
             hooks: HookTable::new(),
             timer_frac_acc: 0,
             bank,
@@ -80,8 +88,32 @@ impl Cpu {
         self.bank.as_ref()
     }
 
+    /// Reset CPU state, SRAM, and peripheral bank **in place**
+    /// without creating a new bank `Arc`. Used by the GUI CPU
+    /// worker so clones of the bank handle held by the UI and
+    /// MCP threads stay valid across a reset. The peripheral
+    /// bank's non-volatile state (SPI flash contents, SFP EEPROM,
+    /// eFuse snapshot) is preserved.
+    pub fn reset_soc_in_place(&mut self, boot_mode: BootMode) {
+        let saved_timer1_irq = self.state.timer1_irq;
+        self.state = CpuState::new();
+        self.state.timer1_irq = saved_timer1_irq;
+
+        let sram_size = self.mem.sram_size();
+        let zeros = vec![0u8; sram_size];
+        self.mem.load_binary(0, &zeros);
+
+        if let Some(bank) = self.bank.as_ref() {
+            let mut guard = bank.write();
+            match boot_mode {
+                BootMode::Warm => guard.reset_warm(),
+                BootMode::Cold => guard.reset_cold(),
+            }
+        }
+    }
+
     pub fn step(&mut self) -> Result<(), Exception> {
-        if self.state.halted {
+        if self.state.halted || self.state.paused {
             return Ok(());
         }
 
@@ -92,6 +124,12 @@ impl Cpu {
                 match hooks::execute_hook(hook, &mut self.state, &mut self.mem)? {
                     HookAction::Skip => return Ok(()),
                     HookAction::Continue => {}
+                    HookAction::Pause => {
+                        self.state.paused = true;
+                        self.state.pause_reason =
+                            crate::cpu::registers::PauseReason::Breakpoint(self.state.pc);
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -133,16 +171,35 @@ impl Cpu {
         let next_pc = self.state.pc + decoded.total_size();
 
         if self.trace {
-            eprintln!(
-                "[TRACE] PC=0x{:08X} size={} Z={} N={} C={} V={} {:?}",
-                self.state.pc,
-                decoded.total_size(),
-                self.state.flag_z as u8,
-                self.state.flag_n as u8,
-                self.state.flag_c as u8,
-                self.state.flag_v as u8,
-                decoded.inst
-            );
+            let src = self
+                .debug_info
+                .as_ref()
+                .and_then(|di| di.lookup(self.state.pc));
+            if let Some(loc) = src {
+                eprintln!(
+                    "[TRACE] PC=0x{:08X} size={} Z={} N={} C={} V={} {:?} @{}:{}",
+                    self.state.pc,
+                    decoded.total_size(),
+                    self.state.flag_z as u8,
+                    self.state.flag_n as u8,
+                    self.state.flag_c as u8,
+                    self.state.flag_v as u8,
+                    decoded.inst,
+                    loc.file,
+                    loc.line
+                );
+            } else {
+                eprintln!(
+                    "[TRACE] PC=0x{:08X} size={} Z={} N={} C={} V={} {:?}",
+                    self.state.pc,
+                    decoded.total_size(),
+                    self.state.flag_z as u8,
+                    self.state.flag_n as u8,
+                    self.state.flag_c as u8,
+                    self.state.flag_v as u8,
+                    decoded.inst
+                );
+            }
         }
 
         // For BL.D/JL.D: set blink to address AFTER the delay slot
@@ -174,6 +231,15 @@ impl Cpu {
         }
 
         self.state.instruction_count += 1;
+
+        // Watchpoint trap — if any read/write during executor set a
+        // hit, pause the CPU. The next step() runs past the
+        // watchpoint only after the UI clears `paused`.
+        if let Some((wp_addr, wp_mode)) = self.mem.watchpoints.take_hit() {
+            self.state.paused = true;
+            self.state.pause_reason =
+                crate::cpu::registers::PauseReason::Watch(wp_addr, wp_mode);
+        }
 
         // Timers + peripheral bank
         self.tick_timers_and_bank();

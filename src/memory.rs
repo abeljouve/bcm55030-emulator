@@ -1,15 +1,110 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::cache::{DCache, ICache, IC_LINE_SIZE};
+use crate::cache::{DCache, DCacheLineInfo, ICache, IC_LINE_SIZE};
 use crate::cpu::exception::Exception;
 use crate::soc::bank::{BootMode, PeripheralBank};
 use crate::soc::peripheral::DatapathOp;
 
 /// BCM55030 unified SRAM: 512 KB. No ICCM/DCCM.
 pub const SRAM_SIZE: usize = 512 * 1024;
+
+/// Access direction a watchpoint triggers on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchMode {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+/// A single watchpoint entry. Half-open range `[addr, addr + size)`.
+#[derive(Clone, Copy, Debug)]
+pub struct Watchpoint {
+    pub addr: u32,
+    pub size: u32,
+    pub mode: WatchMode,
+}
+
+impl Watchpoint {
+    /// Does the access `[access_addr, access_addr + access_size)`
+    /// overlap this watchpoint's range, *and* match its configured
+    /// direction?
+    #[inline]
+    pub fn matches(&self, access_addr: u32, access_size: u32, access: WatchMode) -> bool {
+        let a_end = access_addr.saturating_add(access_size);
+        let w_end = self.addr.saturating_add(self.size);
+        let overlaps = access_addr < w_end && self.addr < a_end;
+        let mode_match = matches!(
+            (self.mode, access),
+            (WatchMode::ReadWrite, _)
+                | (WatchMode::Read, WatchMode::Read)
+                | (WatchMode::Write, WatchMode::Write)
+        );
+        overlaps && mode_match
+    }
+}
+
+/// Watchpoint list + last hit. The check path uses interior
+/// mutability on `hit` so `read_*` helpers (`&self`) can record a
+/// trap without taking `&mut self`.
+#[derive(Default, Debug)]
+pub struct WatchpointTable {
+    pub entries: Vec<Watchpoint>,
+    /// Most recent hit: `(access_addr, access_mode)`. Cleared by
+    /// `Cpu::step` after transitioning to the paused state via
+    /// `take_hit()`.
+    hit: Cell<Option<(u32, WatchMode)>>,
+}
+
+impl WatchpointTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn add(&mut self, wp: Watchpoint) -> usize {
+        self.entries.push(wp);
+        self.entries.len() - 1
+    }
+
+    pub fn remove(&mut self, index: usize) {
+        if index < self.entries.len() {
+            self.entries.remove(index);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.hit.set(None);
+    }
+
+    /// Consume the last hit (if any). Called by `Cpu::step` after the
+    /// executor returns, to decide whether to pause.
+    #[inline]
+    pub fn take_hit(&self) -> Option<(u32, WatchMode)> {
+        self.hit.replace(None)
+    }
+
+    /// Scan the table for a matching entry and record a hit through
+    /// interior mutability. The fast path is the empty-table case —
+    /// callers must gate the call behind `!self.is_empty()` so
+    /// read_* helpers pay nothing when no watchpoints are set.
+    pub fn check(&self, addr: u32, size: u32, access: WatchMode) -> bool {
+        for wp in &self.entries {
+            if wp.matches(addr, size, access) {
+                self.hit.set(Some((addr, access)));
+                return true;
+            }
+        }
+        false
+    }
+}
 
 pub struct Memory {
     /// Unified SRAM (SoC mode) / flat memory (tests). **Lock-free**:
@@ -38,6 +133,10 @@ pub struct Memory {
     /// firmware accesses — enable with `--unmapped-exception` to
     /// discover new unmodelled registers.
     pub unmapped_exception: bool,
+
+    /// UI / MCP watchpoints. Default empty — the hot path only pays
+    /// a single `is_empty()` branch when no watchpoints are set.
+    pub watchpoints: WatchpointTable,
 }
 
 impl Memory {
@@ -51,6 +150,7 @@ impl Memory {
             dcache: None,
             icache: None,
             unmapped_exception: false,
+            watchpoints: WatchpointTable::new(),
         }
     }
 
@@ -66,6 +166,7 @@ impl Memory {
             dcache: Some(DCache::new()),
             icache: Some(RefCell::new(ICache::new())),
             unmapped_exception: false,
+            watchpoints: WatchpointTable::new(),
         }
     }
 
@@ -107,6 +208,34 @@ impl Memory {
 
     pub fn sram_size(&self) -> usize {
         self.data.len()
+    }
+
+    /// Clone the full backing byte buffer (SRAM in SoC mode, flat
+    /// memory in tests). Used by the UI / MCP worker to refresh its
+    /// disassembly-panel SRAM view on demand.
+    pub fn sram_snapshot(&self) -> Vec<u8> {
+        self.data.clone()
+    }
+
+    /// Borrow a slice of the backing buffer without cloning. Returns
+    /// `None` if the requested range exits the buffer.
+    pub fn sram_slice(&self, start: u32, len: u32) -> Option<&[u8]> {
+        let s = start as usize;
+        let e = s.checked_add(len as usize)?;
+        if e > self.data.len() {
+            return None;
+        }
+        Some(&self.data[s..e])
+    }
+
+    /// Snapshot every physical D-cache line. Empty in flat mode (no
+    /// cache). Callers use this to populate the "D-cache state"
+    /// sub-tab of the memory viewer.
+    pub fn dcache_snapshot(&self) -> Vec<DCacheLineInfo> {
+        self.dcache
+            .as_ref()
+            .map(DCache::snapshot_lines)
+            .unwrap_or_default()
     }
 
     /// Load a binary blob into SRAM (unified memory).
@@ -155,6 +284,9 @@ impl Memory {
     }
 
     pub fn read_byte(&self, addr: u32) -> Result<u8, Exception> {
+        if !self.watchpoints.is_empty() {
+            self.watchpoints.check(addr, 1, WatchMode::Read);
+        }
         if self.bank.is_some() {
             if let Some(ref dc) = self.dcache {
                 if let Some(val) = dc.peek_byte(addr) {
@@ -174,6 +306,9 @@ impl Memory {
     }
 
     pub fn read_half(&self, addr: u32) -> Result<u16, Exception> {
+        if !self.watchpoints.is_empty() {
+            self.watchpoints.check(addr, 2, WatchMode::Read);
+        }
         if let Some(ref dc) = self.dcache {
             if let (Some(hi), Some(lo)) = (dc.peek_byte(addr), dc.peek_byte(addr + 1)) {
                 return Ok(((hi as u16) << 8) | (lo as u16));
@@ -202,6 +337,9 @@ impl Memory {
     }
 
     pub fn read_word(&self, addr: u32) -> Result<u32, Exception> {
+        if !self.watchpoints.is_empty() {
+            self.watchpoints.check(addr, 4, WatchMode::Read);
+        }
         if let Some(ref dc) = self.dcache {
             if let (Some(b0), Some(b1), Some(b2), Some(b3)) = (
                 dc.peek_byte(addr),
@@ -252,6 +390,9 @@ impl Memory {
     }
 
     pub fn write_byte(&mut self, addr: u32, val: u8) -> Result<(), Exception> {
+        if !self.watchpoints.is_empty() {
+            self.watchpoints.check(addr, 1, WatchMode::Write);
+        }
         if self.bank.is_some() {
             if let Some(off) = self.sram_offset(addr) {
                 self.check_watchpoint(off, 1);
@@ -274,6 +415,9 @@ impl Memory {
     }
 
     pub fn write_half(&mut self, addr: u32, val: u16) -> Result<(), Exception> {
+        if !self.watchpoints.is_empty() {
+            self.watchpoints.check(addr, 2, WatchMode::Write);
+        }
         if self.bank.is_some() {
             if let Some(off) = self.sram_offset(addr) {
                 if off + 1 < self.data.len() {
@@ -308,6 +452,9 @@ impl Memory {
     }
 
     pub fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
+        if !self.watchpoints.is_empty() {
+            self.watchpoints.check(addr, 4, WatchMode::Write);
+        }
         if self.bank.is_some() {
             if addr & 3 != 0 {
                 if let Some(off) = self.sram_offset(addr) {
@@ -548,14 +695,6 @@ impl Memory {
         dc.write_byte(addr + 1, (val >> 16) as u8);
         dc.write_byte(addr + 2, (val >> 8) as u8);
         dc.write_byte(addr + 3, val as u8);
-        if let Some(off) = self.sram_offset(addr) {
-            if off + 3 < self.data.len() {
-                self.data[off] = (val >> 24) as u8;
-                self.data[off + 1] = (val >> 16) as u8;
-                self.data[off + 2] = (val >> 8) as u8;
-                self.data[off + 3] = val as u8;
-            }
-        }
         Ok(())
     }
 
@@ -771,13 +910,86 @@ mod tests {
         assert_eq!(mem.read_word(0).unwrap(), 0xAABBCCDD);
     }
 
+    // Cached writes are write-back: the dirty value lives in the D-cache
+    // and SRAM stays stale until a flush. Cached reads (`read_word_data`
+    // with `cache_bypass=false`) and cache-peek reads (`read_word`) see
+    // the new value. Uncached reads (`read_word_data` with
+    // `cache_bypass=true`) reach SRAM directly and therefore see the
+    // pre-write contents — scan7b test 7 on real HW confirms `.di` loads
+    // never consult the cache.
     #[test]
-    fn test_dcache_sram_write_through() {
+    fn test_dcache_writes_are_write_back() {
         let mut mem = Memory::new_soc(4096, BootMode::Warm);
         mem.write_word_data(0x100, 0xDEADBEEF, false).unwrap();
+
+        // Cached and cache-peek paths see the new value.
         assert_eq!(mem.read_word_data(0x100, false).unwrap(), 0xDEADBEEF);
+        assert_eq!(mem.read_word(0x100).unwrap(), 0xDEADBEEF);
+
+        // Uncached read bypasses the cache → sees pre-write SRAM (0).
+        assert_eq!(mem.read_word_data(0x100, true).unwrap(), 0);
+
+        // Invalidate with IM=1 flushes dirty → SRAM now has the value.
+        mem.dcache_invalidate_all().unwrap();
         assert_eq!(mem.read_word_data(0x100, true).unwrap(), 0xDEADBEEF);
         assert_eq!(mem.read_word(0x100).unwrap(), 0xDEADBEEF);
+    }
+
+    // Direct Memory-API repro of the alleged coherence bug from
+    // the design notes. The TODO note
+    // claimed a cached write of `0xDEADBEEF` to addr X followed by
+    // a cached write to addr X+4 (same 32 B line) would make a
+    // subsequent cached read of X return X+4's value instead of the
+    // seed. These probes force each of the interesting configurations
+    // and assert that the cached read of X is always the seed.
+    #[test]
+    fn test_dcache_adjacent_words_no_alias() {
+        let mut mem = Memory::new_soc(16 * 1024, BootMode::Warm);
+        let canary: u32 = 0x3A30;
+        let ticks: u32 = 0x3A34;
+        assert_eq!(canary & !0x1F, ticks & !0x1F, "must share one 32 B line");
+
+        // 1. Pre-warmed line: BSS-style zero, then seed, then adjacent.
+        for a in (0x3A20u32..0x3A40).step_by(4) {
+            mem.write_word_data(a, 0, false).unwrap();
+        }
+        mem.write_word_data(canary, 0xDEADBEEF, false).unwrap();
+        mem.write_word_data(ticks, 0xAA, false).unwrap();
+        assert_eq!(mem.read_word_data(canary, false).unwrap(), 0xDEADBEEF);
+        assert_eq!(mem.read_word_data(ticks, false).unwrap(), 0xAA);
+
+        // 2. Cold line: line isn't touched before the seed.
+        let mut mem = Memory::new_soc(16 * 1024, BootMode::Warm);
+        mem.write_word_data(canary, 0xDEADBEEF, false).unwrap();
+        mem.write_word_data(ticks, 0xAA, false).unwrap();
+        assert_eq!(mem.read_word_data(canary, false).unwrap(), 0xDEADBEEF);
+
+        // 3. Byte-level seed then word-level adjacent write. Exercises
+        //    the mix of write_byte_data / write_word_data that firmware
+        //    compilers emit when packing structs.
+        let mut mem = Memory::new_soc(16 * 1024, BootMode::Warm);
+        for (i, b) in [0xDE, 0xAD, 0xBE, 0xEF].iter().enumerate() {
+            mem.write_byte_data(canary + i as u32, *b, false).unwrap();
+        }
+        mem.write_word_data(ticks, 0xAA, false).unwrap();
+        assert_eq!(mem.read_word_data(canary, false).unwrap(), 0xDEADBEEF);
+
+        // 4. Force an eviction of the canary line between the seed
+        //    and the adjacent write by hammering the same set with
+        //    three other tags. RR replacement guarantees the victim
+        //    cycles and the canary line gets flushed to SRAM.
+        let mut mem = Memory::new_soc(128 * 1024, BootMode::Warm);
+        mem.write_word_data(canary, 0xDEADBEEF, false).unwrap();
+        let stride: u32 = 64 * 32;
+        for k in 1..=3 {
+            mem.write_word_data(canary + k * stride, 0x1111_0000 | k, false)
+                .unwrap();
+        }
+        // Cached read must refill from SRAM (evicted line was flushed).
+        assert_eq!(mem.read_word_data(canary, false).unwrap(), 0xDEADBEEF);
+        mem.write_word_data(ticks, 0xAA, false).unwrap();
+        assert_eq!(mem.read_word_data(canary, false).unwrap(), 0xDEADBEEF);
+        assert_eq!(mem.read_word_data(ticks, false).unwrap(), 0xAA);
     }
 
     #[test]

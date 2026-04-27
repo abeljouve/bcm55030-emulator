@@ -181,6 +181,23 @@ impl Peripheral for Uart {
         }
     }
 
+    fn peek_word(&self, addr: u32) -> Result<u32, Exception> {
+        let Some(reg) = Self::reg_offset(addr) else {
+            return Ok(0);
+        };
+        let b: u8 = match reg {
+            // Side-effect-free peek of the RX FIFO head. Real
+            // `read_word(0x00)` pops the front byte — `peek_word`
+            // must not.
+            0x00 => self.rx_queue.front().copied().unwrap_or(0),
+            0x04 => self.read_ier(),
+            0x08 => self.baud_div_lo,
+            0x0C => self.baud_div_hi,
+            _ => 0,
+        };
+        Ok((b as u32) << 24)
+    }
+
     fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
         if let Some(reg) = Self::reg_offset(addr) {
             self.write_reg_byte(reg, (val >> 24) as u8);

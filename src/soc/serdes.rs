@@ -15,13 +15,19 @@
 //!     now serves a lane-indexed register file so per-lane state is
 //!     coherent (audit 5.1).
 //!
-//! Not yet claimed (left to sysreg_shim for now):
-//!   * `0x01002400..0x010024FF` — Lane HW Reset / Enable / Mode
-//!   * `0x01002D00..0x01002D1F` — Lane Mode Controller
-//!   * Extended SerDes config (`0x01003500..`)
+//! Claimed as of Phase 4a (scenario plan):
+//!   * **`0x01002400..0x01002A00`** — Lane HW Reset / Enable / Mode +
+//!     10G mirror.  Contains MDIO command registers with bit-31 "go"
+//!     semantics: firmware writes `val | 0x80000000`, then polls until
+//!     bit 31 clears.  The emulator auto-clears bit 31 on the next
+//!     read (matching `REG_MPCP_CMD_LATCH` in `epon_mac.rs`).
+//!     Evidence: `unhandled_mmio.json` — 5 addresses with command-bit
+//!     pattern (`0x0100240C`, `0x01002420`, `0x01002644`, `0x0100280C`,
+//!     `0x01002820`).
+//!   * **`0x01002D00..0x01002D40`** — Lane Mode Controller.
 //!
-//! Those subranges will migrate here in later sessions once we have
-//! validated the Session 2 scaffold against the boot-to-prompt test.
+//! Not yet claimed (left to sysreg_shim for now):
+//!   * Extended SerDes config (`0x01003500..`)
 //!
 //! Audit items resolved in this session:
 //!   * **5.1** — SerDes indirect range returns 1. Replaced by a proper
@@ -41,6 +47,8 @@
 //! (Filter/Mask Controller) per `hwregs`, not to the SerDes. It will
 //! migrate to `fatal_filter.rs` in Session 7.
 
+use std::collections::HashSet;
+
 use crate::cpu::exception::Exception;
 use crate::soc::peripheral::{
     AddressRange, LaneSpeed, Peripheral, PeripheralError, PeripheralEvent, PeripheralSnapshot,
@@ -51,12 +59,22 @@ use crate::soc::peripheral::{
 pub const SERDES_MAIN_BASE: u32 = 0x0100_0180;
 pub const SERDES_MAIN_END: u32 = 0x0100_01F8;
 
+/// SerDes Lane MDIO / HW Enable / Mode window (1G + 10G banks).
+pub const SERDES_LANE_BASE: u32 = 0x0100_2400;
+pub const SERDES_LANE_END: u32 = 0x0100_2A00;
+
+/// Lane Mode Controller window.
+pub const SERDES_MODE_BASE: u32 = 0x0100_2D00;
+pub const SERDES_MODE_END: u32 = 0x0100_2D40;
+
 /// SerDes Lane Status File window — a 256-entry × 8-byte per-lane
 /// status table. Reads return a lane-indexed register file.
 pub const SERDES_WINDOW_BASE: u32 = 0x224A_0000;
 pub const SERDES_WINDOW_END: u32 = 0x224A_0800;
 
 const SERDES_MAIN_WORDS: usize = ((SERDES_MAIN_END - SERDES_MAIN_BASE) / 4) as usize;
+const SERDES_LANE_WORDS: usize = ((SERDES_LANE_END - SERDES_LANE_BASE) / 4) as usize;
+const SERDES_MODE_WORDS: usize = ((SERDES_MODE_END - SERDES_MODE_BASE) / 4) as usize;
 
 /// Lane count. The BCM55030 exposes four electrical lanes: PON RX, PON
 /// TX, UNI lane 1, UNI lane 2 — the firmware assigns them as lanes
@@ -65,6 +83,8 @@ pub const LANE_COUNT: usize = 4;
 
 const SERDES_RANGES: &[AddressRange] = &[
     AddressRange::new(SERDES_MAIN_BASE, SERDES_MAIN_END),
+    AddressRange::new(SERDES_LANE_BASE, SERDES_LANE_END),
+    AddressRange::new(SERDES_MODE_BASE, SERDES_MODE_END),
     AddressRange::new(SERDES_WINDOW_BASE, SERDES_WINDOW_END),
 ];
 
@@ -113,9 +133,24 @@ impl LaneState {
     }
 }
 
+/// Ticks after enable before a lane auto-locks (~ matches the
+/// real HW EPON timer delay of ~1024 ticks during bring-up).
+const LANE_LOCK_DELAY_TICKS: u64 = 16;
+
 pub struct SerDes {
     /// Backing store for the main MMIO window.
     raw_store: [u32; SERDES_MAIN_WORDS],
+    /// Backing store for the Lane MDIO / HW Enable window.
+    lane_store: Vec<u32>,
+    /// Backing store for the Lane Mode Controller window.
+    mode_store: Vec<u32>,
+    /// Addresses where bit 31 was written as 1 ("go" command).  The
+    /// next `read_word` returns with bit 31 cleared and removes the
+    /// entry — matching the hardware's "operation complete" semantics.
+    cmd_pending_clear: HashSet<u32>,
+    /// Per-lane tick counter for auto-lock progression.  Starts
+    /// counting when `enabled` becomes true and `locked` is false.
+    lane_lock_countdown: [u64; LANE_COUNT],
     pub lanes: [LaneState; LANE_COUNT],
     /// Per-lane status file at `0x224A0000 + lane*8`.
     window: Vec<u8>,
@@ -130,6 +165,10 @@ impl SerDes {
     pub fn new() -> Self {
         Self {
             raw_store: [0u32; SERDES_MAIN_WORDS],
+            lane_store: vec![0u32; SERDES_LANE_WORDS],
+            mode_store: vec![0u32; SERDES_MODE_WORDS],
+            cmd_pending_clear: HashSet::new(),
+            lane_lock_countdown: [0; LANE_COUNT],
             lanes: [LaneState::cold(); LANE_COUNT],
             window: vec![0u8; (SERDES_WINDOW_END - SERDES_WINDOW_BASE) as usize],
             error_status: 0,
@@ -140,7 +179,26 @@ impl SerDes {
     #[inline]
     pub fn claims(&self, addr: u32) -> bool {
         (SERDES_MAIN_BASE..SERDES_MAIN_END).contains(&addr)
+            || (SERDES_LANE_BASE..SERDES_LANE_END).contains(&addr)
+            || (SERDES_MODE_BASE..SERDES_MODE_END).contains(&addr)
             || (SERDES_WINDOW_BASE..SERDES_WINDOW_END).contains(&addr)
+    }
+
+    #[inline]
+    fn lane_idx(addr: u32) -> usize {
+        ((addr - SERDES_LANE_BASE) / 4) as usize
+    }
+
+    #[inline]
+    fn mode_idx(addr: u32) -> usize {
+        ((addr - SERDES_MODE_BASE) / 4) as usize
+    }
+
+    fn is_cmd_bit_register(addr: u32) -> bool {
+        matches!(
+            addr,
+            0x0100_240C | 0x0100_2420 | 0x0100_2644 | 0x0100_280C | 0x0100_2820
+        )
     }
 
     fn main_idx(addr: u32) -> usize {
@@ -196,6 +254,12 @@ impl SerDes {
             if (SERDES_MAIN_BASE..SERDES_MAIN_END).contains(&abs) {
                 let idx = Self::main_idx(abs);
                 self.raw_store[idx] = val;
+            } else if (SERDES_LANE_BASE..SERDES_LANE_END).contains(&abs) {
+                let idx = Self::lane_idx(abs);
+                self.lane_store[idx] = val;
+            } else if (SERDES_MODE_BASE..SERDES_MODE_END).contains(&abs) {
+                let idx = Self::mode_idx(abs);
+                self.mode_store[idx] = val;
             }
         }
         for lane in &mut self.lanes {
@@ -222,6 +286,18 @@ impl Peripheral for SerDes {
             let b3 = self.window[base + 3] as u32;
             return Ok((b0 << 24) | (b1 << 16) | (b2 << 8) | b3);
         }
+        if (SERDES_LANE_BASE..SERDES_LANE_END).contains(&addr) {
+            let idx = Self::lane_idx(addr);
+            let mut val = self.lane_store[idx];
+            if self.cmd_pending_clear.remove(&addr) {
+                val &= !0x8000_0000;
+                self.lane_store[idx] = val;
+            }
+            return Ok(val);
+        }
+        if (SERDES_MODE_BASE..SERDES_MODE_END).contains(&addr) {
+            return Ok(self.mode_store[Self::mode_idx(addr)]);
+        }
         match addr {
             REG_LANE0_LINK_LOCK => Ok(self.compute_lane_lock(0)),
             REG_LANE2_LINK_LOCK => Ok(self.compute_lane_lock(1)),
@@ -238,13 +314,21 @@ impl Peripheral for SerDes {
             self.window[base + 3] = val as u8;
             return Ok(());
         }
+        if (SERDES_LANE_BASE..SERDES_LANE_END).contains(&addr) {
+            let idx = Self::lane_idx(addr);
+            self.lane_store[idx] = val;
+            if Self::is_cmd_bit_register(addr) && (val & 0x8000_0000) != 0 {
+                self.cmd_pending_clear.insert(addr);
+            }
+            return Ok(());
+        }
+        if (SERDES_MODE_BASE..SERDES_MODE_END).contains(&addr) {
+            self.mode_store[Self::mode_idx(addr)] = val;
+            return Ok(());
+        }
         let idx = Self::main_idx(addr);
-        // Side effects before committing the write:
         match addr {
             REG_PON_LANE_INDEX => {
-                // The firmware writes the PON lane index into bits
-                // [1:0]. Use that as a hint to mark the corresponding
-                // lane as enabled (deriving link lock for free).
                 let lane_idx = (val & 0x3) as usize;
                 if lane_idx < LANE_COUNT {
                     self.lanes[lane_idx].enabled = true;
@@ -252,7 +336,6 @@ impl Peripheral for SerDes {
                 }
             }
             REG_UNI_LANE_INDEX => {
-                // UNI lane index lives in bits [21:20].
                 let lane_idx = 2 + ((val >> 20) & 0x3) as usize;
                 if lane_idx < LANE_COUNT {
                     self.lanes[lane_idx].enabled = true;
@@ -280,6 +363,8 @@ impl Peripheral for SerDes {
             self.window_write(addr, val);
             return Ok(());
         }
+        // For cmd-bit registers, byte write should not trigger cmd-bit
+        // auto-clear. Route via raw store instead of write_word.
         let word_addr = addr & !3;
         let byte_idx = addr & 3;
         let old = self.read_word(word_addr)?;
@@ -289,10 +374,26 @@ impl Peripheral for SerDes {
         self.write_word(word_addr, new)
     }
 
-    fn tick(&mut self, _cpu_instructions: u64) {}
+    fn tick(&mut self, _cpu_instructions: u64) {
+        for i in 0..LANE_COUNT {
+            if self.lanes[i].enabled && !self.lanes[i].locked && !self.lanes[i].rx_los {
+                self.lane_lock_countdown[i] += 1;
+                if self.lane_lock_countdown[i] >= LANE_LOCK_DELAY_TICKS {
+                    self.lanes[i].locked = true;
+                    self.lane_lock_countdown[i] = 0;
+                }
+            } else if !self.lanes[i].enabled || self.lanes[i].rx_los {
+                self.lane_lock_countdown[i] = 0;
+            }
+        }
+    }
 
     fn reset_cold(&mut self) {
         self.raw_store = [0u32; SERDES_MAIN_WORDS];
+        self.lane_store.fill(0);
+        self.mode_store.fill(0);
+        self.cmd_pending_clear.clear();
+        self.lane_lock_countdown = [0; LANE_COUNT];
         self.lanes = [LaneState::cold(); LANE_COUNT];
         self.window.fill(0);
         self.error_status = 0;
@@ -447,5 +548,86 @@ mod tests {
         assert!(s.claims(0x224A_0010));
         assert!(!s.claims(0x0100_0170));
         assert!(!s.claims(0x0100_01F8));
+        assert!(s.claims(0x0100_240C));
+        assert!(s.claims(0x0100_2820));
+        assert!(s.claims(0x0100_2D00));
+        assert!(!s.claims(0x0100_2A00));
+    }
+
+    #[test]
+    fn cmd_bit_auto_clear_on_read() {
+        let mut s = SerDes::new();
+        s.write_word(0x0100_240C, 0x8000_5000).unwrap();
+        assert_eq!(s.read_word(0x0100_240C).unwrap(), 0x0000_5000);
+        assert_eq!(s.read_word(0x0100_240C).unwrap(), 0x0000_5000);
+    }
+
+    #[test]
+    fn cmd_bit_no_clear_without_bit31() {
+        let mut s = SerDes::new();
+        s.write_word(0x0100_240C, 0x0000_5000).unwrap();
+        assert_eq!(s.read_word(0x0100_240C).unwrap(), 0x0000_5000);
+    }
+
+    #[test]
+    fn cmd_bit_10g_mirror() {
+        let mut s = SerDes::new();
+        s.write_word(0x0100_280C, 0x8000_5000).unwrap();
+        assert_eq!(s.read_word(0x0100_280C).unwrap(), 0x0000_5000);
+    }
+
+    #[test]
+    fn cmd_bit_hw_enable() {
+        let mut s = SerDes::new();
+        s.write_word(0x0100_2644, 0x8000_0501).unwrap();
+        assert_eq!(s.read_word(0x0100_2644).unwrap(), 0x0000_0501);
+    }
+
+    #[test]
+    fn lane_store_roundtrip() {
+        let mut s = SerDes::new();
+        s.write_word(0x0100_2418, 0x0010_0C01).unwrap();
+        assert_eq!(s.read_word(0x0100_2418).unwrap(), 0x0010_0C01);
+    }
+
+    #[test]
+    fn mode_store_roundtrip() {
+        let mut s = SerDes::new();
+        s.write_word(0x0100_2D00, 0xDEAD_BEEF).unwrap();
+        assert_eq!(s.read_word(0x0100_2D00).unwrap(), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn tick_auto_lock_progression() {
+        let mut s = SerDes::new();
+        s.reset_cold();
+        s.inject_event(&PeripheralEvent::SerDes(SerDesEvent::SetLaneEnabled(0, true)))
+            .unwrap();
+        assert!(s.lanes[0].enabled);
+        assert!(!s.lanes[0].locked);
+
+        for _ in 0..LANE_LOCK_DELAY_TICKS - 1 {
+            s.tick(0);
+        }
+        assert!(!s.lanes[0].locked);
+
+        s.tick(0);
+        assert!(s.lanes[0].locked);
+        assert_ne!(s.read_word(0x0100_0194).unwrap() & (1 << 1), 0);
+    }
+
+    #[test]
+    fn tick_auto_lock_blocked_by_rx_los() {
+        let mut s = SerDes::new();
+        s.reset_cold();
+        s.inject_event(&PeripheralEvent::SerDes(SerDesEvent::SetLaneEnabled(0, true)))
+            .unwrap();
+        s.inject_event(&PeripheralEvent::SerDes(SerDesEvent::InjectRxLos(0, true)))
+            .unwrap();
+
+        for _ in 0..LANE_LOCK_DELAY_TICKS * 2 {
+            s.tick(0);
+        }
+        assert!(!s.lanes[0].locked);
     }
 }

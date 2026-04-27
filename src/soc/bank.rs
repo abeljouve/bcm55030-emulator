@@ -11,7 +11,10 @@
 //! path — which does not touch the bank at all.
 
 use std::collections::HashMap;
+use std::io::{BufWriter, Write};
 use std::sync::mpsc;
+
+use parking_lot::Mutex;
 
 use crate::cpu::exception::Exception;
 use crate::soc::alarm_events::AlarmEvents;
@@ -27,10 +30,12 @@ use crate::soc::pbc::Pbc;
 use crate::soc::peripheral::{
     DatapathOp, Peripheral, PeripheralEvent, PeripheralId, PeripheralSnapshot,
 };
+use crate::soc::scenario::ScenarioEngine;
 use crate::soc::serdes::SerDes;
 use crate::soc::sysreg_shim::SysregShim;
 use crate::soc::timer::EponTimer;
 use crate::soc::uart::Uart;
+use crate::soc::vlan_lue::VlanLue;
 
 /// CPU instruction ticks between bank tick invocations. Higher = less
 /// contention but coarser peripheral advancement. The EPON free-running
@@ -51,6 +56,52 @@ pub struct MmioTraceEntry {
     pub first_insn: u64,
     /// bit 0 = byte access, bit 1 = half, bit 2 = word
     pub access_widths: u8,
+}
+
+/// Per-access sequential MMIO trace (for `--trace-mmio-seq`).
+///
+/// Holds an open file handle (wrapped in a `BufWriter`) and an optional
+/// set of address ranges. When ranges is non-empty, only accesses whose
+/// address falls inside at least one range are written. When the `Vec` is
+/// empty every access is recorded.
+pub struct SeqTrace {
+    writer: BufWriter<std::fs::File>,
+    /// Filter ranges `[start, end)`. Empty = record everything.
+    ranges: Vec<(u32, u32)>,
+}
+
+impl SeqTrace {
+    /// Open `path` for writing and attach the optional filter ranges.
+    pub fn open(path: &str, ranges: Vec<(u32, u32)>) -> std::io::Result<Self> {
+        let file = std::fs::File::create(path)?;
+        Ok(Self {
+            writer: BufWriter::with_capacity(64 * 1024, file),
+            ranges,
+        })
+    }
+
+    /// Returns `true` when `addr` passes the configured filter.
+    #[inline]
+    pub fn addr_matches(&self, addr: u32) -> bool {
+        if self.ranges.is_empty() {
+            return true;
+        }
+        self.ranges.iter().any(|(start, end)| addr >= *start && addr < *end)
+    }
+
+    /// Write one JSON Lines entry. Never panics — silently ignores write errors.
+    #[inline]
+    pub fn emit(&mut self, cycle: u64, pc: u32, addr: u32, value: u32, rw: &str, width: &str, periph: &str) {
+        let _ = writeln!(
+            self.writer,
+            r#"{{"cycle":{cycle},"pc":{pc},"addr":{addr},"value":{value},"rw":"{rw}","width":"{width}","periph":"{periph}"}}"#,
+        );
+    }
+
+    /// Flush the internal buffer. Call at clean exit.
+    pub fn flush(&mut self) {
+        let _ = self.writer.flush();
+    }
 }
 
 /// Boot mode — controls whether peripherals apply the post-boot snapshot
@@ -75,6 +126,12 @@ pub struct PeripheralBank {
     pub fatal_filter: FatalFilter,
     pub mpcp: Mpcp,
     pub nco: Nco,
+    pub vlan_lue: VlanLue,
+
+    /// Scenario engine — MMIO overrides, scheduled events, and MMIO
+    /// watchpoints.  Overrides are checked BEFORE the peripheral
+    /// dispatch chain.  All stimulus is HW-level, never firmware.
+    pub scenario: ScenarioEngine,
 
     /// Temporary residual-plus-legacy-arms for the SYSREG range
     /// (`0x01000000..0x01003800`). Hosts every stub that has not yet been
@@ -85,7 +142,15 @@ pub struct PeripheralBank {
     pub sysreg: SysregShim,
 
     uart_rx_sender: mpsc::Sender<u8>,
-    uart_rx_receiver: mpsc::Receiver<u8>,
+    /// Wrapped in `parking_lot::Mutex` so `PeripheralBank` is
+    /// `Sync`. `mpsc::Receiver` is `Send` but not `Sync`, which
+    /// would prevent `Arc<RwLock<PeripheralBank>>` from crossing
+    /// thread boundaries in the UI / MCP workers. Contention is
+    /// zero — only the bank's own `tick()` drains it, always
+    /// while the bank is write-locked — so the mutex acquisition
+    /// stays in parking_lot's fast path (no syscall, no
+    /// poisoning).
+    uart_rx_receiver: Mutex<mpsc::Receiver<u8>>,
 
     /// Current CPU context for trace entries and watchpoint messages.
     pub current_pc: u32,
@@ -114,6 +179,11 @@ pub struct PeripheralBank {
     /// `--unmapped-exception` on the main binary to surface
     /// unmodelled firmware probes.
     pub unmapped_exception: bool,
+
+    /// Per-access sequential MMIO trace (`--trace-mmio-seq`). `None`
+    /// by default — zero overhead when disabled. When present, every
+    /// successful MMIO access appends a JSON Lines entry.
+    pub seq_trace: Option<SeqTrace>,
 }
 
 impl PeripheralBank {
@@ -133,9 +203,11 @@ impl PeripheralBank {
             fatal_filter: FatalFilter::new(),
             mpcp: Mpcp::new(),
             nco: Nco::new(),
+            vlan_lue: VlanLue::new(),
+            scenario: ScenarioEngine::new(),
             sysreg: SysregShim::new(),
             uart_rx_sender: tx,
-            uart_rx_receiver: rx,
+            uart_rx_receiver: Mutex::new(rx),
             current_pc: 0,
             current_blink: 0,
             current_insn: 0,
@@ -144,6 +216,7 @@ impl PeripheralBank {
             irq_pending: 0,
             boot_mode,
             unmapped_exception: false,
+            seq_trace: None,
         };
         // Apply the requested reset flavour.
         match boot_mode {
@@ -165,7 +238,7 @@ impl PeripheralBank {
     /// [`tick`] before other peripherals tick, so UART IRQ bits that
     /// arise from newly-received bytes are visible in the same pass.
     fn drain_uart_channel(&mut self) {
-        while let Ok(b) = self.uart_rx_receiver.try_recv() {
+        while let Ok(b) = self.uart_rx_receiver.lock().try_recv() {
             self.uart.push_rx_byte(b);
         }
     }
@@ -187,12 +260,27 @@ impl PeripheralBank {
         self.fatal_filter.tick(cpu_instructions);
         self.mpcp.tick(cpu_instructions);
         self.nco.tick(cpu_instructions);
+        self.vlan_lue.tick(cpu_instructions);
         self.sysreg.tick(cpu_instructions);
+        self.scenario.tick(cpu_instructions);
 
         // Aggregate IRQ pending bits. UART is the only v1 contributor
         // (IRQ 5, level 1). Other peripherals will add their bits once
         // they land.
         self.irq_pending = self.uart.irq_pending();
+    }
+
+    /// Process deferred writes from scenario effects.
+    fn drain_scenario_deferred(&mut self) {
+        let writes = self.scenario.take_deferred_writes();
+        for w in writes {
+            let _ = self.write_word_inner(w.address, w.value);
+        }
+    }
+
+    /// Check if the scenario engine requested a pause.
+    pub fn scenario_pause_requested(&mut self) -> bool {
+        self.scenario.take_pause()
     }
 
     /// Cold reset — zeros volatile state in all peripherals. Called on
@@ -211,6 +299,7 @@ impl PeripheralBank {
         self.fatal_filter.reset_cold();
         self.mpcp.reset_cold();
         self.nco.reset_cold();
+        self.vlan_lue.reset_cold();
         self.sysreg.reset_cold();
         self.irq_pending = 0;
         self.current_pc = 0;
@@ -233,6 +322,7 @@ impl PeripheralBank {
         self.fatal_filter.reset_warm();
         self.mpcp.reset_warm();
         self.nco.reset_warm();
+        self.vlan_lue.reset_warm();
         self.sysreg.reset_warm();
         self.irq_pending = 0;
         self.current_pc = 0;
@@ -250,6 +340,18 @@ impl PeripheralBank {
         self.sysreg.update_cpu_context(pc, insn);
     }
 
+    /// Emit one entry to the sequential MMIO trace if enabled and the
+    /// address matches the configured filter. Inlined so the branch
+    /// folds away at the call site when `seq_trace` is `None`.
+    #[inline]
+    fn seq_emit(&mut self, addr: u32, value: u32, rw: &str, width: &str, periph: &str) {
+        if let Some(ref mut st) = self.seq_trace {
+            if st.addr_matches(addr) {
+                st.emit(self.current_insn, self.current_pc, addr, value, rw, width, periph);
+            }
+        }
+    }
+
     /// Snapshot each peripheral for UI display. Cheap (shallow clones)
     /// so the UI can call it every frame under a short read lock.
     pub fn snapshot_all(&self) -> Vec<PeripheralSnapshot> {
@@ -257,6 +359,7 @@ impl PeripheralBank {
             self.uart.snapshot(),
             self.pbc.snapshot(),
             self.bsc_i2c.snapshot(),
+            self.bsc_i2c.sfp_snapshot(),
             self.serdes.snapshot(),
             self.epon_mac.snapshot(),
             self.macsec.snapshot(),
@@ -318,49 +421,103 @@ impl PeripheralBank {
 
     // -------- MMIO routing --------
 
-    pub fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
+    /// Side-effect-free probe of `addr`, used by the MCP
+    /// `peek_mmio` tool and by the future peripheral inspector's
+    /// continuous polling. Falls back to the peripheral trait's
+    /// default (`Ok(0)`) when no override exists — each peripheral
+    /// adds real peek support incrementally.
+    pub fn peek_word(&self, addr: u32) -> Result<u32, Exception> {
+        if !self.scenario.overrides.is_empty() {
+            if let Some(v) = self.scenario.overrides.peek_read(addr) {
+                return Ok(v);
+            }
+        }
         if self.uart.claims(addr) {
-            return self.uart.read_word(addr);
+            return self.uart.peek_word(addr);
         }
         if self.pbc.claims(addr) {
-            return self.pbc.read_word(addr);
+            return self.pbc.peek_word(addr);
         }
         if self.bsc_i2c.claims(addr) {
-            return self.bsc_i2c.read_word(addr);
+            return self.bsc_i2c.peek_word(addr);
         }
         if self.serdes.claims(addr) {
-            return self.serdes.read_word(addr);
+            return self.serdes.peek_word(addr);
         }
         if self.epon_mac.claims(addr) {
-            return self.epon_mac.read_word(addr);
+            return self.epon_mac.peek_word(addr);
         }
         if self.macsec.claims(addr) {
-            return self.macsec.read_word(addr);
+            return self.macsec.peek_word(addr);
         }
         if self.dma.claims(addr) {
-            return self.dma.read_word(addr);
+            return self.dma.peek_word(addr);
         }
         if self.timer.claims(addr) {
-            return self.timer.read_word(addr);
+            return self.timer.peek_word(addr);
         }
         if self.efuse_udr.claims(addr) {
-            return self.efuse_udr.read_word(addr);
+            return self.efuse_udr.peek_word(addr);
         }
         if self.fatal_filter.claims(addr) {
-            return self.fatal_filter.read_word(addr);
+            return self.fatal_filter.peek_word(addr);
         }
         if self.mpcp.claims(addr) {
-            return self.mpcp.read_word(addr);
+            return self.mpcp.peek_word(addr);
         }
         if self.nco.claims(addr) {
-            return self.nco.read_word(addr);
+            return self.nco.peek_word(addr);
         }
-        if self.sysreg.claims(addr) {
-            return self.sysreg.read_word(addr);
+        if self.vlan_lue.claims(addr) {
+            return self.vlan_lue.peek_word(addr);
         }
+        // SysregShim residual has no peek path yet.
+        Ok(0)
+    }
+
+    pub fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
+        let result = self.read_word_inner(addr);
+        self.scenario.on_mmio_read(addr);
+        self.drain_scenario_deferred();
+        result
+    }
+
+    fn read_word_inner(&mut self, addr: u32) -> Result<u32, Exception> {
+        if !self.scenario.overrides.is_empty() {
+            if let Some(v) = self.scenario.overrides.try_read(addr) {
+                self.seq_emit(addr, v, "r", "word", "override");
+                return Ok(v);
+            }
+        }
+        macro_rules! dispatch_rw {
+            ($periph:expr, $name:expr) => {{
+                let v = $periph.read_word(addr)?;
+                self.seq_emit(addr, v, "r", "word", $name);
+                return Ok(v);
+            }};
+        }
+        if self.uart.claims(addr) { dispatch_rw!(self.uart, "uart"); }
+        if self.pbc.claims(addr) { dispatch_rw!(self.pbc, "pbc"); }
+        if self.bsc_i2c.claims(addr) { dispatch_rw!(self.bsc_i2c, "bsc_i2c"); }
+        if self.serdes.claims(addr) { dispatch_rw!(self.serdes, "serdes"); }
+        if self.epon_mac.claims(addr) { dispatch_rw!(self.epon_mac, "epon_mac"); }
+        if self.macsec.claims(addr) { dispatch_rw!(self.macsec, "macsec"); }
+        if self.dma.claims(addr) { dispatch_rw!(self.dma, "dma"); }
+        if self.timer.claims(addr) { dispatch_rw!(self.timer, "timer"); }
+        if self.efuse_udr.claims(addr) { dispatch_rw!(self.efuse_udr, "efuse_udr"); }
+        if self.fatal_filter.claims(addr) { dispatch_rw!(self.fatal_filter, "fatal_filter"); }
+        if self.mpcp.claims(addr) { dispatch_rw!(self.mpcp, "mpcp"); }
+        if self.nco.claims(addr) { dispatch_rw!(self.nco, "nco"); }
+        if self.vlan_lue.claims(addr) {
+            let v = self.vlan_lue.read_word(addr)?;
+            self.seq_emit(addr, v, "r", "word", "vlan_lue");
+            return Ok(v);
+        }
+        if self.sysreg.claims(addr) { dispatch_rw!(self.sysreg, "sysreg"); }
         if self.trace {
             eprintln!("[MMIO] read  word  0x{:08X} → 0x00000000 (unmapped)", addr);
         }
+        self.seq_emit(addr, 0, "r", "word", "unmapped");
         if self.unmapped_exception {
             return Err(Exception::MemoryError { address: addr, is_write: false });
         }
@@ -368,56 +525,60 @@ impl PeripheralBank {
     }
 
     pub fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
-        if self.uart.claims(addr) {
-            return self.uart.write_word(addr, val);
+        let result = self.write_word_inner(addr, val);
+        self.scenario.on_mmio_write(addr);
+        self.drain_scenario_deferred();
+        result
+    }
+
+    fn write_word_inner(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
+        let val = if !self.scenario.overrides.is_empty() {
+            if let Some(masked) = self.scenario.overrides.filter_write(addr, val) {
+                self.seq_emit(addr, masked, "w", "word", "override-mask");
+                masked
+            } else {
+                val
+            }
+        } else {
+            val
+        };
+        macro_rules! dispatch_ww {
+            ($periph:expr, $name:expr) => {{
+                $periph.write_word(addr, val)?;
+                self.seq_emit(addr, val, "w", "word", $name);
+                return Ok(());
+            }};
         }
+        if self.uart.claims(addr) { dispatch_ww!(self.uart, "uart"); }
         if self.pbc.claims(addr) {
             self.pbc.write_word(addr, val)?;
-            // Cross-peripheral dispatch: if the write triggered a
-            // SerDes SPI slave command, route it to the SerDes now
-            // that the PBC write is complete.
             if let Some((tx, rx_len)) = self.pbc.take_pending_spi_serdes() {
                 let rx = self.serdes.spi_command(&tx, rx_len);
                 self.pbc.complete_spi_serdes(&rx);
             }
+            self.seq_emit(addr, val, "w", "word", "pbc");
             return Ok(());
         }
-        if self.bsc_i2c.claims(addr) {
-            return self.bsc_i2c.write_word(addr, val);
+        if self.bsc_i2c.claims(addr) { dispatch_ww!(self.bsc_i2c, "bsc_i2c"); }
+        if self.serdes.claims(addr) { dispatch_ww!(self.serdes, "serdes"); }
+        if self.epon_mac.claims(addr) { dispatch_ww!(self.epon_mac, "epon_mac"); }
+        if self.macsec.claims(addr) { dispatch_ww!(self.macsec, "macsec"); }
+        if self.dma.claims(addr) { dispatch_ww!(self.dma, "dma"); }
+        if self.timer.claims(addr) { dispatch_ww!(self.timer, "timer"); }
+        if self.efuse_udr.claims(addr) { dispatch_ww!(self.efuse_udr, "efuse_udr"); }
+        if self.fatal_filter.claims(addr) { dispatch_ww!(self.fatal_filter, "fatal_filter"); }
+        if self.mpcp.claims(addr) { dispatch_ww!(self.mpcp, "mpcp"); }
+        if self.nco.claims(addr) { dispatch_ww!(self.nco, "nco"); }
+        if self.vlan_lue.claims(addr) {
+            self.vlan_lue.write_word(addr, val)?;
+            self.seq_emit(addr, val, "w", "word", "vlan_lue");
+            return Ok(());
         }
-        if self.serdes.claims(addr) {
-            return self.serdes.write_word(addr, val);
-        }
-        if self.epon_mac.claims(addr) {
-            return self.epon_mac.write_word(addr, val);
-        }
-        if self.macsec.claims(addr) {
-            return self.macsec.write_word(addr, val);
-        }
-        if self.dma.claims(addr) {
-            return self.dma.write_word(addr, val);
-        }
-        if self.timer.claims(addr) {
-            return self.timer.write_word(addr, val);
-        }
-        if self.efuse_udr.claims(addr) {
-            return self.efuse_udr.write_word(addr, val);
-        }
-        if self.fatal_filter.claims(addr) {
-            return self.fatal_filter.write_word(addr, val);
-        }
-        if self.mpcp.claims(addr) {
-            return self.mpcp.write_word(addr, val);
-        }
-        if self.nco.claims(addr) {
-            return self.nco.write_word(addr, val);
-        }
-        if self.sysreg.claims(addr) {
-            return self.sysreg.write_word(addr, val);
-        }
+        if self.sysreg.claims(addr) { dispatch_ww!(self.sysreg, "sysreg"); }
         if self.trace {
             eprintln!("[MMIO] write word  0x{:08X} = 0x{:08X} (unmapped)", addr, val);
         }
+        self.seq_emit(addr, val, "w", "word", "unmapped");
         if self.unmapped_exception {
             return Err(Exception::MemoryError { address: addr, is_write: true });
         }
@@ -425,45 +586,32 @@ impl PeripheralBank {
     }
 
     pub fn read_half(&mut self, addr: u32) -> Result<u16, Exception> {
-        if self.uart.claims(addr) {
-            return self.uart.read_half(addr);
+        macro_rules! dispatch_rh {
+            ($periph:expr, $name:expr) => {{
+                let v = $periph.read_half(addr)?;
+                self.seq_emit(addr, v as u32, "r", "half", $name);
+                return Ok(v);
+            }};
         }
-        if self.pbc.claims(addr) {
-            return self.pbc.read_half(addr);
+        if self.uart.claims(addr) { dispatch_rh!(self.uart, "uart"); }
+        if self.pbc.claims(addr) { dispatch_rh!(self.pbc, "pbc"); }
+        if self.bsc_i2c.claims(addr) { dispatch_rh!(self.bsc_i2c, "bsc_i2c"); }
+        if self.serdes.claims(addr) { dispatch_rh!(self.serdes, "serdes"); }
+        if self.epon_mac.claims(addr) { dispatch_rh!(self.epon_mac, "epon_mac"); }
+        if self.macsec.claims(addr) { dispatch_rh!(self.macsec, "macsec"); }
+        if self.dma.claims(addr) { dispatch_rh!(self.dma, "dma"); }
+        if self.timer.claims(addr) { dispatch_rh!(self.timer, "timer"); }
+        if self.efuse_udr.claims(addr) { dispatch_rh!(self.efuse_udr, "efuse_udr"); }
+        if self.fatal_filter.claims(addr) { dispatch_rh!(self.fatal_filter, "fatal_filter"); }
+        if self.mpcp.claims(addr) { dispatch_rh!(self.mpcp, "mpcp"); }
+        if self.nco.claims(addr) { dispatch_rh!(self.nco, "nco"); }
+        if self.vlan_lue.claims(addr) {
+            let v = self.vlan_lue.read_half(addr)?;
+            self.seq_emit(addr, v as u32, "r", "half", "vlan_lue");
+            return Ok(v);
         }
-        if self.bsc_i2c.claims(addr) {
-            return self.bsc_i2c.read_half(addr);
-        }
-        if self.serdes.claims(addr) {
-            return self.serdes.read_half(addr);
-        }
-        if self.epon_mac.claims(addr) {
-            return self.epon_mac.read_half(addr);
-        }
-        if self.macsec.claims(addr) {
-            return self.macsec.read_half(addr);
-        }
-        if self.dma.claims(addr) {
-            return self.dma.read_half(addr);
-        }
-        if self.timer.claims(addr) {
-            return self.timer.read_half(addr);
-        }
-        if self.efuse_udr.claims(addr) {
-            return self.efuse_udr.read_half(addr);
-        }
-        if self.fatal_filter.claims(addr) {
-            return self.fatal_filter.read_half(addr);
-        }
-        if self.mpcp.claims(addr) {
-            return self.mpcp.read_half(addr);
-        }
-        if self.nco.claims(addr) {
-            return self.nco.read_half(addr);
-        }
-        if self.sysreg.claims(addr) {
-            return self.sysreg.read_half(addr);
-        }
+        if self.sysreg.claims(addr) { dispatch_rh!(self.sysreg, "sysreg"); }
+        self.seq_emit(addr, 0, "r", "half", "unmapped");
         if self.unmapped_exception {
             return Err(Exception::MemoryError { address: addr, is_write: false });
         }
@@ -471,45 +619,32 @@ impl PeripheralBank {
     }
 
     pub fn write_half(&mut self, addr: u32, val: u16) -> Result<(), Exception> {
-        if self.uart.claims(addr) {
-            return self.uart.write_half(addr, val);
+        macro_rules! dispatch_wh {
+            ($periph:expr, $name:expr) => {{
+                $periph.write_half(addr, val)?;
+                self.seq_emit(addr, val as u32, "w", "half", $name);
+                return Ok(());
+            }};
         }
-        if self.pbc.claims(addr) {
-            return self.pbc.write_half(addr, val);
+        if self.uart.claims(addr) { dispatch_wh!(self.uart, "uart"); }
+        if self.pbc.claims(addr) { dispatch_wh!(self.pbc, "pbc"); }
+        if self.bsc_i2c.claims(addr) { dispatch_wh!(self.bsc_i2c, "bsc_i2c"); }
+        if self.serdes.claims(addr) { dispatch_wh!(self.serdes, "serdes"); }
+        if self.epon_mac.claims(addr) { dispatch_wh!(self.epon_mac, "epon_mac"); }
+        if self.macsec.claims(addr) { dispatch_wh!(self.macsec, "macsec"); }
+        if self.dma.claims(addr) { dispatch_wh!(self.dma, "dma"); }
+        if self.timer.claims(addr) { dispatch_wh!(self.timer, "timer"); }
+        if self.efuse_udr.claims(addr) { dispatch_wh!(self.efuse_udr, "efuse_udr"); }
+        if self.fatal_filter.claims(addr) { dispatch_wh!(self.fatal_filter, "fatal_filter"); }
+        if self.mpcp.claims(addr) { dispatch_wh!(self.mpcp, "mpcp"); }
+        if self.nco.claims(addr) { dispatch_wh!(self.nco, "nco"); }
+        if self.vlan_lue.claims(addr) {
+            self.vlan_lue.write_half(addr, val)?;
+            self.seq_emit(addr, val as u32, "w", "half", "vlan_lue");
+            return Ok(());
         }
-        if self.bsc_i2c.claims(addr) {
-            return self.bsc_i2c.write_half(addr, val);
-        }
-        if self.serdes.claims(addr) {
-            return self.serdes.write_half(addr, val);
-        }
-        if self.epon_mac.claims(addr) {
-            return self.epon_mac.write_half(addr, val);
-        }
-        if self.macsec.claims(addr) {
-            return self.macsec.write_half(addr, val);
-        }
-        if self.dma.claims(addr) {
-            return self.dma.write_half(addr, val);
-        }
-        if self.timer.claims(addr) {
-            return self.timer.write_half(addr, val);
-        }
-        if self.efuse_udr.claims(addr) {
-            return self.efuse_udr.write_half(addr, val);
-        }
-        if self.fatal_filter.claims(addr) {
-            return self.fatal_filter.write_half(addr, val);
-        }
-        if self.mpcp.claims(addr) {
-            return self.mpcp.write_half(addr, val);
-        }
-        if self.nco.claims(addr) {
-            return self.nco.write_half(addr, val);
-        }
-        if self.sysreg.claims(addr) {
-            return self.sysreg.write_half(addr, val);
-        }
+        if self.sysreg.claims(addr) { dispatch_wh!(self.sysreg, "sysreg"); }
+        self.seq_emit(addr, val as u32, "w", "half", "unmapped");
         if self.unmapped_exception {
             return Err(Exception::MemoryError { address: addr, is_write: true });
         }
@@ -517,45 +652,32 @@ impl PeripheralBank {
     }
 
     pub fn read_byte(&mut self, addr: u32) -> Result<u8, Exception> {
-        if self.uart.claims(addr) {
-            return self.uart.read_byte(addr);
+        macro_rules! dispatch_rb {
+            ($periph:expr, $name:expr) => {{
+                let v = $periph.read_byte(addr)?;
+                self.seq_emit(addr, v as u32, "r", "byte", $name);
+                return Ok(v);
+            }};
         }
-        if self.pbc.claims(addr) {
-            return self.pbc.read_byte(addr);
+        if self.uart.claims(addr) { dispatch_rb!(self.uart, "uart"); }
+        if self.pbc.claims(addr) { dispatch_rb!(self.pbc, "pbc"); }
+        if self.bsc_i2c.claims(addr) { dispatch_rb!(self.bsc_i2c, "bsc_i2c"); }
+        if self.serdes.claims(addr) { dispatch_rb!(self.serdes, "serdes"); }
+        if self.epon_mac.claims(addr) { dispatch_rb!(self.epon_mac, "epon_mac"); }
+        if self.macsec.claims(addr) { dispatch_rb!(self.macsec, "macsec"); }
+        if self.dma.claims(addr) { dispatch_rb!(self.dma, "dma"); }
+        if self.timer.claims(addr) { dispatch_rb!(self.timer, "timer"); }
+        if self.efuse_udr.claims(addr) { dispatch_rb!(self.efuse_udr, "efuse_udr"); }
+        if self.fatal_filter.claims(addr) { dispatch_rb!(self.fatal_filter, "fatal_filter"); }
+        if self.mpcp.claims(addr) { dispatch_rb!(self.mpcp, "mpcp"); }
+        if self.nco.claims(addr) { dispatch_rb!(self.nco, "nco"); }
+        if self.vlan_lue.claims(addr) {
+            let v = self.vlan_lue.read_byte(addr)?;
+            self.seq_emit(addr, v as u32, "r", "byte", "vlan_lue");
+            return Ok(v);
         }
-        if self.bsc_i2c.claims(addr) {
-            return self.bsc_i2c.read_byte(addr);
-        }
-        if self.serdes.claims(addr) {
-            return self.serdes.read_byte(addr);
-        }
-        if self.epon_mac.claims(addr) {
-            return self.epon_mac.read_byte(addr);
-        }
-        if self.macsec.claims(addr) {
-            return self.macsec.read_byte(addr);
-        }
-        if self.dma.claims(addr) {
-            return self.dma.read_byte(addr);
-        }
-        if self.timer.claims(addr) {
-            return self.timer.read_byte(addr);
-        }
-        if self.efuse_udr.claims(addr) {
-            return self.efuse_udr.read_byte(addr);
-        }
-        if self.fatal_filter.claims(addr) {
-            return self.fatal_filter.read_byte(addr);
-        }
-        if self.mpcp.claims(addr) {
-            return self.mpcp.read_byte(addr);
-        }
-        if self.nco.claims(addr) {
-            return self.nco.read_byte(addr);
-        }
-        if self.sysreg.claims(addr) {
-            return self.sysreg.read_byte(addr);
-        }
+        if self.sysreg.claims(addr) { dispatch_rb!(self.sysreg, "sysreg"); }
+        self.seq_emit(addr, 0, "r", "byte", "unmapped");
         if self.unmapped_exception {
             return Err(Exception::MemoryError { address: addr, is_write: false });
         }
@@ -563,45 +685,32 @@ impl PeripheralBank {
     }
 
     pub fn write_byte(&mut self, addr: u32, val: u8) -> Result<(), Exception> {
-        if self.uart.claims(addr) {
-            return self.uart.write_byte(addr, val);
+        macro_rules! dispatch_wb {
+            ($periph:expr, $name:expr) => {{
+                $periph.write_byte(addr, val)?;
+                self.seq_emit(addr, val as u32, "w", "byte", $name);
+                return Ok(());
+            }};
         }
-        if self.pbc.claims(addr) {
-            return self.pbc.write_byte(addr, val);
+        if self.uart.claims(addr) { dispatch_wb!(self.uart, "uart"); }
+        if self.pbc.claims(addr) { dispatch_wb!(self.pbc, "pbc"); }
+        if self.bsc_i2c.claims(addr) { dispatch_wb!(self.bsc_i2c, "bsc_i2c"); }
+        if self.serdes.claims(addr) { dispatch_wb!(self.serdes, "serdes"); }
+        if self.epon_mac.claims(addr) { dispatch_wb!(self.epon_mac, "epon_mac"); }
+        if self.macsec.claims(addr) { dispatch_wb!(self.macsec, "macsec"); }
+        if self.dma.claims(addr) { dispatch_wb!(self.dma, "dma"); }
+        if self.timer.claims(addr) { dispatch_wb!(self.timer, "timer"); }
+        if self.efuse_udr.claims(addr) { dispatch_wb!(self.efuse_udr, "efuse_udr"); }
+        if self.fatal_filter.claims(addr) { dispatch_wb!(self.fatal_filter, "fatal_filter"); }
+        if self.mpcp.claims(addr) { dispatch_wb!(self.mpcp, "mpcp"); }
+        if self.nco.claims(addr) { dispatch_wb!(self.nco, "nco"); }
+        if self.vlan_lue.claims(addr) {
+            self.vlan_lue.write_byte(addr, val)?;
+            self.seq_emit(addr, val as u32, "w", "byte", "vlan_lue");
+            return Ok(());
         }
-        if self.bsc_i2c.claims(addr) {
-            return self.bsc_i2c.write_byte(addr, val);
-        }
-        if self.serdes.claims(addr) {
-            return self.serdes.write_byte(addr, val);
-        }
-        if self.epon_mac.claims(addr) {
-            return self.epon_mac.write_byte(addr, val);
-        }
-        if self.macsec.claims(addr) {
-            return self.macsec.write_byte(addr, val);
-        }
-        if self.dma.claims(addr) {
-            return self.dma.write_byte(addr, val);
-        }
-        if self.timer.claims(addr) {
-            return self.timer.write_byte(addr, val);
-        }
-        if self.efuse_udr.claims(addr) {
-            return self.efuse_udr.write_byte(addr, val);
-        }
-        if self.fatal_filter.claims(addr) {
-            return self.fatal_filter.write_byte(addr, val);
-        }
-        if self.mpcp.claims(addr) {
-            return self.mpcp.write_byte(addr, val);
-        }
-        if self.nco.claims(addr) {
-            return self.nco.write_byte(addr, val);
-        }
-        if self.sysreg.claims(addr) {
-            return self.sysreg.write_byte(addr, val);
-        }
+        if self.sysreg.claims(addr) { dispatch_wb!(self.sysreg, "sysreg"); }
+        self.seq_emit(addr, val as u32, "w", "byte", "unmapped");
         if self.unmapped_exception {
             return Err(Exception::MemoryError { address: addr, is_write: true });
         }
