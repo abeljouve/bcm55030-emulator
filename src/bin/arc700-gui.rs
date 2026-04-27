@@ -28,6 +28,8 @@ fn usage(prog: &str) {
     eprintln!("  --mcp-port <PORT>   TCP port for the MCP server (default: {DEFAULT_MCP_PORT}, 0 = random)");
     eprintln!("  --no-mcp            Disable the integrated MCP server");
     eprintln!("  --cold-boot         Use cold-boot mode on reset (default: warm)");
+    eprintln!("  --olt-enable                Enable EPON OLT emulation");
+    eprintln!("  --olt-mac <MAC>             OLT MAC address (AA:BB:CC:DD:EE:FF)");
     eprintln!("  --verbose, -v       Enable [BCM55030] / [Hook] stderr trace");
     eprintln!("  --help, -h          This help");
     eprintln!();
@@ -38,6 +40,8 @@ struct GuiConfig {
     mcp_enabled: bool,
     mcp_port: u16,
     boot_mode: BootMode,
+    olt_enable: bool,
+    olt_mac: Option<[u8; 6]>,
 }
 
 fn parse_args() -> GuiConfig {
@@ -47,6 +51,8 @@ fn parse_args() -> GuiConfig {
         mcp_enabled: true,
         mcp_port: DEFAULT_MCP_PORT,
         boot_mode: BootMode::Warm,
+        olt_enable: false,
+        olt_mac: None,
     };
     let mut i = 1;
     while i < args.len() {
@@ -65,6 +71,35 @@ fn parse_args() -> GuiConfig {
             "--no-mcp" => cfg.mcp_enabled = false,
             "--cold-boot" => cfg.boot_mode = BootMode::Cold,
             "--warm-boot" => cfg.boot_mode = BootMode::Warm,
+            "--olt-enable" => cfg.olt_enable = true,
+            "--olt-mac" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --olt-mac requires AA:BB:CC:DD:EE:FF");
+                    process::exit(1);
+                }
+                let mac_str = &args[i];
+                let parts: Vec<&str> = mac_str.split(':').collect();
+                if parts.len() == 6 {
+                    let mut mac = [0u8; 6];
+                    let mut ok = true;
+                    for (j, p) in parts.iter().enumerate() {
+                        match u8::from_str_radix(p, 16) {
+                            Ok(v) => mac[j] = v,
+                            Err(_) => { ok = false; break; }
+                        }
+                    }
+                    if ok {
+                        cfg.olt_mac = Some(mac);
+                    } else {
+                        eprintln!("Error: invalid MAC: {mac_str}");
+                        process::exit(1);
+                    }
+                } else {
+                    eprintln!("Error: invalid MAC format: {mac_str}");
+                    process::exit(1);
+                }
+            }
             "--verbose" | "-v" => bcm55030_emulator::set_verbose(true),
             "--help" | "-h" => {
                 usage(prog);
@@ -99,6 +134,15 @@ fn main() {
     // bank Arc so this setting survives across reset /
     // load_firmware.
     bank.write().uart.stdout_passthrough = false;
+
+    if cfg.olt_enable {
+        let mut b = bank.write();
+        b.olt.set_enabled(true);
+        if let Some(mac) = cfg.olt_mac {
+            b.olt.config.mac = mac;
+        }
+        b.olt.set_link_up(true);
+    }
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<CpuCommand>();
     let uart_tx = bank.read().uart_rx_sender();
