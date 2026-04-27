@@ -707,9 +707,11 @@ impl Olt {
             self.gate_count += 1;
         }
 
-        // Periodic OAM keepalive.
-        if (self.mpcp_state == OltMpcpState::Registered
-            || self.mpcp_state == OltMpcpState::WaitAck)
+        // Periodic OAM keepalive — sent whenever link is up, regardless
+        // of MPCP state. On real hardware the OLT sends OAM Info PDUs
+        // before MPCP registration to prevent the ONU's keepalive
+        // watchdog from timing out.
+        if self.link_up
             && self.ticks_elapsed >= self.last_oam_tick + self.config.oam_interval_ticks
         {
             self.last_oam_tick = self.ticks_elapsed;
@@ -958,6 +960,7 @@ mod tests {
     fn oam_keepalive_sent_periodically() {
         let mut olt = Olt::new();
         olt.set_enabled(true);
+        olt.set_link_up(true);
         olt.mpcp_state = OltMpcpState::Registered;
         olt.onu_mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
         olt.config.oam_interval_ticks = 100;
