@@ -184,7 +184,7 @@ pub enum SerDesEvent {
     ClearErrorStatus,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum LaneSpeed {
     OneGigabit,
     TenGigabit,
@@ -230,7 +230,7 @@ pub enum PbcEvent {
 
 /// Immutable snapshot of a peripheral's state for UI display. Peripherals
 /// return a variant-specific payload; the UI dispatches on the enum.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub enum PeripheralSnapshot {
     Empty { name: &'static str },
     Uart(UartSnapshot),
@@ -271,7 +271,7 @@ impl PeripheralSnapshot {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct MacsecSnapshot {
     pub control: u32,
     pub enable_mode: u32,
@@ -281,25 +281,25 @@ pub struct MacsecSnapshot {
     pub pn_overflow_mask: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct TimerSnapshot {
     pub counter: u32,
     pub prescaler: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct EfuseSnapshot {
     pub udr_status: u32,
     pub clock_toggles: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct FatalFilterSnapshot {
     pub fatal_status: u32,
     pub link_up_bitmap: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct AlarmSnapshot {
     /// Opcodes currently held pending by the UI test harness. Up
     /// to 32 distinct opcodes can be tracked.
@@ -310,14 +310,14 @@ pub struct AlarmSnapshot {
     pub live_opcodes: Vec<u16>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct DmaSnapshot {
     pub channels_enabled: u32,
     pub channels_busy: u32,
     pub irq_pending_bitmap: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct EponMacSnapshot {
     pub chip_id: u32,
     pub chip_rev: u32,
@@ -329,13 +329,13 @@ pub struct EponMacSnapshot {
     pub llid_irq_pending: [u32; 6],
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct SerDesSnapshot {
     pub lanes: [SerDesLaneSnapshot; 4],
     pub error_status: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct SerDesLaneSnapshot {
     pub enabled: bool,
     pub locked: bool,
@@ -343,7 +343,7 @@ pub struct SerDesLaneSnapshot {
     pub speed: LaneSpeed,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct UartSnapshot {
     pub ier: u8,
     pub baud_divisor: u16,
@@ -351,7 +351,7 @@ pub struct UartSnapshot {
     pub tx_log_tail: Vec<u8>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct SfpSnapshot {
     pub vendor: String,
     pub serial: String,
@@ -363,7 +363,7 @@ pub struct SfpSnapshot {
     pub rx_power_uw: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct PbcSnapshot {
     pub flash_dirty: bool,
     pub flash_size: usize,
@@ -372,7 +372,7 @@ pub struct PbcSnapshot {
     pub dma_data_addr: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct BscSnapshot {
     pub busy: bool,
     pub last_device_addr: u8,

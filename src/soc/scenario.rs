@@ -212,6 +212,9 @@ pub struct ScheduledEvent {
     pub effect: ScenarioEffect,
     pub label: Option<String>,
     pub fired: bool,
+    /// When true, the event re-arms after firing (occurrence counter
+    /// resets).  Default false = one-shot.
+    pub repeat: bool,
 }
 
 /// MMIO watchpoint with an associated action.
@@ -289,6 +292,10 @@ impl ScenarioEngine {
     // ── Events ──────────────────────────────────────────────────────
 
     pub fn schedule(&mut self, trigger: ScenarioTrigger, effect: ScenarioEffect, label: Option<String>) -> u32 {
+        self.schedule_ex(trigger, effect, label, false)
+    }
+
+    pub fn schedule_ex(&mut self, trigger: ScenarioTrigger, effect: ScenarioEffect, label: Option<String>, repeat: bool) -> u32 {
         let id = self.next_event_id;
         self.next_event_id += 1;
         let idx = self.events.len();
@@ -298,6 +305,7 @@ impl ScenarioEngine {
             effect,
             label,
             fired: false,
+            repeat,
         });
         match &trigger {
             ScenarioTrigger::AtInstruction(n) => {
@@ -324,6 +332,10 @@ impl ScenarioEngine {
 
     pub fn pending_events(&self) -> impl Iterator<Item = &ScheduledEvent> {
         self.events.iter().filter(|e| !e.fired)
+    }
+
+    pub fn all_events(&self) -> &[ScheduledEvent] {
+        &self.events
     }
 
     /// Process instruction-triggered events.  Call from `bank.tick()`.
@@ -361,7 +373,12 @@ impl ScenarioEngine {
                     continue;
                 }
                 if let ScenarioTrigger::OnMmioRead { occurrence, .. } = self.events[idx].trigger {
-                    if current == occurrence {
+                    let should_fire = if self.events[idx].repeat {
+                        occurrence > 0 && current % occurrence == 0
+                    } else {
+                        current == occurrence
+                    };
+                    if should_fire {
                         self.fire_event(idx);
                     }
                 }
@@ -384,7 +401,12 @@ impl ScenarioEngine {
                     continue;
                 }
                 if let ScenarioTrigger::OnMmioWrite { occurrence, .. } = self.events[idx].trigger {
-                    if current == occurrence {
+                    let should_fire = if self.events[idx].repeat {
+                        occurrence > 0 && current % occurrence == 0
+                    } else {
+                        current == occurrence
+                    };
+                    if should_fire {
                         self.fire_event(idx);
                     }
                 }
@@ -395,9 +417,13 @@ impl ScenarioEngine {
     }
 
     fn fire_event(&mut self, idx: usize) {
-        self.events[idx].fired = true;
         let effect = self.events[idx].effect.clone();
         self.apply_effect(&effect);
+        if self.events[idx].repeat {
+            self.events[idx].fired = false;
+        } else {
+            self.events[idx].fired = true;
+        }
     }
 
     fn apply_effect(&mut self, effect: &ScenarioEffect) {

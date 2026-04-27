@@ -443,6 +443,9 @@ impl Worker {
         };
 
         self.reset_cpu(boot_mode);
+        if let Some(bank) = self.cpu.bank() {
+            bank.write().uart.clear_tx_log();
+        }
         self.breakpoints.clear();
         for addr in saved_bps {
             self.cpu.hooks.insert(addr, Hook::Breakpoint);

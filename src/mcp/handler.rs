@@ -54,6 +54,74 @@ impl EmulatorHandler {
     }
 }
 
+// ---------- HexU32 — accepts both integer and hex-string in MCP params ---
+
+/// A `u32` that deserializes from either a JSON number or a hex string
+/// (`"0x01000E04"`).  Serializes as a decimal number for JSON round-trip,
+/// but the `JsonSchema` advertises `oneOf [integer, string]` so the MCP
+/// client knows hex is accepted.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HexU32(pub u32);
+
+impl From<HexU32> for u32 {
+    fn from(h: HexU32) -> u32 { h.0 }
+}
+
+impl std::ops::Deref for HexU32 {
+    type Target = u32;
+    fn deref(&self) -> &u32 { &self.0 }
+}
+
+impl<'de> serde::Deserialize<'de> for HexU32 {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = HexU32;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "an integer or a hex string like \"0x01000E04\"")
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<HexU32, E> {
+                Ok(HexU32(v as u32))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<HexU32, E> {
+                Ok(HexU32(v as u32))
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<HexU32, E> {
+                let s = s.trim();
+                if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                    u32::from_str_radix(hex, 16)
+                        .map(HexU32)
+                        .map_err(serde::de::Error::custom)
+                } else {
+                    s.parse::<u32>()
+                        .map(HexU32)
+                        .map_err(serde::de::Error::custom)
+                }
+            }
+        }
+        de.deserialize_any(Visitor)
+    }
+}
+
+impl serde::Serialize for HexU32 {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_u32(self.0)
+    }
+}
+
+impl schemars::JsonSchema for HexU32 {
+    fn schema_name() -> std::borrow::Cow<'static, str> { std::borrow::Cow::Borrowed("HexU32") }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "description": "A 32-bit unsigned integer. Accepts decimal (16786444) or hex string (\"0x0100240C\").",
+            "oneOf": [
+                { "type": "integer", "minimum": 0 },
+                { "type": "string", "pattern": "^(0[xX])?[0-9a-fA-F]+$" }
+            ]
+        })).unwrap()
+    }
+}
+
 // ---------- Tool request / response DTOs ---------------------------------
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
@@ -108,7 +176,7 @@ pub struct FirmwareInfoResult {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct PeekMmioParams {
-    pub address: u32,
+    pub address: HexU32,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -119,16 +187,16 @@ pub struct PeekMmioResult {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReadFlashParams {
-    pub offset: u32,
-    pub length: u32,
+    pub offset: HexU32,
+    pub length: HexU32,
 }
 
 // ---------- Phase 5a mutation DTOs ---------------------------------------
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct WriteMmioParams {
-    pub address: u32,
-    pub value: u32,
+    pub address: HexU32,
+    pub value: HexU32,
     /// Access width: `"byte"`, `"half"`, or `"word"` (default).
     pub width: Option<String>,
 }
@@ -153,7 +221,7 @@ pub struct SendUartInputResult {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct WriteFlashParams {
-    pub offset: u32,
+    pub offset: HexU32,
     /// Hex string of bytes to write (no separators, upper- or
     /// lower-case). Byte count = hex string length / 2.
     pub hex: String,
@@ -172,13 +240,13 @@ pub struct FlashPathParams {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct AddSymbolParams {
-    pub address: u32,
+    pub address: HexU32,
     pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct AddCommentParams {
-    pub address: u32,
+    pub address: HexU32,
     pub comment: String,
 }
 
@@ -224,11 +292,8 @@ pub struct DumpMmioTraceResult {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SetMmioOverrideParams {
-    /// MMIO address (word-aligned).
-    pub address: u32,
-    /// Value to return on read (for `static` / `oneshot` modes) or
-    /// bitmask of bits to suppress on write (`mask` mode).
-    pub value: u32,
+    pub address: HexU32,
+    pub value: HexU32,
     /// `"static"` (default), `"oneshot"`, or `"mask"`.
     #[serde(default = "default_override_mode")]
     pub mode: String,
@@ -249,7 +314,7 @@ fn default_oneshot_count() -> u32 {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RemoveMmioOverrideParams {
-    pub address: u32,
+    pub address: HexU32,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -281,6 +346,10 @@ pub struct ScheduleEventParams {
     /// `{"type": "pause"}`.
     pub effect: serde_json::Value,
     pub label: Option<String>,
+    /// When true, the event re-arms after firing (fires on every
+    /// N-th occurrence).  Default false = one-shot.
+    #[serde(default)]
+    pub repeat: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -311,7 +380,7 @@ pub struct ListScheduledEventsResult {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SetMmioWatchpointParams {
-    pub address: u32,
+    pub address: HexU32,
     /// Size in bytes (default 4 = one word).
     #[serde(default = "default_wp_size")]
     pub size: u32,
@@ -387,7 +456,7 @@ pub struct CpuStepParams {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct CpuRunToParams {
-    pub address: u32,
+    pub address: HexU32,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -405,7 +474,7 @@ pub struct LoadFirmwareParams {
     /// `"cold"` or `"warm"` (default).
     pub boot_mode: Option<String>,
     /// Reset vector / PC after load. Defaults to `0x0`.
-    pub entry_point: Option<u32>,
+    pub entry_point: Option<HexU32>,
     #[serde(default = "default_true")]
     pub keep_breakpoints: bool,
 }
@@ -425,18 +494,18 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SetBreakpointParams {
-    pub address: u32,
+    pub address: HexU32,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RemoveBreakpointParams {
-    pub address: u32,
+    pub address: HexU32,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SetWatchpointParams {
-    pub address: u32,
-    pub size: u32,
+    pub address: HexU32,
+    pub size: HexU32,
     /// `"read"`, `"write"`, or `"rw"`.
     pub mode: String,
 }
@@ -449,20 +518,20 @@ pub struct RemoveWatchpointParams {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct WriteRegisterParams {
     pub name: String,
-    pub value: u32,
+    pub value: HexU32,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct WriteMemoryParams {
-    pub address: u32,
+    pub address: HexU32,
     /// Hex-encoded bytes.
     pub hex: String,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReadMemoryParams {
-    pub address: u32,
-    pub length: u32,
+    pub address: HexU32,
+    pub length: HexU32,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -475,7 +544,7 @@ pub struct ReadMemoryResult {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReadMmioParams {
-    pub address: u32,
+    pub address: HexU32,
     pub width: Option<String>,
 }
 
@@ -491,11 +560,7 @@ pub struct ReadFlashResult {
 pub struct PeripheralEntry {
     pub index: usize,
     pub name: String,
-    /// Debug-format dump of the peripheral snapshot. Phase 4
-    /// ships this as a single string because `PeripheralSnapshot`
-    /// does not yet derive `Serialize`; phases 5+ wire proper
-    /// JSON projection as peripherals get their inspector tabs.
-    pub debug: String,
+    pub snapshot: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -621,7 +686,7 @@ impl EmulatorHandler {
 
     #[tool(
         name = "list_peripherals",
-        description = "Return every peripheral snapshot published in the most recent emulator frame. Debug-format string per entry in phase 4; proper JSON projections land in phases 5+."
+        description = "Return every peripheral snapshot as structured JSON."
     )]
     async fn list_peripherals(&self) -> Json<ListPeripheralsResult> {
         let snap = self.handle.snapshot.lock();
@@ -632,7 +697,7 @@ impl EmulatorHandler {
             .map(|(index, p)| PeripheralEntry {
                 index,
                 name: p.name().to_string(),
-                debug: format!("{:?}", p),
+                snapshot: serde_json::to_value(p).unwrap_or_default(),
             })
             .collect();
         Json(ListPeripheralsResult { peripherals })
@@ -650,10 +715,10 @@ impl EmulatorHandler {
             .handle
             .bank
             .read()
-            .peek_word(params.address)
+            .peek_word(params.address.0)
             .unwrap_or(0);
         Json(PeekMmioResult {
-            address: params.address,
+            address: params.address.0,
             value,
         })
     }
@@ -711,8 +776,8 @@ impl EmulatorHandler {
     ) -> Json<ReadFlashResult> {
         let guard = self.handle.bank.read();
         let flash = &guard.pbc.flash.data;
-        let start = params.offset as usize;
-        let end = start.saturating_add(params.length as usize).min(flash.len());
+        let start = params.offset.0 as usize;
+        let end = start.saturating_add(params.length.0 as usize).min(flash.len());
         let slice = if start < flash.len() {
             &flash[start..end]
         } else {
@@ -723,7 +788,7 @@ impl EmulatorHandler {
             .map(|b| format!("{:02X}", b))
             .collect::<String>();
         Json(ReadFlashResult {
-            offset: params.offset,
+            offset: params.offset.0,
             length: slice.len() as u32,
             hex,
         })
@@ -746,9 +811,9 @@ impl EmulatorHandler {
             .unwrap_or("word")
             .to_ascii_lowercase();
         let _ = match width.as_str() {
-            "byte" => guard.write_byte(params.address, params.value as u8),
-            "half" => guard.write_half(params.address, params.value as u16),
-            _ => guard.write_word(params.address, params.value),
+            "byte" => guard.write_byte(params.address.0, params.value.0 as u8),
+            "half" => guard.write_half(params.address.0, params.value.0 as u16),
+            _ => guard.write_word(params.address.0, params.value.0),
         };
         Json(OkResult { ok: true })
     }
@@ -785,13 +850,13 @@ impl EmulatorHandler {
             Err(_) => {
                 return Json(WriteFlashResult {
                     bytes_written: 0,
-                    offset: params.offset,
+                    offset: params.offset.0,
                 });
             }
         };
         let mut guard = self.handle.bank.write();
         let flash = &mut guard.pbc.flash.data;
-        let start = params.offset as usize;
+        let start = params.offset.0 as usize;
         let end = (start + bytes.len()).min(flash.len());
         let written = end.saturating_sub(start);
         if written > 0 {
@@ -800,7 +865,7 @@ impl EmulatorHandler {
         }
         Json(WriteFlashResult {
             bytes_written: written,
-            offset: params.offset,
+            offset: params.offset.0,
         })
     }
 
@@ -839,7 +904,7 @@ impl EmulatorHandler {
         Parameters(params): Parameters<AddSymbolParams>,
     ) -> Json<OkResult> {
         let mut ann = self.handle.annotations.write();
-        ann.symbols.insert(params.address, params.name);
+        ann.symbols.insert(params.address.0, params.name);
         Json(OkResult { ok: true })
     }
 
@@ -852,7 +917,7 @@ impl EmulatorHandler {
         Parameters(params): Parameters<AddCommentParams>,
     ) -> Json<OkResult> {
         let mut ann = self.handle.annotations.write();
-        ann.comments.insert(params.address, params.comment);
+        ann.comments.insert(params.address.0, params.comment);
         Json(OkResult { ok: true })
     }
 
@@ -884,15 +949,15 @@ impl EmulatorHandler {
     ) -> Json<OkResult> {
         use crate::soc::scenario::OverrideSpec;
         let spec = match params.mode.as_str() {
-            "static" => OverrideSpec::StaticRead { value: params.value },
+            "static" => OverrideSpec::StaticRead { value: params.value.0 },
             "oneshot" => OverrideSpec::OneShotRead {
-                value: params.value,
+                value: params.value.0,
                 remaining: params.count,
             },
-            "mask" => OverrideSpec::MaskedWriteIgnore { mask: params.value },
+            "mask" => OverrideSpec::MaskedWriteIgnore { mask: params.value.0 },
             _ => return Json(OkResult { ok: false }),
         };
-        self.handle.bank.write().scenario.overrides.set(params.address, spec, params.label);
+        self.handle.bank.write().scenario.overrides.set(params.address.0, spec, params.label);
         Json(OkResult { ok: true })
     }
 
@@ -904,7 +969,7 @@ impl EmulatorHandler {
         &self,
         Parameters(params): Parameters<RemoveMmioOverrideParams>,
     ) -> Json<OkResult> {
-        let ok = self.handle.bank.write().scenario.overrides.remove(params.address);
+        let ok = self.handle.bank.write().scenario.overrides.remove(params.address.0);
         Json(OkResult { ok })
     }
 
@@ -961,7 +1026,7 @@ impl EmulatorHandler {
             Some(e) => e,
             None => return Json(ScheduleEventResult { ok: false, id: None }),
         };
-        let id = self.handle.bank.write().scenario.schedule(trigger, effect, params.label);
+        let id = self.handle.bank.write().scenario.schedule_ex(trigger, effect, params.label, params.repeat);
         Json(ScheduleEventResult { ok: true, id: Some(id) })
     }
 
@@ -985,7 +1050,8 @@ impl EmulatorHandler {
         let guard = self.handle.bank.read();
         let events: Vec<ScheduledEventEntry> = guard
             .scenario
-            .pending_events()
+            .all_events()
+            .iter()
             .map(|e| ScheduledEventEntry {
                 id: e.id,
                 trigger: format!("{:?}", e.trigger),
@@ -1024,7 +1090,7 @@ impl EmulatorHandler {
             }
         };
         let id = self.handle.bank.write().scenario.add_watchpoint(
-            params.address,
+            params.address.0,
             params.size,
             mode,
             action,
@@ -1204,7 +1270,7 @@ impl EmulatorHandler {
             .handle
             .cpu_cmd
             .send(CpuCommand::RunTo {
-                address: params.address,
+                address: params.address.0,
             })
             .is_ok();
         Json(OkResult { ok })
@@ -1255,7 +1321,7 @@ impl EmulatorHandler {
             Some("cold") => BootMode::Cold,
             _ => BootMode::Warm,
         };
-        let entry_point = params.entry_point.unwrap_or(0);
+        let entry_point = params.entry_point.map(|h| h.0).unwrap_or(0);
         let (tx, rx) = oneshot::<Result<crate::emu::command::LoadFirmwareResult, String>>();
         if self
             .handle
@@ -1322,7 +1388,7 @@ impl EmulatorHandler {
             .handle
             .cpu_cmd
             .send(CpuCommand::SetBreakpoint {
-                address: params.address,
+                address: params.address.0,
                 response: tx,
             })
             .is_err()
@@ -1349,7 +1415,7 @@ impl EmulatorHandler {
             .handle
             .cpu_cmd
             .send(CpuCommand::RemoveBreakpoint {
-                address: params.address,
+                address: params.address.0,
             })
             .is_ok();
         Json(OkResult { ok })
@@ -1373,8 +1439,8 @@ impl EmulatorHandler {
             .handle
             .cpu_cmd
             .send(CpuCommand::SetWatchpoint {
-                addr: params.address,
-                size: params.size,
+                addr: params.address.0,
+                size: params.size.0,
                 mode,
                 response: tx,
             })
@@ -1422,7 +1488,7 @@ impl EmulatorHandler {
             .cpu_cmd
             .send(CpuCommand::WriteRegister {
                 name: params.name,
-                value: params.value,
+                value: params.value.0,
                 response: tx,
             })
             .is_err()
@@ -1454,7 +1520,7 @@ impl EmulatorHandler {
             .handle
             .cpu_cmd
             .send(CpuCommand::WriteSram {
-                addr: params.address,
+                addr: params.address.0,
                 bytes,
                 response: tx,
             })
@@ -1486,7 +1552,7 @@ impl EmulatorHandler {
             .is_err()
         {
             return Json(ReadMemoryResult {
-                address: params.address,
+                address: params.address.0,
                 length: 0,
                 hex: String::new(),
                 ascii: String::new(),
@@ -1500,15 +1566,15 @@ impl EmulatorHandler {
         .flatten();
         let Some(snap) = snap else {
             return Json(ReadMemoryResult {
-                address: params.address,
+                address: params.address.0,
                 length: 0,
                 hex: String::new(),
                 ascii: String::new(),
             });
         };
-        let start = params.address as usize;
+        let start = params.address.0 as usize;
         let end = start
-            .saturating_add(params.length as usize)
+            .saturating_add(params.length.0 as usize)
             .min(snap.bytes.len());
         let slice = if start < snap.bytes.len() {
             &snap.bytes[start..end]
@@ -1521,7 +1587,7 @@ impl EmulatorHandler {
             .map(|b| if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' })
             .collect::<String>();
         Json(ReadMemoryResult {
-            address: params.address,
+            address: params.address.0,
             length: slice.len() as u32,
             hex,
             ascii,
@@ -1543,12 +1609,12 @@ impl EmulatorHandler {
             .unwrap_or("word")
             .to_ascii_lowercase();
         let value = match width.as_str() {
-            "byte" => guard.read_byte(params.address).unwrap_or(0) as u32,
-            "half" => guard.read_half(params.address).unwrap_or(0) as u32,
-            _ => guard.read_word(params.address).unwrap_or(0),
+            "byte" => guard.read_byte(params.address.0).unwrap_or(0) as u32,
+            "half" => guard.read_half(params.address.0).unwrap_or(0) as u32,
+            _ => guard.read_word(params.address.0).unwrap_or(0),
         };
         Json(PeekMmioResult {
-            address: params.address,
+            address: params.address.0,
             value,
         })
     }
