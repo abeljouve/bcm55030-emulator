@@ -655,6 +655,12 @@ impl Memory {
 
     pub fn read_half_data(&mut self, addr: u32, cache_bypass: bool) -> Result<u16, Exception> {
         if cache_bypass || addr & 1 != 0 || !self.dcache_enabled() {
+            if self.sram_offset(addr).is_none() {
+                if let Some(ref bank) = self.bank {
+                    return bank.write().read_half(addr);
+                }
+                return Ok(0);
+            }
             let b0 = self.read_byte_backing(addr)?;
             let b1 = self.read_byte_backing(addr.wrapping_add(1))?;
             return Ok(((b0 as u16) << 8) | (b1 as u16));
@@ -674,6 +680,16 @@ impl Memory {
         // is raised. The byte-by-byte path below is HW-faithful,
         // not a workaround.
         if cache_bypass || addr & 3 != 0 || !self.dcache_enabled() {
+            // Non-SRAM (MMIO): route through bank.read_word to
+            // preserve word-level peripheral dispatch (OLT mailbox
+            // CMD/STATUS, FIFO pops, history recording). Decomposing
+            // into 4 byte reads loses these intercepts.
+            if self.sram_offset(addr).is_none() {
+                if let Some(ref bank) = self.bank {
+                    return bank.write().read_word(addr);
+                }
+                return Ok(0);
+            }
             let b0 = self.read_byte_backing(addr)? as u32;
             let b1 = self.read_byte_backing(addr.wrapping_add(1))? as u32;
             let b2 = self.read_byte_backing(addr.wrapping_add(2))? as u32;
