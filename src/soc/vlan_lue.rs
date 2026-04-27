@@ -15,13 +15,15 @@
 use crate::cpu::exception::Exception;
 
 const BASE: u32 = 0x0100_3000;
-const END: u32 = 0x0100_3020;
+const END: u32 = 0x0100_3080;
 const OFF_VLAN_CTRL: u32 = 0x00;
 const OFF_CUSTOM_ETHERTYPE: u32 = 0x0C;
 const OFF_CMD: u32 = 0x10;
 const OFF_DATA2: u32 = 0x14;
 const OFF_DATA1: u32 = 0x18;
 const OFF_DATA0: u32 = 0x1C;
+const OFF_FILTER_RULES: u32 = 0x20;
+const FILTER_RULE_COUNT: usize = 7;
 
 const TABLE_SIZE: usize = 256;
 
@@ -41,6 +43,8 @@ pub struct VlanLue {
     data0: u32,
     table: Vec<TableEntry>,
     regs_04_08: [u32; 2],
+    filter_rules: [u32; FILTER_RULE_COUNT],
+    extended: Vec<u32>,
 }
 
 impl VlanLue {
@@ -54,6 +58,8 @@ impl VlanLue {
             data0: 0,
             table: vec![TableEntry::default(); TABLE_SIZE],
             regs_04_08: [0; 2],
+            filter_rules: [0; FILTER_RULE_COUNT],
+            extended: vec![0u32; ((END - BASE) / 4) as usize],
         }
     }
 
@@ -73,6 +79,8 @@ impl VlanLue {
             *e = TableEntry::default();
         }
         self.regs_04_08 = [0; 2];
+        self.filter_rules = [0; FILTER_RULE_COUNT];
+        self.extended.fill(0);
     }
 
     pub fn reset_warm(&mut self) {
@@ -112,7 +120,13 @@ impl VlanLue {
             OFF_DATA0 => self.data0,
             0x04 => self.regs_04_08[0],
             0x08 => self.regs_04_08[1],
-            _ => 0,
+            o if o >= OFF_FILTER_RULES && o < OFF_FILTER_RULES + (FILTER_RULE_COUNT as u32) * 4 => {
+                self.filter_rules[((o - OFF_FILTER_RULES) / 4) as usize]
+            }
+            _ => {
+                let idx = (off / 4) as usize;
+                if idx < self.extended.len() { self.extended[idx] } else { 0 }
+            }
         })
     }
 
@@ -145,7 +159,15 @@ impl VlanLue {
             OFF_DATA0 => self.data0 = val,
             0x04 => self.regs_04_08[0] = val,
             0x08 => self.regs_04_08[1] = val,
-            _ => {}
+            o if o >= OFF_FILTER_RULES && o < OFF_FILTER_RULES + (FILTER_RULE_COUNT as u32) * 4 => {
+                self.filter_rules[((o - OFF_FILTER_RULES) / 4) as usize] = val;
+            }
+            _ => {
+                let idx = (off / 4) as usize;
+                if idx < self.extended.len() {
+                    self.extended[idx] = val;
+                }
+            }
         }
         Ok(())
     }
@@ -193,7 +215,13 @@ impl VlanLue {
             OFF_DATA0 => self.data0,
             0x04 => self.regs_04_08[0],
             0x08 => self.regs_04_08[1],
-            _ => 0,
+            o if o >= OFF_FILTER_RULES && o < OFF_FILTER_RULES + (FILTER_RULE_COUNT as u32) * 4 => {
+                self.filter_rules[((o - OFF_FILTER_RULES) / 4) as usize]
+            }
+            _ => {
+                let idx = (off / 4) as usize;
+                if idx < self.extended.len() { self.extended[idx] } else { 0 }
+            }
         })
     }
 }

@@ -86,6 +86,7 @@ const REG_RX_GRANT_MASK: u32 = 0x0100_0030;
 const REG_IRQ_MASK: u32 = 0x0100_0034;
 const REG_EPON_STATUS: u32 = 0x0100_0044;
 const REG_ACTIVE_FLAGS: u32 = 0x0100_0054;
+const REG_MDIO_COMMAND: u32 = 0x0100_0060;
 const REG_SPECIAL_0064: u32 = 0x0100_0064;
 /// MPCP-adjacent command latch. The firmware writes a value with
 /// bits `[31:27]` set (command opcode) and polls the register for
@@ -193,7 +194,7 @@ impl EponMac {
             REG_CHIP_ID | REG_CHIP_REV | REG_LLID_CAPTURE_MASK | REG_LLID_ACTIVE_BITMAP
             | REG_LLID_MASK_CONTROL | REG_LLID_COUNTER_MASK | REG_TX_GRANT_MASK
             | REG_RX_GRANT_MASK | REG_IRQ_MASK | REG_EPON_STATUS | REG_ACTIVE_FLAGS
-            | REG_SPECIAL_0064 | REG_MPCP_CMD_LATCH => true,
+            | REG_MDIO_COMMAND | REG_SPECIAL_0064 | REG_MPCP_CMD_LATCH => true,
             _ => {
                 (EPON_TABLE_BASE..EPON_TABLE_END).contains(&addr)
                     || (EPON_LLID_BASE..EPON_LLID_TOP).contains(&addr)
@@ -230,7 +231,7 @@ impl EponMac {
 
     fn write_store_no_side_effects(&mut self, addr: u32, val: u32) {
         match addr {
-            REG_CHIP_ID | REG_CHIP_REV | REG_SPECIAL_0064 => {
+            REG_CHIP_ID | REG_CHIP_REV | REG_MDIO_COMMAND | REG_SPECIAL_0064 => {
                 // Fixed / read-only values — ignore warm seed.
             }
             REG_MPCP_CMD_LATCH => self.mpcp_cmd_latch = val,
@@ -290,6 +291,7 @@ impl Peripheral for EponMac {
             REG_IRQ_MASK => return Ok(self.irq_mask),
             REG_EPON_STATUS => return Ok(self.epon_status),
             REG_ACTIVE_FLAGS => return Ok(self.active_flags),
+            REG_MDIO_COMMAND => return Ok(0),
             REG_SPECIAL_0064 => return Ok(0x5382_0000 | 0x0000_FFFF),
             _ => {}
         }
@@ -343,6 +345,7 @@ impl Peripheral for EponMac {
             REG_IRQ_MASK => return Ok(self.irq_mask),
             REG_EPON_STATUS => return Ok(self.epon_status),
             REG_ACTIVE_FLAGS => return Ok(self.active_flags),
+            REG_MDIO_COMMAND => return Ok(0),
             REG_SPECIAL_0064 => {
                 // Audit 5.12: shim returned (stored & 0xFFFF0000) | 0xFFFF.
                 // We now back this from the table-less store: upper half
@@ -439,6 +442,7 @@ impl Peripheral for EponMac {
                 self.active_flags = val;
                 return Ok(());
             }
+            REG_MDIO_COMMAND => return Ok(()),
             REG_SPECIAL_0064 => return Ok(()),
             _ => {}
         }
