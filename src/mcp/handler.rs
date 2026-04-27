@@ -478,6 +478,74 @@ pub struct LastAccessJson {
     pub value: HexValue,
 }
 
+// ---------- OLT DTOs -----------------------------------------------------
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OltStateResult {
+    pub enabled: bool,
+    pub mpcp_state: String,
+    pub olt_mac: String,
+    pub onu_mac: String,
+    pub assigned_llid: u16,
+    pub mpcp_timestamp: HexValue,
+    pub tx_frame_count: usize,
+    pub rx_frame_count: usize,
+    pub oam_keepalive_count: u64,
+    pub gate_count: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OltConfigParams {
+    /// OLT MAC address (e.g. `"00:0A:F7:01:00:01"`).
+    pub mac: Option<String>,
+    /// Starting LLID for ONU registration.
+    pub llid_start: Option<u16>,
+    /// OAM keepalive interval in bank ticks.
+    pub oam_interval_ticks: Option<u64>,
+    /// GATE interval in bank ticks.
+    pub gate_interval_ticks: Option<u64>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OltConfigResult {
+    pub mac: String,
+    pub llid_start: u16,
+    pub oam_interval_ticks: u64,
+    pub gate_interval_ticks: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OltEnableParams {
+    /// Set to true to enable, false to disable.
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OltInjectFrameParams {
+    /// Hex string of raw Ethernet frame bytes.
+    pub hex: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OltFrameLogEntry {
+    pub tick: u64,
+    pub description: String,
+    pub hex: String,
+    pub length: usize,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct OltFrameLogParams {
+    /// Return only the last N entries.
+    pub last: Option<usize>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OltFrameLogResult {
+    pub total: usize,
+    pub entries: Vec<OltFrameLogEntry>,
+}
+
 // ---------- Scenario override DTOs (Phase 1) -----------------------------
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -2645,6 +2713,225 @@ impl EmulatorHandler {
             block,
         })
     }
+
+    // ── OLT emulator tools ─────────────────────────────────────────
+
+    #[tool(
+        name = "olt_get_state",
+        description = "Return the current OLT emulator state: MPCP registration state, MAC addresses, LLID, frame counts."
+    )]
+    async fn olt_get_state(&self) -> Json<OltStateResult> {
+        let bank = self.handle.bank.read();
+        // Access the OLT snapshot via the snapshot_all vector which
+        // includes the OLT as the last entry.
+        let snaps = bank.snapshot_all();
+        let olt_snap = snaps.iter().find_map(|s| {
+            if let PeripheralSnapshot::Olt(ref o) = s {
+                Some(o.clone())
+            } else {
+                None
+            }
+        });
+        match olt_snap {
+            Some(s) => Json(OltStateResult {
+                enabled: s.enabled,
+                mpcp_state: s.mpcp_state,
+                olt_mac: s.olt_mac,
+                onu_mac: s.onu_mac,
+                assigned_llid: s.assigned_llid,
+                mpcp_timestamp: HexValue(s.mpcp_timestamp),
+                tx_frame_count: s.tx_frame_count,
+                rx_frame_count: s.rx_frame_count,
+                oam_keepalive_count: s.oam_keepalive_count,
+                gate_count: s.gate_count,
+            }),
+            None => Json(OltStateResult {
+                enabled: false,
+                mpcp_state: "unknown".into(),
+                olt_mac: "00:00:00:00:00:00".into(),
+                onu_mac: "00:00:00:00:00:00".into(),
+                assigned_llid: 0,
+                mpcp_timestamp: HexValue(0),
+                tx_frame_count: 0,
+                rx_frame_count: 0,
+                oam_keepalive_count: 0,
+                gate_count: 0,
+            }),
+        }
+    }
+
+    #[tool(
+        name = "olt_get_config",
+        description = "Return the OLT emulator configuration: MAC address, LLID range, timing parameters."
+    )]
+    async fn olt_get_config(&self) -> Json<OltConfigResult> {
+        let bank = self.handle.bank.read();
+        let cfg = &bank.olt.config;
+        Json(OltConfigResult {
+            mac: format_mac(&cfg.mac),
+            llid_start: cfg.llid_start,
+            oam_interval_ticks: cfg.oam_interval_ticks,
+            gate_interval_ticks: cfg.gate_interval_ticks,
+        })
+    }
+
+    #[tool(
+        name = "olt_set_config",
+        description = "Update OLT emulator configuration. Only provided fields are changed."
+    )]
+    async fn olt_set_config(
+        &self,
+        Parameters(params): Parameters<OltConfigParams>,
+    ) -> Json<OltConfigResult> {
+        let mut bank = self.handle.bank.write();
+        if let Some(ref mac_str) = params.mac {
+            if let Some(mac) = parse_mac_str(mac_str) {
+                bank.olt.config.mac = mac;
+            }
+        }
+        if let Some(llid) = params.llid_start {
+            bank.olt.config.llid_start = llid;
+        }
+        if let Some(interval) = params.oam_interval_ticks {
+            bank.olt.config.oam_interval_ticks = interval;
+        }
+        if let Some(interval) = params.gate_interval_ticks {
+            bank.olt.config.gate_interval_ticks = interval;
+        }
+        let cfg = &bank.olt.config;
+        Json(OltConfigResult {
+            mac: format_mac(&cfg.mac),
+            llid_start: cfg.llid_start,
+            oam_interval_ticks: cfg.oam_interval_ticks,
+            gate_interval_ticks: cfg.gate_interval_ticks,
+        })
+    }
+
+    #[tool(
+        name = "olt_enable",
+        description = "Enable or disable OLT emulation. When enabled, the OLT auto-starts MPCP discovery and OAM keepalive."
+    )]
+    async fn olt_enable(
+        &self,
+        Parameters(params): Parameters<OltEnableParams>,
+    ) -> Json<OkResult> {
+        let mut bank = self.handle.bank.write();
+        bank.olt.set_enabled(params.enabled);
+        if params.enabled {
+            bank.olt.set_link_up(true);
+        }
+        Json(OkResult { ok: true })
+    }
+
+    #[tool(
+        name = "olt_inject_frame",
+        description = "Inject a raw Ethernet frame into the ONU's RX path through the OLT emulator. Provide frame bytes as hex."
+    )]
+    async fn olt_inject_frame(
+        &self,
+        Parameters(params): Parameters<OltInjectFrameParams>,
+    ) -> Json<OkResult> {
+        let bytes = match hex_decode(&params.hex) {
+            Some(b) => b,
+            None => return Json(OkResult { ok: false }),
+        };
+        let mut bank = self.handle.bank.write();
+        bank.olt.inject_raw_frame(bytes);
+        Json(OkResult { ok: true })
+    }
+
+    #[tool(
+        name = "olt_get_tx_log",
+        description = "Return the log of frames captured from ONU TX (ONU → OLT direction)."
+    )]
+    async fn olt_get_tx_log(
+        &self,
+        Parameters(params): Parameters<OltFrameLogParams>,
+    ) -> Json<OltFrameLogResult> {
+        let bank = self.handle.bank.read();
+        let log = bank.olt.tx_log();
+        let last = params.last.unwrap_or(50);
+        let start = log.len().saturating_sub(last);
+        let entries: Vec<OltFrameLogEntry> = log
+            .iter()
+            .skip(start)
+            .map(|f| OltFrameLogEntry {
+                tick: f.tick,
+                description: f.description.clone(),
+                hex: bytes_to_hex(&f.data),
+                length: f.data.len(),
+            })
+            .collect();
+        Json(OltFrameLogResult {
+            total: log.len(),
+            entries,
+        })
+    }
+
+    #[tool(
+        name = "olt_get_rx_log",
+        description = "Return the log of frames injected to ONU RX (OLT → ONU direction)."
+    )]
+    async fn olt_get_rx_log(
+        &self,
+        Parameters(params): Parameters<OltFrameLogParams>,
+    ) -> Json<OltFrameLogResult> {
+        let bank = self.handle.bank.read();
+        let log = bank.olt.rx_log();
+        let last = params.last.unwrap_or(50);
+        let start = log.len().saturating_sub(last);
+        let entries: Vec<OltFrameLogEntry> = log
+            .iter()
+            .skip(start)
+            .map(|f| OltFrameLogEntry {
+                tick: f.tick,
+                description: f.description.clone(),
+                hex: bytes_to_hex(&f.data),
+                length: f.data.len(),
+            })
+            .collect();
+        Json(OltFrameLogResult {
+            total: log.len(),
+            entries,
+        })
+    }
+}
+
+fn format_mac(mac: &[u8; 6]) -> String {
+    format!(
+        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
+}
+
+fn parse_mac_str(s: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16).ok()?;
+    }
+    Some(mac)
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(s.len() / 2);
+    for i in (0..s.len()).step_by(2) {
+        let byte = u8::from_str_radix(&s[i..i + 2], 16).ok()?;
+        bytes.push(byte);
+    }
+    Some(bytes)
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02X}", b)).collect()
 }
 
 // ---------- ServerHandler impl -------------------------------------------
@@ -2793,6 +3080,9 @@ fn is_mutation_tool(name: &str) -> bool {
             | "restore_snapshot"
             | "delete_snapshot"
             | "load_symbols_file"
+            | "olt_enable"
+            | "olt_set_config"
+            | "olt_inject_frame"
     )
 }
 

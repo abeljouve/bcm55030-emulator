@@ -11,6 +11,7 @@ use crate::soc::fatal_filter::FatalFilter;
 use crate::soc::macsec::Macsec;
 use crate::soc::mpcp::Mpcp;
 use crate::soc::nco::Nco;
+use crate::soc::olt::Olt;
 use crate::soc::pbc::Pbc;
 use crate::soc::scenario::ScenarioEngine;
 use crate::soc::serdes::SerDes;
@@ -35,6 +36,7 @@ pub struct PeripheralBankSaveState {
     pub mpcp: Mpcp,
     pub nco: Nco,
     pub vlan_lue: VlanLue,
+    pub olt: Olt,
     pub scenario: ScenarioEngine,
     pub sysreg: SysregShim,
 }

@@ -26,6 +26,7 @@ use crate::soc::fatal_filter::FatalFilter;
 use crate::soc::macsec::Macsec;
 use crate::soc::mpcp::Mpcp;
 use crate::soc::nco::Nco;
+use crate::soc::olt::Olt;
 use crate::soc::pbc::Pbc;
 use crate::soc::peripheral::{
     DatapathOp, Peripheral, PeripheralEvent, PeripheralId, PeripheralSnapshot,
@@ -154,6 +155,7 @@ pub struct PeripheralBank {
     pub mpcp: Mpcp,
     pub nco: Nco,
     pub vlan_lue: VlanLue,
+    pub olt: Olt,
 
     /// Scenario engine — MMIO overrides, scheduled events, and MMIO
     /// watchpoints.  Overrides are checked BEFORE the peripheral
@@ -240,6 +242,7 @@ impl PeripheralBank {
             mpcp: Mpcp::new(),
             nco: Nco::new(),
             vlan_lue: VlanLue::new(),
+            olt: Olt::new(),
             scenario: ScenarioEngine::new(),
             sysreg: SysregShim::new(),
             uart_rx_sender: tx,
@@ -300,6 +303,10 @@ impl PeripheralBank {
         self.mpcp.tick(cpu_instructions);
         self.nco.tick(cpu_instructions);
         self.vlan_lue.tick(cpu_instructions);
+        self.olt.tick(cpu_instructions);
+        // Drain OLT RX frames into the mailbox engine (word_index=1 is
+        // the primary RX queue based on Phase 2b fuzzer results).
+        self.olt.load_frames_into_mailbox(1);
         self.sysreg.tick(cpu_instructions);
         self.scenario.tick(cpu_instructions);
 
@@ -339,6 +346,7 @@ impl PeripheralBank {
         self.mpcp.reset_cold();
         self.nco.reset_cold();
         self.vlan_lue.reset_cold();
+        self.olt.reset_cold();
         self.sysreg.reset_cold();
         self.irq_pending = 0;
         self.current_pc = 0;
@@ -362,6 +370,7 @@ impl PeripheralBank {
         self.mpcp.reset_warm();
         self.nco.reset_warm();
         self.vlan_lue.reset_warm();
+        self.olt.reset_warm();
         self.sysreg.reset_warm();
         self.irq_pending = 0;
         self.current_pc = 0;
@@ -441,12 +450,13 @@ impl PeripheralBank {
             self.timer.snapshot(),
             self.efuse_udr.snapshot(),
             self.fatal_filter.snapshot(),
+            self.olt.snapshot(),
         ]
     }
 
     /// Dispatch a UI event to the peripheral that understands it.
     pub fn inject_event(&mut self, event: &PeripheralEvent) -> bool {
-        let targets: [&mut dyn Peripheral; 13] = [
+        let targets: [&mut dyn Peripheral; 14] = [
             &mut self.uart,
             &mut self.pbc,
             &mut self.bsc_i2c,
@@ -460,6 +470,7 @@ impl PeripheralBank {
             &mut self.fatal_filter,
             &mut self.mpcp,
             &mut self.nco,
+            &mut self.olt,
         ];
         for p in targets {
             if p.inject_event(event).is_ok() {
@@ -527,6 +538,7 @@ impl PeripheralBank {
             mpcp: self.mpcp.clone(),
             nco: self.nco.clone(),
             vlan_lue: self.vlan_lue.clone(),
+            olt: self.olt.clone(),
             scenario: self.scenario.clone(),
             sysreg: self.sysreg.clone(),
         }
@@ -547,6 +559,7 @@ impl PeripheralBank {
         self.mpcp = state.mpcp;
         self.nco = state.nco;
         self.vlan_lue = state.vlan_lue;
+        self.olt = state.olt;
         self.scenario = state.scenario;
         self.sysreg = state.sysreg;
         self.irq_pending = 0;
@@ -656,6 +669,23 @@ impl PeripheralBank {
             self.seq_emit(addr, v, "r", "word", "vlan_lue");
             return Ok(v);
         }
+        if crate::soc::olt::Olt::claims_mailbox(addr) {
+            if let Some(v) = self.olt.read_bitmap(addr) {
+                self.record_history(addr, v, "read", "word", "olt_bitmap");
+                self.seq_emit(addr, v, "r", "word", "olt_bitmap");
+                return Ok(v);
+            }
+            if let Some(v) = self.olt.read_cmd_status(addr) {
+                self.record_history(addr, v, "read", "word", "olt_status");
+                self.seq_emit(addr, v, "r", "word", "olt_status");
+                return Ok(v);
+            }
+            if let Some(v) = self.olt.read_data(addr) {
+                self.record_history(addr, v, "read", "word", "olt_data");
+                self.seq_emit(addr, v, "r", "word", "olt_data");
+                return Ok(v);
+            }
+        }
         if self.sysreg.claims(addr) { dispatch_rw!(self.sysreg, "sysreg"); }
         if self.trace {
             eprintln!("[MMIO] read  word  0x{:08X} → 0x00000000 (unmapped)", addr);
@@ -722,6 +752,11 @@ impl PeripheralBank {
             self.vlan_lue.write_word(addr, val)?;
             self.record_history(addr, val, "write", "word", "vlan_lue");
             self.seq_emit(addr, val, "w", "word", "vlan_lue");
+            return Ok(());
+        }
+        if crate::soc::olt::Olt::claims_mailbox(addr) && self.olt.write_cmd(addr, val) {
+            self.record_history(addr, val, "write", "word", "olt_cmd");
+            self.seq_emit(addr, val, "w", "word", "olt_cmd");
             return Ok(());
         }
         if self.sysreg.claims(addr) { dispatch_ww!(self.sysreg, "sysreg"); }

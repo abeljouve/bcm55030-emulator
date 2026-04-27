@@ -35,6 +35,8 @@ fn usage(prog: &str) {
     eprintln!("  --trace-mmio-range S:E      Restrict --trace-mmio-seq to [S,E) (hex, repeatable)");
     eprintln!("  --scenario <FILE>           Load a JSON scenario file at startup");
     eprintln!("  --mcp-port <PORT>           Start MCP server on PORT (enables worker mode)");
+    eprintln!("  --olt-enable                Enable EPON OLT emulation");
+    eprintln!("  --olt-mac <MAC>             OLT MAC address (AA:BB:CC:DD:EE:FF)");
     eprintln!();
     eprintln!("For the egui GUI, build with --features ui:");
     eprintln!("  cargo run --release --features ui --bin arc700-gui");
@@ -69,11 +71,25 @@ struct Config {
     trace_mmio_ranges: Vec<(u32, u32)>,
     scenario_path: Option<String>,
     mcp_port: Option<u16>,
+    olt_enable: bool,
+    olt_mac: Option<[u8; 6]>,
 }
 
 fn parse_hex(s: &str) -> Option<u32> {
     let s = s.trim_start_matches("0x").trim_start_matches("0X");
     u32::from_str_radix(s, 16).ok()
+}
+
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16).ok()?;
+    }
+    Some(mac)
 }
 
 fn parse_args() -> Config {
@@ -100,6 +116,8 @@ fn parse_args() -> Config {
         trace_mmio_ranges: Vec::new(),
         scenario_path: None,
         mcp_port: None,
+        olt_enable: false,
+        olt_mac: None,
     };
 
     let mut i = 1;
@@ -246,6 +264,18 @@ fn parse_args() -> Config {
                 }
                 cfg.mcp_port = Some(args[i].parse().unwrap_or_else(|_| {
                     eprintln!("Error: invalid port: {}", args[i]);
+                    process::exit(1);
+                }));
+            }
+            "--olt-enable" => cfg.olt_enable = true,
+            "--olt-mac" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --olt-mac requires AA:BB:CC:DD:EE:FF");
+                    process::exit(1);
+                }
+                cfg.olt_mac = Some(parse_mac(&args[i]).unwrap_or_else(|| {
+                    eprintln!("Error: invalid MAC address: {}", args[i]);
                     process::exit(1);
                 }));
             }
@@ -627,6 +657,18 @@ fn main() {
                 process::exit(1);
             }
         }
+    }
+
+    // Configure OLT emulation.
+    if cfg.olt_enable {
+        let mut bank = cpu.bank().unwrap().write();
+        bank.olt.set_enabled(true);
+        if let Some(mac) = cfg.olt_mac {
+            bank.olt.config.mac = mac;
+        }
+        // Automatically set the link as up so the OLT starts
+        // MPCP discovery once the firmware reaches the event loop.
+        bank.olt.set_link_up(true);
     }
 
     if let Some(port) = cfg.mcp_port {

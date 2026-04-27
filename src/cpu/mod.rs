@@ -23,6 +23,15 @@ const UART_IRQ: u32 = 5;
 /// UART IRQ poll prescaler (audit 3.2).
 const UART_PRESCALER: u64 = 256;
 
+/// Number of consecutive same-PC steps before the emulator treats
+/// the tight loop as a watchdog-triggered warm reset. On real
+/// BCM55030 hardware, `system_reboot_infinite_loop` configures
+/// Timer 1 for a 100 ms watchdog that resets the chip; the CPU
+/// spins on `b .` until the timer fires. Modelling this as a
+/// simple PC-stall detector avoids burning host time on millions
+/// of no-op iterations.
+const TIGHT_LOOP_THRESHOLD: u32 = 64;
+
 pub struct Cpu {
     pub state: CpuState,
     pub mem: Memory,
@@ -54,6 +63,15 @@ pub struct Cpu {
     bank: Option<Arc<RwLock<PeripheralBank>>>,
     /// Instructions elapsed since the last bank tick.
     pub bank_tick_accumulator: u64,
+
+    /// Tight-loop (branch-to-self) detection state. When the PC does
+    /// not change across consecutive steps, this counter increments.
+    /// Once it reaches [`TIGHT_LOOP_THRESHOLD`], the emulator treats
+    /// the spin as a watchdog-triggered warm reset — modelling the
+    /// BCM55030's Timer 1 watchdog that fires after the firmware
+    /// enters `system_reboot_infinite_loop`.
+    tight_loop_count: u32,
+    tight_loop_last_pc: u32,
 }
 
 impl Cpu {
@@ -71,6 +89,8 @@ impl Cpu {
             timer_frac_acc: 0,
             bank: None,
             bank_tick_accumulator: 0,
+            tight_loop_count: 0,
+            tight_loop_last_pc: u32::MAX,
         }
     }
 
@@ -93,6 +113,8 @@ impl Cpu {
             timer_frac_acc: 0,
             bank,
             bank_tick_accumulator: 0,
+            tight_loop_count: 0,
+            tight_loop_last_pc: u32::MAX,
         }
     }
 
@@ -116,6 +138,9 @@ impl Cpu {
         let sram_size = self.mem.sram_size();
         let zeros = vec![0u8; sram_size];
         self.mem.load_binary(0, &zeros);
+
+        self.tight_loop_count = 0;
+        self.tight_loop_last_pc = u32::MAX;
 
         if let Some(bank) = self.bank.as_ref() {
             let mut guard = bank.write();
@@ -246,6 +271,37 @@ impl Cpu {
         }
 
         self.state.instruction_count += 1;
+
+        // Tight-loop detection: if the PC is the same as last step,
+        // the CPU is spinning on `b .` (branch to self). After
+        // TIGHT_LOOP_THRESHOLD consecutive same-PC steps, treat this
+        // as the BCM55030 Timer 1 watchdog firing and trigger a warm
+        // reset. This models `system_reboot_infinite_loop` which
+        // configures Timer 1 for 100 ms then spins — the watchdog
+        // resets the chip on real hardware.
+        //
+        // Only active in SoC mode (bank present) — flat-mode tests
+        // have no watchdog to model and may legitimately reach zero-
+        // filled memory that decodes as branch-to-self.
+        if self.bank.is_some() {
+            if self.state.pc == self.tight_loop_last_pc {
+                self.tight_loop_count += 1;
+                if self.tight_loop_count >= TIGHT_LOOP_THRESHOLD {
+                    eprintln!(
+                        "[BCM55030] Tight loop detected at PC=0x{:08X} ({} iterations) — \
+                         watchdog reset (warm reboot)",
+                        self.state.pc, self.tight_loop_count
+                    );
+                    self.tight_loop_count = 0;
+                    self.tight_loop_last_pc = u32::MAX;
+                    self.state.halted = true;
+                    return Ok(());
+                }
+            } else {
+                self.tight_loop_count = 0;
+                self.tight_loop_last_pc = self.state.pc;
+            }
+        }
 
         // Shadow call stack: push on BL/JL, pop on J [blink].
         if let Some((_, true)) = delay_info {

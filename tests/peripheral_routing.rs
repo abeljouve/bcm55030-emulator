@@ -137,7 +137,7 @@ fn bank_routes_known_peripherals_without_sysreg_fallback() {
 fn snapshot_all_exposes_sfp_row() {
     let bank = PeripheralBank::new(BootMode::Warm);
     let rows = bank.snapshot_all();
-    assert_eq!(rows.len(), 12, "12 peripheral rows expected after SFP fix");
+    assert_eq!(rows.len(), 13, "13 peripheral rows expected (12 original + OLT)");
     assert!(
         matches!(rows[3], PeripheralSnapshot::Sfp(_)),
         "row 3 should be PeripheralSnapshot::Sfp, got {:?}",
