@@ -29,6 +29,7 @@ fn usage(prog: &str) {
     eprintln!("  --unmapped-exception        Trap unclaimed MMIO as MemoryError (audit 2.2)");
     eprintln!("  --trace-mmio-seq <FILE>     Write per-access MMIO trace as JSON Lines to FILE");
     eprintln!("  --trace-mmio-range S:E      Restrict --trace-mmio-seq to [S,E) (hex, repeatable)");
+    eprintln!("  --scenario <FILE>           Load a JSON scenario file at startup");
     eprintln!();
     eprintln!("This is the headless CLI binary. For the egui GUI with integrated MCP");
     eprintln!("server, build and run the `arc700-gui` binary instead:");
@@ -62,6 +63,7 @@ struct Config {
     /// recording to accesses where `start <= addr < end`. Multiple
     /// flags OR together.
     trace_mmio_ranges: Vec<(u32, u32)>,
+    scenario_path: Option<String>,
 }
 
 fn parse_hex(s: &str) -> Option<u32> {
@@ -91,6 +93,7 @@ fn parse_args() -> Config {
         debug_elf: None,
         trace_mmio_seq: None,
         trace_mmio_ranges: Vec::new(),
+        scenario_path: None,
     };
 
     let mut i = 1;
@@ -220,6 +223,14 @@ fn parse_args() -> Config {
                     process::exit(1);
                 });
                 cfg.trace_mmio_ranges.push((start, end));
+            }
+            "--scenario" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --scenario requires a file path");
+                    process::exit(1);
+                }
+                cfg.scenario_path = Some(args[i].clone());
             }
             "--help" | "-h" => {
                 usage(prog);
@@ -510,6 +521,17 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("Error opening --trace-mmio-seq {}: {}", path, e);
+                process::exit(1);
+            }
+        }
+    }
+
+    if let Some(ref path) = cfg.scenario_path {
+        let mut bank = cpu.bank().unwrap().write();
+        match bank.scenario.load_file(std::path::Path::new(path)) {
+            Ok(n) => eprintln!("[scenario] loaded {} entries from {}", n, path),
+            Err(e) => {
+                eprintln!("Error loading --scenario {}: {}", path, e);
                 process::exit(1);
             }
         }

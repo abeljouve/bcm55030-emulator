@@ -9,6 +9,7 @@
 //! one-shot overrides or fire triggers.  Only CPU-driven accesses do.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 
 /// What an override does when the address is hit.
 #[derive(Clone, Debug)]
@@ -109,6 +110,75 @@ impl MmioOverrideRegistry {
 
     pub fn len(&self) -> usize {
         self.overrides.len()
+    }
+}
+
+// ── JSON parsing helpers ─────────────────────────────────────────────
+
+pub fn parse_hex_or_dec(v: &serde_json::Value) -> Option<u32> {
+    if let Some(n) = v.as_u64() {
+        return Some(n as u32);
+    }
+    if let Some(s) = v.as_str() {
+        let s = s.trim();
+        if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            return u32::from_str_radix(hex, 16).ok();
+        }
+        return s.parse::<u32>().ok();
+    }
+    None
+}
+
+pub fn parse_trigger(v: &serde_json::Value) -> Option<ScenarioTrigger> {
+    let ty = v.get("type")?.as_str()?;
+    match ty {
+        "at_instruction" => {
+            let n = v.get("n")?.as_u64()?;
+            Some(ScenarioTrigger::AtInstruction(n))
+        }
+        "on_mmio_read" => {
+            let addr = parse_hex_or_dec(v.get("address")?)?;
+            let occ = v.get("occurrence")?.as_u64()? as u32;
+            Some(ScenarioTrigger::OnMmioRead { address: addr, occurrence: occ })
+        }
+        "on_mmio_write" => {
+            let addr = parse_hex_or_dec(v.get("address")?)?;
+            let occ = v.get("occurrence")?.as_u64()? as u32;
+            Some(ScenarioTrigger::OnMmioWrite { address: addr, occurrence: occ })
+        }
+        _ => None,
+    }
+}
+
+pub fn parse_effect(v: &serde_json::Value) -> Option<ScenarioEffect> {
+    let ty = v.get("type")?.as_str()?;
+    match ty {
+        "set_override" => {
+            let addr = parse_hex_or_dec(v.get("address")?)?;
+            let value = parse_hex_or_dec(v.get("value")?)?;
+            let mode = v.get("mode").and_then(|m| m.as_str()).unwrap_or("static");
+            let spec = match mode {
+                "oneshot" => {
+                    let count = v.get("count").and_then(|c| c.as_u64()).unwrap_or(1) as u32;
+                    OverrideSpec::OneShotRead { value, remaining: count }
+                }
+                "mask" => OverrideSpec::MaskedWriteIgnore { mask: value },
+                _ => OverrideSpec::StaticRead { value },
+            };
+            let label = v.get("label").and_then(|l| l.as_str()).map(String::from);
+            Some(ScenarioEffect::SetOverride { address: addr, spec, label })
+        }
+        "remove_override" => {
+            let addr = parse_hex_or_dec(v.get("address")?)?;
+            Some(ScenarioEffect::RemoveOverride { address: addr })
+        }
+        "write_mmio" => {
+            let addr = parse_hex_or_dec(v.get("address")?)?;
+            let value = parse_hex_or_dec(v.get("value")?)?;
+            Some(ScenarioEffect::WriteMmio { address: addr, value })
+        }
+        "pause" => Some(ScenarioEffect::Pause),
+        _ => None,
     }
 }
 
@@ -416,6 +486,65 @@ impl ScenarioEngine {
     /// Take and clear deferred writes.
     pub fn take_deferred_writes(&mut self) -> Vec<DeferredWrite> {
         std::mem::take(&mut self.deferred_writes)
+    }
+
+    /// Load a JSON scenario file.  Returns the number of entries loaded.
+    pub fn load_file(&mut self, path: &Path) -> Result<usize, String> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("read {}: {}", path.display(), e))?;
+        self.load_json(&content)
+    }
+
+    /// Load scenario from a JSON string.
+    pub fn load_json(&mut self, json: &str) -> Result<usize, String> {
+        let doc: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| format!("parse: {e}"))?;
+        let events = doc.get("events")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "missing 'events' array".to_string())?;
+        let mut loaded = 0;
+        for (i, entry) in events.iter().enumerate() {
+            let tool = entry.get("tool").and_then(|v| v.as_str())
+                .ok_or_else(|| format!("event[{i}]: missing 'tool'"))?;
+            let params = entry.get("params")
+                .ok_or_else(|| format!("event[{i}]: missing 'params'"))?;
+            match tool {
+                "set_mmio_override" => {
+                    let addr = parse_hex_or_dec(params.get("address")
+                        .ok_or_else(|| format!("event[{i}]: missing address"))?)
+                        .ok_or_else(|| format!("event[{i}]: bad address"))?;
+                    let value = parse_hex_or_dec(params.get("value")
+                        .ok_or_else(|| format!("event[{i}]: missing value"))?)
+                        .ok_or_else(|| format!("event[{i}]: bad value"))?;
+                    let mode = params.get("mode").and_then(|m| m.as_str()).unwrap_or("static");
+                    let spec = match mode {
+                        "oneshot" => {
+                            let count = params.get("count").and_then(|c| c.as_u64()).unwrap_or(1) as u32;
+                            OverrideSpec::OneShotRead { value, remaining: count }
+                        }
+                        "mask" => OverrideSpec::MaskedWriteIgnore { mask: value },
+                        _ => OverrideSpec::StaticRead { value },
+                    };
+                    let label = params.get("label").and_then(|l| l.as_str()).map(String::from);
+                    self.overrides.set(addr, spec, label);
+                }
+                "schedule_event" => {
+                    let trigger = parse_trigger(params.get("trigger")
+                        .ok_or_else(|| format!("event[{i}]: missing trigger"))?)
+                        .ok_or_else(|| format!("event[{i}]: bad trigger"))?;
+                    let effect = parse_effect(params.get("effect")
+                        .ok_or_else(|| format!("event[{i}]: missing effect"))?)
+                        .ok_or_else(|| format!("event[{i}]: bad effect"))?;
+                    let label = params.get("label").and_then(|l| l.as_str()).map(String::from);
+                    self.schedule(trigger, effect, label);
+                }
+                other => {
+                    return Err(format!("event[{i}]: unsupported tool '{other}'"));
+                }
+            }
+            loaded += 1;
+        }
+        Ok(loaded)
     }
 
     pub fn clear_all(&mut self) {

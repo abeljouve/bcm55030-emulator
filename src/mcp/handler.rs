@@ -354,6 +354,21 @@ pub struct ListMmioWatchpointsResult {
     pub watchpoints: Vec<MmioWatchpointEntry>,
 }
 
+// ---------- Scenario file DTOs (Phase 3) ---------------------------------
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LoadScenarioParams {
+    /// Raw JSON string of the scenario file content.
+    pub json: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LoadScenarioResult {
+    pub ok: bool,
+    pub loaded: usize,
+    pub error: Option<String>,
+}
+
 // ---------- Phase 5b CpuCommand DTOs -------------------------------------
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Default)]
@@ -1063,6 +1078,32 @@ impl EmulatorHandler {
         })
     }
 
+    // ---------- Scenario file tools (Phase 3) ----------------------------
+
+    #[tool(
+        name = "load_scenario",
+        description = "Load a JSON scenario file. Each entry in the 'events' array is an MCP tool call (set_mmio_override, schedule_event). Returns the number of entries loaded."
+    )]
+    async fn load_scenario(
+        &self,
+        Parameters(params): Parameters<LoadScenarioParams>,
+    ) -> Json<LoadScenarioResult> {
+        let mut guard = self.handle.bank.write();
+        match guard.scenario.load_json(&params.json) {
+            Ok(n) => Json(LoadScenarioResult { ok: true, loaded: n, error: None }),
+            Err(e) => Json(LoadScenarioResult { ok: false, loaded: 0, error: Some(e) }),
+        }
+    }
+
+    #[tool(
+        name = "clear_scenario",
+        description = "Remove all overrides, scheduled events, and MMIO watchpoints."
+    )]
+    async fn clear_scenario(&self) -> Json<OkResult> {
+        self.handle.bank.write().scenario.clear_all();
+        Json(OkResult { ok: true })
+    }
+
     // ---------- MMIO trace tools -----------------------------------------
 
     #[tool(
@@ -1656,74 +1697,7 @@ fn is_mutation_tool(name: &str) -> bool {
 
 // ---------- Helpers -------------------------------------------------------
 
-fn parse_hex_or_dec(v: &serde_json::Value) -> Option<u32> {
-    if let Some(n) = v.as_u64() {
-        return Some(n as u32);
-    }
-    if let Some(s) = v.as_str() {
-        let s = s.trim();
-        if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-            return u32::from_str_radix(hex, 16).ok();
-        }
-        return s.parse::<u32>().ok();
-    }
-    None
-}
-
-fn parse_trigger(v: &serde_json::Value) -> Option<crate::soc::scenario::ScenarioTrigger> {
-    use crate::soc::scenario::ScenarioTrigger;
-    let ty = v.get("type")?.as_str()?;
-    match ty {
-        "at_instruction" => {
-            let n = v.get("n")?.as_u64()?;
-            Some(ScenarioTrigger::AtInstruction(n))
-        }
-        "on_mmio_read" => {
-            let addr = parse_hex_or_dec(v.get("address")?)?;
-            let occ = v.get("occurrence")?.as_u64()? as u32;
-            Some(ScenarioTrigger::OnMmioRead { address: addr, occurrence: occ })
-        }
-        "on_mmio_write" => {
-            let addr = parse_hex_or_dec(v.get("address")?)?;
-            let occ = v.get("occurrence")?.as_u64()? as u32;
-            Some(ScenarioTrigger::OnMmioWrite { address: addr, occurrence: occ })
-        }
-        _ => None,
-    }
-}
-
-fn parse_effect(v: &serde_json::Value) -> Option<crate::soc::scenario::ScenarioEffect> {
-    use crate::soc::scenario::{OverrideSpec, ScenarioEffect};
-    let ty = v.get("type")?.as_str()?;
-    match ty {
-        "set_override" => {
-            let addr = parse_hex_or_dec(v.get("address")?)?;
-            let value = parse_hex_or_dec(v.get("value")?)?;
-            let mode = v.get("mode").and_then(|m| m.as_str()).unwrap_or("static");
-            let spec = match mode {
-                "oneshot" => {
-                    let count = v.get("count").and_then(|c| c.as_u64()).unwrap_or(1) as u32;
-                    OverrideSpec::OneShotRead { value, remaining: count }
-                }
-                "mask" => OverrideSpec::MaskedWriteIgnore { mask: value },
-                _ => OverrideSpec::StaticRead { value },
-            };
-            let label = v.get("label").and_then(|l| l.as_str()).map(|s| s.to_string());
-            Some(ScenarioEffect::SetOverride { address: addr, spec, label })
-        }
-        "remove_override" => {
-            let addr = parse_hex_or_dec(v.get("address")?)?;
-            Some(ScenarioEffect::RemoveOverride { address: addr })
-        }
-        "write_mmio" => {
-            let addr = parse_hex_or_dec(v.get("address")?)?;
-            let value = parse_hex_or_dec(v.get("value")?)?;
-            Some(ScenarioEffect::WriteMmio { address: addr, value })
-        }
-        "pause" => Some(ScenarioEffect::Pause),
-        _ => None,
-    }
-}
+use crate::soc::scenario::{parse_effect, parse_trigger};
 
 fn reg_by_name(cpu: &crate::emu::snapshot::CpuSnapshot, name: &str) -> Option<u32> {
     let lower = name.to_ascii_lowercase();

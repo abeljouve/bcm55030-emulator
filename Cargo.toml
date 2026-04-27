@@ -17,15 +17,13 @@ required-features = ["ui", "mcp"]
 [features]
 default = []
 # Enable the egui/eframe GUI layer. Pulls in native windowing.
-ui  = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:egui-phosphor", "dep:rfd", "dep:serde", "dep:serde_json"]
+ui  = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:egui-phosphor", "dep:rfd"]
 # Enable the integrated MCP server (rmcp + axum HTTP transport).
 mcp = [
     "dep:rmcp",
     "dep:tokio",
     "dep:axum",
     "dep:schemars",
-    "dep:serde",
-    "dep:serde_json",
     "dep:tracing",
 ]
 
@@ -49,8 +47,8 @@ rfd          = { version = "0.17", optional = true }
 tokio        = { version = "1",    optional = true, features = ["rt-multi-thread", "macros", "sync", "net"] }
 axum         = { version = "0.8",  optional = true }
 schemars     = { version = "1",    optional = true }
-serde        = { version = "1",    optional = true, features = ["derive"] }
-serde_json   = { version = "1",    optional = true }
+serde        = { version = "1",    features = ["derive"] }
+serde_json   = "1"
 tracing      = { version = "0.1",  optional = true }
 rmcp         = { version = "1.4",  optional = true, features = [
     "server",
