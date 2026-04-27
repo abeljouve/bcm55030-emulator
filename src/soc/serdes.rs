@@ -133,6 +133,10 @@ impl LaneState {
     }
 }
 
+/// Ticks after enable before a lane auto-locks (~ matches the
+/// real HW EPON timer delay of ~1024 ticks during bring-up).
+const LANE_LOCK_DELAY_TICKS: u64 = 16;
+
 pub struct SerDes {
     /// Backing store for the main MMIO window.
     raw_store: [u32; SERDES_MAIN_WORDS],
@@ -144,6 +148,9 @@ pub struct SerDes {
     /// next `read_word` returns with bit 31 cleared and removes the
     /// entry — matching the hardware's "operation complete" semantics.
     cmd_pending_clear: HashSet<u32>,
+    /// Per-lane tick counter for auto-lock progression.  Starts
+    /// counting when `enabled` becomes true and `locked` is false.
+    lane_lock_countdown: [u64; LANE_COUNT],
     pub lanes: [LaneState; LANE_COUNT],
     /// Per-lane status file at `0x224A0000 + lane*8`.
     window: Vec<u8>,
@@ -161,6 +168,7 @@ impl SerDes {
             lane_store: vec![0u32; SERDES_LANE_WORDS],
             mode_store: vec![0u32; SERDES_MODE_WORDS],
             cmd_pending_clear: HashSet::new(),
+            lane_lock_countdown: [0; LANE_COUNT],
             lanes: [LaneState::cold(); LANE_COUNT],
             window: vec![0u8; (SERDES_WINDOW_END - SERDES_WINDOW_BASE) as usize],
             error_status: 0,
@@ -366,13 +374,26 @@ impl Peripheral for SerDes {
         self.write_word(word_addr, new)
     }
 
-    fn tick(&mut self, _cpu_instructions: u64) {}
+    fn tick(&mut self, _cpu_instructions: u64) {
+        for i in 0..LANE_COUNT {
+            if self.lanes[i].enabled && !self.lanes[i].locked && !self.lanes[i].rx_los {
+                self.lane_lock_countdown[i] += 1;
+                if self.lane_lock_countdown[i] >= LANE_LOCK_DELAY_TICKS {
+                    self.lanes[i].locked = true;
+                    self.lane_lock_countdown[i] = 0;
+                }
+            } else if !self.lanes[i].enabled || self.lanes[i].rx_los {
+                self.lane_lock_countdown[i] = 0;
+            }
+        }
+    }
 
     fn reset_cold(&mut self) {
         self.raw_store = [0u32; SERDES_MAIN_WORDS];
         self.lane_store.fill(0);
         self.mode_store.fill(0);
         self.cmd_pending_clear.clear();
+        self.lane_lock_countdown = [0; LANE_COUNT];
         self.lanes = [LaneState::cold(); LANE_COUNT];
         self.window.fill(0);
         self.error_status = 0;
@@ -574,5 +595,39 @@ mod tests {
         let mut s = SerDes::new();
         s.write_word(0x0100_2D00, 0xDEAD_BEEF).unwrap();
         assert_eq!(s.read_word(0x0100_2D00).unwrap(), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn tick_auto_lock_progression() {
+        let mut s = SerDes::new();
+        s.reset_cold();
+        s.inject_event(&PeripheralEvent::SerDes(SerDesEvent::SetLaneEnabled(0, true)))
+            .unwrap();
+        assert!(s.lanes[0].enabled);
+        assert!(!s.lanes[0].locked);
+
+        for _ in 0..LANE_LOCK_DELAY_TICKS - 1 {
+            s.tick(0);
+        }
+        assert!(!s.lanes[0].locked);
+
+        s.tick(0);
+        assert!(s.lanes[0].locked);
+        assert_ne!(s.read_word(0x0100_0194).unwrap() & (1 << 1), 0);
+    }
+
+    #[test]
+    fn tick_auto_lock_blocked_by_rx_los() {
+        let mut s = SerDes::new();
+        s.reset_cold();
+        s.inject_event(&PeripheralEvent::SerDes(SerDesEvent::SetLaneEnabled(0, true)))
+            .unwrap();
+        s.inject_event(&PeripheralEvent::SerDes(SerDesEvent::InjectRxLos(0, true)))
+            .unwrap();
+
+        for _ in 0..LANE_LOCK_DELAY_TICKS * 2 {
+            s.tick(0);
+        }
+        assert!(!s.lanes[0].locked);
     }
 }
