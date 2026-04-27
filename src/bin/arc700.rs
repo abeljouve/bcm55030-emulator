@@ -7,6 +7,13 @@ use std::sync::mpsc::Sender;
 use bcm55030_emulator::cpu::Cpu;
 use bcm55030_emulator::soc::bank::BootMode;
 
+#[cfg(feature = "mcp")]
+use std::sync::Arc;
+#[cfg(feature = "mcp")]
+use std::sync::mpsc;
+#[cfg(feature = "mcp")]
+use parking_lot::{Mutex, RwLock};
+
 fn usage(prog: &str) {
     eprintln!("BCM55030 ARC 700 Emulator");
     eprintln!();
@@ -30,10 +37,16 @@ fn usage(prog: &str) {
     eprintln!("  --trace-mmio-seq <FILE>     Write per-access MMIO trace as JSON Lines to FILE");
     eprintln!("  --trace-mmio-range S:E      Restrict --trace-mmio-seq to [S,E) (hex, repeatable)");
     eprintln!("  --scenario <FILE>           Load a JSON scenario file at startup");
+    #[cfg(feature = "mcp")]
+    eprintln!("  --mcp-port <PORT>           Start MCP server on PORT (enables worker mode)");
     eprintln!();
+    #[cfg(not(feature = "mcp"))]
+    {
     eprintln!("This is the headless CLI binary. For the egui GUI with integrated MCP");
     eprintln!("server, build and run the `arc700-gui` binary instead:");
     eprintln!("  cargo run --release --features ui,mcp --bin arc700-gui");
+    eprintln!("Or rebuild with --features mcp for headless MCP: --mcp-port <PORT>");
+    }
 }
 
 struct Config {
@@ -64,6 +77,8 @@ struct Config {
     /// flags OR together.
     trace_mmio_ranges: Vec<(u32, u32)>,
     scenario_path: Option<String>,
+    #[cfg(feature = "mcp")]
+    mcp_port: Option<u16>,
 }
 
 fn parse_hex(s: &str) -> Option<u32> {
@@ -94,6 +109,8 @@ fn parse_args() -> Config {
         trace_mmio_seq: None,
         trace_mmio_ranges: Vec::new(),
         scenario_path: None,
+        #[cfg(feature = "mcp")]
+        mcp_port: None,
     };
 
     let mut i = 1;
@@ -231,6 +248,18 @@ fn parse_args() -> Config {
                     process::exit(1);
                 }
                 cfg.scenario_path = Some(args[i].clone());
+            }
+            #[cfg(feature = "mcp")]
+            "--mcp-port" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --mcp-port requires a number");
+                    process::exit(1);
+                }
+                cfg.mcp_port = Some(args[i].parse().unwrap_or_else(|_| {
+                    eprintln!("Error: invalid port: {}", args[i]);
+                    process::exit(1);
+                }));
             }
             "--help" | "-h" => {
                 usage(prog);
@@ -413,6 +442,82 @@ fn reset_cpu_for_reboot(cpu: &mut Cpu) {
     }
 }
 
+#[cfg(feature = "mcp")]
+fn run_with_mcp(cpu: Cpu, cfg: &Config, port: u16) {
+    use bcm55030_emulator::emu::command::CpuCommand;
+    use bcm55030_emulator::emu::{
+        Annotations, EmulatorHandle, EmulatorSnapshot, EventLog, McpStatus,
+    };
+
+    let bank = cpu
+        .bank()
+        .cloned()
+        .expect("BCM55030 Cpu must have a peripheral bank");
+
+    let (cmd_tx, cmd_rx) = mpsc::channel::<CpuCommand>();
+    let uart_tx = bank.read().uart_rx_sender();
+    let peripherals = bank.read().snapshot_all();
+
+    let mut snap = EmulatorSnapshot::placeholder(cfg.boot_mode);
+    snap.peripherals = peripherals;
+
+    let handle = EmulatorHandle {
+        bank,
+        snapshot: Arc::new(Mutex::new(snap)),
+        cpu_cmd: cmd_tx,
+        uart_tx: uart_tx.clone(),
+        annotations: Arc::new(RwLock::new(Annotations::new())),
+        event_log: Arc::new(Mutex::new(EventLog::default())),
+        mcp_status: Arc::new(Mutex::new(McpStatus::default())),
+        firmware_info: Arc::new(Mutex::new(None)),
+    };
+
+    let handle_for_worker = handle.clone();
+    let boot_mode = cfg.boot_mode;
+    let worker = std::thread::Builder::new()
+        .name("arc700-cpu-worker".to_string())
+        .spawn(move || {
+            bcm55030_emulator::emu::cpu_worker::run(
+                cpu,
+                handle_for_worker,
+                cmd_rx,
+                Box::new(move |_| Cpu::new_bcm55030(boot_mode)),
+            );
+        })
+        .expect("spawn cpu worker");
+
+    let _mcp_thread = bcm55030_emulator::mcp::spawn_server(handle.clone(), port);
+
+    if let Some(bp) = cfg.breakpoint {
+        let (tx, _rx) = bcm55030_emulator::emu::command::oneshot();
+        let _ = handle.cpu_cmd.send(CpuCommand::SetBreakpoint { address: bp, response: tx });
+    }
+
+    let max = if cfg.max_cycles == u64::MAX { None } else { Some(cfg.max_cycles) };
+    let _ = handle.cpu_cmd.send(CpuCommand::Run { max_insns: max });
+
+    eprintln!("[arc700] MCP server on port {port}, worker running");
+    eprintln!("[arc700] Press Ctrl-C to stop");
+
+    let orig_termios = setup_raw_terminal();
+
+    loop {
+        while let Some(byte) = try_read_stdin() {
+            if byte == 3 {
+                eprintln!("\n[arc700] Ctrl-C, shutting down");
+                let _ = handle.cpu_cmd.send(CpuCommand::Shutdown);
+                let _ = worker.join();
+                if let Some(ref orig) = orig_termios {
+                    restore_terminal(orig);
+                }
+                return;
+            }
+            let _ = uart_tx.send(byte);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 fn main() {
     let cfg = parse_args();
     bcm55030_emulator::set_verbose(cfg.verbose);
@@ -535,6 +640,12 @@ fn main() {
                 process::exit(1);
             }
         }
+    }
+
+    #[cfg(feature = "mcp")]
+    if let Some(port) = cfg.mcp_port {
+        run_with_mcp(cpu, &cfg, port);
+        return;
     }
 
     let orig_termios = setup_raw_terminal();
