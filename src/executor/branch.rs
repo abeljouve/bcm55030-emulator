@@ -28,13 +28,12 @@ pub fn execute_branch(
 
     match delay {
         DelayMode::Delay => {
-            // For BL.D, blink is set later in step() when we know the delay slot size.
-            // For B.D (no link), nothing to do here.
             state.delay_state = DelayState::DelaySlot { target, is_link: link };
         }
         DelayMode::NoDelay => {
             if link {
                 state.write_core_reg(REG_BLINK, next_pc)?;
+                state.link_executed = true;
             }
             state.pc = target;
             state.pc_written = true;
@@ -126,12 +125,12 @@ pub fn execute_jump(
 
     match delay {
         DelayMode::Delay => {
-            // For JL.D, blink is set later in step() when we know the delay slot size.
             state.delay_state = DelayState::DelaySlot { target, is_link: link };
         }
         DelayMode::NoDelay => {
             if link {
                 state.write_core_reg(REG_BLINK, next_pc)?;
+                state.link_executed = true;
             }
             state.pc = target;
             state.pc_written = true;

@@ -2,6 +2,7 @@ pub mod condition;
 pub mod exception;
 pub mod registers;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -37,6 +38,13 @@ pub struct Cpu {
     /// the old `register_hooks()` were deleted per the contributor guide. The
     /// infrastructure stays for the future UI debug features.
     pub hooks: HookTable,
+    /// Shadow call stack for `get_call_stack` MCP tool. Pushed on BL/JL,
+    /// popped on J [blink]. Max depth 64 — deeper nesting truncates.
+    pub shadow_call_stack: Vec<u32>,
+    /// Per-function instruction counter for `get_function_profile`. Keyed
+    /// by call-site PC (top of shadow stack), incremented each step.
+    pub function_profile: HashMap<u32, u64>,
+    pub profiling_enabled: bool,
     /// Fractional accumulator for ARC Timer0/1 tick rate.
     /// 156.25 MHz clock, ~1.76 cycles/instruction average.
     timer_frac_acc: u32,
@@ -57,6 +65,9 @@ impl Cpu {
             trace: false,
             debug_info: None,
             hooks: HookTable::new(),
+            shadow_call_stack: Vec::new(),
+            function_profile: HashMap::new(),
+            profiling_enabled: false,
             timer_frac_acc: 0,
             bank: None,
             bank_tick_accumulator: 0,
@@ -76,6 +87,9 @@ impl Cpu {
             trace: false,
             debug_info: None,
             hooks: HookTable::new(),
+            shadow_call_stack: Vec::new(),
+            function_profile: HashMap::new(),
+            profiling_enabled: false,
             timer_frac_acc: 0,
             bank,
             bank_tick_accumulator: 0,
@@ -219,6 +233,7 @@ impl Cpu {
 
         // Execute
         self.state.pc_written = false;
+        self.state.link_executed = false;
         executor::execute(&decoded, &mut self.state, &mut self.mem)?;
 
         // PC update logic
@@ -231,6 +246,29 @@ impl Cpu {
         }
 
         self.state.instruction_count += 1;
+
+        // Shadow call stack: push on BL/JL, pop on J [blink].
+        if let Some((_, true)) = delay_info {
+            if self.shadow_call_stack.len() < 64 {
+                self.shadow_call_stack.push(next_pc);
+            }
+        } else if self.state.link_executed {
+            if self.shadow_call_stack.len() < 64 {
+                let blink = self.state.core_regs[REG_BLINK as usize];
+                self.shadow_call_stack.push(blink);
+            }
+        } else if self.state.pc_written {
+            let blink = self.state.core_regs[REG_BLINK as usize];
+            if self.state.pc == blink && !self.shadow_call_stack.is_empty() {
+                self.shadow_call_stack.pop();
+            }
+        }
+
+        if self.profiling_enabled {
+            if let Some(&frame_pc) = self.shadow_call_stack.last() {
+                *self.function_profile.entry(frame_pc).or_insert(0) += 1;
+            }
+        }
 
         // Watchpoint trap — if any read/write during executor set a
         // hit, pause the CPU. The next step() runs past the

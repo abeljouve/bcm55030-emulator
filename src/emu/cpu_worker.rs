@@ -357,6 +357,20 @@ impl Worker {
                     *entry = 0;
                 }
             }
+            CpuCommand::RequestCallStack { response } => {
+                let _ = response.send(self.cpu.shadow_call_stack.clone());
+            }
+            CpuCommand::RequestFunctionProfile { response } => {
+                let mut entries: Vec<(u32, u64)> = self.cpu.function_profile.iter().map(|(&k, &v)| (k, v)).collect();
+                entries.sort_by(|a, b| b.1.cmp(&a.1));
+                let _ = response.send(entries);
+            }
+            CpuCommand::SetProfiling { enabled } => {
+                self.cpu.profiling_enabled = enabled;
+                if !enabled {
+                    self.cpu.function_profile.clear();
+                }
+            }
             CpuCommand::Shutdown => {
                 self.running = false;
                 self.cpu.state.halted = true;

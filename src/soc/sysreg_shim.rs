@@ -54,7 +54,7 @@ impl SysregShim {
             trace: false,
             sysreg_store: vec![0u32; num],
             unhandled_logged: HashSet::new(),
-            mmio_trace: None,
+            mmio_trace: Some(HashMap::new()),
             current_pc: 0,
             current_insn: 0,
         }

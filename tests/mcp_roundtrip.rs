@@ -125,11 +125,14 @@ async fn mcp_roundtrip_read_only_tools() {
         .await
         .expect("peek_mmio");
     let text = render_result(&res);
-    // CHIP_ID = 0x47010203 = 1_191_248_387 decimal (JSON serialises u32 as a
-    // base-10 number).
     assert!(
-        text.contains("1191248387"),
-        "peek_mmio CHIP_ID: {}",
+        text.contains("0x47010203") || text.contains("0x47010203".to_uppercase().as_str()),
+        "peek_mmio CHIP_ID value: {}",
+        text
+    );
+    assert!(
+        text.contains("HW_STATE_REG_N"),
+        "peek_mmio register name: {}",
         text
     );
 
@@ -281,6 +284,63 @@ async fn mcp_roundtrip_read_only_tools() {
         text
     );
 
+    // 13. explain_mmio 0x01000000 → name, block, peripheral, value.
+    let explain_args = serde_json::json!({ "address": 0x01000000u32 })
+        .as_object()
+        .unwrap()
+        .clone();
+    let res = client
+        .call_tool(CallToolRequestParams::new("explain_mmio").with_arguments(explain_args))
+        .await
+        .expect("explain_mmio");
+    let text = render_result(&res);
+    assert!(text.contains("HW_STATE_REG_N"), "explain_mmio name: {}", text);
+    assert!(text.contains("\"peripheral\""), "explain_mmio peripheral: {}", text);
+    assert!(text.contains("0x47010203") || text.contains("0x47010203".to_uppercase().as_str()),
+        "explain_mmio value: {}", text);
+
+    // 14. get_unhandled_mmio: fresh bank, sysreg trace always-on but no
+    //     unhandled accesses yet → empty.
+    let res = client
+        .call_tool(CallToolRequestParams::new("get_unhandled_mmio"))
+        .await
+        .expect("get_unhandled_mmio");
+    let text = render_result(&res);
+    assert!(text.contains("\"count\":0"), "get_unhandled_mmio: {}", text);
+
+    // 15. get_mmio_history: write_mmio already happened (step 11).
+    //     History buffer should have at least 1 entry for 0x01000144.
+    let hist_args = serde_json::json!({ "address": "0x01000144", "last": 5 })
+        .as_object()
+        .unwrap()
+        .clone();
+    let res = client
+        .call_tool(CallToolRequestParams::new("get_mmio_history").with_arguments(hist_args))
+        .await
+        .expect("get_mmio_history");
+    let text = render_result(&res);
+    assert!(text.contains("0x01000144") || text.contains("0x01000144".to_uppercase().as_str()),
+        "get_mmio_history address: {}", text);
+
+    // 16. set_mmio_history_size + clear_mmio_history.
+    let size_args = serde_json::json!({ "size": 100 })
+        .as_object()
+        .unwrap()
+        .clone();
+    let res = client
+        .call_tool(CallToolRequestParams::new("set_mmio_history_size").with_arguments(size_args))
+        .await
+        .expect("set_mmio_history_size");
+    let text = render_result(&res);
+    assert!(text.contains("\"ok\":true"), "set_mmio_history_size: {}", text);
+
+    let res = client
+        .call_tool(CallToolRequestParams::new("clear_mmio_history"))
+        .await
+        .expect("clear_mmio_history");
+    let text = render_result(&res);
+    assert!(text.contains("\"ok\":true"), "clear_mmio_history: {}", text);
+
     client.cancel().await.ok();
 }
 
@@ -376,7 +436,7 @@ async fn mcp_roundtrip_cpu_command_tools() {
             .await
             .expect("get_cpu_state");
         let text = render_result(&res);
-        if text.contains("\"pc\":8") && text.contains("Breakpoint") {
+        if text.contains("\"pc\":\"0x00000008\"") && text.contains("Breakpoint") {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -394,7 +454,7 @@ async fn mcp_roundtrip_cpu_command_tools() {
         .await
         .expect("read_registers");
     let text = render_result(&res);
-    assert!(text.contains("\"pc\":8"), "read_registers: {}", text);
+    assert!(text.contains("\"pc\":\"0x00000008\""), "read_registers: {}", text);
 
     // 5. write_register r0=0xDEADBEEF, then read it back.
     let args = serde_json::json!({ "name": "r0", "value": 0xDEADBEEFu32 })
@@ -424,9 +484,8 @@ async fn mcp_roundtrip_cpu_command_tools() {
         .await
         .expect("read_registers r0");
     let text = render_result(&res);
-    // u32::from(0xDEADBEEF) = 3_735_928_559 as JSON number.
     assert!(
-        text.contains("3735928559"),
+        text.contains("0xDEADBEEF"),
         "r0 after write_register: {}",
         text
     );
@@ -464,8 +523,7 @@ async fn mcp_roundtrip_cpu_command_tools() {
         .await
         .expect("get_cpu_state");
     let text = render_result(&res);
-    // After clearing paused and stepping 2, pc moves from 8 to 12.
-    assert!(text.contains("\"pc\":12"), "after step 2: {}", text);
+    assert!(text.contains("\"pc\":\"0x0000000C\""), "after step 2: {}", text);
 
     // 7. read_memory @ 0 → first 4 bytes = 78E0 78E0 (two NOP_S).
     let args = serde_json::json!({ "address": 0u32, "length": 4u32 })
@@ -501,7 +559,50 @@ async fn mcp_roundtrip_cpu_command_tools() {
         .await
         .expect("get_cpu_state post-reset");
     let text = render_result(&res);
-    assert!(text.contains("\"pc\":0"), "reset pc: {}", text);
+    assert!(text.contains("\"pc\":\"0x00000000\""), "reset pc: {}", text);
+
+    // 9. get_coverage: should have entries since NOPs were executed.
+    let res = client
+        .call_tool(CallToolRequestParams::new("get_coverage"))
+        .await
+        .expect("get_coverage");
+    let text = render_result(&res);
+    assert!(text.contains("\"total_pcs\""), "get_coverage: {}", text);
+
+    // 10. get_call_stack: flat NOPs, no BL/JL → empty stack.
+    let res = client
+        .call_tool(CallToolRequestParams::new("get_call_stack"))
+        .await
+        .expect("get_call_stack");
+    let text = render_result(&res);
+    assert!(text.contains("\"depth\":0"), "get_call_stack: {}", text);
+
+    // 11. set_profiling + get_function_profile.
+    let args = serde_json::json!({ "enabled": true })
+        .as_object()
+        .unwrap()
+        .clone();
+    let res = client
+        .call_tool(CallToolRequestParams::new("set_profiling").with_arguments(args))
+        .await
+        .expect("set_profiling");
+    let text = render_result(&res);
+    assert!(text.contains("\"ok\":true"), "set_profiling: {}", text);
+
+    let res = client
+        .call_tool(CallToolRequestParams::new("get_function_profile"))
+        .await
+        .expect("get_function_profile");
+    let text = render_result(&res);
+    assert!(text.contains("\"entries\""), "get_function_profile: {}", text);
+
+    // 12. reset_coverage.
+    let res = client
+        .call_tool(CallToolRequestParams::new("reset_coverage"))
+        .await
+        .expect("reset_coverage");
+    let text = render_result(&res);
+    assert!(text.contains("\"ok\":true"), "reset_coverage: {}", text);
 
     // Clean shutdown.
     client.cancel().await.ok();

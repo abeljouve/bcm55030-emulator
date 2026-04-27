@@ -10,7 +10,7 @@
 //! per MMIO access) can share it without contention on the SRAM fast
 //! path — which does not touch the bank at all.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufWriter, Write};
 use std::sync::mpsc;
 
@@ -41,6 +41,33 @@ use crate::soc::vlan_lue::VlanLue;
 /// contention but coarser peripheral advancement. The EPON free-running
 /// counter assumes 64 — keep the default here.
 pub const BANK_TICK_PRESCALER: u64 = 64;
+
+/// Per-address last-access record for the `explain_mmio` MCP tool.
+#[derive(Clone, Debug)]
+pub struct LastAccessInfo {
+    pub pc: u32,
+    pub blink: u32,
+    pub insn: u64,
+    pub direction: &'static str,
+    pub value: u32,
+}
+
+const LAST_ACCESS_MAX: usize = 4096;
+
+/// Per-access MMIO history entry for the ring buffer.
+#[derive(Clone, Debug)]
+pub struct MmioHistoryEntry {
+    pub insn: u64,
+    pub pc: u32,
+    pub blink: u32,
+    pub address: u32,
+    pub value: u32,
+    pub direction: &'static str,
+    pub width: &'static str,
+    pub peripheral: &'static str,
+}
+
+pub const DEFAULT_MMIO_HISTORY_SIZE: usize = 8192;
 
 /// Aggregated MMIO trace entry (replaces the one previously owned by
 /// `mmio::MmioController`). Used by `--dump-mmio-trace` / cold-boot
@@ -180,6 +207,15 @@ pub struct PeripheralBank {
     /// unmodelled firmware probes.
     pub unmapped_exception: bool,
 
+    /// Per-address last-access cache for `explain_mmio`. Bounded to
+    /// `LAST_ACCESS_MAX` entries — evicts oldest when full.
+    pub last_access: HashMap<u32, LastAccessInfo>,
+
+    /// Ring buffer of recent MMIO accesses. Bounded to
+    /// `mmio_history_max` entries. Zero overhead when empty (size=0).
+    pub mmio_history: VecDeque<MmioHistoryEntry>,
+    pub mmio_history_max: usize,
+
     /// Per-access sequential MMIO trace (`--trace-mmio-seq`). `None`
     /// by default — zero overhead when disabled. When present, every
     /// successful MMIO access appends a JSON Lines entry.
@@ -216,6 +252,9 @@ impl PeripheralBank {
             irq_pending: 0,
             boot_mode,
             unmapped_exception: false,
+            last_access: HashMap::new(),
+            mmio_history: VecDeque::with_capacity(DEFAULT_MMIO_HISTORY_SIZE),
+            mmio_history_max: DEFAULT_MMIO_HISTORY_SIZE,
             seq_trace: None,
         };
         // Apply the requested reset flavour.
@@ -340,6 +379,40 @@ impl PeripheralBank {
         self.sysreg.update_cpu_context(pc, insn);
     }
 
+    #[inline]
+    fn record_history(&mut self, addr: u32, value: u32, direction: &'static str, width: &'static str, peripheral: &'static str) {
+        if self.mmio_history_max == 0 { return; }
+        if self.mmio_history.len() >= self.mmio_history_max {
+            self.mmio_history.pop_front();
+        }
+        self.mmio_history.push_back(MmioHistoryEntry {
+            insn: self.current_insn,
+            pc: self.current_pc,
+            blink: self.current_blink,
+            address: addr,
+            value,
+            direction,
+            width,
+            peripheral,
+        });
+    }
+
+    #[inline]
+    fn record_last_access(&mut self, addr: u32, value: u32, direction: &'static str) {
+        if self.last_access.len() >= LAST_ACCESS_MAX && !self.last_access.contains_key(&addr) {
+            if let Some(&oldest) = self.last_access.keys().next() {
+                self.last_access.remove(&oldest);
+            }
+        }
+        self.last_access.insert(addr, LastAccessInfo {
+            pc: self.current_pc,
+            blink: self.current_blink,
+            insn: self.current_insn,
+            direction,
+            value,
+        });
+    }
+
     /// Emit one entry to the sequential MMIO trace if enabled and the
     /// address matches the configured filter. Inlined so the branch
     /// folds away at the call site when `seq_trace` is `None`.
@@ -419,6 +492,25 @@ impl PeripheralBank {
         }
     }
 
+    /// Return the name of the peripheral that claims `addr`, if any.
+    pub fn peripheral_for(&self, addr: u32) -> Option<&'static str> {
+        if self.uart.claims(addr) { return Some("uart"); }
+        if self.pbc.claims(addr) { return Some("pbc"); }
+        if self.bsc_i2c.claims(addr) { return Some("bsc_i2c"); }
+        if self.serdes.claims(addr) { return Some("serdes"); }
+        if self.epon_mac.claims(addr) { return Some("epon_mac"); }
+        if self.macsec.claims(addr) { return Some("macsec"); }
+        if self.dma.claims(addr) { return Some("dma"); }
+        if self.timer.claims(addr) { return Some("timer"); }
+        if self.efuse_udr.claims(addr) { return Some("efuse_udr"); }
+        if self.fatal_filter.claims(addr) { return Some("fatal_filter"); }
+        if self.mpcp.claims(addr) { return Some("mpcp"); }
+        if self.nco.claims(addr) { return Some("nco"); }
+        if self.vlan_lue.claims(addr) { return Some("vlan_lue"); }
+        if self.sysreg.claims(addr) { return Some("sysreg"); }
+        None
+    }
+
     // -------- MMIO routing --------
 
     /// Side-effect-free probe of `addr`, used by the MCP
@@ -477,6 +569,9 @@ impl PeripheralBank {
 
     pub fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
         let result = self.read_word_inner(addr);
+        if let Ok(v) = result {
+            self.record_last_access(addr, v, "read");
+        }
         self.scenario.on_mmio_read(addr);
         self.drain_scenario_deferred();
         result
@@ -485,6 +580,7 @@ impl PeripheralBank {
     fn read_word_inner(&mut self, addr: u32) -> Result<u32, Exception> {
         if !self.scenario.overrides.is_empty() {
             if let Some(v) = self.scenario.overrides.try_read(addr) {
+                self.record_history(addr, v, "read", "word", "override");
                 self.seq_emit(addr, v, "r", "word", "override");
                 return Ok(v);
             }
@@ -492,6 +588,7 @@ impl PeripheralBank {
         macro_rules! dispatch_rw {
             ($periph:expr, $name:expr) => {{
                 let v = $periph.read_word(addr)?;
+                self.record_history(addr, v, "read", "word", $name);
                 self.seq_emit(addr, v, "r", "word", $name);
                 return Ok(v);
             }};
@@ -510,6 +607,7 @@ impl PeripheralBank {
         if self.nco.claims(addr) { dispatch_rw!(self.nco, "nco"); }
         if self.vlan_lue.claims(addr) {
             let v = self.vlan_lue.read_word(addr)?;
+            self.record_history(addr, v, "read", "word", "vlan_lue");
             self.seq_emit(addr, v, "r", "word", "vlan_lue");
             return Ok(v);
         }
@@ -526,6 +624,9 @@ impl PeripheralBank {
 
     pub fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
         let result = self.write_word_inner(addr, val);
+        if result.is_ok() {
+            self.record_last_access(addr, val, "write");
+        }
         self.scenario.on_mmio_write(addr);
         self.drain_scenario_deferred();
         result
@@ -534,6 +635,7 @@ impl PeripheralBank {
     fn write_word_inner(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
         let val = if !self.scenario.overrides.is_empty() {
             if let Some(masked) = self.scenario.overrides.filter_write(addr, val) {
+                self.record_history(addr, masked, "write", "word", "override-mask");
                 self.seq_emit(addr, masked, "w", "word", "override-mask");
                 masked
             } else {
@@ -545,6 +647,7 @@ impl PeripheralBank {
         macro_rules! dispatch_ww {
             ($periph:expr, $name:expr) => {{
                 $periph.write_word(addr, val)?;
+                self.record_history(addr, val, "write", "word", $name);
                 self.seq_emit(addr, val, "w", "word", $name);
                 return Ok(());
             }};
@@ -556,6 +659,7 @@ impl PeripheralBank {
                 let rx = self.serdes.spi_command(&tx, rx_len);
                 self.pbc.complete_spi_serdes(&rx);
             }
+            self.record_history(addr, val, "write", "word", "pbc");
             self.seq_emit(addr, val, "w", "word", "pbc");
             return Ok(());
         }
@@ -571,6 +675,7 @@ impl PeripheralBank {
         if self.nco.claims(addr) { dispatch_ww!(self.nco, "nco"); }
         if self.vlan_lue.claims(addr) {
             self.vlan_lue.write_word(addr, val)?;
+            self.record_history(addr, val, "write", "word", "vlan_lue");
             self.seq_emit(addr, val, "w", "word", "vlan_lue");
             return Ok(());
         }

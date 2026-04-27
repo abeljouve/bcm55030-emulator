@@ -166,6 +166,15 @@ pub enum CpuCommand {
     /// Reset the coverage map to zero. Called from the UI
     /// overlay toggle.
     ClearCoverage,
+    RequestCallStack {
+        response: OneshotSender<Vec<u32>>,
+    },
+    RequestFunctionProfile {
+        response: OneshotSender<Vec<(u32, u64)>>,
+    },
+    SetProfiling {
+        enabled: bool,
+    },
     /// Shutdown signal — the worker drops its `Cpu`, sends a last
     /// snapshot (run_state=Halted) and exits.
     Shutdown,

@@ -202,6 +202,9 @@ pub struct CpuState {
     /// Used by step() to distinguish "branch to same address" from "no branch".
     pub pc_written: bool,
 
+    /// Set by executor on BL/JL (link=true, no delay) for shadow call stack.
+    pub link_executed: bool,
+
     /// Fast IRQ shadow set for r0..r3. Saved on IRQ entry, restored on RTIE.
     pub irq_shadow_r0_r3: [u32; 4],
 
@@ -269,6 +272,7 @@ impl CpuState {
             pause_reason: PauseReason::None,
             instruction_count: 0,
             pc_written: false,
+            link_executed: false,
             irq_shadow_r0_r3: [0u32; 4],
             aux_dc_ctrl: 0xC2, // BCM55030 reset: cache enabled, IM=1, LM=1
         };

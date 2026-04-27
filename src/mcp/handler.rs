@@ -72,34 +72,36 @@ impl std::ops::Deref for HexU32 {
     fn deref(&self) -> &u32 { &self.0 }
 }
 
-impl<'de> serde::Deserialize<'de> for HexU32 {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        struct Visitor;
-        impl serde::de::Visitor<'_> for Visitor {
-            type Value = HexU32;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                write!(f, "an integer or a hex string like \"0x01000E04\"")
-            }
-            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<HexU32, E> {
-                Ok(HexU32(v as u32))
-            }
-            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<HexU32, E> {
-                Ok(HexU32(v as u32))
-            }
-            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<HexU32, E> {
-                let s = s.trim();
-                if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                    u32::from_str_radix(hex, 16)
-                        .map(HexU32)
-                        .map_err(serde::de::Error::custom)
-                } else {
-                    s.parse::<u32>()
-                        .map(HexU32)
-                        .map_err(serde::de::Error::custom)
-                }
+fn deserialize_hex_u32<'de, D: serde::Deserializer<'de>>(de: D) -> Result<u32, D::Error> {
+    struct Visitor;
+    impl serde::de::Visitor<'_> for Visitor {
+        type Value = u32;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "an integer or a hex string like \"0x01000E04\"")
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<u32, E> {
+            Ok(v as u32)
+        }
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<u32, E> {
+            Ok(v as u32)
+        }
+        fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<u32, E> {
+            let s = s.trim();
+            if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                u32::from_str_radix(hex, 16)
+                    .map_err(serde::de::Error::custom)
+            } else {
+                s.parse::<u32>()
+                    .map_err(serde::de::Error::custom)
             }
         }
-        de.deserialize_any(Visitor)
+    }
+    de.deserialize_any(Visitor)
+}
+
+impl<'de> serde::Deserialize<'de> for HexU32 {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        deserialize_hex_u32(de).map(HexU32)
     }
 }
 
@@ -122,6 +124,45 @@ impl schemars::JsonSchema for HexU32 {
     }
 }
 
+// ---------- HexValue — hex-string serialization for MCP responses ----------
+
+/// A `u32` that serializes as a hex string (`"0x01000E04"`) in MCP
+/// responses. Deserializes the same as `HexU32` (accepts both integer
+/// and hex string) for round-trip compatibility.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HexValue(pub u32);
+
+impl From<u32> for HexValue {
+    fn from(v: u32) -> Self { HexValue(v) }
+}
+
+impl From<HexValue> for u32 {
+    fn from(h: HexValue) -> u32 { h.0 }
+}
+
+impl serde::Serialize for HexValue {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&format!("0x{:08X}", self.0))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for HexValue {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        deserialize_hex_u32(de).map(HexValue)
+    }
+}
+
+impl schemars::JsonSchema for HexValue {
+    fn schema_name() -> std::borrow::Cow<'static, str> { std::borrow::Cow::Borrowed("HexValue") }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "description": "A 32-bit value as hex string (e.g. \"0x01000E04\").",
+            "type": "string",
+            "pattern": "^0x[0-9A-F]{8}$"
+        })).unwrap()
+    }
+}
+
 // ---------- Tool request / response DTOs ---------------------------------
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
@@ -135,7 +176,7 @@ pub struct ReadRegistersParams {
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ReadRegistersResult {
-    pub values: HashMap<String, u32>,
+    pub values: HashMap<String, HexValue>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -150,12 +191,12 @@ pub struct FlagsResult {
     pub h: bool,
     pub l: bool,
     pub de: bool,
-    pub status32: u32,
+    pub status32: HexValue,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct CpuStateResult {
-    pub pc: u32,
+    pub pc: HexValue,
     pub halted: bool,
     pub sleeping: bool,
     pub paused: bool,
@@ -169,7 +210,7 @@ pub struct FirmwareInfoResult {
     pub loaded: bool,
     pub path: Option<String>,
     pub boot_mode: Option<String>,
-    pub entry_point: Option<u32>,
+    pub entry_point: Option<HexValue>,
     pub flash_size: Option<usize>,
     pub flash_loaded: Option<bool>,
 }
@@ -181,8 +222,10 @@ pub struct PeekMmioParams {
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PeekMmioResult {
-    pub address: u32,
-    pub value: u32,
+    pub address: HexValue,
+    pub value: HexValue,
+    pub name: Option<String>,
+    pub block: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -230,7 +273,7 @@ pub struct WriteFlashParams {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct WriteFlashResult {
     pub bytes_written: usize,
-    pub offset: u32,
+    pub offset: HexValue,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -271,21 +314,168 @@ pub struct InjectPeripheralEventParams {
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct MmioTraceEntryJson {
-    pub address: u32,
+    pub address: HexValue,
     pub peripheral: String,
     pub reads: u64,
     pub writes: u64,
-    pub last_read_value: u32,
-    pub last_write_value: u32,
-    pub first_pc: u32,
+    pub last_read_value: HexValue,
+    pub last_write_value: HexValue,
+    pub first_pc: HexValue,
     pub first_insn: u64,
     pub access_widths: u8,
+    pub name: Option<String>,
+    pub block: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct DumpMmioTraceResult {
     pub enabled: bool,
     pub entries: Vec<MmioTraceEntryJson>,
+}
+
+// ---------- Unhandled MMIO DTOs ------------------------------------------
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct UnhandledMmioEntry {
+    pub address: HexValue,
+    pub reads: u64,
+    pub writes: u64,
+    pub last_read_value: HexValue,
+    pub last_write_value: HexValue,
+    pub first_pc: HexValue,
+    pub first_insn: u64,
+    pub name: Option<String>,
+    pub block: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct UnhandledMmioResult {
+    pub count: usize,
+    pub entries: Vec<UnhandledMmioEntry>,
+}
+
+// ---------- MMIO history DTOs (Phase B) -----------------------------------
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct GetMmioHistoryParams {
+    /// Return only the last N entries.
+    pub last: Option<usize>,
+    /// Filter by MMIO address.
+    pub address: Option<HexU32>,
+    /// Filter: only entries at or after this instruction count.
+    pub from_insn: Option<u64>,
+    /// Filter: only entries at or before this instruction count.
+    pub to_insn: Option<u64>,
+    /// Max entries to return (default 100).
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct MmioHistoryEntryJson {
+    pub insn: u64,
+    pub pc: HexValue,
+    pub blink: HexValue,
+    pub address: HexValue,
+    pub value: HexValue,
+    pub direction: String,
+    pub width: String,
+    pub peripheral: String,
+    pub name: Option<String>,
+    pub block: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct MmioHistoryResult {
+    pub total_in_buffer: usize,
+    pub returned: usize,
+    pub entries: Vec<MmioHistoryEntryJson>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SetMmioHistorySizeParams {
+    pub size: usize,
+}
+
+// ---------- Coverage DTOs (Phase C1) --------------------------------------
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct GetCoverageParams {
+    /// Only return entries at or above this address.
+    pub range_start: Option<HexU32>,
+    /// Only return entries below this address.
+    pub range_end: Option<HexU32>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CoverageEntry {
+    pub address: HexValue,
+    pub hits: u32,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CoverageResult {
+    pub total_pcs: usize,
+    pub entries: Vec<CoverageEntry>,
+}
+
+// ---------- Call stack + profiling DTOs (Phase C2/C3) ---------------------
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CallStackResult {
+    pub depth: usize,
+    pub frames: Vec<HexValue>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FunctionProfileEntry {
+    pub address: HexValue,
+    pub instructions: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct FunctionProfileParams {
+    /// Return top N entries by instruction count (default 20).
+    pub top: Option<usize>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FunctionProfileResult {
+    pub enabled: bool,
+    pub entries: Vec<FunctionProfileEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SetProfilingParams {
+    pub enabled: bool,
+}
+
+// ---------- ExplainMmio DTOs ---------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ExplainMmioParams {
+    pub address: HexU32,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ExplainMmioResult {
+    pub address: HexValue,
+    pub value: HexValue,
+    pub name: Option<String>,
+    pub block: Option<String>,
+    pub access: Option<String>,
+    pub description: Option<String>,
+    pub has_override: bool,
+    pub last_access: Option<LastAccessJson>,
+    pub peripheral: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LastAccessJson {
+    pub pc: HexValue,
+    pub blink: HexValue,
+    pub insn: u64,
+    pub direction: String,
+    pub value: HexValue,
 }
 
 // ---------- Scenario override DTOs (Phase 1) -----------------------------
@@ -319,11 +509,13 @@ pub struct RemoveMmioOverrideParams {
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct MmioOverrideEntry {
-    pub address: u32,
+    pub address: HexValue,
     pub mode: String,
-    pub value: u32,
+    pub value: HexValue,
     pub remaining: Option<u32>,
     pub label: Option<String>,
+    pub name: Option<String>,
+    pub block: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -410,11 +602,13 @@ pub struct RemoveMmioWatchpointParams {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct MmioWatchpointEntry {
     pub id: u32,
-    pub address: u32,
+    pub address: HexValue,
     pub size: u32,
     pub mode: String,
     pub action: String,
     pub label: Option<String>,
+    pub name: Option<String>,
+    pub block: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -483,7 +677,7 @@ pub struct LoadFirmwareParams {
 pub struct LoadFirmwareResponse {
     pub ok: bool,
     pub loaded_bytes: usize,
-    pub entry_point: u32,
+    pub entry_point: HexValue,
     pub flash_bytes: usize,
     pub error: Option<String>,
 }
@@ -536,7 +730,7 @@ pub struct ReadMemoryParams {
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ReadMemoryResult {
-    pub address: u32,
+    pub address: HexValue,
     pub length: u32,
     pub hex: String,
     pub ascii: String,
@@ -549,8 +743,17 @@ pub struct ReadMmioParams {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+pub struct ReadMmioResult {
+    pub address: HexValue,
+    pub value: HexValue,
+    pub width: String,
+    pub name: Option<String>,
+    pub block: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct ReadFlashResult {
-    pub offset: u32,
+    pub offset: HexValue,
     pub length: u32,
     /// Hex-encoded bytes. Upper-case, no separators.
     pub hex: String,
@@ -577,7 +780,7 @@ pub struct UartBufferResult {
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct BreakpointsResult {
-    pub breakpoints: Vec<u32>,
+    pub breakpoints: Vec<HexValue>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -601,7 +804,7 @@ impl EmulatorHandler {
                 loaded: true,
                 path: Some(info.path.display().to_string()),
                 boot_mode: Some(format!("{:?}", info.boot_mode)),
-                entry_point: Some(info.entry_point),
+                entry_point: Some(HexValue(info.entry_point)),
                 flash_size: Some(info.flash_size),
                 flash_loaded: Some(info.flash_loaded),
             },
@@ -623,23 +826,23 @@ impl EmulatorHandler {
             Some(names) => {
                 for n in names {
                     if let Some(v) = reg_by_name(&snap.cpu, &n) {
-                        out.insert(n, v);
+                        out.insert(n, HexValue(v));
                     }
                 }
             }
             None => {
                 for i in 0..32usize {
-                    out.insert(format!("r{}", i), snap.cpu.core_regs[i]);
+                    out.insert(format!("r{}", i), HexValue(snap.cpu.core_regs[i]));
                 }
-                out.insert("pc".into(), snap.cpu.pc);
-                out.insert("sp".into(), snap.cpu.core_regs[28]);
-                out.insert("fp".into(), snap.cpu.core_regs[27]);
-                out.insert("gp".into(), snap.cpu.core_regs[26]);
-                out.insert("blink".into(), snap.cpu.core_regs[31]);
-                out.insert("lp_count".into(), snap.cpu.core_regs[60]);
-                out.insert("status32".into(), snap.cpu.flags.status32);
-                out.insert("ienable".into(), snap.cpu.aux.ienable);
-                out.insert("ipending".into(), snap.cpu.aux.ipending);
+                out.insert("pc".into(), HexValue(snap.cpu.pc));
+                out.insert("sp".into(), HexValue(snap.cpu.core_regs[28]));
+                out.insert("fp".into(), HexValue(snap.cpu.core_regs[27]));
+                out.insert("gp".into(), HexValue(snap.cpu.core_regs[26]));
+                out.insert("blink".into(), HexValue(snap.cpu.core_regs[31]));
+                out.insert("lp_count".into(), HexValue(snap.cpu.core_regs[60]));
+                out.insert("status32".into(), HexValue(snap.cpu.flags.status32));
+                out.insert("ienable".into(), HexValue(snap.cpu.aux.ienable));
+                out.insert("ipending".into(), HexValue(snap.cpu.aux.ipending));
             }
         }
         Json(ReadRegistersResult { values: out })
@@ -663,7 +866,7 @@ impl EmulatorHandler {
             h: f.h,
             l: f.l,
             de: f.de,
-            status32: f.status32,
+            status32: HexValue(f.status32),
         })
     }
 
@@ -674,7 +877,7 @@ impl EmulatorHandler {
     async fn get_cpu_state(&self) -> Json<CpuStateResult> {
         let snap = self.handle.snapshot.lock();
         Json(CpuStateResult {
-            pc: snap.cpu.pc,
+            pc: HexValue(snap.cpu.pc),
             halted: snap.cpu.halted,
             sleeping: snap.cpu.sleeping,
             paused: snap.cpu.paused,
@@ -711,15 +914,19 @@ impl EmulatorHandler {
         &self,
         Parameters(params): Parameters<PeekMmioParams>,
     ) -> Json<PeekMmioResult> {
+        let addr = params.address.0;
         let value = self
             .handle
             .bank
             .read()
-            .peek_word(params.address.0)
+            .peek_word(addr)
             .unwrap_or(0);
+        let (name, block) = reg_lookup(addr);
         Json(PeekMmioResult {
-            address: params.address.0,
-            value,
+            address: HexValue(addr),
+            value: HexValue(value),
+            name,
+            block,
         })
     }
 
@@ -730,7 +937,7 @@ impl EmulatorHandler {
     async fn list_breakpoints(&self) -> Json<BreakpointsResult> {
         let snap = self.handle.snapshot.lock();
         Json(BreakpointsResult {
-            breakpoints: snap.breakpoints.clone(),
+            breakpoints: snap.breakpoints.iter().map(|&a| HexValue(a)).collect(),
         })
     }
 
@@ -788,7 +995,7 @@ impl EmulatorHandler {
             .map(|b| format!("{:02X}", b))
             .collect::<String>();
         Json(ReadFlashResult {
-            offset: params.offset.0,
+            offset: HexValue(params.offset.0),
             length: slice.len() as u32,
             hex,
         })
@@ -850,7 +1057,7 @@ impl EmulatorHandler {
             Err(_) => {
                 return Json(WriteFlashResult {
                     bytes_written: 0,
-                    offset: params.offset.0,
+                    offset: HexValue(params.offset.0),
                 });
             }
         };
@@ -865,7 +1072,7 @@ impl EmulatorHandler {
         }
         Json(WriteFlashResult {
             bytes_written: written,
-            offset: params.offset.0,
+            offset: HexValue(params.offset.0),
         })
     }
 
@@ -992,16 +1199,19 @@ impl EmulatorHandler {
                     }
                     OverrideSpec::MaskedWriteIgnore { mask } => ("mask", *mask, None),
                 };
+                let (name, block) = reg_lookup(addr);
                 MmioOverrideEntry {
-                    address: addr,
+                    address: HexValue(addr),
                     mode: mode.to_string(),
-                    value,
+                    value: HexValue(value),
                     remaining,
                     label: ov.label.clone(),
+                    name,
+                    block,
                 }
             })
             .collect();
-        overrides.sort_by_key(|e| e.address);
+        overrides.sort_by_key(|e| e.address.0);
         Json(ListMmioOverridesResult {
             count: overrides.len(),
             overrides,
@@ -1128,13 +1338,16 @@ impl EmulatorHandler {
                     MmioWatchMode::Write => "write",
                     MmioWatchMode::ReadWrite => "rw",
                 };
+                let (name, block) = reg_lookup(wp.address);
                 MmioWatchpointEntry {
                     id: wp.id,
-                    address: wp.address,
+                    address: HexValue(wp.address),
                     size: wp.size,
                     mode: mode.to_string(),
                     action: format!("{:?}", wp.action),
                     label: wp.label.clone(),
+                    name,
+                    block,
                 }
             })
             .collect();
@@ -1186,25 +1399,290 @@ impl EmulatorHandler {
             Some(map) => {
                 let mut entries: Vec<_> = map
                     .iter()
-                    .map(|(addr, e)| MmioTraceEntryJson {
-                        address: *addr,
-                        peripheral: e.peripheral.to_string(),
-                        reads: e.reads,
-                        writes: e.writes,
-                        last_read_value: e.last_read_value,
-                        last_write_value: e.last_write_value,
-                        first_pc: e.first_pc,
-                        first_insn: e.first_insn,
-                        access_widths: e.access_widths,
+                    .map(|(addr, e)| {
+                        let (name, block) = reg_lookup(*addr);
+                        MmioTraceEntryJson {
+                            address: HexValue(*addr),
+                            peripheral: e.peripheral.to_string(),
+                            reads: e.reads,
+                            writes: e.writes,
+                            last_read_value: HexValue(e.last_read_value),
+                            last_write_value: HexValue(e.last_write_value),
+                            first_pc: HexValue(e.first_pc),
+                            first_insn: e.first_insn,
+                            access_widths: e.access_widths,
+                            name,
+                            block,
+                        }
                     })
                     .collect();
-                entries.sort_by_key(|e| e.address);
+                entries.sort_by_key(|e| e.address.0);
                 Json(DumpMmioTraceResult {
                     enabled: true,
                     entries,
                 })
             }
         }
+    }
+
+    #[tool(
+        name = "get_unhandled_mmio",
+        description = "Return aggregated MMIO accesses to sysreg-range addresses that no dedicated peripheral claimed (unmodelled registers). Always enabled. Enriched with register names from the hwregs database."
+    )]
+    async fn get_unhandled_mmio(&self) -> Json<UnhandledMmioResult> {
+        let guard = self.handle.bank.read();
+        match guard.sysreg.mmio_trace.as_ref() {
+            None => Json(UnhandledMmioResult { count: 0, entries: Vec::new() }),
+            Some(map) => {
+                let mut entries: Vec<_> = map
+                    .iter()
+                    .map(|(addr, e)| {
+                        let (name, block) = reg_lookup(*addr);
+                        UnhandledMmioEntry {
+                            address: HexValue(*addr),
+                            reads: e.reads,
+                            writes: e.writes,
+                            last_read_value: HexValue(e.last_read_value),
+                            last_write_value: HexValue(e.last_write_value),
+                            first_pc: HexValue(e.first_pc),
+                            first_insn: e.first_insn,
+                            name,
+                            block,
+                        }
+                    })
+                    .collect();
+                entries.sort_by_key(|e| e.address.0);
+                Json(UnhandledMmioResult {
+                    count: entries.len(),
+                    entries,
+                })
+            }
+        }
+    }
+
+    #[tool(
+        name = "explain_mmio",
+        description = "All-in-one MMIO register inspector: current value (side-effect-free peek), register name + block from hwregs DB, owning peripheral, active override status, and last firmware access (PC, blink, direction, value). Single tool call replaces peek + lookup + override check."
+    )]
+    async fn explain_mmio(
+        &self,
+        Parameters(params): Parameters<ExplainMmioParams>,
+    ) -> Json<ExplainMmioResult> {
+        let addr = params.address.0;
+        let guard = self.handle.bank.read();
+        let value = guard.peek_word(addr).unwrap_or(0);
+        let (name, block) = reg_lookup(addr);
+        let reg_info = mmio_blocks::lookup(addr);
+        let access = reg_info.map(|r| r.access.to_string());
+        let description = reg_info.map(|r| r.desc.to_string());
+        let has_override = guard.scenario.overrides.peek_read(addr).is_some();
+        let peripheral = guard.peripheral_for(addr).map(|s| s.to_string());
+        let last_access = guard.last_access.get(&addr).map(|la| LastAccessJson {
+            pc: HexValue(la.pc),
+            blink: HexValue(la.blink),
+            insn: la.insn,
+            direction: la.direction.to_string(),
+            value: HexValue(la.value),
+        });
+        Json(ExplainMmioResult {
+            address: HexValue(addr),
+            value: HexValue(value),
+            name,
+            block,
+            access,
+            description,
+            has_override,
+            last_access,
+            peripheral,
+        })
+    }
+
+    // ---------- MMIO history tools (Phase B) ------------------------------
+
+    #[tool(
+        name = "get_mmio_history",
+        description = "Return recent MMIO accesses from the ring buffer. Filters: `last` (tail N), `address` (single register), `from_insn`/`to_insn` (instruction range), `limit` (max returned, default 100). Enriched with register names."
+    )]
+    async fn get_mmio_history(
+        &self,
+        Parameters(params): Parameters<GetMmioHistoryParams>,
+    ) -> Json<MmioHistoryResult> {
+        let guard = self.handle.bank.read();
+        let total = guard.mmio_history.len();
+        let limit = params.limit.unwrap_or(100);
+        let iter: Box<dyn Iterator<Item = &crate::soc::bank::MmioHistoryEntry> + '_> =
+            if let Some(last_n) = params.last {
+                let skip = total.saturating_sub(last_n);
+                Box::new(guard.mmio_history.iter().skip(skip))
+            } else {
+                Box::new(guard.mmio_history.iter())
+            };
+        let filter_addr = params.address.map(|h| h.0);
+        let from = params.from_insn.unwrap_or(0);
+        let to = params.to_insn.unwrap_or(u64::MAX);
+        let entries: Vec<MmioHistoryEntryJson> = iter
+            .filter(|e| {
+                if let Some(a) = filter_addr { if e.address != a { return false; } }
+                e.insn >= from && e.insn <= to
+            })
+            .take(limit)
+            .map(|e| {
+                let (name, block) = reg_lookup(e.address);
+                MmioHistoryEntryJson {
+                    insn: e.insn,
+                    pc: HexValue(e.pc),
+                    blink: HexValue(e.blink),
+                    address: HexValue(e.address),
+                    value: HexValue(e.value),
+                    direction: e.direction.to_string(),
+                    width: e.width.to_string(),
+                    peripheral: e.peripheral.to_string(),
+                    name,
+                    block,
+                }
+            })
+            .collect();
+        let returned = entries.len();
+        Json(MmioHistoryResult {
+            total_in_buffer: total,
+            returned,
+            entries,
+        })
+    }
+
+    #[tool(
+        name = "set_mmio_history_size",
+        description = "Set the MMIO history ring buffer capacity. 0 = disabled. Default 8192."
+    )]
+    async fn set_mmio_history_size(
+        &self,
+        Parameters(params): Parameters<SetMmioHistorySizeParams>,
+    ) -> Json<OkResult> {
+        let mut guard = self.handle.bank.write();
+        guard.mmio_history_max = params.size;
+        while guard.mmio_history.len() > params.size {
+            guard.mmio_history.pop_front();
+        }
+        Json(OkResult { ok: true })
+    }
+
+    #[tool(
+        name = "clear_mmio_history",
+        description = "Clear all entries from the MMIO history ring buffer."
+    )]
+    async fn clear_mmio_history(&self) -> Json<OkResult> {
+        self.handle.bank.write().mmio_history.clear();
+        Json(OkResult { ok: true })
+    }
+
+    // ---------- Coverage + call stack tools (Phase C) ----------------------
+
+    #[tool(
+        name = "get_coverage",
+        description = "Return the coverage map: (address, hit_count) for every PC the CPU has executed. Optional `range_start`/`range_end` to filter to a specific memory region. Requires the CPU worker to be running."
+    )]
+    async fn get_coverage(
+        &self,
+        Parameters(params): Parameters<GetCoverageParams>,
+    ) -> Json<CoverageResult> {
+        let (tx, rx) = oneshot::<Vec<(u32, u32)>>();
+        if self.handle.cpu_cmd.send(CpuCommand::RequestCoverage { response: tx }).is_err() {
+            return Json(CoverageResult { total_pcs: 0, entries: Vec::new() });
+        }
+        let sparse = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+        let lo = params.range_start.map(|h| h.0).unwrap_or(0);
+        let hi = params.range_end.map(|h| h.0).unwrap_or(u32::MAX);
+        let entries: Vec<CoverageEntry> = sparse
+            .iter()
+            .filter(|(addr, _)| *addr >= lo && *addr < hi)
+            .map(|(addr, hits)| CoverageEntry {
+                address: HexValue(*addr),
+                hits: *hits,
+            })
+            .collect();
+        let total = entries.len();
+        Json(CoverageResult {
+            total_pcs: total,
+            entries,
+        })
+    }
+
+    #[tool(
+        name = "reset_coverage",
+        description = "Zero the coverage map so a fresh run can measure from scratch."
+    )]
+    async fn reset_coverage(&self) -> Json<OkResult> {
+        let ok = self.handle.cpu_cmd.send(CpuCommand::ClearCoverage).is_ok();
+        Json(OkResult { ok })
+    }
+
+    #[tool(
+        name = "get_call_stack",
+        description = "Return the shadow call stack — a list of return addresses from BL/JL instructions, most recent last. Approximate: tail calls and ISRs may not be tracked. Requires the CPU worker."
+    )]
+    async fn get_call_stack(&self) -> Json<CallStackResult> {
+        let (tx, rx) = oneshot::<Vec<u32>>();
+        if self.handle.cpu_cmd.send(CpuCommand::RequestCallStack { response: tx }).is_err() {
+            return Json(CallStackResult { depth: 0, frames: Vec::new() });
+        }
+        let stack = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+        let depth = stack.len();
+        Json(CallStackResult {
+            depth,
+            frames: stack.into_iter().map(HexValue).collect(),
+        })
+    }
+
+    #[tool(
+        name = "get_function_profile",
+        description = "Return the top N functions by instruction count. Must be enabled first via `set_profiling`. Keyed by return address (top of shadow call stack during execution)."
+    )]
+    async fn get_function_profile(
+        &self,
+        Parameters(params): Parameters<FunctionProfileParams>,
+    ) -> Json<FunctionProfileResult> {
+        let (tx, rx) = oneshot::<Vec<(u32, u64)>>();
+        if self.handle.cpu_cmd.send(CpuCommand::RequestFunctionProfile { response: tx }).is_err() {
+            return Json(FunctionProfileResult { enabled: false, entries: Vec::new() });
+        }
+        let entries = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+        let top = params.top.unwrap_or(20);
+        let entries: Vec<FunctionProfileEntry> = entries
+            .into_iter()
+            .take(top)
+            .map(|(addr, insns)| FunctionProfileEntry {
+                address: HexValue(addr),
+                instructions: insns,
+            })
+            .collect();
+        Json(FunctionProfileResult {
+            enabled: true,
+            entries,
+        })
+    }
+
+    #[tool(
+        name = "set_profiling",
+        description = "Enable or disable per-function instruction profiling. When disabled, the profile map is cleared. ~5-10% overhead when enabled."
+    )]
+    async fn set_profiling(
+        &self,
+        Parameters(params): Parameters<SetProfilingParams>,
+    ) -> Json<OkResult> {
+        let ok = self.handle.cpu_cmd.send(CpuCommand::SetProfiling { enabled: params.enabled }).is_ok();
+        Json(OkResult { ok })
     }
 
     // ---------- Phase 5b CpuCommand-backed tools ------------------------
@@ -1321,7 +1799,7 @@ impl EmulatorHandler {
             Some("cold") => BootMode::Cold,
             _ => BootMode::Warm,
         };
-        let entry_point = params.entry_point.map(|h| h.0).unwrap_or(0);
+        let entry_point_raw = params.entry_point.map(|h| h.0).unwrap_or(0);
         let (tx, rx) = oneshot::<Result<crate::emu::command::LoadFirmwareResult, String>>();
         if self
             .handle
@@ -1331,7 +1809,7 @@ impl EmulatorHandler {
                 mode: crate::emu::command::FirmwareMode::Soc,
                 boot_mode: mode,
                 flash_path: None,
-                entry_point,
+                entry_point: entry_point_raw,
                 keep_breakpoints: params.keep_breakpoints,
                 response: tx,
             })
@@ -1340,7 +1818,7 @@ impl EmulatorHandler {
             return Json(LoadFirmwareResponse {
                 ok: false,
                 loaded_bytes: 0,
-                entry_point,
+                entry_point: HexValue(entry_point_raw),
                 flash_bytes: 0,
                 error: Some("cpu_cmd channel closed".into()),
             });
@@ -1354,21 +1832,21 @@ impl EmulatorHandler {
             Ok(Ok(r)) => Json(LoadFirmwareResponse {
                 ok: true,
                 loaded_bytes: r.loaded_bytes,
-                entry_point: r.entry_point,
+                entry_point: HexValue(r.entry_point),
                 flash_bytes: r.flash_bytes,
                 error: None,
             }),
             Ok(Err(e)) => Json(LoadFirmwareResponse {
                 ok: false,
                 loaded_bytes: 0,
-                entry_point,
+                entry_point: HexValue(entry_point_raw),
                 flash_bytes: 0,
                 error: Some(e),
             }),
             Err(_) => Json(LoadFirmwareResponse {
                 ok: false,
                 loaded_bytes: 0,
-                entry_point,
+                entry_point: HexValue(entry_point_raw),
                 flash_bytes: 0,
                 error: Some("timeout waiting for worker".into()),
             }),
@@ -1552,7 +2030,7 @@ impl EmulatorHandler {
             .is_err()
         {
             return Json(ReadMemoryResult {
-                address: params.address.0,
+                address: HexValue(params.address.0),
                 length: 0,
                 hex: String::new(),
                 ascii: String::new(),
@@ -1566,7 +2044,7 @@ impl EmulatorHandler {
         .flatten();
         let Some(snap) = snap else {
             return Json(ReadMemoryResult {
-                address: params.address.0,
+                address: HexValue(params.address.0),
                 length: 0,
                 hex: String::new(),
                 ascii: String::new(),
@@ -1587,7 +2065,7 @@ impl EmulatorHandler {
             .map(|b| if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' })
             .collect::<String>();
         Json(ReadMemoryResult {
-            address: params.address.0,
+            address: HexValue(params.address.0),
             length: slice.len() as u32,
             hex,
             ascii,
@@ -1601,7 +2079,8 @@ impl EmulatorHandler {
     async fn read_mmio(
         &self,
         Parameters(params): Parameters<ReadMmioParams>,
-    ) -> Json<PeekMmioResult> {
+    ) -> Json<ReadMmioResult> {
+        let addr = params.address.0;
         let mut guard = self.handle.bank.write();
         let width = params
             .width
@@ -1609,13 +2088,17 @@ impl EmulatorHandler {
             .unwrap_or("word")
             .to_ascii_lowercase();
         let value = match width.as_str() {
-            "byte" => guard.read_byte(params.address.0).unwrap_or(0) as u32,
-            "half" => guard.read_half(params.address.0).unwrap_or(0) as u32,
-            _ => guard.read_word(params.address.0).unwrap_or(0),
+            "byte" => guard.read_byte(addr).unwrap_or(0) as u32,
+            "half" => guard.read_half(addr).unwrap_or(0) as u32,
+            _ => guard.read_word(addr).unwrap_or(0),
         };
-        Json(PeekMmioResult {
-            address: params.address.0,
-            value,
+        let (name, block) = reg_lookup(addr);
+        Json(ReadMmioResult {
+            address: HexValue(addr),
+            value: HexValue(value),
+            width,
+            name,
+            block,
         })
     }
 }
@@ -1758,12 +2241,27 @@ fn is_mutation_tool(name: &str) -> bool {
             | "cancel_event"
             | "set_mmio_watchpoint"
             | "remove_mmio_watchpoint"
+            | "set_mmio_history_size"
+            | "clear_mmio_history"
+            | "reset_coverage"
+            | "set_profiling"
     )
 }
 
 // ---------- Helpers -------------------------------------------------------
 
+use crate::soc::mmio_blocks;
 use crate::soc::scenario::{parse_effect, parse_trigger};
+
+fn reg_lookup(addr: u32) -> (Option<String>, Option<String>) {
+    match mmio_blocks::lookup(addr) {
+        Some(info) => (
+            Some(info.reg_name.to_string()),
+            Some(info.block_name.to_string()),
+        ),
+        None => (None, None),
+    }
+}
 
 fn reg_by_name(cpu: &crate::emu::snapshot::CpuSnapshot, name: &str) -> Option<u32> {
     let lower = name.to_ascii_lowercase();
