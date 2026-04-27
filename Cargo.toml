@@ -12,45 +12,25 @@ path = "src/bin/arc700.rs"
 [[bin]]
 name = "arc700-gui"
 path = "src/bin/arc700-gui.rs"
-required-features = ["ui", "mcp"]
+required-features = ["ui"]
 
 [features]
 default = []
 # Enable the egui/eframe GUI layer. Pulls in native windowing.
 ui  = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:egui-phosphor", "dep:rfd"]
-# Enable the integrated MCP server (rmcp + axum HTTP transport).
-mcp = [
-    "dep:rmcp",
-    "dep:tokio",
-    "dep:axum",
-    "dep:schemars",
-    "dep:tracing",
-]
 
 [dependencies]
 libc = "0.2"
 parking_lot = "0.12"
-# DWARF parsing for `--debug-elf` source-line overlay. Both are
-# no-std friendly but we pull the std feature because the host-side
-# tool runs with std enabled.
 gimli = { version = "0.32", default-features = false, features = ["read", "std"] }
 object = { version = "0.38", default-features = false, features = ["read", "elf", "std"] }
-
-# --- optional deps for the `ui` feature --------------------------------
-# Versions are conservative placeholders — Phase 6 pins them when the
-# GUI code lands. The default build has none of these compiled.
-eframe       = { version = "0.34", optional = true, default-features = false, features = ["default_fonts", "glow", "persistence"] }
-egui         = { version = "0.34", optional = true }
-egui_extras  = { version = "0.34", optional = true, features = ["all_loaders"] }
-egui-phosphor = { version = "0.12", optional = true, default-features = false, features = ["regular"] }
-rfd          = { version = "0.17", optional = true }
-tokio        = { version = "1",    optional = true, features = ["rt-multi-thread", "macros", "sync", "net"] }
-axum         = { version = "0.8",  optional = true }
-schemars     = { version = "1",    optional = true }
 serde        = { version = "1",    features = ["derive"] }
 serde_json   = "1"
-tracing      = { version = "0.1",  optional = true }
-rmcp         = { version = "1.4",  optional = true, features = [
+tokio        = { version = "1",    features = ["rt-multi-thread", "macros", "sync", "net"] }
+axum         = "0.8"
+schemars     = "1"
+tracing      = "0.1"
+rmcp         = { version = "1.4",  features = [
     "server",
     "client",
     "transport-streamable-http-server",
@@ -60,3 +40,10 @@ rmcp         = { version = "1.4",  optional = true, features = [
     "schemars",
     "macros",
 ] }
+
+# --- optional deps for the `ui` feature --------------------------------
+eframe       = { version = "0.34", optional = true, default-features = false, features = ["default_fonts", "glow", "persistence"] }
+egui         = { version = "0.34", optional = true }
+egui_extras  = { version = "0.34", optional = true, features = ["all_loaders"] }
+egui-phosphor = { version = "0.12", optional = true, default-features = false, features = ["regular"] }
+rfd          = { version = "0.17", optional = true }

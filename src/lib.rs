@@ -5,7 +5,6 @@ pub mod decoder;
 pub mod emu;
 pub mod executor;
 pub mod hooks;
-#[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod memory;
 pub mod soc;

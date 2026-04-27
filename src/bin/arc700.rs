@@ -2,17 +2,14 @@ use std::env;
 use std::fs;
 use std::os::unix::io::AsRawFd;
 use std::process;
+use std::sync::mpsc;
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
+
+use parking_lot::{Mutex, RwLock};
 
 use bcm55030_emulator::cpu::Cpu;
 use bcm55030_emulator::soc::bank::BootMode;
-
-#[cfg(feature = "mcp")]
-use std::sync::Arc;
-#[cfg(feature = "mcp")]
-use std::sync::mpsc;
-#[cfg(feature = "mcp")]
-use parking_lot::{Mutex, RwLock};
 
 fn usage(prog: &str) {
     eprintln!("BCM55030 ARC 700 Emulator");
@@ -37,16 +34,10 @@ fn usage(prog: &str) {
     eprintln!("  --trace-mmio-seq <FILE>     Write per-access MMIO trace as JSON Lines to FILE");
     eprintln!("  --trace-mmio-range S:E      Restrict --trace-mmio-seq to [S,E) (hex, repeatable)");
     eprintln!("  --scenario <FILE>           Load a JSON scenario file at startup");
-    #[cfg(feature = "mcp")]
     eprintln!("  --mcp-port <PORT>           Start MCP server on PORT (enables worker mode)");
     eprintln!();
-    #[cfg(not(feature = "mcp"))]
-    {
-    eprintln!("This is the headless CLI binary. For the egui GUI with integrated MCP");
-    eprintln!("server, build and run the `arc700-gui` binary instead:");
-    eprintln!("  cargo run --release --features ui,mcp --bin arc700-gui");
-    eprintln!("Or rebuild with --features mcp for headless MCP: --mcp-port <PORT>");
-    }
+    eprintln!("For the egui GUI, build with --features ui:");
+    eprintln!("  cargo run --release --features ui --bin arc700-gui");
 }
 
 struct Config {
@@ -77,7 +68,6 @@ struct Config {
     /// flags OR together.
     trace_mmio_ranges: Vec<(u32, u32)>,
     scenario_path: Option<String>,
-    #[cfg(feature = "mcp")]
     mcp_port: Option<u16>,
 }
 
@@ -109,7 +99,6 @@ fn parse_args() -> Config {
         trace_mmio_seq: None,
         trace_mmio_ranges: Vec::new(),
         scenario_path: None,
-        #[cfg(feature = "mcp")]
         mcp_port: None,
     };
 
@@ -249,7 +238,6 @@ fn parse_args() -> Config {
                 }
                 cfg.scenario_path = Some(args[i].clone());
             }
-            #[cfg(feature = "mcp")]
             "--mcp-port" => {
                 i += 1;
                 if i >= args.len() {
@@ -442,7 +430,6 @@ fn reset_cpu_for_reboot(cpu: &mut Cpu) {
     }
 }
 
-#[cfg(feature = "mcp")]
 fn run_with_mcp(cpu: Cpu, cfg: &Config, port: u16) {
     use bcm55030_emulator::emu::command::CpuCommand;
     use bcm55030_emulator::emu::{
@@ -642,7 +629,6 @@ fn main() {
         }
     }
 
-    #[cfg(feature = "mcp")]
     if let Some(port) = cfg.mcp_port {
         run_with_mcp(cpu, &cfg, port);
         return;
