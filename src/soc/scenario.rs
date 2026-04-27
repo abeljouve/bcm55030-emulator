@@ -217,6 +217,19 @@ pub struct ScheduledEvent {
     pub repeat: bool,
 }
 
+#[derive(Clone, Debug)]
+pub enum ValueCondition {
+    MaskEqual { mask: u32, expect: u32 },
+}
+
+impl ValueCondition {
+    pub fn matches(&self, value: u32) -> bool {
+        match self {
+            ValueCondition::MaskEqual { mask, expect } => (value & mask) == *expect,
+        }
+    }
+}
+
 /// MMIO watchpoint with an associated action.
 #[derive(Clone, Debug)]
 pub struct MmioWatchpoint {
@@ -226,6 +239,7 @@ pub struct MmioWatchpoint {
     pub mode: MmioWatchMode,
     pub action: MmioWatchAction,
     pub label: Option<String>,
+    pub condition: Option<ValueCondition>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -361,7 +375,7 @@ impl ScenarioEngine {
     }
 
     /// Process a MMIO read access.
-    pub fn on_mmio_read(&mut self, addr: u32) {
+    pub fn on_mmio_read(&mut self, addr: u32, value: u32) {
         let aligned = addr & !3;
         let count = self.read_counts.entry(aligned).or_insert(0);
         *count += 1;
@@ -385,11 +399,11 @@ impl ScenarioEngine {
             }
         }
 
-        self.check_watchpoints(aligned, MmioWatchMode::Read);
+        self.check_watchpoints(aligned, MmioWatchMode::Read, value);
     }
 
     /// Process a MMIO write access.
-    pub fn on_mmio_write(&mut self, addr: u32) {
+    pub fn on_mmio_write(&mut self, addr: u32, value: u32) {
         let aligned = addr & !3;
         let count = self.write_counts.entry(aligned).or_insert(0);
         *count += 1;
@@ -413,7 +427,7 @@ impl ScenarioEngine {
             }
         }
 
-        self.check_watchpoints(aligned, MmioWatchMode::Write);
+        self.check_watchpoints(aligned, MmioWatchMode::Write, value);
     }
 
     fn fire_event(&mut self, idx: usize) {
@@ -455,6 +469,7 @@ impl ScenarioEngine {
         mode: MmioWatchMode,
         action: MmioWatchAction,
         label: Option<String>,
+        condition: Option<ValueCondition>,
     ) -> u32 {
         let id = self.next_wp_id;
         self.next_wp_id += 1;
@@ -465,6 +480,7 @@ impl ScenarioEngine {
             mode,
             action,
             label,
+            condition,
         });
         id
     }
@@ -479,13 +495,14 @@ impl ScenarioEngine {
         &self.watchpoints
     }
 
-    fn check_watchpoints(&mut self, addr: u32, access: MmioWatchMode) {
+    fn check_watchpoints(&mut self, addr: u32, access: MmioWatchMode, value: u32) {
         let actions: Vec<MmioWatchAction> = self.watchpoints
             .iter()
             .filter(|wp| {
                 let matches_mode = wp.mode == MmioWatchMode::ReadWrite || wp.mode == access;
                 let matches_addr = addr >= wp.address && addr < wp.address + wp.size;
-                matches_mode && matches_addr
+                let matches_cond = wp.condition.as_ref().map_or(true, |c| c.matches(value));
+                matches_mode && matches_addr && matches_cond
             })
             .map(|wp| wp.action.clone())
             .collect();
@@ -687,11 +704,11 @@ mod tests {
             ScenarioEffect::Pause,
             None,
         );
-        eng.on_mmio_read(0x0100_240C);
+        eng.on_mmio_read(0x0100_240C, 0);
         assert!(!eng.pause_requested);
-        eng.on_mmio_read(0x0100_240C);
+        eng.on_mmio_read(0x0100_240C, 0);
         assert!(!eng.pause_requested);
-        eng.on_mmio_read(0x0100_240C);
+        eng.on_mmio_read(0x0100_240C, 0);
         assert!(eng.take_pause());
     }
 
@@ -707,7 +724,7 @@ mod tests {
             },
             Some("timer override".into()),
         );
-        eng.on_mmio_write(0x0100_0050);
+        eng.on_mmio_write(0x0100_0050, 0);
         assert_eq!(eng.overrides.try_read(0x0100_0050), Some(0xDEAD));
     }
 
@@ -732,7 +749,7 @@ mod tests {
             ScenarioEffect::WriteMmio { address: 0x0100_0064, value: 0xBEEF },
             None,
         );
-        eng.on_mmio_read(0x0100_0060);
+        eng.on_mmio_read(0x0100_0060, 0);
         let writes = eng.take_deferred_writes();
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].address, 0x0100_0064);
@@ -742,10 +759,10 @@ mod tests {
     #[test]
     fn engine_watchpoint_pause() {
         let mut eng = ScenarioEngine::new();
-        eng.add_watchpoint(0x0100_240C, 4, MmioWatchMode::Write, MmioWatchAction::Pause, None);
-        eng.on_mmio_read(0x0100_240C);
+        eng.add_watchpoint(0x0100_240C, 4, MmioWatchMode::Write, MmioWatchAction::Pause, None, None);
+        eng.on_mmio_read(0x0100_240C, 0);
         assert!(!eng.pause_requested);
-        eng.on_mmio_write(0x0100_240C);
+        eng.on_mmio_write(0x0100_240C, 0);
         assert!(eng.take_pause());
     }
 
@@ -762,8 +779,9 @@ mod tests {
                 label: None,
             }),
             Some("MDIO busy-clear on read".into()),
+            None,
         );
-        eng.on_mmio_read(0x0100_0060);
+        eng.on_mmio_read(0x0100_0060, 0);
         assert_eq!(eng.overrides.peek_read(0x0100_0060), Some(0));
     }
 }

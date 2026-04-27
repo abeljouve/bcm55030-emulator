@@ -376,6 +376,10 @@ impl Worker {
                     self.cpu.function_profile.clear();
                 }
             }
+            CpuCommand::DiffSnapshots { a, b, response } => {
+                let result = self.diff_named_snapshots(&a, &b);
+                let _ = response.send(result);
+            }
             CpuCommand::SaveSnapshot { name, response } => {
                 let result = self.save_named_snapshot(&name);
                 let _ = response.send(result);
@@ -640,6 +644,71 @@ impl Worker {
         let snap = self.build_snapshot();
         *self.handle.snapshot.lock() = snap;
         self.last_publish = Instant::now();
+    }
+
+    fn diff_named_snapshots(
+        &self,
+        a: &str,
+        b: &str,
+    ) -> Result<crate::emu::named_snapshot::SnapshotDiff, String> {
+        use crate::emu::named_snapshot::{SnapshotDiff, SnapshotRegDiff};
+
+        let sa = self
+            .snapshots
+            .get(a)
+            .ok_or_else(|| format!("snapshot '{}' not found", a))?;
+        let sb = self
+            .snapshots
+            .get(b)
+            .ok_or_else(|| format!("snapshot '{}' not found", b))?;
+
+        let mut reg_diffs = Vec::new();
+        let names = [
+            "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12",
+            "r13", "r14", "r15", "r16", "r17", "r18", "r19", "r20", "r21", "r22", "r23", "r24",
+            "r25", "gp", "fp", "sp", "ilink1", "ilink2", "blink",
+        ];
+        for (i, name) in names.iter().enumerate() {
+            let va = sa.cpu_state.core_regs[i];
+            let vb = sb.cpu_state.core_regs[i];
+            if va != vb {
+                reg_diffs.push(SnapshotRegDiff {
+                    name: name.to_string(),
+                    a: va,
+                    b: vb,
+                });
+            }
+        }
+        if sa.cpu_state.core_regs[60] != sb.cpu_state.core_regs[60] {
+            reg_diffs.push(SnapshotRegDiff {
+                name: "lp_count".into(),
+                a: sa.cpu_state.core_regs[60],
+                b: sb.cpu_state.core_regs[60],
+            });
+        }
+        if sa.cpu_state.status32() != sb.cpu_state.status32() {
+            reg_diffs.push(SnapshotRegDiff {
+                name: "status32".into(),
+                a: sa.cpu_state.status32(),
+                b: sb.cpu_state.status32(),
+            });
+        }
+
+        let sram_changed = sa
+            .sram
+            .iter()
+            .zip(sb.sram.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+
+        Ok(SnapshotDiff {
+            register_diffs: reg_diffs,
+            pc_a: sa.pc,
+            pc_b: sb.pc,
+            insn_a: sa.instruction_count,
+            insn_b: sb.instruction_count,
+            sram_changed_bytes: sram_changed,
+        })
     }
 
     fn save_named_snapshot(&mut self, name: &str) -> Result<SnapshotInfo, String> {

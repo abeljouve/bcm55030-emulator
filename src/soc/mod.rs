@@ -11,6 +11,7 @@
 //! bank (`PeripheralBank::uart_rx_sender()`).
 
 pub mod alarm_events;
+pub mod analysis;
 pub mod bank;
 pub mod boot_rom;
 pub mod bsc_i2c;

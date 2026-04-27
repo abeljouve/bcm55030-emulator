@@ -583,6 +583,16 @@ pub struct SetMmioWatchpointParams {
     #[serde(default)]
     pub action: serde_json::Value,
     pub label: Option<String>,
+    /// Optional condition: `{ "mask": "0xFF", "expect": "0x01" }`.
+    /// Watchpoint fires only when `(value & mask) == expect`.
+    #[serde(default)]
+    pub condition: Option<WatchpointConditionParams>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct WatchpointConditionParams {
+    pub mask: HexU32,
+    pub expect: HexU32,
 }
 
 fn default_wp_size() -> u32 { 4 }
@@ -844,6 +854,89 @@ pub struct DeleteSnapshotParams {
 pub struct DeleteSnapshotResult {
     pub ok: bool,
     pub name: String,
+}
+
+// ── Pattern detection + timeline DTOs (Phase E) ─────────────────────────
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PatternEntry {
+    pub pattern_type: String,
+    pub address: HexValue,
+    pub secondary_address: Option<HexValue>,
+    pub count: usize,
+    pub value: Option<HexValue>,
+    pub first_pc: HexValue,
+    pub last_pc: HexValue,
+    pub first_insn: u64,
+    pub last_insn: u64,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DetectPatternsResult {
+    pub count: usize,
+    pub patterns: Vec<PatternEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GetEventTimelineParams {
+    pub from_insn: Option<u64>,
+    pub to_insn: Option<u64>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct TimelineEventJson {
+    pub event_type: String,
+    pub block: Option<String>,
+    pub address: HexValue,
+    pub from_insn: u64,
+    pub to_insn: u64,
+    pub access_count: usize,
+    pub summary: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GetEventTimelineResult {
+    pub count: usize,
+    pub events: Vec<TimelineEventJson>,
+}
+
+// ── Diff + bulk symbols DTOs (Phase F) ──────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DiffSnapshotsParams {
+    pub a: String,
+    pub b: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RegisterDiff {
+    pub name: String,
+    pub a: HexValue,
+    pub b: HexValue,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DiffSnapshotsResult {
+    pub ok: bool,
+    pub register_diffs: Vec<RegisterDiff>,
+    pub pc_a: HexValue,
+    pub pc_b: HexValue,
+    pub insn_a: u64,
+    pub insn_b: u64,
+    pub sram_changed_bytes: usize,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LoadSymbolsFileParams {
+    pub path: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LoadSymbolsFileResult {
+    pub ok: bool,
+    pub loaded: usize,
+    pub error: Option<String>,
 }
 
 // ---------- Tool implementations -----------------------------------------
@@ -1357,12 +1450,19 @@ impl EmulatorHandler {
                 None => return Json(SetMmioWatchpointResult { ok: false, id: None }),
             }
         };
+        let condition = params.condition.map(|c| {
+            crate::soc::scenario::ValueCondition::MaskEqual {
+                mask: c.mask.0,
+                expect: c.expect.0,
+            }
+        });
         let id = self.handle.bank.write().scenario.add_watchpoint(
             params.address.0,
             params.size,
             mode,
             action,
             params.label,
+            condition,
         );
         Json(SetMmioWatchpointResult { ok: true, id: Some(id) })
     }
@@ -2130,6 +2230,196 @@ impl EmulatorHandler {
         })
     }
 
+    // ── Pattern detection + timeline (Phase E) ────────────────────────
+
+    #[tool(
+        name = "detect_mmio_patterns",
+        description = "Analyze the MMIO history buffer for common HW interaction patterns: busy-wait (same addr/value read ≥5×), write-then-poll (write then ≥3 reads), command-bit (bit 31 set, polled until clear)."
+    )]
+    async fn detect_mmio_patterns(&self) -> Json<DetectPatternsResult> {
+        let guard = self.handle.bank.read();
+        let history: Vec<crate::soc::bank::MmioHistoryEntry> =
+            guard.mmio_history.iter().cloned().collect();
+        drop(guard);
+
+        let raw = crate::soc::analysis::detect_patterns(&history);
+        let patterns: Vec<PatternEntry> = raw
+            .into_iter()
+            .map(|p| PatternEntry {
+                pattern_type: p.pattern_type,
+                address: HexValue(p.address),
+                secondary_address: p.secondary_address.map(HexValue),
+                count: p.count,
+                value: p.value.map(HexValue),
+                first_pc: HexValue(p.first_pc),
+                last_pc: HexValue(p.last_pc),
+                first_insn: p.first_insn,
+                last_insn: p.last_insn,
+            })
+            .collect();
+        Json(DetectPatternsResult {
+            count: patterns.len(),
+            patterns,
+        })
+    }
+
+    #[tool(
+        name = "get_event_timeline",
+        description = "Condense MMIO history into a high-level event timeline. Groups consecutive accesses to the same peripheral into bursts, identifies busy-waits and polling loops."
+    )]
+    async fn get_event_timeline(
+        &self,
+        Parameters(params): Parameters<GetEventTimelineParams>,
+    ) -> Json<GetEventTimelineResult> {
+        let guard = self.handle.bank.read();
+        let history: Vec<crate::soc::bank::MmioHistoryEntry> =
+            guard.mmio_history.iter().cloned().collect();
+        drop(guard);
+
+        let raw = crate::soc::analysis::build_timeline(&history, params.from_insn, params.to_insn);
+        let events: Vec<TimelineEventJson> = raw
+            .into_iter()
+            .map(|e| TimelineEventJson {
+                event_type: e.event_type,
+                block: e.block,
+                address: HexValue(e.address),
+                from_insn: e.from_insn,
+                to_insn: e.to_insn,
+                access_count: e.access_count,
+                summary: e.summary,
+            })
+            .collect();
+        Json(GetEventTimelineResult {
+            count: events.len(),
+            events,
+        })
+    }
+
+    // ── Diff snapshots + bulk symbols (Phase F) ─────────────────────
+
+    #[tool(
+        name = "diff_snapshots",
+        description = "Compare two named snapshots. Returns register diffs, SRAM change count, and instruction/PC deltas."
+    )]
+    async fn diff_snapshots(
+        &self,
+        Parameters(params): Parameters<DiffSnapshotsParams>,
+    ) -> Json<DiffSnapshotsResult> {
+        let err = |msg: String| {
+            DiffSnapshotsResult {
+                ok: false,
+                register_diffs: Vec::new(),
+                pc_a: HexValue(0),
+                pc_b: HexValue(0),
+                insn_a: 0,
+                insn_b: 0,
+                sram_changed_bytes: 0,
+                error: Some(msg),
+            }
+        };
+        let (tx, rx) = oneshot();
+        if self
+            .handle
+            .cpu_cmd
+            .send(CpuCommand::DiffSnapshots {
+                a: params.a.clone(),
+                b: params.b.clone(),
+                response: tx,
+            })
+            .is_err()
+        {
+            return Json(err("cpu_cmd channel closed".into()));
+        }
+        let result = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(Duration::from_secs(10))
+        })
+        .await
+        .unwrap_or(Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        match result {
+            Ok(Ok(diff)) => Json(DiffSnapshotsResult {
+                ok: true,
+                register_diffs: diff
+                    .register_diffs
+                    .into_iter()
+                    .map(|d| RegisterDiff {
+                        name: d.name,
+                        a: HexValue(d.a),
+                        b: HexValue(d.b),
+                    })
+                    .collect(),
+                pc_a: HexValue(diff.pc_a),
+                pc_b: HexValue(diff.pc_b),
+                insn_a: diff.insn_a,
+                insn_b: diff.insn_b,
+                sram_changed_bytes: diff.sram_changed_bytes,
+                error: None,
+            }),
+            Ok(Err(e)) => Json(err(e)),
+            Err(_) => Json(err("timeout".into())),
+        }
+    }
+
+    #[tool(
+        name = "load_symbols_file",
+        description = "Bulk-load symbols from a JSON file. Format: `{\"0x1234\": \"name\", ...}` or `[{\"address\": \"0x1234\", \"name\": \"foo\"}, ...]`."
+    )]
+    async fn load_symbols_file(
+        &self,
+        Parameters(params): Parameters<LoadSymbolsFileParams>,
+    ) -> Json<LoadSymbolsFileResult> {
+        let content = match std::fs::read_to_string(&params.path) {
+            Ok(c) => c,
+            Err(e) => {
+                return Json(LoadSymbolsFileResult {
+                    ok: false,
+                    loaded: 0,
+                    error: Some(format!("read {}: {}", params.path, e)),
+                })
+            }
+        };
+        let doc: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                return Json(LoadSymbolsFileResult {
+                    ok: false,
+                    loaded: 0,
+                    error: Some(format!("parse: {e}")),
+                })
+            }
+        };
+
+        let mut ann = self.handle.annotations.write();
+        let mut count = 0;
+
+        if let Some(obj) = doc.as_object() {
+            for (k, v) in obj {
+                if let (Some(addr), Some(name)) = (parse_addr_str(k), v.as_str()) {
+                    ann.symbols.insert(addr, name.to_string());
+                    count += 1;
+                }
+            }
+        } else if let Some(arr) = doc.as_array() {
+            for entry in arr {
+                let addr = entry
+                    .get("address")
+                    .and_then(|v| v.as_str())
+                    .and_then(parse_addr_str)
+                    .or_else(|| entry.get("address").and_then(|v| v.as_u64()).map(|n| n as u32));
+                let name = entry.get("name").and_then(|v| v.as_str());
+                if let (Some(a), Some(n)) = (addr, name) {
+                    ann.symbols.insert(a, n.to_string());
+                    count += 1;
+                }
+            }
+        }
+
+        Json(LoadSymbolsFileResult {
+            ok: true,
+            loaded: count,
+            error: None,
+        })
+    }
+
     // ── Named snapshots ──────────────────────────────────────────────
 
     #[tool(
@@ -2502,6 +2792,7 @@ fn is_mutation_tool(name: &str) -> bool {
             | "save_snapshot"
             | "restore_snapshot"
             | "delete_snapshot"
+            | "load_symbols_file"
     )
 }
 
@@ -2561,6 +2852,15 @@ fn _run_state_guard(r: RunState) {
 #[allow(dead_code)]
 fn _peripheral_guard(p: PeripheralSnapshot) {
     let _ = p;
+}
+
+fn parse_addr_str(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u32>().ok()
+    }
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, ()> {

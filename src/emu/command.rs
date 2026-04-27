@@ -176,6 +176,11 @@ pub enum CpuCommand {
     SetProfiling {
         enabled: bool,
     },
+    DiffSnapshots {
+        a: String,
+        b: String,
+        response: OneshotSender<Result<crate::emu::named_snapshot::SnapshotDiff, String>>,
+    },
     SaveSnapshot {
         name: String,
         response: OneshotSender<Result<SnapshotInfo, String>>,

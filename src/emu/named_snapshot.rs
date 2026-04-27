@@ -66,6 +66,23 @@ impl NamedSnapshot {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct SnapshotRegDiff {
+    pub name: String,
+    pub a: u32,
+    pub b: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct SnapshotDiff {
+    pub register_diffs: Vec<SnapshotRegDiff>,
+    pub pc_a: u32,
+    pub pc_b: u32,
+    pub insn_a: u64,
+    pub insn_b: u64,
+    pub sram_changed_bytes: usize,
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct SnapshotInfo {
     pub name: String,

@@ -613,10 +613,11 @@ impl PeripheralBank {
 
     pub fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
         let result = self.read_word_inner(addr);
-        if let Ok(v) = result {
-            self.record_last_access(addr, v, "read");
+        let value = *result.as_ref().unwrap_or(&0);
+        if result.is_ok() {
+            self.record_last_access(addr, value, "read");
         }
-        self.scenario.on_mmio_read(addr);
+        self.scenario.on_mmio_read(addr, value);
         self.drain_scenario_deferred();
         result
     }
@@ -671,7 +672,7 @@ impl PeripheralBank {
         if result.is_ok() {
             self.record_last_access(addr, val, "write");
         }
-        self.scenario.on_mmio_write(addr);
+        self.scenario.on_mmio_write(addr, val);
         self.drain_scenario_deferred();
         result
     }
