@@ -750,6 +750,22 @@ impl PeripheralBank {
         }
         // OLT CMD write intercept — must be before epon_mac.
         if crate::soc::olt::Olt::claims_mailbox(addr) && self.olt.write_cmd(addr, val) {
+            // Immediately sync bitmap into epon_mac so the firmware
+            // doesn't see stale 0xFFFFFFFF on the next bitmap check
+            // within the same tick window.
+            if self.olt.config.enabled {
+                let bmp = if !self.olt.mailbox_pending.is_empty() {
+                    0xFFFF_FFFFu32
+                } else {
+                    0
+                };
+                for wi in 0..6u32 {
+                    let a = 0x0100_1438 + wi * 0x200;
+                    if a < 0x0100_2000 {
+                        self.epon_mac.poke_llid_store(a, bmp);
+                    }
+                }
+            }
             self.record_history(addr, val, "write", "word", "olt_cmd");
             self.seq_emit(addr, val, "w", "word", "olt_cmd");
             return Ok(());
