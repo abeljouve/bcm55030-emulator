@@ -14,6 +14,10 @@ name = "arc700-gui"
 path = "src/bin/arc700-gui.rs"
 required-features = ["ui"]
 
+[[bin]]
+name = "hw-fuzzer"
+path = "src/bin/hw_fuzzer.rs"
+
 [features]
 default = []
 # Enable the egui/eframe GUI layer. Pulls in native windowing.
