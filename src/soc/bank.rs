@@ -310,12 +310,16 @@ impl PeripheralBank {
         // word_index via the CMD/STATUS FIFO intercept.
         self.olt.load_frames_into_mailbox(0);
         // Sync OLT bitmaps into the epon_mac LLID backing store.
-        // Also broadcast the bitmap across ALL word_indices so the
-        // firmware sees frames regardless of which queue pin it uses.
+        // Only set when mailbox_pending has unread frames. Once the
+        // firmware issues a CMD write and the frame moves to the FIFO,
+        // the bitmap clears so the firmware doesn't try to read a
+        // second non-existent frame.
         if self.olt.config.enabled {
-            let has_frames = !self.olt.mailbox_pending.is_empty()
-                || !self.olt.mailbox_fifo.is_empty();
-            let bmp = if has_frames { 0xFFFF_FFFFu32 } else { 0 };
+            let bmp = if !self.olt.mailbox_pending.is_empty() {
+                0xFFFF_FFFFu32
+            } else {
+                0
+            };
             for wi in 0..6u32 {
                 let addr = 0x0100_1438 + wi * 0x200;
                 if addr < 0x0100_2000 {
