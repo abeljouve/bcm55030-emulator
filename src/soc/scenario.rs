@@ -1,16 +1,14 @@
-//! MMIO override registry for HW scenario programming.
+//! MMIO scenario engine — override registry, scheduled events, and
+//! MMIO watchpoints for HW scenario programming.
 //!
-//! Overrides intercept MMIO reads/writes **before** the normal peripheral
-//! dispatch chain.  This models external HW stimulus — "the PHY drove
-//! this value on the bus" — not firmware patching.  `ScenarioEffect`
-//! deliberately has no variant that touches CPU state (registers, PC,
-//! SRAM).  Rule 1 (no firmware hooks) is preserved.
+//! Everything here models **hardware stimulus**, not firmware patching.
+//! `ScenarioEffect` has no variant that touches CPU state (registers,
+//! PC, SRAM).  Rule 1 (no firmware hooks) is preserved.
 //!
 //! `peek_word` (GUI 60 Hz polling, MCP `peek_mmio`) does NOT consume
-//! one-shot overrides.  Only `read_word` / `write_word` (CPU-driven
-//! accesses with side effects) decrement the remaining counter.
+//! one-shot overrides or fire triggers.  Only CPU-driven accesses do.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// What an override does when the address is hit.
 #[derive(Clone, Debug)]
@@ -114,6 +112,326 @@ impl MmioOverrideRegistry {
     }
 }
 
+// ── Scenario engine (Phase 2) ────────────────────────────────────────
+
+/// When an event fires.
+#[derive(Clone, Debug)]
+pub enum ScenarioTrigger {
+    /// Fire at CPU instruction count N.
+    AtInstruction(u64),
+    /// Fire on the N-th read of `address`.
+    OnMmioRead { address: u32, occurrence: u32 },
+    /// Fire on the N-th write to `address`.
+    OnMmioWrite { address: u32, occurrence: u32 },
+}
+
+/// What happens when an event fires.  No variant touches CPU state.
+#[derive(Clone, Debug)]
+pub enum ScenarioEffect {
+    SetOverride { address: u32, spec: OverrideSpec, label: Option<String> },
+    RemoveOverride { address: u32 },
+    WriteMmio { address: u32, value: u32 },
+    Pause,
+}
+
+/// A scheduled event with a unique ID.
+#[derive(Clone, Debug)]
+pub struct ScheduledEvent {
+    pub id: u32,
+    pub trigger: ScenarioTrigger,
+    pub effect: ScenarioEffect,
+    pub label: Option<String>,
+    pub fired: bool,
+}
+
+/// MMIO watchpoint with an associated action.
+#[derive(Clone, Debug)]
+pub struct MmioWatchpoint {
+    pub id: u32,
+    pub address: u32,
+    pub size: u32,
+    pub mode: MmioWatchMode,
+    pub action: MmioWatchAction,
+    pub label: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmioWatchMode {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+#[derive(Clone, Debug)]
+pub enum MmioWatchAction {
+    Pause,
+    Fire(ScenarioEffect),
+}
+
+/// Deferred writes from scenario effects.  The caller must drain
+/// these after the scenario engine processes an access.
+#[derive(Clone, Debug)]
+pub struct DeferredWrite {
+    pub address: u32,
+    pub value: u32,
+}
+
+/// Central scenario engine — owns overrides, scheduled events, and
+/// MMIO watchpoints.
+#[derive(Clone, Debug, Default)]
+pub struct ScenarioEngine {
+    pub overrides: MmioOverrideRegistry,
+
+    events: Vec<ScheduledEvent>,
+    next_event_id: u32,
+
+    /// Instruction-triggered events, sorted by instruction count.
+    insn_queue: BTreeMap<u64, Vec<usize>>,
+    /// Read-triggered events, keyed by address.
+    read_triggers: HashMap<u32, Vec<usize>>,
+    /// Write-triggered events, keyed by address.
+    write_triggers: HashMap<u32, Vec<usize>>,
+    /// Per-address read/write counters for occurrence tracking.
+    read_counts: HashMap<u32, u32>,
+    write_counts: HashMap<u32, u32>,
+
+    watchpoints: Vec<MmioWatchpoint>,
+    next_wp_id: u32,
+
+    /// Pause requested by a scenario effect.
+    pub pause_requested: bool,
+
+    /// Deferred writes from effects (processed by caller).
+    pub deferred_writes: Vec<DeferredWrite>,
+}
+
+impl ScenarioEngine {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.overrides.is_empty()
+            && self.events.is_empty()
+            && self.watchpoints.is_empty()
+    }
+
+    // ── Events ──────────────────────────────────────────────────────
+
+    pub fn schedule(&mut self, trigger: ScenarioTrigger, effect: ScenarioEffect, label: Option<String>) -> u32 {
+        let id = self.next_event_id;
+        self.next_event_id += 1;
+        let idx = self.events.len();
+        self.events.push(ScheduledEvent {
+            id,
+            trigger: trigger.clone(),
+            effect,
+            label,
+            fired: false,
+        });
+        match &trigger {
+            ScenarioTrigger::AtInstruction(n) => {
+                self.insn_queue.entry(*n).or_default().push(idx);
+            }
+            ScenarioTrigger::OnMmioRead { address, .. } => {
+                self.read_triggers.entry(*address & !3).or_default().push(idx);
+            }
+            ScenarioTrigger::OnMmioWrite { address, .. } => {
+                self.write_triggers.entry(*address & !3).or_default().push(idx);
+            }
+        }
+        id
+    }
+
+    pub fn cancel(&mut self, id: u32) -> bool {
+        if let Some(ev) = self.events.iter_mut().find(|e| e.id == id && !e.fired) {
+            ev.fired = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn pending_events(&self) -> impl Iterator<Item = &ScheduledEvent> {
+        self.events.iter().filter(|e| !e.fired)
+    }
+
+    /// Process instruction-triggered events.  Call from `bank.tick()`.
+    pub fn tick(&mut self, cpu_instructions: u64) {
+        let to_fire: Vec<usize> = self.insn_queue
+            .range(..=cpu_instructions)
+            .flat_map(|(_, idxs)| idxs.iter().copied())
+            .filter(|&idx| !self.events[idx].fired)
+            .collect();
+
+        for idx in to_fire {
+            self.fire_event(idx);
+        }
+
+        // Remove processed instruction triggers.
+        let keys: Vec<u64> = self.insn_queue
+            .range(..=cpu_instructions)
+            .map(|(&k, _)| k)
+            .collect();
+        for k in keys {
+            self.insn_queue.remove(&k);
+        }
+    }
+
+    /// Process a MMIO read access.
+    pub fn on_mmio_read(&mut self, addr: u32) {
+        let aligned = addr & !3;
+        let count = self.read_counts.entry(aligned).or_insert(0);
+        *count += 1;
+        let current = *count;
+
+        if let Some(idxs) = self.read_triggers.get(&aligned).cloned() {
+            for idx in idxs {
+                if self.events[idx].fired {
+                    continue;
+                }
+                if let ScenarioTrigger::OnMmioRead { occurrence, .. } = self.events[idx].trigger {
+                    if current == occurrence {
+                        self.fire_event(idx);
+                    }
+                }
+            }
+        }
+
+        self.check_watchpoints(aligned, MmioWatchMode::Read);
+    }
+
+    /// Process a MMIO write access.
+    pub fn on_mmio_write(&mut self, addr: u32) {
+        let aligned = addr & !3;
+        let count = self.write_counts.entry(aligned).or_insert(0);
+        *count += 1;
+        let current = *count;
+
+        if let Some(idxs) = self.write_triggers.get(&aligned).cloned() {
+            for idx in idxs {
+                if self.events[idx].fired {
+                    continue;
+                }
+                if let ScenarioTrigger::OnMmioWrite { occurrence, .. } = self.events[idx].trigger {
+                    if current == occurrence {
+                        self.fire_event(idx);
+                    }
+                }
+            }
+        }
+
+        self.check_watchpoints(aligned, MmioWatchMode::Write);
+    }
+
+    fn fire_event(&mut self, idx: usize) {
+        self.events[idx].fired = true;
+        let effect = self.events[idx].effect.clone();
+        self.apply_effect(&effect);
+    }
+
+    fn apply_effect(&mut self, effect: &ScenarioEffect) {
+        match effect {
+            ScenarioEffect::SetOverride { address, spec, label } => {
+                self.overrides.set(*address, spec.clone(), label.clone());
+            }
+            ScenarioEffect::RemoveOverride { address } => {
+                self.overrides.remove(*address);
+            }
+            ScenarioEffect::WriteMmio { address, value } => {
+                self.deferred_writes.push(DeferredWrite {
+                    address: *address,
+                    value: *value,
+                });
+            }
+            ScenarioEffect::Pause => {
+                self.pause_requested = true;
+            }
+        }
+    }
+
+    // ── MMIO Watchpoints ────────────────────────────────────────────
+
+    pub fn add_watchpoint(
+        &mut self,
+        address: u32,
+        size: u32,
+        mode: MmioWatchMode,
+        action: MmioWatchAction,
+        label: Option<String>,
+    ) -> u32 {
+        let id = self.next_wp_id;
+        self.next_wp_id += 1;
+        self.watchpoints.push(MmioWatchpoint {
+            id,
+            address: address & !3,
+            size: size.max(4),
+            mode,
+            action,
+            label,
+        });
+        id
+    }
+
+    pub fn remove_watchpoint(&mut self, id: u32) -> bool {
+        let len_before = self.watchpoints.len();
+        self.watchpoints.retain(|wp| wp.id != id);
+        self.watchpoints.len() < len_before
+    }
+
+    pub fn watchpoints(&self) -> &[MmioWatchpoint] {
+        &self.watchpoints
+    }
+
+    fn check_watchpoints(&mut self, addr: u32, access: MmioWatchMode) {
+        let actions: Vec<MmioWatchAction> = self.watchpoints
+            .iter()
+            .filter(|wp| {
+                let matches_mode = wp.mode == MmioWatchMode::ReadWrite || wp.mode == access;
+                let matches_addr = addr >= wp.address && addr < wp.address + wp.size;
+                matches_mode && matches_addr
+            })
+            .map(|wp| wp.action.clone())
+            .collect();
+
+        for action in actions {
+            match action {
+                MmioWatchAction::Pause => {
+                    self.pause_requested = true;
+                }
+                MmioWatchAction::Fire(effect) => {
+                    self.apply_effect(&effect);
+                }
+            }
+        }
+    }
+
+    /// Take and clear the pause flag.
+    pub fn take_pause(&mut self) -> bool {
+        let p = self.pause_requested;
+        self.pause_requested = false;
+        p
+    }
+
+    /// Take and clear deferred writes.
+    pub fn take_deferred_writes(&mut self) -> Vec<DeferredWrite> {
+        std::mem::take(&mut self.deferred_writes)
+    }
+
+    pub fn clear_all(&mut self) {
+        self.overrides.clear();
+        self.events.clear();
+        self.insn_queue.clear();
+        self.read_triggers.clear();
+        self.write_triggers.clear();
+        self.read_counts.clear();
+        self.write_counts.clear();
+        self.watchpoints.clear();
+        self.pause_requested = false;
+        self.deferred_writes.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +502,113 @@ mod tests {
         assert!(reg.remove(0x0100_0000));
         assert!(!reg.remove(0x0100_0000));
         assert!(reg.is_empty());
+    }
+
+    // ── ScenarioEngine tests ────────────────────────────────────────
+
+    #[test]
+    fn engine_instruction_trigger() {
+        let mut eng = ScenarioEngine::new();
+        eng.schedule(
+            ScenarioTrigger::AtInstruction(100),
+            ScenarioEffect::SetOverride {
+                address: 0x0100_240C,
+                spec: OverrideSpec::StaticRead { value: 0x5000 },
+                label: None,
+            },
+            None,
+        );
+        eng.tick(50);
+        assert!(eng.overrides.is_empty());
+        eng.tick(100);
+        assert_eq!(eng.overrides.try_read(0x0100_240C), Some(0x5000));
+    }
+
+    #[test]
+    fn engine_mmio_read_trigger() {
+        let mut eng = ScenarioEngine::new();
+        eng.schedule(
+            ScenarioTrigger::OnMmioRead { address: 0x0100_240C, occurrence: 3 },
+            ScenarioEffect::Pause,
+            None,
+        );
+        eng.on_mmio_read(0x0100_240C);
+        assert!(!eng.pause_requested);
+        eng.on_mmio_read(0x0100_240C);
+        assert!(!eng.pause_requested);
+        eng.on_mmio_read(0x0100_240C);
+        assert!(eng.take_pause());
+    }
+
+    #[test]
+    fn engine_mmio_write_trigger() {
+        let mut eng = ScenarioEngine::new();
+        eng.schedule(
+            ScenarioTrigger::OnMmioWrite { address: 0x0100_0050, occurrence: 1 },
+            ScenarioEffect::SetOverride {
+                address: 0x0100_0050,
+                spec: OverrideSpec::StaticRead { value: 0xDEAD },
+                label: None,
+            },
+            Some("timer override".into()),
+        );
+        eng.on_mmio_write(0x0100_0050);
+        assert_eq!(eng.overrides.try_read(0x0100_0050), Some(0xDEAD));
+    }
+
+    #[test]
+    fn engine_cancel_event() {
+        let mut eng = ScenarioEngine::new();
+        let id = eng.schedule(
+            ScenarioTrigger::AtInstruction(50),
+            ScenarioEffect::Pause,
+            None,
+        );
+        assert!(eng.cancel(id));
+        eng.tick(50);
+        assert!(!eng.pause_requested);
+    }
+
+    #[test]
+    fn engine_deferred_write() {
+        let mut eng = ScenarioEngine::new();
+        eng.schedule(
+            ScenarioTrigger::OnMmioRead { address: 0x0100_0060, occurrence: 1 },
+            ScenarioEffect::WriteMmio { address: 0x0100_0064, value: 0xBEEF },
+            None,
+        );
+        eng.on_mmio_read(0x0100_0060);
+        let writes = eng.take_deferred_writes();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].address, 0x0100_0064);
+        assert_eq!(writes[0].value, 0xBEEF);
+    }
+
+    #[test]
+    fn engine_watchpoint_pause() {
+        let mut eng = ScenarioEngine::new();
+        eng.add_watchpoint(0x0100_240C, 4, MmioWatchMode::Write, MmioWatchAction::Pause, None);
+        eng.on_mmio_read(0x0100_240C);
+        assert!(!eng.pause_requested);
+        eng.on_mmio_write(0x0100_240C);
+        assert!(eng.take_pause());
+    }
+
+    #[test]
+    fn engine_watchpoint_fire_effect() {
+        let mut eng = ScenarioEngine::new();
+        eng.add_watchpoint(
+            0x0100_0060,
+            4,
+            MmioWatchMode::Read,
+            MmioWatchAction::Fire(ScenarioEffect::SetOverride {
+                address: 0x0100_0060,
+                spec: OverrideSpec::OneShotRead { value: 0, remaining: 1 },
+                label: None,
+            }),
+            Some("MDIO busy-clear on read".into()),
+        );
+        eng.on_mmio_read(0x0100_0060);
+        assert_eq!(eng.overrides.peek_read(0x0100_0060), Some(0));
     }
 }

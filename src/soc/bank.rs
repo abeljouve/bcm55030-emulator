@@ -30,7 +30,7 @@ use crate::soc::pbc::Pbc;
 use crate::soc::peripheral::{
     DatapathOp, Peripheral, PeripheralEvent, PeripheralId, PeripheralSnapshot,
 };
-use crate::soc::scenario::MmioOverrideRegistry;
+use crate::soc::scenario::ScenarioEngine;
 use crate::soc::serdes::SerDes;
 use crate::soc::sysreg_shim::SysregShim;
 use crate::soc::timer::EponTimer;
@@ -128,10 +128,10 @@ pub struct PeripheralBank {
     pub nco: Nco,
     pub vlan_lue: VlanLue,
 
-    /// MMIO override registry for scenario programming.  Overrides are
-    /// checked BEFORE the peripheral dispatch chain — they model external
-    /// HW stimulus, not firmware hooks.
-    pub overrides: MmioOverrideRegistry,
+    /// Scenario engine — MMIO overrides, scheduled events, and MMIO
+    /// watchpoints.  Overrides are checked BEFORE the peripheral
+    /// dispatch chain.  All stimulus is HW-level, never firmware.
+    pub scenario: ScenarioEngine,
 
     /// Temporary residual-plus-legacy-arms for the SYSREG range
     /// (`0x01000000..0x01003800`). Hosts every stub that has not yet been
@@ -204,7 +204,7 @@ impl PeripheralBank {
             mpcp: Mpcp::new(),
             nco: Nco::new(),
             vlan_lue: VlanLue::new(),
-            overrides: MmioOverrideRegistry::new(),
+            scenario: ScenarioEngine::new(),
             sysreg: SysregShim::new(),
             uart_rx_sender: tx,
             uart_rx_receiver: Mutex::new(rx),
@@ -262,11 +262,25 @@ impl PeripheralBank {
         self.nco.tick(cpu_instructions);
         self.vlan_lue.tick(cpu_instructions);
         self.sysreg.tick(cpu_instructions);
+        self.scenario.tick(cpu_instructions);
 
         // Aggregate IRQ pending bits. UART is the only v1 contributor
         // (IRQ 5, level 1). Other peripherals will add their bits once
         // they land.
         self.irq_pending = self.uart.irq_pending();
+    }
+
+    /// Process deferred writes from scenario effects.
+    fn drain_scenario_deferred(&mut self) {
+        let writes = self.scenario.take_deferred_writes();
+        for w in writes {
+            let _ = self.write_word_inner(w.address, w.value);
+        }
+    }
+
+    /// Check if the scenario engine requested a pause.
+    pub fn scenario_pause_requested(&mut self) -> bool {
+        self.scenario.take_pause()
     }
 
     /// Cold reset — zeros volatile state in all peripherals. Called on
@@ -413,8 +427,8 @@ impl PeripheralBank {
     /// default (`Ok(0)`) when no override exists — each peripheral
     /// adds real peek support incrementally.
     pub fn peek_word(&self, addr: u32) -> Result<u32, Exception> {
-        if !self.overrides.is_empty() {
-            if let Some(v) = self.overrides.peek_read(addr) {
+        if !self.scenario.overrides.is_empty() {
+            if let Some(v) = self.scenario.overrides.peek_read(addr) {
                 return Ok(v);
             }
         }
@@ -462,8 +476,15 @@ impl PeripheralBank {
     }
 
     pub fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
-        if !self.overrides.is_empty() {
-            if let Some(v) = self.overrides.try_read(addr) {
+        let result = self.read_word_inner(addr);
+        self.scenario.on_mmio_read(addr);
+        self.drain_scenario_deferred();
+        result
+    }
+
+    fn read_word_inner(&mut self, addr: u32) -> Result<u32, Exception> {
+        if !self.scenario.overrides.is_empty() {
+            if let Some(v) = self.scenario.overrides.try_read(addr) {
                 self.seq_emit(addr, v, "r", "word", "override");
                 return Ok(v);
             }
@@ -504,8 +525,15 @@ impl PeripheralBank {
     }
 
     pub fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
-        let val = if !self.overrides.is_empty() {
-            if let Some(masked) = self.overrides.filter_write(addr, val) {
+        let result = self.write_word_inner(addr, val);
+        self.scenario.on_mmio_write(addr);
+        self.drain_scenario_deferred();
+        result
+    }
+
+    fn write_word_inner(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
+        let val = if !self.scenario.overrides.is_empty() {
+            if let Some(masked) = self.scenario.overrides.filter_write(addr, val) {
                 self.seq_emit(addr, masked, "w", "word", "override-mask");
                 masked
             } else {
@@ -524,9 +552,6 @@ impl PeripheralBank {
         if self.uart.claims(addr) { dispatch_ww!(self.uart, "uart"); }
         if self.pbc.claims(addr) {
             self.pbc.write_word(addr, val)?;
-            // Cross-peripheral dispatch: if the write triggered a
-            // SerDes SPI slave command, route it to the SerDes now
-            // that the PBC write is complete.
             if let Some((tx, rx_len)) = self.pbc.take_pending_spi_serdes() {
                 let rx = self.serdes.spi_command(&tx, rx_len);
                 self.pbc.complete_spi_serdes(&rx);
