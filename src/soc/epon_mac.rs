@@ -185,6 +185,27 @@ impl EponMac {
         }
     }
 
+    /// Write a raw value into the LLID backing store at the given
+    /// absolute MMIO address. Used by the OLT emulator to inject
+    /// bitmap bits and mailbox data into the EPON MAC's address space
+    /// without going through the normal write_word side-effect path.
+    pub fn poke_llid_store(&mut self, addr: u32, val: u32) {
+        if (EPON_LLID_BASE..EPON_LLID_TOP).contains(&addr) {
+            let idx = Self::llid_idx(addr);
+            self.llid_store[idx] = val;
+        }
+    }
+
+    /// Read a raw value from the LLID backing store.
+    pub fn peek_llid_store(&self, addr: u32) -> u32 {
+        if (EPON_LLID_BASE..EPON_LLID_TOP).contains(&addr) {
+            let idx = Self::llid_idx(addr);
+            self.llid_store[idx]
+        } else {
+            0
+        }
+    }
+
     #[inline]
     pub fn claims(&self, addr: u32) -> bool {
         // Word-align the address so half / byte sub-offsets (e.g.

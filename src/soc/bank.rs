@@ -307,6 +307,17 @@ impl PeripheralBank {
         // Drain OLT RX frames into the mailbox engine (word_index=1 is
         // the primary RX queue based on Phase 2b fuzzer results).
         self.olt.load_frames_into_mailbox(1);
+        // Sync the OLT bitmap into the epon_mac LLID backing store so
+        // the firmware's epon_llid_bitmap_check sees the frames. The
+        // bitmap lives at BITMAP_BASE + word_idx * 0x200 which falls
+        // inside the epon_mac's LLID address range.
+        for wi in 0..8u32 {
+            let bmp = self.olt.mailbox_bitmap[wi as usize];
+            let addr = 0x0100_1438 + wi * 0x200;
+            if addr < 0x0100_2000 {
+                self.epon_mac.poke_llid_store(addr, bmp);
+            }
+        }
         self.sysreg.tick(cpu_instructions);
         self.scenario.tick(cpu_instructions);
 
@@ -651,6 +662,24 @@ impl PeripheralBank {
                 return Ok(v);
             }};
         }
+        // OLT mailbox CMD_STATUS/DATA reads must be checked BEFORE
+        // epon_mac because the mailbox registers (0x010015C0+) fall
+        // inside the epon_mac LLID address range (0x01001400-0x01002000).
+        // The bitmap reads go through epon_mac normally (we poke the
+        // llid_store in tick), but CMD_STATUS and DATA need the OLT's
+        // FIFO side effects (pop-on-read).
+        if crate::soc::olt::Olt::claims_mailbox(addr) {
+            if let Some(v) = self.olt.read_cmd_status(addr) {
+                self.record_history(addr, v, "read", "word", "olt_status");
+                self.seq_emit(addr, v, "r", "word", "olt_status");
+                return Ok(v);
+            }
+            if let Some(v) = self.olt.read_data(addr) {
+                self.record_history(addr, v, "read", "word", "olt_data");
+                self.seq_emit(addr, v, "r", "word", "olt_data");
+                return Ok(v);
+            }
+        }
         if self.uart.claims(addr) { dispatch_rw!(self.uart, "uart"); }
         if self.pbc.claims(addr) { dispatch_rw!(self.pbc, "pbc"); }
         if self.bsc_i2c.claims(addr) { dispatch_rw!(self.bsc_i2c, "bsc_i2c"); }
@@ -668,23 +697,6 @@ impl PeripheralBank {
             self.record_history(addr, v, "read", "word", "vlan_lue");
             self.seq_emit(addr, v, "r", "word", "vlan_lue");
             return Ok(v);
-        }
-        if crate::soc::olt::Olt::claims_mailbox(addr) {
-            if let Some(v) = self.olt.read_bitmap(addr) {
-                self.record_history(addr, v, "read", "word", "olt_bitmap");
-                self.seq_emit(addr, v, "r", "word", "olt_bitmap");
-                return Ok(v);
-            }
-            if let Some(v) = self.olt.read_cmd_status(addr) {
-                self.record_history(addr, v, "read", "word", "olt_status");
-                self.seq_emit(addr, v, "r", "word", "olt_status");
-                return Ok(v);
-            }
-            if let Some(v) = self.olt.read_data(addr) {
-                self.record_history(addr, v, "read", "word", "olt_data");
-                self.seq_emit(addr, v, "r", "word", "olt_data");
-                return Ok(v);
-            }
         }
         if self.sysreg.claims(addr) { dispatch_rw!(self.sysreg, "sysreg"); }
         if self.trace {
@@ -727,6 +739,12 @@ impl PeripheralBank {
                 return Ok(());
             }};
         }
+        // OLT CMD write intercept — must be before epon_mac.
+        if crate::soc::olt::Olt::claims_mailbox(addr) && self.olt.write_cmd(addr, val) {
+            self.record_history(addr, val, "write", "word", "olt_cmd");
+            self.seq_emit(addr, val, "w", "word", "olt_cmd");
+            return Ok(());
+        }
         if self.uart.claims(addr) { dispatch_ww!(self.uart, "uart"); }
         if self.pbc.claims(addr) {
             self.pbc.write_word(addr, val)?;
@@ -752,11 +770,6 @@ impl PeripheralBank {
             self.vlan_lue.write_word(addr, val)?;
             self.record_history(addr, val, "write", "word", "vlan_lue");
             self.seq_emit(addr, val, "w", "word", "vlan_lue");
-            return Ok(());
-        }
-        if crate::soc::olt::Olt::claims_mailbox(addr) && self.olt.write_cmd(addr, val) {
-            self.record_history(addr, val, "write", "word", "olt_cmd");
-            self.seq_emit(addr, val, "w", "word", "olt_cmd");
             return Ok(());
         }
         if self.sysreg.claims(addr) { dispatch_ww!(self.sysreg, "sysreg"); }
