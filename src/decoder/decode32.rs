@@ -475,7 +475,8 @@ fn decode_alu_op(
             let u6 = extract_u6(word);
             let a_reg = extract_a_reg(word);
 
-            let has_limm = b_reg == 62;
+            // For MOV, B is destination-only — B=62 does NOT mean LIMM.
+            let has_limm = if op.is_mov() { false } else { b_reg == 62 };
             let limm_val = if has_limm {
                 Some(mem.fetch_word(pc + 4)?)
             } else {
@@ -508,7 +509,8 @@ fn decode_alu_op(
             // REG_S12IMM: B = B op S12
             let s12 = extract_s12(word) as u32;
 
-            let has_limm = b_reg == 62;
+            // For MOV, B is destination-only — B=62 does NOT mean LIMM.
+            let has_limm = if op.is_mov() { false } else { b_reg == 62 };
             let limm_val = if has_limm {
                 Some(mem.fetch_word(pc + 4)?)
             } else {
@@ -585,7 +587,8 @@ fn decode_alu_op(
                 // COND_U6IMM: B = B op U6
                 let u6 = extract_u6(word);
 
-                let has_limm = b_reg == 62;
+                // For MOV, B is destination-only — B=62 does NOT mean LIMM.
+                let has_limm = if op.is_mov() { false } else { b_reg == 62 };
                 let limm_val = if has_limm {
                     Some(mem.fetch_word(pc + 4)?)
                 } else {
@@ -1406,4 +1409,32 @@ fn decode_extension_ops(
         has_limm,
         pc,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decoder::ByteSliceFetch;
+
+    #[test]
+    fn mov_b62_u6_no_limm() {
+        // MOV r62, 0: P=1, sub=0x0A, B=62, U6=0, F=0.
+        // B=62 is destination-only for MOV → no LIMM fetch.
+        let bytes: [u8; 8] = [0x26, 0x4A, 0x70, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+        let fetch = ByteSliceFetch::new(&bytes, 0);
+        let decoded = decode_32bit(0x264A7000, 0, &fetch).unwrap();
+        assert!(!decoded.has_limm, "MOV with B=62 in P=1 must not fetch LIMM");
+        assert_eq!(decoded.size, 4);
+    }
+
+    #[test]
+    fn cmp_b62_u6_has_limm() {
+        // CMP limm, 0: P=1, sub=0x0C, B=62, U6=0.
+        // B=62 is source for CMP → LIMM fetch required.
+        let bytes: [u8; 8] = [0x26, 0x4C, 0x70, 0x00, 0x00, 0x00, 0x00, 0x42];
+        let fetch = ByteSliceFetch::new(&bytes, 0);
+        let decoded = decode_32bit(0x264C7000, 0, &fetch).unwrap();
+        assert!(decoded.has_limm, "CMP with B=62 in P=1 must fetch LIMM");
+        assert_eq!(decoded.size, 4);
+    }
 }
