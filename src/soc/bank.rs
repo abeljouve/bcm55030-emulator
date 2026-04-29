@@ -330,20 +330,15 @@ impl PeripheralBank {
             self.olt.link_change_pending = false;
             self.epon_mac.set_1g_link_change_bit();
             self.epon_mac.set_phy_link_status_bit();
-            self.pending_cache_inv.push(
-                DatapathOp::CacheInvalidate { addr: 0x0100_0410 },
-            );
-            self.pending_cache_inv.push(
-                DatapathOp::CacheInvalidate { addr: 0x0100_0E04 },
-            );
+            self.epon_mac.set_discovery_status_bit();
+            for &addr in &[0x0100_0410u32, 0x0100_0E04, 0x0100_1040] {
+                self.pending_cache_inv.push(
+                    DatapathOp::CacheInvalidate { addr },
+                );
+            }
         }
         if self.olt.config.enabled && self.olt.link_up {
             self.epon_mac.set_discovery_status_bit();
-            if self.pending_cache_inv.is_empty() {
-                self.pending_cache_inv.push(
-                    DatapathOp::CacheInvalidate { addr: 0x0100_1040 },
-                );
-            }
         }
         if self.olt.config.enabled {
             let bmp = if !self.olt.mailbox_pending.is_empty() {
