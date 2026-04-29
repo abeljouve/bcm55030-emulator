@@ -537,6 +537,10 @@ impl Memory {
     /// Pull pending `DatapathOp`s from the bank and apply them to SRAM
     /// / flash. Called after any MMIO write that might have triggered a
     /// DMA transfer (PBC flash DMA is the only current source).
+    pub fn drain_datapath_public(&mut self) -> Result<(), Exception> {
+        self.drain_datapath()
+    }
+
     fn drain_datapath(&mut self) -> Result<(), Exception> {
         let ops = if let Some(ref bank) = self.bank {
             bank.write().take_pending_datapath()

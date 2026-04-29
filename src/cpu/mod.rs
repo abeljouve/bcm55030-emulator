@@ -395,6 +395,7 @@ impl Cpu {
             if let Some(ref bank) = self.bank {
                 bank.write().tick(BANK_TICK_PRESCALER);
             }
+            let _ = self.mem.drain_datapath_public();
         }
     }
 
