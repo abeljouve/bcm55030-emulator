@@ -516,8 +516,10 @@ impl Peripheral for EponMac {
                 return Ok(());
             }
             REG_DISCOVERY_STATUS => {
-                // W1C for bits[2:1].
-                self.discovery_status &= !(val & 0x6);
+                // Bit 0: latch trigger (write-through, readback confirms done).
+                // Bits[2:1]: W1C (write 1 to clear status).
+                self.discovery_status = (self.discovery_status & !(val & 0x6))
+                    | (val & !0x6);
                 return Ok(());
             }
             _ => {}
