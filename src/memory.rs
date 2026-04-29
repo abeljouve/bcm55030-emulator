@@ -578,6 +578,11 @@ impl Memory {
                     }
                 }
             }
+            DatapathOp::CacheInvalidate { addr: inv_addr } => {
+                if let Some(ref mut dc) = self.dcache {
+                    dc.invalidate_line(inv_addr & !0x1F);
+                }
+            }
             DatapathOp::FlashWrite {
                 peripheral,
                 flash_addr,

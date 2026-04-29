@@ -51,6 +51,9 @@ pub enum DatapathOp {
         sram_addr: u32,
         data: Vec<u8>,
     },
+    /// Invalidate a D-cache line covering `addr`. Used when a peripheral
+    /// updates an MMIO register that the firmware reads via cached loads.
+    CacheInvalidate { addr: u32 },
     /// DCCM → flash write. The memory layer reads `length` bytes from
     /// `sram_addr` and calls the PBC peripheral back with the data.
     FlashWrite {
