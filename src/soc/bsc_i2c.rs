@@ -3,21 +3,23 @@
 //! The BSC is the on-chip I²C master that talks to the SFP EEPROM
 //! (devices `0xA0` and `0xA2`) at MMIO offsets:
 //!
-//!   * `0x01000140` — command / start register. Bits[27..32] encode the
-//!     command, bits[18..27] encode `(word_index + 0x100)`, bit 0
-//!     selects A0h (0) or A2h (1).
-//!   * `0x0100014C` — read data register. The firmware polls this for
-//!     the four bytes of the most recent transaction.
-//!   * `0x01000150` — busy/status register. Bit 31 = busy. Set on
-//!     command, cleared on completion (after `BSC_BUSY_TICKS`).
+//!   * `0x01000140` — CMD register. Bit 28 = sub-addr latch, bit 27 =
+//!     read trigger. Bits[26:18] = `(0x100 + word_idx)`. Bits[6:0] =
+//!     I2C slave address (0x50 = A0h, 0x51 = A2h). Bits[31:27]
+//!     auto-clear after the command is latched.
+//!   * `0x0100014C` — DATA register. Write: sets EEPROM sub-address for
+//!     the next CMD latch. Read: returns 4-byte result of last word read.
+//!   * `0x01000150` — STAT register. Bit 31 = busy. A write with bit 22
+//!     set arms a burst read; byte_count in bits[13:3].
 //!
-//! Session 1 implements a state machine sufficient for the firmware's
-//! polling loop: any number of registers in the BSC range are stored
-//! verbatim, but the three registers above drive a real micro state
-//! machine (`Idle → Busy → Done`). The owned [`SfpEeprom`] supplies
-//! the read data, including the live DDM overlay for A2h bytes 96–109.
+//! Protocol (matches silicon):
+//!   1. DATA ← sub_addr
+//!   2. CMD latch (bit 28) → latches sub_addr, goes busy
+//!   3. STAT arm (bit 22, byte_count) → arms burst, sets EEPROM pointer
+//!   4. CMD read triggers (bit 27) → sequential words from pointer
+//!   5. After byte_count bytes, protocol returns to Idle
 //!
-//! Audit 5.10 is resolved here.
+//! Reads without proper init (latch + arm) return stale data.
 
 use crate::cpu::exception::Exception;
 use crate::soc::peripheral::{
@@ -45,22 +47,27 @@ enum BusState {
     Done,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProtocolState {
+    Idle,
+    SubAddrLatched,
+    Armed,
+}
+
 #[derive(Clone)]
 pub struct BscI2c {
     pub sfp: SfpEeprom,
     state: BusState,
     busy_counter: u8,
-    /// Last device select bit from REG_CMD (0 = A0h, 1 = A2h).
+    protocol: ProtocolState,
+    pending_sub_addr: u16,
+    sub_addr: u16,
+    eeprom_ptr: u16,
+    byte_count: u16,
+    bytes_read: u16,
     last_device: u8,
-    /// Word index (in 4-byte words) from REG_CMD bits[18..27].
-    last_word_idx: u16,
-    /// 16-bit base address from REG_BASE_ADDR low half.
-    base_addr: u16,
-    /// Pending read result (4 bytes packed LE).
     pending_read_word: u32,
-    /// Force NACK on next transaction (UI fault injection).
     force_nack: bool,
-    /// Verbatim register store for unmodelled BSC offsets in the range.
     raw_store: [u32; 6],
 }
 
@@ -70,9 +77,13 @@ impl BscI2c {
             sfp: SfpEeprom::new_default(),
             state: BusState::Idle,
             busy_counter: 0,
+            protocol: ProtocolState::Idle,
+            pending_sub_addr: 0,
+            sub_addr: 0,
+            eeprom_ptr: 0,
+            byte_count: 0,
+            bytes_read: 0,
             last_device: 0,
-            last_word_idx: 0,
-            base_addr: 0,
             pending_read_word: 0,
             force_nack: false,
             raw_store: [0u32; 6],
@@ -110,24 +121,31 @@ impl BscI2c {
 
     fn issue_command(&mut self, val: u32) {
         self.last_device = (val & 0x1) as u8;
-        let param_5 = (val >> 18) & 0x1FF;
         let cmd_hi = (val >> 27) & 0x1F;
-        if (cmd_hi & 1) != 0 && param_5 >= 0x100 {
-            self.last_word_idx = (param_5 - 0x100) as u16;
-            let read_off = self.base_addr.wrapping_add(self.last_word_idx * 4);
-            self.pending_read_word = self.sfp.read_word(self.last_device, read_off);
-            if self.force_nack {
-                self.pending_read_word = 0xFFFF_FFFF;
-                self.force_nack = false;
+
+        if cmd_hi & 2 != 0 {
+            self.sub_addr = self.pending_sub_addr;
+            self.protocol = ProtocolState::SubAddrLatched;
+            self.state = BusState::Busy;
+            self.busy_counter = BSC_BUSY_TICKS;
+        } else if cmd_hi & 1 != 0 {
+            if matches!(self.protocol, ProtocolState::Armed) && self.bytes_read < self.byte_count
+            {
+                self.pending_read_word = self.sfp.read_word(self.last_device, self.eeprom_ptr);
+                if self.force_nack {
+                    self.pending_read_word = 0xFFFF_FFFF;
+                    self.force_nack = false;
+                }
+                self.eeprom_ptr = self.eeprom_ptr.wrapping_add(4);
+                self.bytes_read += 4;
+                if self.bytes_read >= self.byte_count {
+                    self.protocol = ProtocolState::Idle;
+                }
             }
             self.state = BusState::Busy;
             self.busy_counter = BSC_BUSY_TICKS;
         }
-        // Hardware behaviour: command bits (27-31) auto-clear once the
-        // command is latched. The firmware polls REG_CMD waiting for
-        // these bits to drop. Without this, the polling loop at
-        // `epon_link_config_and_enable_all @ ram:20032CB0` spins
-        // forever (regression caught during the Session 1 refactor).
+
         if let Some(i) = self.store_idx(REG_CMD) {
             self.raw_store[i] = val & 0x07FF_FFFF;
         }
@@ -143,6 +161,33 @@ impl Peripheral for BscI2c {
         BSC_RANGES
     }
 
+    fn peek_word(&self, addr: u32) -> Result<u32, Exception> {
+        let off = addr - 0x01000000;
+        match off {
+            REG_CMD => Ok(self
+                .store_idx(REG_CMD)
+                .map(|i| self.raw_store[i])
+                .unwrap_or(0)),
+            REG_BASE_ADDR => Ok(self.pending_read_word),
+            REG_STATUS => {
+                let mut val = self
+                    .store_idx(REG_STATUS)
+                    .map(|i| self.raw_store[i])
+                    .unwrap_or(0);
+                if matches!(self.state, BusState::Busy) {
+                    val |= 0x8000_0000;
+                } else {
+                    val &= !0x8000_0000;
+                }
+                Ok(val)
+            }
+            _ => Ok(self
+                .store_idx(off)
+                .map(|i| self.raw_store[i])
+                .unwrap_or(0)),
+        }
+    }
+
     fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
         let off = addr - 0x01000000;
         match off {
@@ -151,15 +196,10 @@ impl Peripheral for BscI2c {
                 .map(|i| self.raw_store[i])
                 .unwrap_or(0)),
             REG_BASE_ADDR => {
-                if matches!(self.state, BusState::Busy | BusState::Done) {
-                    let val = self.pending_read_word;
-                    if matches!(self.state, BusState::Done) {
-                        self.state = BusState::Idle;
-                    }
-                    Ok(val)
-                } else {
-                    Ok(self.base_addr as u32)
+                if matches!(self.state, BusState::Done) {
+                    self.state = BusState::Idle;
                 }
+                Ok(self.pending_read_word)
             }
             REG_STATUS => {
                 let mut val = self
@@ -187,10 +227,24 @@ impl Peripheral for BscI2c {
         }
         match off {
             REG_CMD => self.issue_command(val),
-            REG_BASE_ADDR => self.base_addr = (val & 0xFFFF) as u16,
+            REG_BASE_ADDR => self.pending_sub_addr = (val & 0xFFFF) as u16,
             REG_STATUS => {
-                // Writing 1 to bit 31 normally clears it on real HW.
-                // Mirror that behaviour for parity.
+                if let Some(i) = self.store_idx(REG_STATUS) {
+                    self.raw_store[i] = val & !1;
+                }
+                if val & 0x0040_0000 != 0
+                    && matches!(self.protocol, ProtocolState::SubAddrLatched)
+                {
+                    let bc = ((val >> 3) & 0x7FF) as u16;
+                    if bc > 0 {
+                        self.byte_count = bc;
+                        self.eeprom_ptr = self.sub_addr;
+                        self.bytes_read = 0;
+                        self.protocol = ProtocolState::Armed;
+                        self.state = BusState::Busy;
+                        self.busy_counter = BSC_BUSY_TICKS;
+                    }
+                }
             }
             _ => {}
         }
@@ -209,9 +263,13 @@ impl Peripheral for BscI2c {
     fn reset_cold(&mut self) {
         self.state = BusState::Idle;
         self.busy_counter = 0;
+        self.protocol = ProtocolState::Idle;
+        self.pending_sub_addr = 0;
+        self.sub_addr = 0;
+        self.eeprom_ptr = 0;
+        self.byte_count = 0;
+        self.bytes_read = 0;
         self.last_device = 0;
-        self.last_word_idx = 0;
-        self.base_addr = 0;
         self.pending_read_word = 0;
         self.force_nack = false;
         self.raw_store = [0u32; 6];
@@ -222,7 +280,7 @@ impl Peripheral for BscI2c {
         PeripheralSnapshot::Bsc(BscSnapshot {
             busy: matches!(self.state, BusState::Busy),
             last_device_addr: if self.last_device == 0 { 0xA0 } else { 0xA2 },
-            last_word_addr: self.base_addr.wrapping_add(self.last_word_idx * 4),
+            last_word_addr: self.eeprom_ptr,
         })
     }
 
@@ -272,20 +330,147 @@ mod tests {
     use super::*;
 
     #[test]
+    fn data_reg_returns_zero_when_idle() {
+        let mut bsc = BscI2c::new();
+        bsc.write_word(0x0100014C, 0x0000_000C).unwrap();
+        let v = bsc.read_word(0x0100014C).unwrap();
+        assert_eq!(v, 0, "DATA register must not echo back written value in Idle");
+    }
+
+    #[test]
+    fn stat_bit0_auto_clears() {
+        let mut bsc = BscI2c::new();
+        bsc.write_word(0x01000150, 0x0B).unwrap();
+        let v = bsc.read_word(0x01000150).unwrap();
+        assert_eq!(v, 0x0A, "STAT bit 0 must auto-clear on write");
+    }
+
+    #[test]
+    fn device_select_from_slave_addr_bit0() {
+        let mut bsc = BscI2c::new();
+        bsc.write_word(0x0100014C, 0x0000_0050).unwrap();
+        // slave addr 0x51 (A2h) → bit 0 = 1 → device 1
+        let cmd = (1u32 << 27) | (0x100u32 << 18) | 0x51;
+        bsc.write_word(0x01000140, cmd).unwrap();
+        assert_eq!(bsc.last_device, 1);
+
+        // slave addr 0x50 (A0h) → bit 0 = 0 → device 0
+        let cmd2 = (1u32 << 27) | (0x100u32 << 18) | 0x50;
+        bsc.write_word(0x01000140, cmd2).unwrap();
+        assert_eq!(bsc.last_device, 0);
+    }
+
+    #[test]
     fn busy_clears_after_ticks() {
         let mut bsc = BscI2c::new();
         bsc.write_word(0x0100014C, 0x0000_0050).unwrap();
-        // Issue a read of word_idx=0 on A2h (device=1)
-        let cmd = (1u32 << 27) | (0x100u32 << 18) | 1;
+        let cmd = (1u32 << 27) | (0x100u32 << 18) | 0x51;
         bsc.write_word(0x01000140, cmd).unwrap();
-        // Status bit 31 set immediately
         let s = bsc.read_word(0x01000150).unwrap();
         assert_ne!(s & 0x8000_0000, 0);
-        // After enough ticks, it clears
         for _ in 0..BSC_BUSY_TICKS {
             bsc.tick(64);
         }
         let s = bsc.read_word(0x01000150).unwrap();
         assert_eq!(s & 0x8000_0000, 0);
+    }
+
+    fn do_init(bsc: &mut BscI2c, sub_addr: u16, byte_count: u16, slave: u32) {
+        bsc.write_word(0x0100014C, sub_addr as u32).unwrap();
+        bsc.write_word(0x01000140, (2u32 << 27) | slave).unwrap();
+        for _ in 0..BSC_BUSY_TICKS {
+            bsc.tick(1);
+        }
+        bsc.write_word(0x01000150, 0x0B).unwrap();
+        bsc.write_word(0x01000140, 0x0400_0000 | slave).unwrap();
+        let arm_val = 0x0040_0000 | ((byte_count as u32) << 3) | 1;
+        bsc.write_word(0x01000150, arm_val).unwrap();
+        for _ in 0..BSC_BUSY_TICKS {
+            bsc.tick(1);
+        }
+    }
+
+    #[test]
+    fn reference_protocol_reads_correct_data() {
+        let mut bsc = BscI2c::new();
+        do_init(&mut bsc, 0, 16, 0x50);
+
+        for word_idx in 0u32..4 {
+            let cmd = (1u32 << 27) | ((0x100 + word_idx) << 18) | 0x50;
+            bsc.write_word(0x01000140, cmd).unwrap();
+            for _ in 0..BSC_BUSY_TICKS {
+                bsc.tick(1);
+            }
+            let data = bsc.read_word(0x0100014C).unwrap();
+            let expected = bsc.sfp.read_word(0, word_idx as u16 * 4);
+            assert_eq!(data, expected, "word {} mismatch", word_idx);
+        }
+    }
+
+    #[test]
+    fn reads_without_init_return_stale() {
+        let mut bsc = BscI2c::new();
+        let cmd = (1u32 << 27) | (0x100u32 << 18) | 0x50;
+        bsc.write_word(0x01000140, cmd).unwrap();
+        for _ in 0..BSC_BUSY_TICKS {
+            bsc.tick(1);
+        }
+        let data = bsc.read_word(0x0100014C).unwrap();
+        assert_eq!(data, 0, "read without init must return stale (0)");
+    }
+
+    #[test]
+    fn burst_exhaustion_returns_stale() {
+        let mut bsc = BscI2c::new();
+        do_init(&mut bsc, 0, 4, 0x50);
+
+        let cmd = (1u32 << 27) | (0x100u32 << 18) | 0x50;
+        bsc.write_word(0x01000140, cmd).unwrap();
+        for _ in 0..BSC_BUSY_TICKS {
+            bsc.tick(1);
+        }
+        let data1 = bsc.read_word(0x0100014C).unwrap();
+        let expected = bsc.sfp.read_word(0, 0);
+        assert_eq!(data1, expected);
+
+        let cmd2 = (1u32 << 27) | (0x101u32 << 18) | 0x50;
+        bsc.write_word(0x01000140, cmd2).unwrap();
+        for _ in 0..BSC_BUSY_TICKS {
+            bsc.tick(1);
+        }
+        let data2 = bsc.read_word(0x0100014C).unwrap();
+        assert_eq!(data2, data1, "stale data after burst exhaustion");
+    }
+
+    #[test]
+    fn a2h_device_select_with_init() {
+        let mut bsc = BscI2c::new();
+        do_init(&mut bsc, 0, 4, 0x51);
+
+        let cmd = (1u32 << 27) | (0x100u32 << 18) | 0x51;
+        bsc.write_word(0x01000140, cmd).unwrap();
+        for _ in 0..BSC_BUSY_TICKS {
+            bsc.tick(1);
+        }
+        let data = bsc.read_word(0x0100014C).unwrap();
+        let expected = bsc.sfp.read_word(1, 0);
+        assert_eq!(data, expected, "A2h word 0 mismatch");
+    }
+
+    #[test]
+    fn sequential_reads_advance_pointer() {
+        let mut bsc = BscI2c::new();
+        do_init(&mut bsc, 8, 8, 0x50);
+
+        for word_idx in 0u32..2 {
+            let cmd = (1u32 << 27) | ((0x100 + word_idx) << 18) | 0x50;
+            bsc.write_word(0x01000140, cmd).unwrap();
+            for _ in 0..BSC_BUSY_TICKS {
+                bsc.tick(1);
+            }
+            let data = bsc.read_word(0x0100014C).unwrap();
+            let expected = bsc.sfp.read_word(0, 8 + word_idx as u16 * 4);
+            assert_eq!(data, expected, "word {} from offset 8", word_idx);
+        }
     }
 }

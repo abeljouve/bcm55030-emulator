@@ -54,6 +54,10 @@ pub const AUX_IRQ_PENDING: u32 = 0x416;
 /// ARCVER=0x24, build=0xB4. Non-existent aux regs also return this value.
 pub const IDENTITY_VALUE: u32 = 0x00B40124;
 
+// NOTE: Ghidra's `Auxregs0028` = STATUS32 (AUX 0x0A * 4 = byte offset 0x28).
+// There is NO BCM55030-custom AUX at number 0x28. See the design notes
+// for the correction history.
+
 // BCR addresses
 pub const AUX_BCR_VER: u32 = 0x60;
 pub const AUX_BTA_LINK_BUILD: u32 = 0x63;
@@ -213,6 +217,7 @@ pub struct CpuState {
     /// Synced to DCache via executor post-processing on StoreAux(0x48).
     /// BCM55030 reset value: 0xC2 (cache enabled, IM=1, LM=1, bit1=1).
     pub aux_dc_ctrl: u32,
+
 }
 
 impl CpuState {
