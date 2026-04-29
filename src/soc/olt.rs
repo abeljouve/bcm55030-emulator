@@ -308,7 +308,9 @@ impl Olt {
             eprintln!("[OLT] Enabled — OLT MAC {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
                 self.config.mac[0], self.config.mac[1], self.config.mac[2],
                 self.config.mac[3], self.config.mac[4], self.config.mac[5]);
+            self.set_link_up(true);
         } else {
+            self.set_link_up(false);
             eprintln!("[OLT] Disabled");
         }
     }
