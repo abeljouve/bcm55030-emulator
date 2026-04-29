@@ -889,7 +889,20 @@ impl PeripheralBank {
             self.seq_emit(addr, val, "w", "word", "mpcp_bus");
             return Ok(());
         }
-        if self.serdes.claims(addr) { dispatch_ww!(self.serdes, "serdes"); }
+        if self.serdes.claims(addr) {
+            if addr == 0x0100_01B0 && self.olt.config.enabled {
+                let old = self.serdes.peek_word(addr).unwrap_or(0);
+                self.serdes.write_word(addr, val)?;
+                if (val & 0x800) != 0 && (old & 0x800) == 0 {
+                    self.handle_mpcp_burst_trigger();
+                }
+            } else {
+                self.serdes.write_word(addr, val)?;
+            }
+            self.record_history(addr, val, "write", "word", "serdes");
+            self.seq_emit(addr, val, "w", "word", "serdes");
+            return Ok(());
+        }
         if self.epon_mac.claims(addr) { dispatch_ww!(self.epon_mac, "epon_mac"); }
         if self.macsec.claims(addr) { dispatch_ww!(self.macsec, "macsec"); }
         if self.dma.claims(addr) { dispatch_ww!(self.dma, "dma"); }
@@ -902,17 +915,6 @@ impl PeripheralBank {
             self.vlan_lue.write_word(addr, val)?;
             self.record_history(addr, val, "write", "word", "vlan_lue");
             self.seq_emit(addr, val, "w", "word", "vlan_lue");
-            return Ok(());
-        }
-        if addr == 0x0100_01B0 && self.olt.config.enabled {
-            let old = self.sysreg.read_word(addr).unwrap_or(0);
-            let rising = (val & 0x800) != 0 && (old & 0x800) == 0;
-            self.sysreg.write_word(addr, val)?;
-            if rising {
-                self.handle_mpcp_burst_trigger();
-            }
-            self.record_history(addr, val, "write", "word", "sysreg");
-            self.seq_emit(addr, val, "w", "word", "sysreg");
             return Ok(());
         }
         if self.sysreg.claims(addr) { dispatch_ww!(self.sysreg, "sysreg"); }
