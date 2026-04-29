@@ -64,7 +64,7 @@ impl FatalFilter {
         (FATAL_FILTER_BASE..FATAL_FILTER_END).contains(&addr)
     }
 
-    fn apply_warm_snapshot(&mut self) {
+    fn apply_silicon_power_on(&mut self) {
         for &(off, val) in super::mmio_init::SYSREG_INIT_VALUES {
             let abs = 0x0100_0000 + off;
             if !self.claims(abs) {
@@ -74,8 +74,8 @@ impl FatalFilter {
                 REG_FILTER_STATUS => self.filter_status = val,
                 REG_FILTER_ENABLE => self.filter_enable = val,
                 REG_FILTER_IRQ => self.filter_irq = val,
-                // Fatal aggregator stays at 0 on warm reset — it's
-                // a latched-error register, not a config register.
+                // Fatal aggregator stays at 0 — it's a latched-error
+                // register, not a config register.
                 REG_FILTER_FATAL => {}
                 _ => {}
             }
@@ -124,11 +124,12 @@ impl Peripheral for FatalFilter {
         self.filter_enable = 0;
         self.filter_irq = 0;
         self.link_up_bitmap = 0;
+        self.apply_silicon_power_on();
     }
 
     fn reset_warm(&mut self) {
+        // Silicon power-on snapshot already applied in `reset_cold`.
         self.reset_cold();
-        self.apply_warm_snapshot();
     }
 
     fn snapshot(&self) -> PeripheralSnapshot {

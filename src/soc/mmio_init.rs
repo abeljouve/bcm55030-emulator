@@ -1,107 +1,90 @@
-//! Post-boot sysreg snapshot from live HW (firmware v3.2.9, 2026-04-10).
+//! Silicon power-on defaults for the BCM55030 sysreg aperture.
 //!
-//! These are **not** cold-reset values. Each entry is a (offset,
-//! value) pair captured from a live BCM55030 board after the
-//! bootloader + firmware finished their own initialisation sequence.
-//! Every peripheral with a `reset_warm` path iterates this list
+//! Captured 2026-04-29 via the `hardware probing` baremetal binary, which
+//! reads MMIO registers immediately after stage-1 hands off to
+//! stage-2. Stage-1 was audited to touch ZERO SerDes/EPON registers
+//! (only UART, PBC/SPI, and CPU AUX cache regs), so these values
+//! are the true silicon power-on defaults.
+//!
+//! Coverage of `[0x01000000..0x01000300]` and
+//! `[0x01001000..0x01001100]` is exhaustive — both ranges were
+//! brute-scanned and any address not listed below reads zero on
+//! silicon. Values outside those ranges remain best-effort
+//! observations (typically post-boot snapshots from earlier
+//! sessions); they are kept verbatim until hardware probing is extended.
+//!
+//! Every peripheral with a `reset_cold` path iterates this list
 //! and applies the slice that falls inside its claim set
 //! (`epon_mac`, `serdes`, `macsec`, `dma`, `efuse_udr`,
-//! `fatal_filter`, `sysreg_shim` for the residual). The list is
-//! intentionally monolithic: splitting it per peripheral would
-//! churn every refactor without reducing total line count.
+//! `fatal_filter`, `mpcp`, `bsc_i2c`, `sysreg_shim` for the
+//! residual). Cold and warm reset both apply this seed — the only
+//! difference is that warm pre-sets `STATUS32.E1/E2` in
+//! `boot_from_flash`. Closes deferral D6.
 //!
-//! Cold-boot parity (`BootMode::Cold`) intentionally skips this
-//! seed and forces each peripheral's real cold-reset state —
-//! tracked in the design notes deferral D6.
+//! See `the design notes` for the audit
+//! that produced these values.
 
-/// (offset_from_0x01000000, init_value).
+/// (offset_from_0x01000000, silicon power-on value).
 pub const SYSREG_INIT_VALUES: &[(u32, u32)] = &[
-    (0x0000, 0x47010203),
-    (0x0004, 0xB2110816),
-    (0x0008, 0xD0C2FF7B),
-    (0x000C, 0x0114B820),
-    (0x0010, 0x08000060),
-    (0x0014, 0xFFFFFFFF),
-    (0x0018, 0x00000006),
-    (0x001C, 0xFFFFFFFF),
-    (0x0020, 0x00028124),
-    (0x0024, 0x00077EDB),
-    (0x002C, 0x00000124),
-    (0x0030, 0x0000FFFF),
-    (0x0038, 0x0000FFFF),
-    (0x0040, 0x3E3E0E41),
-    (0x0048, 0x80000000),
-    (0x0064, 0x5382FFFF),
-    (0x0080, 0x77777710),
-    (0x0084, 0x77777777),
-    (0x0088, 0x77777777),
-    (0x008C, 0x00000077),
-    (0x00A0, 0x00000001),
-    (0x00A4, 0x00000001),
-    (0x00A8, 0x00000003),
-    (0x00AC, 0x0000001A),
-    (0x00B0, 0xFFFFFFFF),
-    (0x00B4, 0x00000007),
-    (0x00B8, 0xFFFFFFFF),
-    (0x0140, 0x04000050),
-    (0x0144, 0x00000002),
-    (0x014C, 0x0000000D),
-    (0x0150, 0x00400008),
-    (0x0160, 0x0002002A),
-    (0x0164, 0x00000002),
-    (0x0170, 0x00000012),
-    (0x0180, 0x00009D08),
-    (0x0184, 0x00002604),
-    (0x0188, 0x00003904),
-    (0x0194, 0x0000000F),
-    (0x0198, 0xF000011F),
-    (0x019C, 0xFFFFFFFF),
-    (0x01A0, 0xFFFFFFFF),
-    (0x01A4, 0xEDB04DFF),
-    (0x01B0, 0x00008700),
-    (0x01C4, 0x00000904),
-    (0x01D4, 0x00000003),
-    (0x01D8, 0xF0000017),
-    (0x01DC, 0xFFFFFFFF),
-    (0x01E0, 0x45504F4E),
-    (0x01E4, 0xEDB04D00),
-    (0x0200, 0x00000002),
+    // -------- 0x000..0x100 — chip ID, IRQ masks, EPON command set --
+    (0x0000, 0x47010203), // CHIP_ID_0
+    (0x0004, 0xB2110816), // CHIP_ID_1
+    (0x0010, 0x08000000), // SYSREG_0x10
+    (0x0014, 0xFFFFFFFF), // IRQ_MASK_1
+    (0x001C, 0xFFFFFFFF), // IRQ_MASK_2
+    (0x0024, 0x00077FF7), // LLID_COUNTER_MASK
+    (0x0030, 0x0000FFFF), // RX_GRANT_MASK
+    (0x0040, 0x3E3E0E41), // I2C_BUS_CTRL (efuse_udr CLK_RESET)
+    (0x0048, 0x80000000), // SYSREG_0x48 (efuse_udr SDA shadow)
+    (0x0080, 0x77777777), // CAL_80
+    (0x0084, 0x77777777), // CAL_84
+    (0x0088, 0x77777777), // CAL_88
+    (0x008C, 0x00000077), // CAL_8C
+    (0x00A8, 0x00000003), // MASK_A8
+    (0x00AC, 0xFFFFFFFF), // MASK_AC
+    (0x00B0, 0xFFFFFFFF), // MASK_B0
+    (0x00B4, 0xFFFFFFFF), // MASK_B4
+    (0x00B8, 0xFFFFFFFF), // MASK_B8
+    // -------- 0x140..0x180 — BSC I²C + IND command set --------
+    (0x0140, 0x00015000), // BSC_CMD
+    (0x0150, 0x00800004), // BSC_STATUS
+    (0x0160, 0x00015000), // IND_CMD (MPCP_CMD_LATCH)
+    (0x0170, 0x00800004), // IND_DATA
+    // -------- 0x200..0x240 — SerDes lane configuration --------
     (0x0204, 0x00000003),
     (0x0208, 0x00000007),
-    (0x020C, 0x00000110),
-    (0x0210, 0x00000005),
-    (0x021C, 0x00001501),
-    (0x0224, 0x05060203),
-    (0x0228, 0x00000040),
-    (0x022C, 0x0008B981),
-    (0x0230, 0x00031F20),
+    (0x020C, 0x00000440),
+    (0x0210, 0x04000103),
+    (0x021C, 0x801E001A),
+    (0x0224, 0x05000003),
+    (0x0228, 0x0001E800),
+    (0x022C, 0x00010008),
+    (0x0230, 0x00010000),
     (0x0234, 0x000000F7),
     (0x0238, 0x000FFFFF),
-    (0x0240, 0x800000E0),
-    (0x0244, 0x00000001),
-    (0x0248, 0x00000001),
-    (0x025C, 0x004E0000),
-    (0x0288, 0x00000001),
-    (0x0294, 0x00000001),
-    (0x02A0, 0x00000001),
+    // -------- 0x2C0..0x2F0 — counter/flag area --------
     (0x02C0, 0x00000001),
     (0x02C4, 0x00000001),
-    (0x02CC, 0x00000001),
+    (0x02C8, 0x00000001),
     (0x02D0, 0x00000001),
+    (0x02D4, 0x00000001),
     (0x02D8, 0x00000001),
     (0x02DC, 0x00000001),
+    (0x02E0, 0x00000001),
     (0x02E4, 0x00000001),
     (0x02E8, 0x00000001),
     (0x02EC, 0x00000001),
+    // -------- 0x340..0x36C — unprobed; observed values retained --
     (0x0340, 0x00000020),
     (0x034C, 0x0080FFFF),
     (0x0360, 0x00000020),
     (0x036C, 0x0080FFFF),
+    // -------- 0x400..0x540 — EPON table region (unprobed beyond
+    //                         0x0410 which is silicon=0) --------
     (0x0400, 0x0010082F),
     (0x0404, 0x00000206),
     (0x0408, 0x00000007),
     (0x040C, 0x0060040F),
-    (0x0410, 0x00000222),
     (0x0418, 0x0007FFFE),
     (0x0424, 0x000003FF),
     (0x043C, 0x00017FFE),
@@ -128,6 +111,7 @@ pub const SYSREG_INIT_VALUES: &[(u32, u32)] = &[
     (0x0534, 0x55555555),
     (0x0538, 0x55555555),
     (0x053C, 0x55555555),
+    // -------- 0xC00..0xF04 — EPON table tail (unprobed) --------
     (0x0C00, 0x80004003),
     (0x0C08, 0x0000007F),
     (0x0C10, 0x00000FFF),
@@ -183,41 +167,7 @@ pub const SYSREG_INIT_VALUES: &[(u32, u32)] = &[
     (0x0EB8, 0x0002756A),
     (0x0EDC, 0x00004EAD),
     (0x0F04, 0x000000FF),
-    (0x1000, 0x00C00133),
-    (0x1004, 0x00040016),
-    (0x1008, 0x0000FFFF),
-    (0x1014, 0x00000001),
-    (0x101C, 0xFFEF0010),
-    (0x1024, 0xFFFFFFFE),
-    (0x102C, 0x00FFFFFE),
-    (0x1030, 0x00000001),
-    (0x1034, 0x00000001),
-    (0x103C, 0x00000054),
-    (0x1040, 0x00000001),
-    (0x1050, 0x0000FFFF),
-    (0x105C, 0x0000FFFF),
-    (0x1080, 0x7FFF2F57),
-    (0x1084, 0x7FFFFFFF),
-    (0x1088, 0x7FFFFFFF),
-    (0x108C, 0x7FFFFFFF),
-    (0x1090, 0x7FFFFFFF),
-    (0x1094, 0x7FFFFFFF),
-    (0x1098, 0x7FFFFFFF),
-    (0x109C, 0x7FFFFFFF),
-    (0x10A0, 0x7FFFFFFF),
-    (0x10A4, 0x7FFFFFFF),
-    (0x10A8, 0x7FFFFFFF),
-    (0x10AC, 0xFFFFFFFF),
-    (0x10B0, 0xFFFFFFFF),
-    (0x10B4, 0x00FFFFFF),
-    (0x10C4, 0x000007D0),
-    (0x10CC, 0x00000040),
-    (0x10D0, 0x00000100),
-    (0x10D4, 0x00000100),
-    (0x10D8, 0x00000040),
-    (0x10E0, 0x00000EE8),
-    (0x10E4, 0x00000002),
-    (0x10E8, 0x0000012C),
+    // -------- 0x110C..0x132C — EPON LLID tail (unprobed) --------
     (0x110C, 0x00000054),
     (0x1114, 0x002A3A0A),
     (0x1120, 0x00000400),
@@ -228,6 +178,7 @@ pub const SYSREG_INIT_VALUES: &[(u32, u32)] = &[
     (0x12C0, 0x00060000),
     (0x1320, 0x00FFFFFF),
     (0x1328, 0x00FFFFFE),
+    // -------- 0x1400..0x14C0 — LLID slot 0 --------
     (0x1400, 0x00000003),
     (0x1408, 0x00018000),
     (0x140C, 0x0001FFFF),
@@ -240,6 +191,7 @@ pub const SYSREG_INIT_VALUES: &[(u32, u32)] = &[
     (0x14B8, 0x07027000),
     (0x14BC, 0x07037028),
     (0x14C0, 0x07047038),
+    // -------- 0x15C0..0x17E8 — LLID slots 1..2 --------
     (0x15C0, 0x80000000),
     (0x15C4, 0x0B4DD474),
     (0x15C8, 0x0B4DD474),
@@ -264,6 +216,7 @@ pub const SYSREG_INIT_VALUES: &[(u32, u32)] = &[
     (0x17D0, 0x0B4DD474),
     (0x17D4, 0x00000BFC),
     (0x17E8, 0x80000000),
+    // -------- 0x1C00..0x1C3C — LLID slot 3 --------
     (0x1C00, 0x00000003),
     (0x1C0C, 0x0001FFFF),
     (0x1C18, 0xFFFFFEFF),
@@ -271,6 +224,7 @@ pub const SYSREG_INIT_VALUES: &[(u32, u32)] = &[
     (0x1C20, 0x0001FFFF),
     (0x1C24, 0x0001FFFF),
     (0x1C3C, 0x000001B0),
+    // -------- 0x2400..0x2D30 — DMA / MACsec --------
     (0x2400, 0x00000013),
     (0x2404, 0x00000001),
     (0x240C, 0x40013040),
@@ -312,6 +266,7 @@ pub const SYSREG_INIT_VALUES: &[(u32, u32)] = &[
     (0x2D28, 0x00008000),
     (0x2D2C, 0x00000100),
     (0x2D30, 0x00000020),
+    // -------- 0x3500..0x3610 — MACsec key tail / fatal filter --------
     (0x3500, 0x00010000),
     (0x3508, 0xFFFFFFFF),
     (0x3520, 0x0000001A),

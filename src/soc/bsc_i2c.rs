@@ -273,6 +273,17 @@ impl Peripheral for BscI2c {
         self.pending_read_word = 0;
         self.force_nack = false;
         self.raw_store = [0u32; 6];
+        // Silicon power-on snapshot for the BSC backing store.
+        // Verified 2026-04-29 via hardware probing — see
+        // `the design notes`.
+        for &(off, val) in super::mmio_init::SYSREG_INIT_VALUES {
+            let abs = 0x0100_0000 + off;
+            if (BSC_BASE..BSC_END).contains(&abs) {
+                if let Some(i) = self.store_idx(abs - 0x0100_0000) {
+                    self.raw_store[i] = val;
+                }
+            }
+        }
         self.sfp.reset_to_snapshot();
     }
 

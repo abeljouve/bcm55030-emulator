@@ -117,7 +117,7 @@ impl DmaChannelController {
         ((rel / DMA_STRIDE) as usize, rel % DMA_STRIDE)
     }
 
-    fn apply_warm_snapshot(&mut self) {
+    fn apply_silicon_power_on(&mut self) {
         for &(off, val) in super::mmio_init::SYSREG_INIT_VALUES {
             let abs = 0x0100_0000 + off;
             if self.claims(abs) {
@@ -195,11 +195,12 @@ impl Peripheral for DmaChannelController {
         for flag in &mut self.drain_flag {
             *flag = true;
         }
+        self.apply_silicon_power_on();
     }
 
     fn reset_warm(&mut self) {
+        // Silicon power-on snapshot already applied in `reset_cold`.
         self.reset_cold();
-        self.apply_warm_snapshot();
     }
 
     fn snapshot(&self) -> PeripheralSnapshot {

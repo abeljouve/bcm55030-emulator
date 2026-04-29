@@ -58,9 +58,21 @@ use crate::soc::peripheral::{
 
 pub const CHIP_ID_VALUE: u32 = 0x47010203;
 pub const CHIP_REV_VALUE: u32 = 0xB2110816;
-pub const LLID_CAPTURE_MASK_RESET: u32 = 0x0114_B820;
-pub const LLID_ACTIVE_RESET: u32 = 0x0000_0006;
+/// Silicon power-on default for LLID_CAPTURE_MASK / PON_MODE — zero on
+/// hardware (verified 2026-04-29 via hardware probing). Bit 15 of this
+/// register gates into an unclocked PCS domain, so a non-zero reset
+/// value would freeze the bus on real silicon. See
+/// `the design notes`.
+pub const LLID_CAPTURE_MASK_RESET: u32 = 0x0000_0000;
+/// Silicon power-on default for LLID_ACTIVE_BITMAP — zero on hardware
+/// (verified 2026-04-29 via hardware probing). Reference firmware programs the
+/// active bitmap during init.
+pub const LLID_ACTIVE_RESET: u32 = 0x0000_0000;
 pub const RX_GRANT_MASK_RESET: u32 = 0x0000_FFFF;
+/// Silicon power-on default for LLID_COUNTER_MASK at +0x024.
+pub const LLID_COUNTER_MASK_RESET: u32 = 0x0007_7FF7;
+/// Silicon power-on default for MPCP_CMD_LATCH / IND_CMD at +0x160.
+pub const MPCP_CMD_LATCH_RESET: u32 = 0x0001_5000;
 pub const EPON_SIG_VALUE: u32 = 0x4550_4F4E; // "EPON"
 
 /// Number of active LLID slots the firmware scans in the stride-0x200
@@ -156,6 +168,11 @@ pub struct EponMac {
     epon_status: u32,
     active_flags: u32,
     hw_state_status: u32,
+    /// REG_SPECIAL_0064 backing store. Silicon power-on is zero —
+    /// the previous shim returned 0x5382_FFFF unconditionally, which
+    /// did not match real silicon (verified 2026-04-29 via hardware probing).
+    /// Reference firmware programs this register during its init.
+    special_0064: u32,
 
     pub trace: bool,
 }
@@ -164,25 +181,28 @@ impl EponMac {
     pub fn new() -> Self {
         let table_words = ((EPON_TABLE_END - EPON_TABLE_BASE) / 4) as usize;
         let llid_words = ((EPON_LLID_TOP - EPON_LLID_BASE) / 4) as usize;
-        Self {
+        let mut me = Self {
             table_store: vec![0u32; table_words],
             llid_store: vec![0u32; llid_words],
             llid_irq_pending: [0; LLID_SLOT_COUNT],
             llid_drain_flag: [true; LLID_SLOT_COUNT],
-            mpcp_cmd_latch: 0,
+            mpcp_cmd_latch: MPCP_CMD_LATCH_RESET,
             mpcp_cmd_pending_clear: 0,
             llid_capture_mask: LLID_CAPTURE_MASK_RESET,
             llid_active_bitmap: LLID_ACTIVE_RESET,
             llid_mask_control: 0,
-            llid_counter_mask: 0,
+            llid_counter_mask: LLID_COUNTER_MASK_RESET,
             tx_grant_mask: 0,
             rx_grant_mask: RX_GRANT_MASK_RESET,
             irq_mask: 0,
             epon_status: 0,
             active_flags: 0,
             hw_state_status: 0,
+            special_0064: 0,
             trace: false,
-        }
+        };
+        me.apply_silicon_power_on();
+        me
     }
 
     /// Write a raw value into the LLID backing store at the given
@@ -244,7 +264,7 @@ impl EponMac {
         (slot, within)
     }
 
-    fn apply_warm_snapshot(&mut self) {
+    fn apply_silicon_power_on(&mut self) {
         for &(off, val) in super::mmio_init::SYSREG_INIT_VALUES {
             let abs = 0x0100_0000 + off;
             if !self.claims(abs) {
@@ -257,10 +277,11 @@ impl EponMac {
 
     fn write_store_no_side_effects(&mut self, addr: u32, val: u32) {
         match addr {
-            REG_CHIP_ID | REG_CHIP_REV | REG_MDIO_COMMAND | REG_SPECIAL_0064
+            REG_CHIP_ID | REG_CHIP_REV | REG_MDIO_COMMAND
             | REG_HW_STATE_STATUS => {
-                // Fixed / read-only values — ignore warm seed.
+                // Fixed / read-only values — ignore power-on seed.
             }
+            REG_SPECIAL_0064 => self.special_0064 = val,
             REG_MPCP_CMD_LATCH => self.mpcp_cmd_latch = val,
             REG_LLID_CAPTURE_MASK => self.llid_capture_mask = val,
             REG_LLID_ACTIVE_BITMAP => self.llid_active_bitmap = val,
@@ -319,7 +340,7 @@ impl Peripheral for EponMac {
             REG_EPON_STATUS => return Ok(self.epon_status),
             REG_ACTIVE_FLAGS => return Ok(self.active_flags),
             REG_MDIO_COMMAND => return Ok(0),
-            REG_SPECIAL_0064 => return Ok(0x5382_0000 | 0x0000_FFFF),
+            REG_SPECIAL_0064 => return Ok(self.special_0064),
             REG_HW_STATE_STATUS => return Ok(self.hw_state_status),
             _ => {}
         }
@@ -375,14 +396,7 @@ impl Peripheral for EponMac {
             REG_ACTIVE_FLAGS => return Ok(self.active_flags),
             REG_MDIO_COMMAND => return Ok(0),
             REG_HW_STATE_STATUS => return Ok(self.hw_state_status),
-            REG_SPECIAL_0064 => {
-                // Audit 5.12: shim returned (stored & 0xFFFF0000) | 0xFFFF.
-                // We now back this from the table-less store: upper half
-                // from the warm snapshot, lower half forced to 0xFFFF.
-                // Use a dedicated scratch slot so the firmware can read
-                // the warm-snapshot upper half reliably.
-                return Ok(0x5382_0000 | 0x0000_FFFF);
-            }
+            REG_SPECIAL_0064 => return Ok(self.special_0064),
             _ => {}
         }
 
@@ -476,7 +490,10 @@ impl Peripheral for EponMac {
                 self.hw_state_status = val;
                 return Ok(());
             }
-            REG_SPECIAL_0064 => return Ok(()),
+            REG_SPECIAL_0064 => {
+                self.special_0064 = val;
+                return Ok(());
+            }
             _ => {}
         }
 
@@ -535,23 +552,29 @@ impl Peripheral for EponMac {
         self.llid_store.fill(0);
         self.llid_irq_pending = [0; LLID_SLOT_COUNT];
         self.llid_drain_flag = [true; LLID_SLOT_COUNT];
-        self.mpcp_cmd_latch = 0;
+        self.mpcp_cmd_latch = MPCP_CMD_LATCH_RESET;
         self.mpcp_cmd_pending_clear = 0;
         self.llid_capture_mask = LLID_CAPTURE_MASK_RESET;
         self.llid_active_bitmap = LLID_ACTIVE_RESET;
         self.llid_mask_control = 0;
-        self.llid_counter_mask = 0;
+        self.llid_counter_mask = LLID_COUNTER_MASK_RESET;
         self.tx_grant_mask = 0;
         self.rx_grant_mask = RX_GRANT_MASK_RESET;
         self.irq_mask = 0;
         self.epon_status = 0;
         self.active_flags = 0;
         self.hw_state_status = 0;
+        self.special_0064 = 0;
+        // Apply silicon power-on snapshot (covers table_store /
+        // llid_store entries that aren't reset by individual fields).
+        self.apply_silicon_power_on();
     }
 
     fn reset_warm(&mut self) {
+        // Silicon power-on snapshot already covers warm reset state —
+        // the only difference is `STATUS32.E1/E2`, set in
+        // `boot_from_flash`. Closes deferral D6.
         self.reset_cold();
-        self.apply_warm_snapshot();
     }
 
     fn snapshot(&self) -> PeripheralSnapshot {
@@ -653,13 +676,22 @@ mod tests {
     }
 
     #[test]
-    fn warm_reset_seeds_rx_grant_mask() {
+    fn cold_reset_silicon_power_on_defaults() {
         let mut m = EponMac::new();
-        m.reset_warm();
-        // mmio_init.rs → 0x0030 = 0x0000FFFF
+        m.reset_cold();
+        // Silicon: RX_GRANT_MASK = 0x0000FFFF
         assert_eq!(m.read_word(REG_RX_GRANT_MASK).unwrap(), 0x0000_FFFF);
-        // 0x000C = 0x0114B820
-        assert_eq!(m.read_word(REG_LLID_CAPTURE_MASK).unwrap(), 0x0114_B820);
+        // Silicon: LLID_CAPTURE_MASK / PON_MODE = 0 (bit 15 would
+        // freeze silicon if set — see emu-sysreg-reset-values-wrong).
+        assert_eq!(m.read_word(REG_LLID_CAPTURE_MASK).unwrap(), 0);
+        // Silicon: LLID_ACTIVE_BITMAP = 0
+        assert_eq!(m.read_word(REG_LLID_ACTIVE_BITMAP).unwrap(), 0);
+        // Silicon: LLID_COUNTER_MASK = 0x00077FF7
+        assert_eq!(m.read_word(REG_LLID_COUNTER_MASK).unwrap(), 0x0007_7FF7);
+        // Silicon: MPCP_CMD_LATCH = 0x00015000
+        assert_eq!(m.read_word(REG_MPCP_CMD_LATCH).unwrap(), 0x0001_5000);
+        // Silicon: SPECIAL_0064 = 0
+        assert_eq!(m.read_word(REG_SPECIAL_0064).unwrap(), 0);
     }
 
     #[test]

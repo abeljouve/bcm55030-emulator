@@ -127,16 +127,6 @@ impl LaneState {
         }
     }
 
-    const fn warm() -> Self {
-        // Post-boot snapshot: lanes brought up, no RX loss, link OK.
-        Self {
-            enabled: true,
-            locked: true,
-            rx_los: false,
-            speed: LaneSpeed::Pon10G,
-            mdio_address: 0,
-        }
-    }
 }
 
 /// Ticks after enable before a lane auto-locks (~ matches the
@@ -255,7 +245,13 @@ impl SerDes {
         vec![0xFFu8; rx_len]
     }
 
-    fn apply_warm_snapshot(&mut self) {
+    fn apply_silicon_power_on(&mut self) {
+        // Silicon power-on values land in the backing stores; lanes
+        // remain disabled/unlocked because silicon shows
+        // LANE_BUS_EN=0 and LINK_LOCK_01/23=0 at power-on (verified
+        // 2026-04-29 via hardware probing — see
+        // `the design notes`). Reference
+        // firmware programs lane enables itself during init.
         for &(off, val) in super::mmio_init::SYSREG_INIT_VALUES {
             let abs = 0x0100_0000 + off;
             if (SERDES_MAIN_BASE..SERDES_MAIN_END).contains(&abs) {
@@ -268,9 +264,6 @@ impl SerDes {
                 let idx = Self::mode_idx(abs);
                 self.mode_store[idx] = val;
             }
-        }
-        for lane in &mut self.lanes {
-            *lane = LaneState::warm();
         }
     }
 }
@@ -410,11 +403,12 @@ impl Peripheral for SerDes {
         self.lanes = [LaneState::cold(); LANE_COUNT];
         self.window.fill(0);
         self.error_status = 0;
+        self.apply_silicon_power_on();
     }
 
     fn reset_warm(&mut self) {
+        // Silicon power-on snapshot already covers warm reset state.
         self.reset_cold();
-        self.apply_warm_snapshot();
     }
 
     fn snapshot(&self) -> PeripheralSnapshot {
@@ -510,19 +504,22 @@ mod tests {
     }
 
     #[test]
-    fn warm_reset_loads_lane_config() {
+    fn warm_reset_silicon_power_on_lanes_unlocked() {
         let mut s = SerDes::new();
         s.reset_warm();
-        // Warm mode assumes lanes are locked — bits 1 and 3 of link
-        // lock registers must be set.
-        assert_eq!(
-            s.read_word(0x0100_0194).unwrap() & LANE_LOCK_MASK_01,
-            LANE_LOCK_MASK_01
-        );
-        assert_eq!(
-            s.read_word(0x0100_01D4).unwrap() & LANE_LOCK_MASK_01,
-            LANE_LOCK_MASK_01
-        );
+        // Silicon power-on shows LANE_BUS_EN=0 and LINK_LOCK_01/23=0
+        // — lanes are unlocked at power-on. Reference firmware brings
+        // them up itself. See emu-sysreg-reset-values-wrong.
+        for l in &s.lanes {
+            assert!(!l.enabled);
+            assert!(!l.locked);
+        }
+        assert_eq!(s.read_word(0x0100_0194).unwrap() & LANE_LOCK_MASK_01, 0);
+        assert_eq!(s.read_word(0x0100_01D4).unwrap() & LANE_LOCK_MASK_01, 0);
+        // LANE01_RESET / LANE_BUS_EN must read zero — bit 15 of
+        // PON_MODE freezes silicon when set, so any non-zero seed
+        // here is a regression of this bug.
+        assert_eq!(s.read_word(0x0100_0180).unwrap(), 0);
     }
 
     #[test]
@@ -547,6 +544,13 @@ mod tests {
     fn inject_rx_los_drops_lock() {
         let mut s = SerDes::new();
         s.reset_warm();
+        // Silicon power-on shows lanes unlocked. Bring lane 0 up
+        // first (as reference firmware would), then inject RX LOS.
+        s.inject_event(&PeripheralEvent::SerDes(SerDesEvent::SetLaneEnabled(0, true)))
+            .unwrap();
+        s.inject_event(&PeripheralEvent::SerDes(SerDesEvent::SetLinkLocked(0, true)))
+            .unwrap();
+        assert!(s.lanes[0].locked);
         s.inject_event(&PeripheralEvent::SerDes(SerDesEvent::InjectRxLos(0, true)))
             .unwrap();
         assert!(s.lanes[0].rx_los);

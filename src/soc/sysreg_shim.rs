@@ -72,22 +72,29 @@ impl SysregShim {
         self.current_insn = insn;
     }
 
-    /// Cold reset. Zeroes the residual backing store.
+    /// Cold reset. Zeroes the residual backing store, then applies
+    /// the silicon power-on snapshot from `SYSREG_INIT_VALUES`. The
+    /// snapshot reflects values observed by `hardware probing` immediately
+    /// after stage-1 hands off to stage-2 — i.e. true silicon
+    /// defaults, not a post-boot snapshot.
     pub fn reset_cold(&mut self) {
         for slot in &mut self.sysreg_store {
             *slot = 0;
         }
-    }
-
-    /// Warm reset — apply `SYSREG_INIT_VALUES` on top of cold reset.
-    pub fn reset_warm(&mut self) {
-        self.reset_cold();
         for &(off, val) in super::mmio_init::SYSREG_INIT_VALUES {
             let idx = (off / 4) as usize;
             if idx < self.sysreg_store.len() {
                 self.sysreg_store[idx] = val;
             }
         }
+    }
+
+    /// Warm reset — silicon power-on values are already applied by
+    /// `reset_cold`. The cold/warm distinction lives in
+    /// `boot_from_flash` (which pre-sets `STATUS32.E1/E2` only in
+    /// warm mode).
+    pub fn reset_warm(&mut self) {
+        self.reset_cold();
     }
 
     /// No-op tick. The shim no longer owns any tick-driven state

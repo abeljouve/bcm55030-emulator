@@ -98,7 +98,7 @@ impl Mpcp {
         None
     }
 
-    fn apply_warm_snapshot(&mut self) {
+    fn apply_silicon_power_on(&mut self) {
         for &(off, val) in super::mmio_init::SYSREG_INIT_VALUES {
             let abs = 0x0100_0000 + off;
             if let Some((region, idx)) = self.locate(abs) {
@@ -137,11 +137,12 @@ impl Peripheral for Mpcp {
         for store in &mut self.stores {
             store.fill(0);
         }
+        self.apply_silicon_power_on();
     }
 
     fn reset_warm(&mut self) {
+        // Silicon power-on snapshot already applied in `reset_cold`.
         self.reset_cold();
-        self.apply_warm_snapshot();
     }
 
     fn snapshot(&self) -> PeripheralSnapshot {

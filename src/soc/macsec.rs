@@ -151,7 +151,7 @@ impl Macsec {
         }
     }
 
-    fn apply_warm_snapshot(&mut self) {
+    fn apply_silicon_power_on(&mut self) {
         for &(off, val) in super::mmio_init::SYSREG_INIT_VALUES {
             let abs = 0x0100_0000 + off;
             if (MACSEC_SA_BASE..MACSEC_SA_END).contains(&abs) {
@@ -252,11 +252,12 @@ impl Peripheral for Macsec {
         self.key_tail_pending_clear.fill(0);
         self.pn_overflow_mask = 0;
         self.fatal_error_mask = 0;
+        self.apply_silicon_power_on();
     }
 
     fn reset_warm(&mut self) {
+        // Silicon power-on snapshot already applied in `reset_cold`.
         self.reset_cold();
-        self.apply_warm_snapshot();
     }
 
     fn snapshot(&self) -> PeripheralSnapshot {

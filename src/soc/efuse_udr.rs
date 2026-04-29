@@ -81,7 +81,7 @@ impl EfuseUdr {
         matches!(word, REG_I2C_UDR_CLK_RESET | REG_I2C_UDR_SDA | REG_I2C_UDR_SCL)
     }
 
-    fn apply_warm_snapshot(&mut self) {
+    fn apply_silicon_power_on(&mut self) {
         for &(off, val) in super::mmio_init::SYSREG_INIT_VALUES {
             let abs = 0x0100_0000 + off;
             match abs {
@@ -184,11 +184,12 @@ impl Peripheral for EfuseUdr {
         self.sda_clear = 0;
         self.scl_clear = 0;
         self.clock_toggles = 0;
+        self.apply_silicon_power_on();
     }
 
     fn reset_warm(&mut self) {
+        // Silicon power-on snapshot already applied in `reset_cold`.
         self.reset_cold();
-        self.apply_warm_snapshot();
     }
 
     fn snapshot(&self) -> PeripheralSnapshot {
