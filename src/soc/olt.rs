@@ -109,6 +109,11 @@ const OAM_KEEPALIVE_INTERVAL_TICKS: u64 = 20_000;
 /// Ticks between periodic GATE frames.
 const GATE_INTERVAL_TICKS: u64 = 30_000;
 
+/// Delay before link_up activates after olt_enable. Lets the firmware
+/// complete boot and SerDes init before seeing PHY link-change events.
+/// ~900K ticks × 64 insns/tick ≈ 57M insns (just after boot).
+const LINK_UP_DELAY_TICKS: u64 = 900_000;
+
 /// Delay (in ticks) before responding to a REGISTER_REQ with REGISTER.
 const REGISTER_RESPONSE_DELAY_TICKS: u64 = 100;
 
@@ -258,8 +263,9 @@ pub struct Olt {
     /// auto-starts MPCP discovery once the link is up.
     pub link_up: bool,
     /// One-shot flag: set when link_up transitions to true.
-    /// Consumed by the bank tick to set bit 6 in PHY link status register.
     pub link_change_pending: bool,
+    /// Countdown before link_up activates (0 = immediate or already fired).
+    pub link_up_delay: u64,
 
     // ── DMA mailbox state ──────────────────────────────────────────
     /// Per-word_index bitmap values. When non-zero, the firmware's
@@ -294,6 +300,7 @@ impl Olt {
             rx_log: VecDeque::new(),
             link_up: false,
             link_change_pending: false,
+            link_up_delay: 0,
             mailbox_bitmap: [0; 8],
             mailbox_fifo: VecDeque::new(),
             mailbox_pending: VecDeque::new(),
@@ -308,9 +315,11 @@ impl Olt {
             eprintln!("[OLT] Enabled — OLT MAC {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
                 self.config.mac[0], self.config.mac[1], self.config.mac[2],
                 self.config.mac[3], self.config.mac[4], self.config.mac[5]);
-            self.set_link_up(true);
+            eprintln!("[OLT] link_up deferred — fires after {} ticks", LINK_UP_DELAY_TICKS);
+            self.link_up_delay = LINK_UP_DELAY_TICKS;
         } else {
             self.set_link_up(false);
+            self.link_up_delay = 0;
             eprintln!("[OLT] Disabled");
         }
     }
@@ -814,6 +823,12 @@ impl Peripheral for Olt {
     }
 
     fn tick(&mut self, _cpu_instructions: u64) {
+        if self.link_up_delay > 0 {
+            self.link_up_delay -= 1;
+            if self.link_up_delay == 0 {
+                self.set_link_up(true);
+            }
+        }
         self.advance();
     }
 
