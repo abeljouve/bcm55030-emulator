@@ -1,51 +1,31 @@
 //! BCM55030 Broadcom Serial Controller (BSC) I²C master.
 //!
-//! The BSC is the on-chip I²C master that talks to the SFP EEPROM
-//! (devices `0xA0` and `0xA2`) at MMIO offsets:
+//! Lane 0 of the lane state table indirect bus. Talks to the SFP
+//! EEPROM (devices `0xA0` and `0xA2`) at MMIO offsets:
 //!
-//!   * `0x01000140` — CMD register. Bit 28 = sub-addr latch, bit 27 =
-//!     read trigger. Bits[26:18] = `(0x100 + word_idx)`. Bits[6:0] =
-//!     I2C slave address (0x50 = A0h, 0x51 = A2h). Bits[31:27]
-//!     auto-clear after the command is latched.
-//!   * `0x0100014C` — DATA register. Write: sets EEPROM sub-address for
-//!     the next CMD latch. Read: returns 4-byte result of last word read.
-//!   * `0x01000150` — STAT register. Bit 31 = busy. A write with bit 22
-//!     set arms a burst read; byte_count in bits[13:3].
+//!   * `0x01000140` — CMD register (lane_base + 0x48)
+//!   * `0x0100014C` — DATA register (lane_base + 0x54)
+//!   * `0x01000150` — STAT register (lane_base + 0x58)
 //!
-//! Protocol (matches silicon):
-//!   1. DATA ← sub_addr
-//!   2. CMD latch (bit 28) → latches sub_addr, goes busy
-//!   3. STAT arm (bit 22, byte_count) → arms burst, sets EEPROM pointer
-//!   4. CMD read triggers (bit 27) → sequential words from pointer
-//!   5. After byte_count bytes, protocol returns to Idle
-//!
-//! Reads without proper init (latch + arm) return stale data.
+//! Uses the shared `LaneBus` for CMD/DATA/STAT protocol.
 
 use crate::cpu::exception::Exception;
+use crate::soc::lane_bus::LaneBus;
 use crate::soc::peripheral::{
     AddressRange, BscEvent, BscSnapshot, Peripheral, PeripheralError, PeripheralEvent,
     PeripheralSnapshot, SfpSnapshot,
 };
 use crate::soc::sfp_eeprom::SfpEeprom;
 
+/// Lane 0 base in the lane state table.
+const LANE0_BASE: u32 = 0x0100_00F8;
+
 pub const BSC_BASE: u32 = 0x01000140;
 pub const BSC_END: u32 = 0x01000158;
 
-const REG_CMD: u32 = 0x140;
-const REG_BASE_ADDR: u32 = 0x14C;
-const REG_STATUS: u32 = 0x150;
-
 const BSC_RANGES: &[AddressRange] = &[AddressRange::new(BSC_BASE, BSC_END)];
 
-/// Number of bank ticks the busy bit stays asserted after a command.
 const BSC_BUSY_TICKS: u8 = 2;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum BusState {
-    Idle,
-    Busy,
-    Done,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProtocolState {
@@ -57,8 +37,10 @@ enum ProtocolState {
 #[derive(Clone)]
 pub struct BscI2c {
     pub sfp: SfpEeprom,
-    state: BusState,
-    busy_counter: u8,
+    pub bus: LaneBus,
+    /// Backing store for intermediate addresses (0x144, 0x148, 0x154)
+    /// that fall between CMD/DATA/STAT in the BSC range.
+    aux_store: [u32; 3],
     protocol: ProtocolState,
     pending_sub_addr: u16,
     sub_addr: u16,
@@ -68,15 +50,14 @@ pub struct BscI2c {
     last_device: u8,
     pending_read_word: u32,
     force_nack: bool,
-    raw_store: [u32; 6],
 }
 
 impl BscI2c {
     pub fn new() -> Self {
         Self {
             sfp: SfpEeprom::new_default(),
-            state: BusState::Idle,
-            busy_counter: 0,
+            bus: LaneBus::new(LANE0_BASE, BSC_BUSY_TICKS),
+            aux_store: [0; 3],
             protocol: ProtocolState::Idle,
             pending_sub_addr: 0,
             sub_addr: 0,
@@ -86,7 +67,6 @@ impl BscI2c {
             last_device: 0,
             pending_read_word: 0,
             force_nack: false,
-            raw_store: [0u32; 6],
         }
     }
 
@@ -95,17 +75,15 @@ impl BscI2c {
         (BSC_BASE..BSC_END).contains(&addr)
     }
 
-    fn store_idx(&self, offset: u32) -> Option<usize> {
-        if offset >= 0x140 && offset < 0x158 {
-            Some(((offset - 0x140) / 4) as usize)
-        } else {
-            None
+    fn aux_idx(addr: u32) -> Option<usize> {
+        match addr {
+            0x0100_0144 => Some(0),
+            0x0100_0148 => Some(1),
+            0x0100_0154 => Some(2),
+            _ => None,
         }
     }
 
-    /// Build a snapshot of the owned SFP EEPROM's display state. The
-    /// bank exposes this as a separate peripheral row so the UI can
-    /// render an "SFP DDM" tab without reaching into BSC internals.
     pub fn sfp_snapshot(&self) -> PeripheralSnapshot {
         PeripheralSnapshot::Sfp(SfpSnapshot {
             vendor: self.sfp.vendor_name(),
@@ -126,8 +104,7 @@ impl BscI2c {
         if cmd_hi & 2 != 0 {
             self.sub_addr = self.pending_sub_addr;
             self.protocol = ProtocolState::SubAddrLatched;
-            self.state = BusState::Busy;
-            self.busy_counter = BSC_BUSY_TICKS;
+            self.bus.go_busy();
         } else if cmd_hi & 1 != 0 {
             if matches!(self.protocol, ProtocolState::Armed) && self.bytes_read < self.byte_count
             {
@@ -142,13 +119,11 @@ impl BscI2c {
                     self.protocol = ProtocolState::Idle;
                 }
             }
-            self.state = BusState::Busy;
-            self.busy_counter = BSC_BUSY_TICKS;
+            self.bus.go_busy();
         }
 
-        if let Some(i) = self.store_idx(REG_CMD) {
-            self.raw_store[i] = val & 0x07FF_FFFF;
-        }
+        // BSC clears cmd bits immediately (not deferred like other lanes).
+        self.bus.clear_cmd_bits_now();
     }
 }
 
@@ -162,107 +137,72 @@ impl Peripheral for BscI2c {
     }
 
     fn peek_word(&self, addr: u32) -> Result<u32, Exception> {
-        let off = addr - 0x01000000;
-        match off {
-            REG_CMD => Ok(self
-                .store_idx(REG_CMD)
-                .map(|i| self.raw_store[i])
-                .unwrap_or(0)),
-            REG_BASE_ADDR => Ok(self.pending_read_word),
-            REG_STATUS => {
-                let mut val = self
-                    .store_idx(REG_STATUS)
-                    .map(|i| self.raw_store[i])
-                    .unwrap_or(0);
-                if matches!(self.state, BusState::Busy) {
-                    val |= 0x8000_0000;
-                } else {
-                    val &= !0x8000_0000;
-                }
-                Ok(val)
-            }
-            _ => Ok(self
-                .store_idx(off)
-                .map(|i| self.raw_store[i])
-                .unwrap_or(0)),
+        if addr == self.bus.cmd_addr {
+            Ok(self.bus.peek_cmd())
+        } else if addr == self.bus.data_addr {
+            Ok(self.pending_read_word)
+        } else if addr == self.bus.stat_addr {
+            Ok(self.bus.read_stat())
+        } else if let Some(i) = Self::aux_idx(addr) {
+            Ok(self.aux_store[i])
+        } else {
+            Ok(0)
         }
     }
 
     fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
-        let off = addr - 0x01000000;
-        match off {
-            REG_CMD => Ok(self
-                .store_idx(REG_CMD)
-                .map(|i| self.raw_store[i])
-                .unwrap_or(0)),
-            REG_BASE_ADDR => {
-                if matches!(self.state, BusState::Done) {
-                    self.state = BusState::Idle;
-                }
-                Ok(self.pending_read_word)
+        if addr == self.bus.cmd_addr {
+            Ok(self.bus.read_cmd())
+        } else if addr == self.bus.data_addr {
+            if self.bus.is_done() {
+                self.bus.set_idle();
             }
-            REG_STATUS => {
-                let mut val = self
-                    .store_idx(REG_STATUS)
-                    .map(|i| self.raw_store[i])
-                    .unwrap_or(0);
-                if matches!(self.state, BusState::Busy) {
-                    val |= 0x8000_0000;
-                } else {
-                    val &= !0x8000_0000;
-                }
-                Ok(val)
-            }
-            _ => Ok(self
-                .store_idx(off)
-                .map(|i| self.raw_store[i])
-                .unwrap_or(0)),
+            Ok(self.pending_read_word)
+        } else if addr == self.bus.stat_addr {
+            Ok(self.bus.read_stat())
+        } else if let Some(i) = Self::aux_idx(addr) {
+            Ok(self.aux_store[i])
+        } else {
+            Ok(0)
         }
     }
 
     fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
-        let off = addr - 0x01000000;
-        if let Some(i) = self.store_idx(off) {
-            self.raw_store[i] = val;
+        if let Some(i) = Self::aux_idx(addr) {
+            self.aux_store[i] = val;
+            return Ok(());
         }
-        match off {
-            REG_CMD => self.issue_command(val),
-            REG_BASE_ADDR => self.pending_sub_addr = (val & 0xFFFF) as u16,
-            REG_STATUS => {
-                if let Some(i) = self.store_idx(REG_STATUS) {
-                    self.raw_store[i] = val & !1;
-                }
-                if val & 0x0040_0000 != 0
-                    && matches!(self.protocol, ProtocolState::SubAddrLatched)
-                {
-                    let bc = ((val >> 3) & 0x7FF) as u16;
-                    if bc > 0 {
-                        self.byte_count = bc;
-                        self.eeprom_ptr = self.sub_addr;
-                        self.bytes_read = 0;
-                        self.protocol = ProtocolState::Armed;
-                        self.state = BusState::Busy;
-                        self.busy_counter = BSC_BUSY_TICKS;
-                    }
+        if addr == self.bus.cmd_addr {
+            self.bus.write_cmd(val);
+            self.issue_command(val);
+        } else if addr == self.bus.data_addr {
+            self.bus.write_data(val);
+            self.pending_sub_addr = (val & 0xFFFF) as u16;
+        } else if addr == self.bus.stat_addr {
+            self.bus.write_stat(val);
+            if val & 0x0040_0000 != 0
+                && matches!(self.protocol, ProtocolState::SubAddrLatched)
+            {
+                let bc = ((val >> 3) & 0x7FF) as u16;
+                if bc > 0 {
+                    self.byte_count = bc;
+                    self.eeprom_ptr = self.sub_addr;
+                    self.bytes_read = 0;
+                    self.protocol = ProtocolState::Armed;
+                    self.bus.go_busy();
                 }
             }
-            _ => {}
         }
         Ok(())
     }
 
     fn tick(&mut self, _cpu_instructions: u64) {
-        if matches!(self.state, BusState::Busy) && self.busy_counter > 0 {
-            self.busy_counter -= 1;
-            if self.busy_counter == 0 {
-                self.state = BusState::Done;
-            }
-        }
+        self.bus.tick();
     }
 
     fn reset_cold(&mut self) {
-        self.state = BusState::Idle;
-        self.busy_counter = 0;
+        self.bus.reset();
+        self.aux_store = [0; 3];
         self.protocol = ProtocolState::Idle;
         self.pending_sub_addr = 0;
         self.sub_addr = 0;
@@ -272,24 +212,13 @@ impl Peripheral for BscI2c {
         self.last_device = 0;
         self.pending_read_word = 0;
         self.force_nack = false;
-        self.raw_store = [0u32; 6];
-        // Silicon power-on snapshot for the BSC backing store.
-        // Verified 2026-04-29 via hardware probing — see
-        // `the design notes`.
-        for &(off, val) in super::mmio_init::SYSREG_INIT_VALUES {
-            let abs = 0x0100_0000 + off;
-            if (BSC_BASE..BSC_END).contains(&abs) {
-                if let Some(i) = self.store_idx(abs - 0x0100_0000) {
-                    self.raw_store[i] = val;
-                }
-            }
-        }
+        self.bus.apply_init(super::mmio_init::SYSREG_INIT_VALUES);
         self.sfp.reset_to_snapshot();
     }
 
     fn snapshot(&self) -> PeripheralSnapshot {
         PeripheralSnapshot::Bsc(BscSnapshot {
-            busy: matches!(self.state, BusState::Busy),
+            busy: self.bus.is_busy(),
             last_device_addr: if self.last_device == 0 { 0xA0 } else { 0xA2 },
             last_word_addr: self.eeprom_ptr,
         })
@@ -302,12 +231,10 @@ impl Peripheral for BscI2c {
                 Ok(())
             }
             PeripheralEvent::Bsc(BscEvent::Reset) => {
-                self.state = BusState::Idle;
-                self.busy_counter = 0;
+                self.bus.set_idle();
                 Ok(())
             }
             PeripheralEvent::Sfp(_) => {
-                // Forward DDM/identity edits to the SFP sub-device.
                 use crate::soc::peripheral::SfpEvent;
                 if let PeripheralEvent::Sfp(ev) = event {
                     match ev {
@@ -360,12 +287,10 @@ mod tests {
     fn device_select_from_slave_addr_bit0() {
         let mut bsc = BscI2c::new();
         bsc.write_word(0x0100014C, 0x0000_0050).unwrap();
-        // slave addr 0x51 (A2h) → bit 0 = 1 → device 1
         let cmd = (1u32 << 27) | (0x100u32 << 18) | 0x51;
         bsc.write_word(0x01000140, cmd).unwrap();
         assert_eq!(bsc.last_device, 1);
 
-        // slave addr 0x50 (A0h) → bit 0 = 0 → device 0
         let cmd2 = (1u32 << 27) | (0x100u32 << 18) | 0x50;
         bsc.write_word(0x01000140, cmd2).unwrap();
         assert_eq!(bsc.last_device, 0);
