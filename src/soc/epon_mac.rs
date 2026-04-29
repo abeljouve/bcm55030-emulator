@@ -110,6 +110,10 @@ const REG_SPECIAL_0064: u32 = 0x0100_0064;
 /// pattern matches MPCP LLID control (block 22) but the offset is
 /// not documented.
 const REG_MPCP_CMD_LATCH: u32 = 0x0100_0160;
+/// EPON discovery status. Bit 2 = OLT discovery detected, bit 1 =
+/// discovery change. W1C for bits[2:1]. `mpcp_epon_get_status` returns
+/// true when `(val & 6) == 4` (bit 2 set, bit 1 clear).
+const REG_DISCOVERY_STATUS: u32 = 0x0100_1040;
 
 /// LLID 0/31 anchor registers — the HW clears bit 0 on every write.
 /// The firmware programs the rest of the bitfields; bit 0 is the
@@ -168,6 +172,7 @@ pub struct EponMac {
     epon_status: u32,
     active_flags: u32,
     hw_state_status: u32,
+    discovery_status: u32,
     /// REG_SPECIAL_0064 backing store. Silicon power-on is zero —
     /// the previous shim returned 0x5382_FFFF unconditionally, which
     /// did not match real silicon (verified 2026-04-29 via hardware probing).
@@ -198,6 +203,7 @@ impl EponMac {
             epon_status: 0,
             active_flags: 0,
             hw_state_status: 0,
+            discovery_status: 0,
             special_0064: 0,
             trace: false,
         };
@@ -209,6 +215,18 @@ impl EponMac {
     /// absolute MMIO address. Used by the OLT emulator to inject
     /// bitmap bits and mailbox data into the EPON MAC's address space
     /// without going through the normal write_word side-effect path.
+    /// Set the 10G PHY link status bit (bit 6 of REG_HW_STATE_STATUS).
+    /// Called by the bank tick when the OLT link change event fires.
+    pub fn set_phy_link_status_bit(&mut self) {
+        self.hw_state_status |= 0x40;
+    }
+
+    /// Set bit 2 of REG_DISCOVERY_STATUS (OLT discovery detected).
+    /// Called by the bank tick when the OLT is enabled and link is up.
+    pub fn set_discovery_status_bit(&mut self) {
+        self.discovery_status |= 0x4;
+    }
+
     pub fn poke_llid_store(&mut self, addr: u32, val: u32) {
         if (EPON_LLID_BASE..EPON_LLID_TOP).contains(&addr) {
             let idx = Self::llid_idx(addr);
@@ -240,7 +258,7 @@ impl EponMac {
             | REG_LLID_MASK_CONTROL | REG_LLID_COUNTER_MASK | REG_TX_GRANT_MASK
             | REG_RX_GRANT_MASK | REG_IRQ_MASK | REG_EPON_STATUS | REG_ACTIVE_FLAGS
             | REG_MDIO_COMMAND | REG_SPECIAL_0064 | REG_MPCP_CMD_LATCH
-            | REG_HW_STATE_STATUS => true,
+            | REG_HW_STATE_STATUS | REG_DISCOVERY_STATUS => true,
             _ => {
                 (EPON_TABLE_BASE..EPON_TABLE_END).contains(&addr)
                     || (EPON_LLID_BASE..EPON_LLID_TOP).contains(&addr)
@@ -342,6 +360,7 @@ impl Peripheral for EponMac {
             REG_MDIO_COMMAND => return Ok(0),
             REG_SPECIAL_0064 => return Ok(self.special_0064),
             REG_HW_STATE_STATUS => return Ok(self.hw_state_status),
+            REG_DISCOVERY_STATUS => return Ok(self.discovery_status),
             _ => {}
         }
         if (EPON_LLID_BASE..EPON_LLID_TOP).contains(&addr) {
@@ -397,6 +416,7 @@ impl Peripheral for EponMac {
             REG_MDIO_COMMAND => return Ok(0),
             REG_HW_STATE_STATUS => return Ok(self.hw_state_status),
             REG_SPECIAL_0064 => return Ok(self.special_0064),
+            REG_DISCOVERY_STATUS => return Ok(self.discovery_status),
             _ => {}
         }
 
@@ -487,11 +507,17 @@ impl Peripheral for EponMac {
             }
             REG_MDIO_COMMAND => return Ok(()),
             REG_HW_STATE_STATUS => {
-                self.hw_state_status = val;
+                // W1C: bits written as 1 are cleared.
+                self.hw_state_status &= !val;
                 return Ok(());
             }
             REG_SPECIAL_0064 => {
                 self.special_0064 = val;
+                return Ok(());
+            }
+            REG_DISCOVERY_STATUS => {
+                // W1C for bits[2:1].
+                self.discovery_status &= !(val & 0x6);
                 return Ok(());
             }
             _ => {}
@@ -564,6 +590,7 @@ impl Peripheral for EponMac {
         self.epon_status = 0;
         self.active_flags = 0;
         self.hw_state_status = 0;
+        self.discovery_status = 0;
         self.special_0064 = 0;
         // Apply silicon power-on snapshot (covers table_store /
         // llid_store entries that aren't reset by individual fields).

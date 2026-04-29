@@ -314,6 +314,13 @@ impl PeripheralBank {
         // firmware issues a CMD write and the frame moves to the FIFO,
         // the bitmap clears so the firmware doesn't try to read a
         // second non-existent frame.
+        if self.olt.link_change_pending {
+            self.olt.link_change_pending = false;
+            self.epon_mac.set_phy_link_status_bit();
+        }
+        if self.olt.config.enabled && self.olt.link_up {
+            self.epon_mac.set_discovery_status_bit();
+        }
         if self.olt.config.enabled {
             let bmp = if !self.olt.mailbox_pending.is_empty() {
                 0xFFFF_FFFFu32

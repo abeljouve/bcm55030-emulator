@@ -253,7 +253,10 @@ pub struct Olt {
 
     /// Whether the PHY link has been detected as up. The OLT
     /// auto-starts MPCP discovery once the link is up.
-    link_up: bool,
+    pub link_up: bool,
+    /// One-shot flag: set when link_up transitions to true.
+    /// Consumed by the bank tick to set bit 6 in PHY link status register.
+    pub link_change_pending: bool,
 
     // ── DMA mailbox state ──────────────────────────────────────────
     /// Per-word_index bitmap values. When non-zero, the firmware's
@@ -287,6 +290,7 @@ impl Olt {
             tx_log: VecDeque::new(),
             rx_log: VecDeque::new(),
             link_up: false,
+            link_change_pending: false,
             mailbox_bitmap: [0; 8],
             mailbox_fifo: VecDeque::new(),
             mailbox_pending: VecDeque::new(),
@@ -488,6 +492,7 @@ impl Olt {
     pub fn set_link_up(&mut self, up: bool) {
         if self.link_up != up {
             self.link_up = up;
+            self.link_change_pending = true;
             if up && self.config.enabled {
                 eprintln!("[OLT] PHY link up — starting MPCP discovery");
                 self.mpcp_state = OltMpcpState::Idle;
