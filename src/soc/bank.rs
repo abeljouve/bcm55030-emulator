@@ -895,6 +895,12 @@ impl PeripheralBank {
         if self.mpcp_bus.claims(addr) {
             if addr == self.mpcp_bus.cmd_addr {
                 self.mpcp_bus.write_cmd(val);
+                // Immediate clear: firmware reads CMD via D-cache so the
+                // deferred clear path (on read_cmd) is never reached.
+                self.mpcp_bus.clear_cmd_bits_now();
+                self.pending_cache_inv.push(
+                    DatapathOp::CacheInvalidate { addr },
+                );
             } else if addr == self.mpcp_bus.data_addr {
                 self.mpcp_bus.write_data(val);
             } else {

@@ -46,13 +46,15 @@ fn residual_sysreg_is_plain_backing_store() {
 /// where the single dependent firmware path polls it.
 #[test]
 fn epon_mac_mpcp_cmd_latch_autoclears_on_second_read() {
+    // MPCP CMD LATCH (lane 8) now uses immediate clear — cmd bits
+    // are cleared on write, not deferred to the next read. The
+    // firmware reads CMD via the D-cache so deferred clear would
+    // never fire.
     let mut bank = PeripheralBank::new(BootMode::Cold);
     let addr = 0x0100_0160;
     bank.write_word(addr, 0xF800_00AA).unwrap();
     let first = bank.read_word(addr).unwrap();
-    assert_eq!(first, 0xF800_00AA);
-    let second = bank.read_word(addr).unwrap();
-    assert_eq!(second, 0x0000_00AA);
+    assert_eq!(first, 0x0000_00AA, "cmd bits cleared immediately on write");
 }
 
 /// Half / byte accesses at sub-word offsets of an epon_mac register
