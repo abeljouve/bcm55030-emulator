@@ -181,6 +181,8 @@ pub struct OltConfig {
     pub oam_interval_ticks: u64,
     /// GATE interval in bank ticks.
     pub gate_interval_ticks: u64,
+    /// ONU MAC override for synthesized TX frames.
+    pub onu_mac_override: Option<[u8; 6]>,
 }
 
 impl Default for OltConfig {
@@ -191,6 +193,7 @@ impl Default for OltConfig {
             llid_start: DEFAULT_LLID,
             oam_interval_ticks: OAM_KEEPALIVE_INTERVAL_TICKS,
             gate_interval_ticks: GATE_INTERVAL_TICKS,
+            onu_mac_override: None,
         }
     }
 }
@@ -225,7 +228,7 @@ pub struct Olt {
     /// Assigned LLID for the registered ONU.
     assigned_llid: u16,
     /// Running MPCP timestamp (incremented each tick).
-    mpcp_timestamp: u32,
+    pub mpcp_timestamp: u32,
 
     /// Tick counter since the OLT was enabled.
     ticks_elapsed: u64,
@@ -501,6 +504,20 @@ impl Olt {
     }
 
     // ── MPCP TX handling (ONU → OLT) ────────────────────────────────
+
+    /// Process a frame transmitted by the firmware's burst controller.
+    pub fn handle_tx_frame(&mut self, frame: &[u8]) {
+        if frame.len() < 14 {
+            return;
+        }
+        let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+        if ethertype == 0x8808 {
+            let desc = self.handle_mpcp_tx(frame);
+            self.log_tx_frame(frame, &desc);
+        } else {
+            self.log_tx_frame(frame, "non-MPCP TX");
+        }
+    }
 
     fn handle_mpcp_tx(&mut self, frame: &[u8]) -> String {
         if frame.len() < 16 {

@@ -406,6 +406,40 @@ impl PeripheralBank {
         self.current_insn = 0;
     }
 
+    /// Burst controller trigger: the firmware pulsed bit 11 of
+    /// PON_LANE_CONFIG_GRP1 (0x010001B0). On real silicon this fires
+    /// whatever MPCP frame is programmed in the TX registers. The
+    /// emulator synthesizes the frame and delivers it to the OLT model.
+    fn handle_mpcp_burst_trigger(&mut self) {
+        if !self.olt.link_up {
+            return;
+        }
+        let onu_mac = self.olt.config.onu_mac_override.unwrap_or([0x02, 0x00, 0x00, 0x01, 0x02, 0x03]);
+        let ts = self.olt.mpcp_timestamp;
+        let mut frame = Vec::with_capacity(64);
+        // DA: slow protocol multicast (IEEE 802.3ah)
+        frame.extend_from_slice(&[0x01, 0x80, 0xC2, 0x00, 0x00, 0x01]);
+        // SA: ONU MAC
+        frame.extend_from_slice(&onu_mac);
+        // EtherType: 0x8808 (MPCP)
+        frame.extend_from_slice(&[0x88, 0x08]);
+        // Opcode: 0x0004 (REGISTER_REQ)
+        frame.extend_from_slice(&[0x00, 0x04]);
+        // Timestamp (4 bytes BE)
+        frame.extend_from_slice(&ts.to_be_bytes());
+        // Pending grants: 0
+        frame.push(0x00);
+        // Flags + padding to 64 bytes minimum
+        while frame.len() < 64 {
+            frame.push(0x00);
+        }
+        eprintln!(
+            "[BCM55030] MPCP burst trigger — synthesized REGISTER_REQ ({} bytes, ONU MAC {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X})",
+            frame.len(), onu_mac[0], onu_mac[1], onu_mac[2], onu_mac[3], onu_mac[4], onu_mac[5]
+        );
+        self.olt.handle_tx_frame(&frame);
+    }
+
     /// Update the CPU context fields in one shot. Called by `Cpu::step()`
     /// before every MMIO access so trace entries can show the touching
     /// PC / blink / insn count.
@@ -803,6 +837,17 @@ impl PeripheralBank {
             self.vlan_lue.write_word(addr, val)?;
             self.record_history(addr, val, "write", "word", "vlan_lue");
             self.seq_emit(addr, val, "w", "word", "vlan_lue");
+            return Ok(());
+        }
+        if addr == 0x0100_01B0 && self.olt.config.enabled {
+            let old = self.sysreg.read_word(addr).unwrap_or(0);
+            let rising = (val & 0x800) != 0 && (old & 0x800) == 0;
+            self.sysreg.write_word(addr, val)?;
+            if rising {
+                self.handle_mpcp_burst_trigger();
+            }
+            self.record_history(addr, val, "write", "word", "sysreg");
+            self.seq_emit(addr, val, "w", "word", "sysreg");
             return Ok(());
         }
         if self.sysreg.claims(addr) { dispatch_ww!(self.sysreg, "sysreg"); }
