@@ -423,12 +423,28 @@ impl PeripheralBank {
     /// PON_LANE_CONFIG_GRP1 (0x010001B0). On real silicon this fires
     /// whatever MPCP frame is programmed in the TX registers. The
     /// emulator synthesizes the frame and delivers it to the OLT model.
+    /// Burst controller trigger: the firmware pulsed bit 11 of
+    /// PON_LANE_CONFIG_GRP1 (0x010001B0). Build the MPCP frame from
+    /// the lane 8 indirect register file and deliver to the OLT.
     fn handle_mpcp_burst_trigger(&mut self) {
         if !self.olt.link_up {
             return;
         }
-        let onu_mac = self.olt.config.onu_mac_override.unwrap_or([0x02, 0x00, 0x00, 0x01, 0x02, 0x03]);
+        // Read MPCP TX config from lane 8 indirect register file.
+        // Regs 0x50-0x53 are programmed by mpcp_build_register_frame.
+        let reg50 = self.mpcp_bus.reg(0x50);
+        let reg51 = self.mpcp_bus.reg(0x51);
+        let _reg52 = self.mpcp_bus.reg(0x52);
+
+        // Determine MPCP opcode from reg 0x51 grant flags.
+        // Bit 4 = discovery_info present → REGISTER_REQ (opcode 4).
+        // Otherwise default to REGISTER_REQ for now.
+        let opcode: u16 = if reg51 & 0x10 != 0 || reg50 == 0 { 0x0004 } else { 0x0004 };
+
+        let onu_mac = self.olt.config.onu_mac_override
+            .unwrap_or([0x02, 0x00, 0x00, 0x01, 0x02, 0x03]);
         let ts = self.olt.mpcp_timestamp;
+
         let mut frame = Vec::with_capacity(64);
         // DA: slow protocol multicast (IEEE 802.3ah)
         frame.extend_from_slice(&[0x01, 0x80, 0xC2, 0x00, 0x00, 0x01]);
@@ -436,19 +452,19 @@ impl PeripheralBank {
         frame.extend_from_slice(&onu_mac);
         // EtherType: 0x8808 (MPCP)
         frame.extend_from_slice(&[0x88, 0x08]);
-        // Opcode: 0x0004 (REGISTER_REQ)
-        frame.extend_from_slice(&[0x00, 0x04]);
+        // Opcode
+        frame.extend_from_slice(&opcode.to_be_bytes());
         // Timestamp (4 bytes BE)
         frame.extend_from_slice(&ts.to_be_bytes());
-        // Pending grants: 0
-        frame.push(0x00);
-        // Flags + padding to 64 bytes minimum
+        // Pending grants + flags + padding to 64 bytes
         while frame.len() < 64 {
             frame.push(0x00);
         }
+
         eprintln!(
-            "[BCM55030] MPCP burst trigger — synthesized REGISTER_REQ ({} bytes, ONU MAC {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X})",
-            frame.len(), onu_mac[0], onu_mac[1], onu_mac[2], onu_mac[3], onu_mac[4], onu_mac[5]
+            "[BCM55030] MPCP burst trigger — opcode 0x{:04X}, reg50=0x{:02X} reg51=0x{:02X}, ONU MAC {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            opcode, reg50, reg51,
+            onu_mac[0], onu_mac[1], onu_mac[2], onu_mac[3], onu_mac[4], onu_mac[5]
         );
         self.olt.handle_tx_frame(&frame);
     }

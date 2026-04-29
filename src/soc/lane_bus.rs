@@ -21,6 +21,9 @@ pub enum BusState {
     Done,
 }
 
+/// Indirect register file capacity (512 entries, 9-bit index).
+const INDIRECT_REG_COUNT: usize = 512;
+
 #[derive(Clone, Debug)]
 pub struct LaneBus {
     pub cmd_addr: u32,
@@ -35,6 +38,11 @@ pub struct LaneBus {
     busy_counter: u8,
     busy_ticks: u8,
     cmd_pending_clear: u32,
+
+    /// Indirect register file. CMD writes with cmd=2 (bit 28) store
+    /// DATA into `regs[reg_idx]`. CMD writes with cmd=1 (bit 27) load
+    /// `regs[reg_idx]` into DATA.
+    regs: Vec<u32>,
 }
 
 impl LaneBus {
@@ -50,6 +58,7 @@ impl LaneBus {
             busy_counter: 0,
             busy_ticks,
             cmd_pending_clear: 0,
+            regs: vec![0u32; INDIRECT_REG_COUNT],
         }
     }
 
@@ -64,6 +73,26 @@ impl LaneBus {
         let cmd_bits = val & 0xF800_0000;
         if cmd_bits != 0 {
             self.cmd_pending_clear = cmd_bits;
+        }
+        self.execute_indirect(val);
+    }
+
+    /// Execute an indirect register operation from the CMD value.
+    /// CMD encoding: `(reg_idx & 0x1FF) << 18 | (mode & 3) << 16 |
+    /// data_low7 | (cmd << 27)`.
+    /// cmd bit 28 = write DATA → regs[reg_idx].
+    /// cmd bit 27 = read regs[reg_idx] → DATA.
+    fn execute_indirect(&mut self, val: u32) {
+        let cmd_hi = (val >> 27) & 0x1F;
+        let reg_idx = ((val >> 18) & 0x1FF) as usize;
+        if reg_idx >= INDIRECT_REG_COUNT {
+            return;
+        }
+        if cmd_hi & 2 != 0 {
+            self.regs[reg_idx] = self.data;
+        }
+        if cmd_hi & 1 != 0 {
+            self.data = self.regs[reg_idx];
         }
     }
 
@@ -132,6 +161,17 @@ impl LaneBus {
         self.stat = val;
     }
 
+    // ── Indirect register file ────────────────────────────────────
+
+    pub fn reg(&self, idx: usize) -> u32 {
+        self.regs.get(idx).copied().unwrap_or(0)
+    }
+
+    pub fn regs_slice(&self, start: usize, len: usize) -> &[u32] {
+        let end = (start + len).min(self.regs.len());
+        &self.regs[start..end]
+    }
+
     // ── Bus state ───────────────────────────────────────────────────
 
     pub fn go_busy(&mut self) {
@@ -166,6 +206,7 @@ impl LaneBus {
         self.stat = 0;
         self.state = BusState::Idle;
         self.busy_counter = 0;
+        self.regs.fill(0);
         self.cmd_pending_clear = 0;
     }
 
