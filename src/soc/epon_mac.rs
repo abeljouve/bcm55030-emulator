@@ -111,7 +111,7 @@ const REG_SPECIAL_0064: u32 = 0x0100_0064;
 /// on the command-bit semantic. Not yet in `hwregs`; the access
 /// pattern matches MPCP LLID control (block 22) but the offset is
 /// not documented.
-const REG_MPCP_CMD_LATCH: u32 = 0x0100_0160;
+// MPCP CMD LATCH moved to LaneBus mpcp_bus (lane 8) in bank.rs.
 /// EPON discovery status. Bit 2 = OLT discovery detected, bit 1 =
 /// discovery change. W1C for bits[2:1]. `mpcp_epon_get_status` returns
 /// true when `(val & 6) == 4` (bit 2 set, bit 1 clear).
@@ -158,12 +158,6 @@ pub struct EponMac {
     /// auto-clear resets it the instant the firmware polls.
     llid_drain_flag: [bool; LLID_SLOT_COUNT],
 
-    /// MPCP command-latch register at `0x01000160`. Bits `[31:27]`
-    /// hold the current opcode; any non-zero value auto-clears on
-    /// the next read so the firmware polling loop progresses.
-    mpcp_cmd_latch: u32,
-    mpcp_cmd_pending_clear: u32,
-
     llid_capture_mask: u32,
     llid_active_bitmap: u32,
     llid_mask_control: u32,
@@ -194,8 +188,6 @@ impl EponMac {
             llid_store: vec![0u32; llid_words],
             llid_irq_pending: [0; LLID_SLOT_COUNT],
             llid_drain_flag: [true; LLID_SLOT_COUNT],
-            mpcp_cmd_latch: MPCP_CMD_LATCH_RESET,
-            mpcp_cmd_pending_clear: 0,
             llid_capture_mask: LLID_CAPTURE_MASK_RESET,
             llid_active_bitmap: LLID_ACTIVE_RESET,
             llid_mask_control: 0,
@@ -265,7 +257,7 @@ impl EponMac {
             REG_CHIP_ID | REG_CHIP_REV | REG_LLID_CAPTURE_MASK | REG_LLID_ACTIVE_BITMAP
             | REG_LLID_MASK_CONTROL | REG_LLID_COUNTER_MASK | REG_TX_GRANT_MASK
             | REG_RX_GRANT_MASK | REG_IRQ_MASK | REG_EPON_STATUS | REG_ACTIVE_FLAGS
-            | REG_MDIO_COMMAND | REG_SPECIAL_0064 | REG_MPCP_CMD_LATCH
+            | REG_MDIO_COMMAND | REG_SPECIAL_0064
             | REG_1G_LINK_STATUS | REG_HW_STATE_STATUS | REG_DISCOVERY_STATUS => true,
             _ => {
                 (EPON_TABLE_BASE..EPON_TABLE_END).contains(&addr)
@@ -308,7 +300,6 @@ impl EponMac {
                 // Fixed / read-only values — ignore power-on seed.
             }
             REG_SPECIAL_0064 => self.special_0064 = val,
-            REG_MPCP_CMD_LATCH => self.mpcp_cmd_latch = val,
             REG_LLID_CAPTURE_MASK => self.llid_capture_mask = val,
             REG_LLID_ACTIVE_BITMAP => self.llid_active_bitmap = val,
             REG_LLID_MASK_CONTROL => self.llid_mask_control = val,
@@ -356,7 +347,6 @@ impl Peripheral for EponMac {
             REG_CHIP_ID => return Ok(CHIP_ID_VALUE),
             REG_CHIP_REV => return Ok(CHIP_REV_VALUE),
             REG_LLID_CAPTURE_MASK => return Ok(self.llid_capture_mask),
-            REG_MPCP_CMD_LATCH => return Ok(self.mpcp_cmd_latch),
             REG_LLID_ACTIVE_BITMAP => return Ok(self.llid_active_bitmap),
             REG_LLID_MASK_CONTROL => return Ok(self.llid_mask_control),
             REG_LLID_COUNTER_MASK => return Ok(self.llid_counter_mask),
@@ -406,14 +396,6 @@ impl Peripheral for EponMac {
             REG_CHIP_ID => return Ok(CHIP_ID_VALUE),
             REG_CHIP_REV => return Ok(CHIP_REV_VALUE),
             REG_LLID_CAPTURE_MASK => return Ok(self.llid_capture_mask),
-            REG_MPCP_CMD_LATCH => {
-                let val = self.mpcp_cmd_latch;
-                if self.mpcp_cmd_pending_clear != 0 {
-                    self.mpcp_cmd_latch &= !self.mpcp_cmd_pending_clear;
-                    self.mpcp_cmd_pending_clear = 0;
-                }
-                return Ok(val);
-            }
             REG_LLID_ACTIVE_BITMAP => return Ok(self.llid_active_bitmap),
             REG_LLID_MASK_CONTROL => return Ok(self.llid_mask_control),
             REG_LLID_COUNTER_MASK => return Ok(self.llid_counter_mask),
@@ -470,14 +452,6 @@ impl Peripheral for EponMac {
             REG_CHIP_ID | REG_CHIP_REV => return Ok(()), // read-only
             REG_LLID_CAPTURE_MASK => {
                 self.llid_capture_mask = val;
-                return Ok(());
-            }
-            REG_MPCP_CMD_LATCH => {
-                self.mpcp_cmd_latch = val;
-                let cmd_bits = val & 0xF800_0000;
-                if cmd_bits != 0 {
-                    self.mpcp_cmd_pending_clear = cmd_bits;
-                }
                 return Ok(());
             }
             REG_LLID_ACTIVE_BITMAP => {
@@ -595,8 +569,6 @@ impl Peripheral for EponMac {
         self.llid_store.fill(0);
         self.llid_irq_pending = [0; LLID_SLOT_COUNT];
         self.llid_drain_flag = [true; LLID_SLOT_COUNT];
-        self.mpcp_cmd_latch = MPCP_CMD_LATCH_RESET;
-        self.mpcp_cmd_pending_clear = 0;
         self.llid_capture_mask = LLID_CAPTURE_MASK_RESET;
         self.llid_active_bitmap = LLID_ACTIVE_RESET;
         self.llid_mask_control = 0;
@@ -733,8 +705,7 @@ mod tests {
         assert_eq!(m.read_word(REG_LLID_ACTIVE_BITMAP).unwrap(), 0);
         // Silicon: LLID_COUNTER_MASK = 0x00077FF7
         assert_eq!(m.read_word(REG_LLID_COUNTER_MASK).unwrap(), 0x0007_7FF7);
-        // Silicon: MPCP_CMD_LATCH = 0x00015000
-        assert_eq!(m.read_word(REG_MPCP_CMD_LATCH).unwrap(), 0x0001_5000);
+        // MPCP_CMD_LATCH moved to LaneBus mpcp_bus (lane 8).
         // Silicon: SPECIAL_0064 = 0
         assert_eq!(m.read_word(REG_SPECIAL_0064).unwrap(), 0);
     }

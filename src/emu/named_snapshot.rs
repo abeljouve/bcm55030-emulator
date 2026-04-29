@@ -25,6 +25,7 @@ pub struct PeripheralBankSaveState {
     pub uart: Uart,
     pub pbc: Pbc,
     pub bsc_i2c: BscI2c,
+    pub mpcp_bus: crate::soc::lane_bus::LaneBus,
     pub serdes: SerDes,
     pub epon_mac: EponMac,
     pub macsec: Macsec,

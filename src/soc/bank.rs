@@ -19,6 +19,7 @@ use parking_lot::Mutex;
 use crate::cpu::exception::Exception;
 use crate::soc::alarm_events::AlarmEvents;
 use crate::soc::bsc_i2c::BscI2c;
+use crate::soc::lane_bus::LaneBus;
 use crate::soc::dma::DmaChannelController;
 use crate::soc::efuse_udr::EfuseUdr;
 use crate::soc::epon_mac::EponMac;
@@ -144,6 +145,8 @@ pub struct PeripheralBank {
     pub uart: Uart,
     pub pbc: Pbc,
     pub bsc_i2c: BscI2c,
+    /// Lane 8 indirect bus — MPCP SerDes register file.
+    pub mpcp_bus: LaneBus,
     pub serdes: SerDes,
     pub epon_mac: EponMac,
     pub macsec: Macsec,
@@ -231,6 +234,11 @@ impl PeripheralBank {
             uart: Uart::new(),
             pbc: Pbc::new(),
             bsc_i2c: BscI2c::new(),
+            mpcp_bus: {
+                let mut bus = LaneBus::new(0x0100_0118, 2);
+                bus.apply_init(super::mmio_init::SYSREG_INIT_VALUES);
+                bus
+            },
             serdes: SerDes::new(),
             epon_mac: EponMac::new(),
             macsec: Macsec::new(),
@@ -292,6 +300,7 @@ impl PeripheralBank {
         self.uart.tick(cpu_instructions);
         self.pbc.tick(cpu_instructions);
         self.bsc_i2c.tick(cpu_instructions);
+        self.mpcp_bus.tick();
         self.serdes.tick(cpu_instructions);
         self.epon_mac.tick(cpu_instructions);
         self.macsec.tick(cpu_instructions);
@@ -363,6 +372,8 @@ impl PeripheralBank {
         self.uart.reset_cold();
         self.pbc.reset_cold();
         self.bsc_i2c.reset_cold();
+        self.mpcp_bus.reset();
+        self.mpcp_bus.apply_init(super::mmio_init::SYSREG_INIT_VALUES);
         self.serdes.reset_cold();
         self.epon_mac.reset_cold();
         self.macsec.reset_cold();
@@ -387,6 +398,8 @@ impl PeripheralBank {
         self.uart.reset_warm();
         self.pbc.reset_warm();
         self.bsc_i2c.reset_warm();
+        self.mpcp_bus.reset();
+        self.mpcp_bus.apply_init(super::mmio_init::SYSREG_INIT_VALUES);
         self.serdes.reset_warm();
         self.epon_mac.reset_warm();
         self.macsec.reset_warm();
@@ -589,6 +602,7 @@ impl PeripheralBank {
             uart: self.uart.clone(),
             pbc: self.pbc.clone(),
             bsc_i2c: self.bsc_i2c.clone(),
+            mpcp_bus: self.mpcp_bus.clone(),
             serdes: self.serdes.clone(),
             epon_mac: self.epon_mac.clone(),
             macsec: self.macsec.clone(),
@@ -610,6 +624,7 @@ impl PeripheralBank {
         self.uart = state.uart;
         self.pbc = state.pbc;
         self.bsc_i2c = state.bsc_i2c;
+        self.mpcp_bus = state.mpcp_bus;
         self.serdes = state.serdes;
         self.epon_mac = state.epon_mac;
         self.macsec = state.macsec;
@@ -651,6 +666,16 @@ impl PeripheralBank {
         }
         if self.bsc_i2c.claims(addr) {
             return self.bsc_i2c.peek_word(addr);
+        }
+        if self.mpcp_bus.claims(addr) {
+            let v = if addr == self.mpcp_bus.cmd_addr {
+                self.mpcp_bus.peek_cmd()
+            } else if addr == self.mpcp_bus.data_addr {
+                self.mpcp_bus.read_data()
+            } else {
+                self.mpcp_bus.peek_stat()
+            };
+            return Ok(v);
         }
         if self.serdes.claims(addr) {
             return self.serdes.peek_word(addr);
@@ -734,6 +759,18 @@ impl PeripheralBank {
         if self.uart.claims(addr) { dispatch_rw!(self.uart, "uart"); }
         if self.pbc.claims(addr) { dispatch_rw!(self.pbc, "pbc"); }
         if self.bsc_i2c.claims(addr) { dispatch_rw!(self.bsc_i2c, "bsc_i2c"); }
+        if self.mpcp_bus.claims(addr) {
+            let v = if addr == self.mpcp_bus.cmd_addr {
+                self.mpcp_bus.read_cmd()
+            } else if addr == self.mpcp_bus.data_addr {
+                self.mpcp_bus.read_data()
+            } else {
+                self.mpcp_bus.read_stat()
+            };
+            self.record_history(addr, v, "read", "word", "mpcp_bus");
+            self.seq_emit(addr, v, "r", "word", "mpcp_bus");
+            return Ok(v);
+        }
         if self.serdes.claims(addr) { dispatch_rw!(self.serdes, "serdes"); }
         if self.epon_mac.claims(addr) { dispatch_rw!(self.epon_mac, "epon_mac"); }
         if self.macsec.claims(addr) { dispatch_rw!(self.macsec, "macsec"); }
@@ -824,6 +861,18 @@ impl PeripheralBank {
             return Ok(());
         }
         if self.bsc_i2c.claims(addr) { dispatch_ww!(self.bsc_i2c, "bsc_i2c"); }
+        if self.mpcp_bus.claims(addr) {
+            if addr == self.mpcp_bus.cmd_addr {
+                self.mpcp_bus.write_cmd(val);
+            } else if addr == self.mpcp_bus.data_addr {
+                self.mpcp_bus.write_data(val);
+            } else {
+                self.mpcp_bus.write_stat(val);
+            }
+            self.record_history(addr, val, "write", "word", "mpcp_bus");
+            self.seq_emit(addr, val, "w", "word", "mpcp_bus");
+            return Ok(());
+        }
         if self.serdes.claims(addr) { dispatch_ww!(self.serdes, "serdes"); }
         if self.epon_mac.claims(addr) { dispatch_ww!(self.epon_mac, "epon_mac"); }
         if self.macsec.claims(addr) { dispatch_ww!(self.macsec, "macsec"); }
