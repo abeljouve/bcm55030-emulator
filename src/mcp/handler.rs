@@ -849,11 +849,17 @@ pub struct ListPeripheralsResult {
     pub peripherals: Vec<PeripheralEntry>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct GetUartBufferParams {
+    /// Output format: `"ascii"` (default, lossy UTF-8) or `"hex"`.
+    pub format: Option<String>,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct UartBufferResult {
     pub bytes_len: usize,
-    pub ascii: String,
-    pub hex: String,
+    pub content: String,
+    pub format: String,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1176,19 +1182,27 @@ impl EmulatorHandler {
 
     #[tool(
         name = "get_uart_buffer",
-        description = "Return the UART TX log (everything the firmware has printed since boot). Decoded as lossy UTF-8 plus a hex dump."
+        description = "Return the UART TX log (everything the firmware has printed since boot). Format: \"ascii\" (default, lossy UTF-8) or \"hex\" (raw hex dump)."
     )]
-    async fn get_uart_buffer(&self) -> Json<UartBufferResult> {
+    async fn get_uart_buffer(
+        &self,
+        Parameters(params): Parameters<GetUartBufferParams>,
+    ) -> Json<UartBufferResult> {
         let bytes = self.handle.bank.read().uart.tx_log_bytes();
-        let ascii = String::from_utf8_lossy(&bytes).to_string();
-        let hex = bytes
-            .iter()
-            .map(|b| format!("{:02X}", b))
-            .collect::<String>();
+        let is_hex = params
+            .format
+            .as_deref()
+            .is_some_and(|f| f.eq_ignore_ascii_case("hex"));
+        let (content, fmt) = if is_hex {
+            let hex = bytes.iter().map(|b| format!("{:02X}", b)).collect();
+            (hex, "hex")
+        } else {
+            (String::from_utf8_lossy(&bytes).to_string(), "ascii")
+        };
         Json(UartBufferResult {
             bytes_len: bytes.len(),
-            ascii,
-            hex,
+            content,
+            format: fmt.to_string(),
         })
     }
 
