@@ -316,6 +316,7 @@ impl PeripheralBank {
         // second non-existent frame.
         if self.olt.link_change_pending {
             self.olt.link_change_pending = false;
+            self.epon_mac.set_1g_link_change_bit();
             self.epon_mac.set_phy_link_status_bit();
         }
         if self.olt.config.enabled && self.olt.link_up {

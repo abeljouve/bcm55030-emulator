@@ -99,6 +99,8 @@ const REG_IRQ_MASK: u32 = 0x0100_0034;
 const REG_EPON_STATUS: u32 = 0x0100_0044;
 const REG_ACTIVE_FLAGS: u32 = 0x0100_0054;
 const REG_MDIO_COMMAND: u32 = 0x0100_0060;
+/// 1G PHY link status. Bit 1 = link change (W1C).
+const REG_1G_LINK_STATUS: u32 = 0x0100_0410;
 const REG_HW_STATE_STATUS: u32 = 0x0100_0E04;
 const REG_SPECIAL_0064: u32 = 0x0100_0064;
 /// MPCP-adjacent command latch. The firmware writes a value with
@@ -171,6 +173,7 @@ pub struct EponMac {
     irq_mask: u32,
     epon_status: u32,
     active_flags: u32,
+    link_status_1g: u32,
     hw_state_status: u32,
     discovery_status: u32,
     /// REG_SPECIAL_0064 backing store. Silicon power-on is zero —
@@ -202,6 +205,7 @@ impl EponMac {
             irq_mask: 0,
             epon_status: 0,
             active_flags: 0,
+            link_status_1g: 0,
             hw_state_status: 0,
             discovery_status: 0,
             special_0064: 0,
@@ -215,8 +219,12 @@ impl EponMac {
     /// absolute MMIO address. Used by the OLT emulator to inject
     /// bitmap bits and mailbox data into the EPON MAC's address space
     /// without going through the normal write_word side-effect path.
+    /// Set the 1G PHY link change bit (bit 1 of REG_1G_LINK_STATUS).
+    pub fn set_1g_link_change_bit(&mut self) {
+        self.link_status_1g |= 0x2;
+    }
+
     /// Set the 10G PHY link status bit (bit 6 of REG_HW_STATE_STATUS).
-    /// Called by the bank tick when the OLT link change event fires.
     pub fn set_phy_link_status_bit(&mut self) {
         self.hw_state_status |= 0x40;
     }
@@ -258,7 +266,7 @@ impl EponMac {
             | REG_LLID_MASK_CONTROL | REG_LLID_COUNTER_MASK | REG_TX_GRANT_MASK
             | REG_RX_GRANT_MASK | REG_IRQ_MASK | REG_EPON_STATUS | REG_ACTIVE_FLAGS
             | REG_MDIO_COMMAND | REG_SPECIAL_0064 | REG_MPCP_CMD_LATCH
-            | REG_HW_STATE_STATUS | REG_DISCOVERY_STATUS => true,
+            | REG_1G_LINK_STATUS | REG_HW_STATE_STATUS | REG_DISCOVERY_STATUS => true,
             _ => {
                 (EPON_TABLE_BASE..EPON_TABLE_END).contains(&addr)
                     || (EPON_LLID_BASE..EPON_LLID_TOP).contains(&addr)
@@ -359,6 +367,7 @@ impl Peripheral for EponMac {
             REG_ACTIVE_FLAGS => return Ok(self.active_flags),
             REG_MDIO_COMMAND => return Ok(0),
             REG_SPECIAL_0064 => return Ok(self.special_0064),
+            REG_1G_LINK_STATUS => return Ok(self.link_status_1g),
             REG_HW_STATE_STATUS => return Ok(self.hw_state_status),
             REG_DISCOVERY_STATUS => return Ok(self.discovery_status),
             _ => {}
@@ -414,6 +423,7 @@ impl Peripheral for EponMac {
             REG_EPON_STATUS => return Ok(self.epon_status),
             REG_ACTIVE_FLAGS => return Ok(self.active_flags),
             REG_MDIO_COMMAND => return Ok(0),
+            REG_1G_LINK_STATUS => return Ok(self.link_status_1g),
             REG_HW_STATE_STATUS => return Ok(self.hw_state_status),
             REG_SPECIAL_0064 => return Ok(self.special_0064),
             REG_DISCOVERY_STATUS => return Ok(self.discovery_status),
@@ -506,6 +516,11 @@ impl Peripheral for EponMac {
                 return Ok(());
             }
             REG_MDIO_COMMAND => return Ok(()),
+            REG_1G_LINK_STATUS => {
+                // W1C: bits written as 1 are cleared.
+                self.link_status_1g &= !val;
+                return Ok(());
+            }
             REG_HW_STATE_STATUS => {
                 // W1C: bits written as 1 are cleared.
                 self.hw_state_status &= !val;
@@ -591,6 +606,7 @@ impl Peripheral for EponMac {
         self.irq_mask = 0;
         self.epon_status = 0;
         self.active_flags = 0;
+        self.link_status_1g = 0;
         self.hw_state_status = 0;
         self.discovery_status = 0;
         self.special_0064 = 0;
