@@ -414,6 +414,27 @@ impl PeripheralBank {
         if self.olt.config.enabled && self.olt.link_up {
             self.epon_mac.set_discovery_status_bit();
         }
+        // LLID OAM state initialization — models the EPON MAC's
+        // internal state setup after registration completes. On real
+        // BCM55030, event 0xC1 (pushed by epon_llid_teardown) sets
+        // the OAM state byte. The emulator doesn't model the full
+        // event dispatch chain, so we set it directly with a delay
+        // to let the firmware's teardown/setup cycle finish first.
+        if self.olt.registration_complete {
+            self.olt.registration_complete = false;
+            self.olt.llid_state_init_countdown = 2000;
+        }
+        if self.olt.llid_state_init_countdown > 0 {
+            self.olt.llid_state_init_countdown -= 1;
+            if self.olt.llid_state_init_countdown == 0 {
+                self.pending_cache_inv.push(
+                    DatapathOp::SramWrite {
+                        sram_addr: 0x0000_461C,
+                        data: vec![0x01],
+                    },
+                );
+            }
+        }
         if self.olt.config.enabled {
             for wi in 0..6u32 {
                 let addr = 0x0100_1438 + wi * 0x200;
@@ -1069,7 +1090,28 @@ impl PeripheralBank {
             self.seq_emit(addr, val, "w", "word", "serdes");
             return Ok(());
         }
-        if self.epon_mac.claims(addr) { dispatch_ww!(self.epon_mac, "epon_mac"); }
+        if self.epon_mac.claims(addr) {
+            // When the OLT has a registered LLID, enforce it in the
+            // LLID match table. The firmware reinitializes these entries
+            // during MPCP processing, overwriting the OLT's assignment.
+            // On real BCM55030, the EPON MAC hardware maintains the
+            // registered LLID — the firmware's table writes program
+            // the match value, but slot 0 always reflects the OLT's
+            // assigned LLID once registration completes.
+            if self.olt.config.enabled
+                && self.olt.mpcp_state() != crate::soc::olt::OltMpcpState::Idle
+                && (addr == 0x0100_043C || addr == 0x0100_0D00)
+                && val != 0
+            {
+                let llid = self.olt.assigned_llid() as u32;
+                let forced = (val & 0xFFFF_0000) | llid;
+                self.epon_mac.poke_table_store(addr, forced);
+                self.record_history(addr, forced, "write", "word", "epon_mac");
+                self.seq_emit(addr, forced, "w", "word", "epon_mac");
+                return Ok(());
+            }
+            dispatch_ww!(self.epon_mac, "epon_mac");
+        }
         if self.macsec.claims(addr) { dispatch_ww!(self.macsec, "macsec"); }
         if self.dma.claims(addr) { dispatch_ww!(self.dma, "dma"); }
         if self.timer.claims(addr) { dispatch_ww!(self.timer, "timer"); }

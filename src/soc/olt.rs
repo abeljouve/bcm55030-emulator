@@ -310,6 +310,16 @@ pub struct Olt {
     /// The bank uses this to schedule a DMA-style clear of the firmware's
     /// Phase 1 guard struct at SRAM 0x7E3CA.
     pub frame_consumed: bool,
+
+    /// One-shot flag: set when the OLT transitions to Registered.
+    /// Bank uses this to initialize the LLID OAM state byte in SRAM,
+    /// modelling the EPON MAC's internal state initialization that
+    /// the firmware's ISR-driven path normally handles.
+    pub registration_complete: bool,
+    /// Countdown before writing the LLID OAM state byte. Delayed so
+    /// the firmware's teardown/setup cycle (which clears the byte)
+    /// finishes first.
+    pub llid_state_init_countdown: u32,
 }
 
 impl Olt {
@@ -339,6 +349,8 @@ impl Olt {
             pending_llid_update: None,
             pending_final_ack: false,
             frame_consumed: false,
+            registration_complete: false,
+            llid_state_init_countdown: 0,
         }
     }
 
@@ -672,6 +684,7 @@ impl Olt {
                     self.mpcp_state = OltMpcpState::WaitFinalAck;
                 } else if self.mpcp_state == OltMpcpState::WaitFinalAck {
                     self.mpcp_state = OltMpcpState::Registered;
+                    self.registration_complete = true;
                     eprintln!(
                         "[OLT] Final REGISTER_ACK received — ONU registered (LLID={})",
                         self.assigned_llid
