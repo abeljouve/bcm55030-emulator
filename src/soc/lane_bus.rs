@@ -167,6 +167,12 @@ impl LaneBus {
         self.regs.get(idx).copied().unwrap_or(0)
     }
 
+    pub fn set_reg(&mut self, idx: usize, val: u32) {
+        if idx < self.regs.len() {
+            self.regs[idx] = val;
+        }
+    }
+
     pub fn regs_slice(&self, start: usize, len: usize) -> &[u32] {
         let end = (start + len).min(self.regs.len());
         &self.regs[start..end]

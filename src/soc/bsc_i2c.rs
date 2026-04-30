@@ -7,6 +7,13 @@
 //!   * `0x0100014C` — DATA register (lane_base + 0x54)
 //!   * `0x01000150` — STAT register (lane_base + 0x58)
 //!
+//! Lanes 1 and 2 share the same address range (4-byte stride) and
+//! are used by the firmware for SerDes PHY indirect register access
+//! (descriptors 0x0411 / 0x0412). Their CMD/DATA addresses overlap
+//! with lane 0 STAT; a `last_cmd_lane` tracker resolves ambiguity.
+//! Calibration done bits (regs 0xBB/0xDB bit 7) are pre-set so that
+//! `serdes_lane_check_calibration_done_bit` returns immediately.
+//!
 //! Uses the shared `LaneBus` for CMD/DATA/STAT protocol.
 
 use crate::cpu::exception::Exception;
@@ -17,11 +24,21 @@ use crate::soc::peripheral::{
 };
 use crate::soc::sfp_eeprom::SfpEeprom;
 
-/// Lane 0 base in the lane state table.
+/// Lane bases in the lane state table (base + lane*4).
 const LANE0_BASE: u32 = 0x0100_00F8;
+const LANE1_BASE: u32 = 0x0100_00FC;
+const LANE2_BASE: u32 = 0x0100_0100;
 
 pub const BSC_BASE: u32 = 0x01000140;
 pub const BSC_END: u32 = 0x01000158;
+
+const LANE1_CMD: u32 = LANE1_BASE + 0x48; // 0x01000144
+const LANE2_CMD: u32 = LANE2_BASE + 0x48; // 0x01000148
+const LANE1_DATA: u32 = LANE1_BASE + 0x54; // 0x01000150 (overlaps lane 0 STAT)
+const LANE2_DATA: u32 = LANE2_BASE + 0x54; // 0x01000154
+
+/// SerDes CDR calibration done bit (bit 7 of indirect regs 0xBB/0xDB).
+const CAL_DONE_BIT: u32 = 0x80;
 
 const BSC_RANGES: &[AddressRange] = &[AddressRange::new(BSC_BASE, BSC_END)];
 
@@ -38,9 +55,9 @@ enum ProtocolState {
 pub struct BscI2c {
     pub sfp: SfpEeprom,
     pub bus: LaneBus,
-    /// Backing store for intermediate addresses (0x144, 0x148, 0x154)
-    /// that fall between CMD/DATA/STAT in the BSC range.
-    aux_store: [u32; 3],
+    pub lane1: LaneBus,
+    pub lane2: LaneBus,
+    last_cmd_lane: u8,
     protocol: ProtocolState,
     pending_sub_addr: u16,
     sub_addr: u16,
@@ -54,10 +71,16 @@ pub struct BscI2c {
 
 impl BscI2c {
     pub fn new() -> Self {
+        let mut lane1 = LaneBus::new(LANE1_BASE, 0);
+        let mut lane2 = LaneBus::new(LANE2_BASE, 0);
+        Self::init_cal_done_bits(&mut lane1);
+        Self::init_cal_done_bits(&mut lane2);
         Self {
             sfp: SfpEeprom::new_default(),
             bus: LaneBus::new(LANE0_BASE, BSC_BUSY_TICKS),
-            aux_store: [0; 3],
+            lane1,
+            lane2,
+            last_cmd_lane: 0,
             protocol: ProtocolState::Idle,
             pending_sub_addr: 0,
             sub_addr: 0,
@@ -70,19 +93,16 @@ impl BscI2c {
         }
     }
 
+    fn init_cal_done_bits(bus: &mut LaneBus) {
+        bus.set_reg(0xBB, CAL_DONE_BIT);
+        bus.set_reg(0xDB, CAL_DONE_BIT);
+    }
+
     #[inline]
     pub fn claims(&self, addr: u32) -> bool {
         (BSC_BASE..BSC_END).contains(&addr)
     }
 
-    fn aux_idx(addr: u32) -> Option<usize> {
-        match addr {
-            0x0100_0144 => Some(0),
-            0x0100_0148 => Some(1),
-            0x0100_0154 => Some(2),
-            _ => None,
-        }
-    }
 
     pub fn sfp_snapshot(&self) -> PeripheralSnapshot {
         PeripheralSnapshot::Sfp(SfpSnapshot {
@@ -141,10 +161,22 @@ impl Peripheral for BscI2c {
             Ok(self.bus.peek_cmd())
         } else if addr == self.bus.data_addr {
             Ok(self.pending_read_word)
-        } else if addr == self.bus.stat_addr {
-            Ok(self.bus.read_stat())
-        } else if let Some(i) = Self::aux_idx(addr) {
-            Ok(self.aux_store[i])
+        } else if addr == LANE1_CMD {
+            Ok(self.lane1.peek_cmd())
+        } else if addr == LANE2_CMD {
+            Ok(self.lane2.peek_cmd())
+        } else if addr == LANE1_DATA {
+            if self.last_cmd_lane == 1 {
+                Ok(self.lane1.read_data())
+            } else {
+                Ok(self.bus.read_stat())
+            }
+        } else if addr == LANE2_DATA {
+            if self.last_cmd_lane == 2 {
+                Ok(self.lane2.read_data())
+            } else {
+                Ok(0)
+            }
         } else {
             Ok(0)
         }
@@ -152,57 +184,97 @@ impl Peripheral for BscI2c {
 
     fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
         if addr == self.bus.cmd_addr {
+            self.last_cmd_lane = 0;
             Ok(self.bus.read_cmd())
         } else if addr == self.bus.data_addr {
             if self.bus.is_done() {
                 self.bus.set_idle();
             }
             Ok(self.pending_read_word)
-        } else if addr == self.bus.stat_addr {
-            Ok(self.bus.read_stat())
-        } else if let Some(i) = Self::aux_idx(addr) {
-            Ok(self.aux_store[i])
+        } else if addr == LANE1_CMD {
+            Ok(self.lane1.read_cmd())
+        } else if addr == LANE2_CMD {
+            Ok(self.lane2.read_cmd())
+        } else if addr == LANE1_DATA {
+            if self.last_cmd_lane == 1 {
+                Ok(self.lane1.read_data())
+            } else {
+                Ok(self.bus.read_stat())
+            }
+        } else if addr == LANE2_DATA {
+            if self.last_cmd_lane == 2 {
+                Ok(self.lane2.read_data())
+            } else {
+                Ok(0)
+            }
         } else {
             Ok(0)
         }
     }
 
     fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
-        if let Some(i) = Self::aux_idx(addr) {
-            self.aux_store[i] = val;
+        if addr == LANE1_CMD {
+            self.last_cmd_lane = 1;
+            self.lane1.write_cmd(val);
+            self.lane1.clear_cmd_bits_now();
+            return Ok(());
+        }
+        if addr == LANE2_CMD {
+            self.last_cmd_lane = 2;
+            self.lane2.write_cmd(val);
+            self.lane2.clear_cmd_bits_now();
+            return Ok(());
+        }
+        if addr == LANE1_DATA {
+            if self.last_cmd_lane == 1 {
+                self.lane1.write_data(val);
+            } else {
+                self.bus.write_stat(val);
+                if val & 0x0040_0000 != 0
+                    && matches!(self.protocol, ProtocolState::SubAddrLatched)
+                {
+                    let bc = ((val >> 3) & 0x7FF) as u16;
+                    if bc > 0 {
+                        self.byte_count = bc;
+                        self.eeprom_ptr = self.sub_addr;
+                        self.bytes_read = 0;
+                        self.protocol = ProtocolState::Armed;
+                        self.bus.go_busy();
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if addr == LANE2_DATA {
+            if self.last_cmd_lane == 2 {
+                self.lane2.write_data(val);
+            }
             return Ok(());
         }
         if addr == self.bus.cmd_addr {
+            self.last_cmd_lane = 0;
             self.bus.write_cmd(val);
             self.issue_command(val);
         } else if addr == self.bus.data_addr {
             self.bus.write_data(val);
             self.pending_sub_addr = (val & 0xFFFF) as u16;
-        } else if addr == self.bus.stat_addr {
-            self.bus.write_stat(val);
-            if val & 0x0040_0000 != 0
-                && matches!(self.protocol, ProtocolState::SubAddrLatched)
-            {
-                let bc = ((val >> 3) & 0x7FF) as u16;
-                if bc > 0 {
-                    self.byte_count = bc;
-                    self.eeprom_ptr = self.sub_addr;
-                    self.bytes_read = 0;
-                    self.protocol = ProtocolState::Armed;
-                    self.bus.go_busy();
-                }
-            }
         }
         Ok(())
     }
 
     fn tick(&mut self, _cpu_instructions: u64) {
         self.bus.tick();
+        self.lane1.tick();
+        self.lane2.tick();
     }
 
     fn reset_cold(&mut self) {
         self.bus.reset();
-        self.aux_store = [0; 3];
+        self.lane1.reset();
+        self.lane2.reset();
+        Self::init_cal_done_bits(&mut self.lane1);
+        Self::init_cal_done_bits(&mut self.lane2);
+        self.last_cmd_lane = 0;
         self.protocol = ProtocolState::Idle;
         self.pending_sub_addr = 0;
         self.sub_addr = 0;
