@@ -328,13 +328,11 @@ impl PeripheralBank {
         self.nco.tick(cpu_instructions);
         self.vlan_lue.tick(cpu_instructions);
         self.olt.tick(cpu_instructions);
-        // Drain OLT RX frames into the mailbox engine. We load into
-        // word_index=0 (bitmap at 0x01001438) since that's the most
-        // common queue. The frames are also available from any
-        // word_index via the CMD/STATUS FIFO intercept.
-        let mbox_before = self.olt.mailbox_pending.len();
-        self.olt.load_frames_into_mailbox(0);
-        if self.olt.mailbox_pending.len() > mbox_before {
+        // Drain OLT RX frames into per-slot mailbox FIFOs. Each frame
+        // is routed by EtherType: MPCP→slot 0x10, OAM→slot 0x0F, etc.
+        let mbox_before = self.olt.total_pending_count();
+        self.olt.load_frames_into_mailbox();
+        if self.olt.total_pending_count() > mbox_before {
             self.dma_master_status[0] |= 1 << 27;
             self.dma_channel_mask[0] |= 1;
         }
@@ -358,14 +356,10 @@ impl PeripheralBank {
             self.epon_mac.set_discovery_status_bit();
         }
         if self.olt.config.enabled {
-            let bmp = if !self.olt.mailbox_pending.is_empty() {
-                0xFFFF_FFFFu32
-            } else {
-                0
-            };
             for wi in 0..6u32 {
                 let addr = 0x0100_1438 + wi * 0x200;
                 if addr < 0x0100_2000 {
+                    let bmp = self.olt.mailbox_bitmap[wi as usize];
                     self.epon_mac.poke_llid_store(addr, bmp);
                     self.pending_cache_inv.push(
                         DatapathOp::CacheInvalidate { addr },
@@ -913,19 +907,14 @@ impl PeripheralBank {
         }
         // OLT CMD write intercept — must be before epon_mac.
         if crate::soc::olt::Olt::claims_mailbox(addr) && self.olt.write_cmd(addr, val) {
-            // Immediately sync bitmap into epon_mac so the firmware
-            // doesn't see stale 0xFFFFFFFF on the next bitmap check
+            // Immediately sync per-slot bitmap into epon_mac so the
+            // firmware doesn't see stale bits on the next bitmap check
             // within the same tick window.
             if self.olt.config.enabled {
-                let bmp = if !self.olt.mailbox_pending.is_empty() {
-                    0xFFFF_FFFFu32
-                } else {
-                    0
-                };
                 for wi in 0..6u32 {
                     let a = 0x0100_1438 + wi * 0x200;
                     if a < 0x0100_2000 {
-                        self.epon_mac.poke_llid_store(a, bmp);
+                        self.epon_mac.poke_llid_store(a, self.olt.mailbox_bitmap[wi as usize]);
                     }
                 }
             }

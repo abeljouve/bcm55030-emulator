@@ -62,7 +62,7 @@
 //! The OLT is disabled by default (backward compatible). Enable
 //! via `--olt-enable` CLI flag or `olt_enable` MCP tool.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::soc::peripheral::{
     AddressRange, Peripheral, PeripheralError, PeripheralEvent, PeripheralSnapshot,
@@ -123,6 +123,18 @@ const MAX_FRAME_LOG: usize = 256;
 
 /// Maximum frame size (bytes).
 const MAX_FRAME_SIZE: usize = 1600;
+
+// ── Per-slot mailbox routing (from firmware RE) ─────────────────────
+
+/// Mailbox slot for MPCP frames (EtherType 0x8808).
+/// Firmware reads with CMD_STATUS = 0x400010, pin = 0x10.
+const SLOT_MPCP: u8 = 0x10;
+/// Mailbox slot for OAM slow-protocol frames (EtherType 0x8809).
+/// Firmware reads with CMD_STATUS = 0x40000F, pin = 0x0F.
+const SLOT_OAM: u8 = 0x0F;
+/// Mailbox slot for MACsec/EAP frames (EtherType 0x888E).
+/// Firmware reads with CMD_STATUS = 0x400000, pin = 0x00.
+const SLOT_MACSEC: u8 = 0x00;
 
 // ── DMA mailbox constants (reverse-engineered: the frame-protocol notes) ──────
 
@@ -275,9 +287,10 @@ pub struct Olt {
     /// FIFO of 32-bit words for the frame currently being read.
     /// Populated when the firmware writes a read command to CMD_STATUS.
     pub mailbox_fifo: VecDeque<u32>,
-    /// Frames waiting to be loaded into the mailbox when the firmware
-    /// issues a read command. Each entry: (word_index, encoded words).
-    pub mailbox_pending: VecDeque<(u8, Vec<u32>)>,
+    /// Per-slot FIFOs of encoded frame words waiting for firmware reads.
+    /// Key = slot number (pin), value = queue of encoded frames.
+    /// Firmware extracts slot from CMD_STATUS write: `val & 0xFF`.
+    pub mailbox_pending: HashMap<u8, VecDeque<Vec<u32>>>,
 
     pub trace: bool,
 }
@@ -304,7 +317,7 @@ impl Olt {
             link_up_delay: 0,
             mailbox_bitmap: [0; 8],
             mailbox_fifo: VecDeque::new(),
-            mailbox_pending: VecDeque::new(),
+            mailbox_pending: HashMap::new(),
             trace: false,
         }
     }
@@ -392,21 +405,59 @@ impl Olt {
         words
     }
 
-    /// Load pending RX frames into the mailbox. Called from bank.tick()
-    /// after the OLT's own tick. Encodes each frame and sets the bitmap.
-    pub fn load_frames_into_mailbox(&mut self, word_index: u8) {
+    /// Determine the mailbox slot for a frame based on EtherType.
+    fn slot_for_frame(frame: &[u8]) -> u8 {
+        if frame.len() >= 14 {
+            let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+            match ethertype {
+                ETHERTYPE_MPCP => SLOT_MPCP,
+                ETHERTYPE_OAM => SLOT_OAM,
+                0x888E => SLOT_MACSEC,
+                _ => SLOT_OAM,
+            }
+        } else {
+            SLOT_OAM
+        }
+    }
+
+    /// Load pending RX frames into per-slot mailbox FIFOs. Called from
+    /// bank.tick() after the OLT's own tick. Routes each frame to the
+    /// correct slot based on EtherType.
+    pub fn load_frames_into_mailbox(&mut self) {
         let frames = self.take_rx_frames();
         for frame in frames {
+            let slot = Self::slot_for_frame(&frame);
             let words = Self::encode_frame_to_mailbox_words(&frame);
-            self.mailbox_pending.push_back((word_index, words));
+            self.mailbox_pending
+                .entry(slot)
+                .or_default()
+                .push_back(words);
         }
-        if !self.mailbox_pending.is_empty() {
-            let wi = word_index as usize;
-            if wi < self.mailbox_bitmap.len() {
-                // Set bit 0 (slot 0) in the bitmap for this word_index
-                self.mailbox_bitmap[wi] |= 1;
+        self.refresh_bitmap();
+    }
+
+    /// Recompute the bitmap array from the per-slot pending queues.
+    pub fn refresh_bitmap(&mut self) {
+        self.mailbox_bitmap = [0; 8];
+        for (&slot, queue) in &self.mailbox_pending {
+            if !queue.is_empty() {
+                let wi = (slot >> 5) as usize;
+                let bit = slot & 0x1F;
+                if wi < self.mailbox_bitmap.len() {
+                    self.mailbox_bitmap[wi] |= 1 << bit;
+                }
             }
         }
+    }
+
+    /// Check if any slot has pending frames.
+    pub fn has_any_pending(&self) -> bool {
+        self.mailbox_pending.values().any(|q| !q.is_empty())
+    }
+
+    /// Total number of pending frames across all slots.
+    pub fn total_pending_count(&self) -> usize {
+        self.mailbox_pending.values().map(|q| q.len()).sum()
     }
 
     /// Handle a read of the LLID bitmap register.
@@ -443,27 +494,28 @@ impl Olt {
     }
 
     /// Handle a write to the CMD/STATUS register.
-    /// Value `0x400000 | slot` = start reading a frame.
+    /// Value `0x400000 | slot` = start reading a frame from slot's FIFO.
     pub fn write_cmd(&mut self, addr: u32, val: u32) -> bool {
         if !self.config.enabled { return false; }
         let offset = addr.wrapping_sub(CMD_STATUS_BASE);
         if offset % MAILBOX_STRIDE != 0 { return false; }
         if val & 0x400000 != 0 {
-            // Read command — load the next pending frame into the FIFO.
-            // Accept from ANY word_index since we broadcast the bitmap.
-            if let Some((_, words)) = self.mailbox_pending.pop_front() {
-                self.mailbox_fifo.clear();
-                self.mailbox_fifo.extend(words);
-                // Clear all bitmaps if no more pending frames
-                if self.mailbox_pending.is_empty() {
-                    self.mailbox_bitmap = [0; 8];
+            let slot = (val & 0xFF) as u8;
+            self.mailbox_fifo.clear();
+            if let Some(queue) = self.mailbox_pending.get_mut(&slot) {
+                if let Some(words) = queue.pop_front() {
+                    self.mailbox_fifo.extend(words);
+                    if self.trace {
+                        eprintln!("[OLT] mailbox: loaded {} words for slot 0x{:02X} (cmd @ +0x{:X})",
+                            self.mailbox_fifo.len(), slot, offset);
+                    }
                 }
-                if self.trace {
-                    eprintln!("[OLT] mailbox: loaded {} words (cmd @ +0x{:X})",
-                        self.mailbox_fifo.len(), offset);
+                if queue.is_empty() {
+                    self.mailbox_pending.remove(&slot);
                 }
-                return true;
             }
+            self.refresh_bitmap();
+            return true;
         }
         false
     }
@@ -1055,5 +1107,99 @@ mod tests {
         olt.set_enabled(true);
         olt.on_tx_frame(&[0x00; 10]); // Too short
         assert_eq!(olt.tx_log.len(), 0);
+    }
+
+    #[test]
+    fn per_slot_fifo_routes_by_ethertype() {
+        let mut olt = Olt::new();
+        olt.set_enabled(true);
+
+        // Inject 3 OAMs then 1 MPCP — in single-FIFO model, MPCP
+        // would be behind 3 OAMs and unreachable via MPCP poll.
+        for _ in 0..3 {
+            let mut oam = vec![0u8; 60];
+            oam[12..14].copy_from_slice(&ETHERTYPE_OAM.to_be_bytes());
+            olt.inject_raw_frame(oam);
+        }
+        let mut mpcp = vec![0u8; 60];
+        mpcp[12..14].copy_from_slice(&ETHERTYPE_MPCP.to_be_bytes());
+        olt.inject_raw_frame(mpcp);
+
+        olt.load_frames_into_mailbox();
+
+        assert_eq!(
+            olt.mailbox_pending.get(&SLOT_MPCP).map(|q| q.len()),
+            Some(1),
+            "MPCP slot should have 1 frame"
+        );
+        assert_eq!(
+            olt.mailbox_pending.get(&SLOT_OAM).map(|q| q.len()),
+            Some(3),
+            "OAM slot should have 3 frames"
+        );
+
+        // Firmware reads MPCP first (CMD_STATUS = 0x400010)
+        assert!(olt.write_cmd(CMD_STATUS_BASE, 0x400000 | SLOT_MPCP as u32));
+        assert!(!olt.mailbox_fifo.is_empty(), "MPCP frame should be loaded");
+
+        // MPCP slot empty, OAM still has 3
+        assert!(olt.mailbox_pending.get(&SLOT_MPCP).is_none());
+        assert_eq!(olt.mailbox_pending.get(&SLOT_OAM).map(|q| q.len()), Some(3));
+    }
+
+    #[test]
+    fn per_slot_bitmap_sets_correct_bits() {
+        let mut olt = Olt::new();
+        olt.set_enabled(true);
+
+        let mut oam = vec![0u8; 60];
+        oam[12..14].copy_from_slice(&ETHERTYPE_OAM.to_be_bytes());
+        olt.inject_raw_frame(oam);
+
+        let mut mpcp = vec![0u8; 60];
+        mpcp[12..14].copy_from_slice(&ETHERTYPE_MPCP.to_be_bytes());
+        olt.inject_raw_frame(mpcp);
+
+        olt.load_frames_into_mailbox();
+
+        // Bitmap word 0 should have bit 15 (OAM) and bit 16 (MPCP) set
+        assert_ne!(olt.mailbox_bitmap[0] & (1 << SLOT_OAM), 0, "OAM bit");
+        assert_ne!(olt.mailbox_bitmap[0] & (1 << SLOT_MPCP), 0, "MPCP bit");
+        // No other bits set
+        assert_eq!(
+            olt.mailbox_bitmap[0],
+            (1 << SLOT_OAM) | (1 << SLOT_MPCP)
+        );
+
+        // After reading MPCP, only OAM bit remains
+        olt.write_cmd(CMD_STATUS_BASE, 0x400000 | SLOT_MPCP as u32);
+        assert_ne!(olt.mailbox_bitmap[0] & (1 << SLOT_OAM), 0);
+        assert_eq!(olt.mailbox_bitmap[0] & (1 << SLOT_MPCP), 0);
+
+        // After reading OAM, bitmap is clear
+        olt.write_cmd(CMD_STATUS_BASE, 0x400000 | SLOT_OAM as u32);
+        assert_eq!(olt.mailbox_bitmap[0], 0);
+    }
+
+    #[test]
+    fn write_cmd_empty_slot_returns_true_clears_fifo() {
+        let mut olt = Olt::new();
+        olt.set_enabled(true);
+
+        // Load OAM only
+        let mut oam = vec![0u8; 60];
+        oam[12..14].copy_from_slice(&ETHERTYPE_OAM.to_be_bytes());
+        olt.inject_raw_frame(oam);
+        olt.load_frames_into_mailbox();
+
+        // Read from MPCP slot — no frame there, but CMD still intercepted
+        assert!(olt.write_cmd(CMD_STATUS_BASE, 0x400000 | SLOT_MPCP as u32));
+        assert!(olt.mailbox_fifo.is_empty(), "No MPCP frame to load");
+
+        // CMD_STATUS read returns None (no data ready)
+        assert!(olt.read_cmd_status(CMD_STATUS_BASE).is_none());
+
+        // OAM slot still has its frame
+        assert_eq!(olt.mailbox_pending.get(&SLOT_OAM).map(|q| q.len()), Some(1));
     }
 }
