@@ -202,11 +202,12 @@ pub struct PeripheralBank {
     /// this into `aux_irq_pending` after each bank tick.
     pub irq_pending: u32,
 
-    /// DMA mailbox registers (W1C semantics).
-    /// master[0] = 0x01000010, master[1] = 0x01000018
-    /// channel[0] = 0x01000014, channel[1] = 0x0100001C
+    /// DMA mailbox registers.
+    /// master[0/1] (0x10/0x18) = W1C status (ISR clears by writing 1).
+    /// channel[0/1] (0x14/0x1C) = R/W mask (firmware writes 0xFFFFFFFF
+    ///   to mask all channels). ISR checks `master & ~mask`.
     dma_master_status: [u32; 2],
-    dma_channel_status: [u32; 2],
+    dma_channel_mask: [u32; 2],
 
     /// Boot mode — peripherals snapshot this during construction.
     pub boot_mode: BootMode,
@@ -274,7 +275,7 @@ impl PeripheralBank {
             trace: false,
             irq_pending: 0,
             dma_master_status: [0; 2],
-            dma_channel_status: [0; 2],
+            dma_channel_mask: [0; 2],
             boot_mode,
             unmapped_exception: false,
             last_access: HashMap::new(),
@@ -335,7 +336,7 @@ impl PeripheralBank {
         self.olt.load_frames_into_mailbox(0);
         if self.olt.mailbox_pending.len() > mbox_before {
             self.dma_master_status[0] |= 1 << 27;
-            self.dma_channel_status[0] |= 1;
+            self.dma_channel_mask[0] |= 1;
         }
         // Sync OLT bitmaps into the epon_mac LLID backing store.
         // Only set when mailbox_pending has unread frames. Once the
@@ -377,14 +378,12 @@ impl PeripheralBank {
 
         // Aggregate IRQ pending bits from all peripherals.
         self.irq_pending = self.uart.irq_pending();
-        // DMA mailbox IRQ 6: level-triggered from W1C master status.
-        // Only fires when the firmware has unmasked channels in 0x14/0x1C.
-        // Currently firmware masks all channels (0xFFFFFFFF), so this
-        // IRQ effectively never fires. Frame RX goes through the event
-        // dispatch polling path instead.
-        if (self.dma_master_status[0] | self.dma_master_status[1]) != 0 {
-            self.irq_pending |= 1 << 6;
-        }
+        // DMA mailbox IRQ 6: NOT generated. The firmware masks all
+        // channels (0xFFFFFFFF in 0x14/0x1C), so the ISR never
+        // dispatches handlers. Frame RX goes through the main loop
+        // polling path (epon_rx_poll_and_dispatch_queues). Generating
+        // IRQ 6 causes an ISR storm because the ISR reads 0x10 via
+        // D-cache (stale value) and the W1C write never reaches MMIO.
     }
 
     /// Process deferred writes from scenario effects.
@@ -425,7 +424,7 @@ impl PeripheralBank {
         self.sysreg.reset_cold();
         self.irq_pending = 0;
         self.dma_master_status = [0; 2];
-        self.dma_channel_status = [0; 2];
+        self.dma_channel_mask = [0; 2];
         self.current_pc = 0;
         self.current_blink = 0;
         self.current_insn = 0;
@@ -852,7 +851,7 @@ impl PeripheralBank {
                 return Ok(v);
             }
             0x0100_0014 => {
-                let v = self.dma_channel_status[0];
+                let v = self.dma_channel_mask[0];
                 self.record_history(addr, v, "read", "word", "dma_mbox");
                 self.seq_emit(addr, v, "r", "word", "dma_mbox");
                 return Ok(v);
@@ -864,7 +863,7 @@ impl PeripheralBank {
                 return Ok(v);
             }
             0x0100_001C => {
-                let v = self.dma_channel_status[1];
+                let v = self.dma_channel_mask[1];
                 self.record_history(addr, v, "read", "word", "dma_mbox");
                 self.seq_emit(addr, v, "r", "word", "dma_mbox");
                 return Ok(v);
@@ -1009,7 +1008,7 @@ impl PeripheralBank {
                 return Ok(());
             }
             0x0100_0014 => {
-                self.dma_channel_status[0] &= !val;
+                self.dma_channel_mask[0] = val;
                 self.record_history(addr, val, "write", "word", "dma_mbox");
                 self.seq_emit(addr, val, "w", "word", "dma_mbox");
                 return Ok(());
@@ -1021,7 +1020,7 @@ impl PeripheralBank {
                 return Ok(());
             }
             0x0100_001C => {
-                self.dma_channel_status[1] &= !val;
+                self.dma_channel_mask[1] = val;
                 self.record_history(addr, val, "write", "word", "dma_mbox");
                 self.seq_emit(addr, val, "w", "word", "dma_mbox");
                 return Ok(());
