@@ -335,6 +335,11 @@ impl PeripheralBank {
         if self.olt.total_pending_count() > mbox_before {
             self.dma_master_status[0] |= 1 << 27;
             self.dma_channel_mask[0] |= 1;
+            // Invalidate D-cache line for DMA master status so the
+            // firmware's ISR reads the real value on the next IRQ 6.
+            self.pending_cache_inv.push(
+                DatapathOp::CacheInvalidate { addr: 0x0100_0010 },
+            );
         }
         // Sync OLT bitmaps into the epon_mac LLID backing store.
         // Only set when mailbox_pending has unread frames. Once the
@@ -908,8 +913,7 @@ impl PeripheralBank {
         // OLT CMD write intercept — must be before epon_mac.
         if crate::soc::olt::Olt::claims_mailbox(addr) && self.olt.write_cmd(addr, val) {
             // Immediately sync per-slot bitmap into epon_mac so the
-            // firmware doesn't see stale bits on the next bitmap check
-            // within the same tick window.
+            // firmware's next bitmap read sees the updated value.
             if self.olt.config.enabled {
                 for wi in 0..6u32 {
                     let a = 0x0100_1438 + wi * 0x200;

@@ -654,8 +654,16 @@ impl Memory {
         Ok(())
     }
 
+    /// MMIO space (outside SRAM) is uncacheable — the D-cache only
+    /// covers SRAM at 0x00000000..0x0007FFFF. Loads/stores to MMIO
+    /// addresses bypass the D-cache regardless of the `.di` flag.
+    #[inline]
+    fn is_mmio(&self, addr: u32) -> bool {
+        self.sram_offset(addr).is_none()
+    }
+
     pub fn read_byte_data(&mut self, addr: u32, cache_bypass: bool) -> Result<u8, Exception> {
-        if cache_bypass || !self.dcache_enabled() {
+        if cache_bypass || self.is_mmio(addr) || !self.dcache_enabled() {
             return self.read_byte_backing(addr);
         }
         self.ensure_cache_line(addr)?;
@@ -663,7 +671,7 @@ impl Memory {
     }
 
     pub fn read_half_data(&mut self, addr: u32, cache_bypass: bool) -> Result<u16, Exception> {
-        if cache_bypass || addr & 1 != 0 || !self.dcache_enabled() {
+        if cache_bypass || addr & 1 != 0 || self.is_mmio(addr) || !self.dcache_enabled() {
             if self.sram_offset(addr).is_none() {
                 if let Some(ref bank) = self.bank {
                     return bank.write().read_half(addr);
@@ -688,11 +696,7 @@ impl Memory {
         // half reads and writes at any byte offset — no exception
         // is raised. The byte-by-byte path below is HW-faithful,
         // not a workaround.
-        if cache_bypass || addr & 3 != 0 || !self.dcache_enabled() {
-            // Non-SRAM (MMIO): route through bank.read_word to
-            // preserve word-level peripheral dispatch (OLT mailbox
-            // CMD/STATUS, FIFO pops, history recording). Decomposing
-            // into 4 byte reads loses these intercepts.
+        if cache_bypass || addr & 3 != 0 || self.is_mmio(addr) || !self.dcache_enabled() {
             if self.sram_offset(addr).is_none() {
                 if let Some(ref bank) = self.bank {
                     return bank.write().read_word(addr);
@@ -715,7 +719,7 @@ impl Memory {
     }
 
     pub fn write_byte_data(&mut self, addr: u32, val: u8, cache_bypass: bool) -> Result<(), Exception> {
-        if cache_bypass || !self.dcache_enabled() {
+        if cache_bypass || self.is_mmio(addr) || !self.dcache_enabled() {
             return self.write_byte(addr, val);
         }
         self.ensure_cache_line(addr)?;
@@ -724,7 +728,7 @@ impl Memory {
     }
 
     pub fn write_half_data(&mut self, addr: u32, val: u16, cache_bypass: bool) -> Result<(), Exception> {
-        if cache_bypass || addr & 1 != 0 || !self.dcache_enabled() {
+        if cache_bypass || addr & 1 != 0 || self.is_mmio(addr) || !self.dcache_enabled() {
             return self.write_half(addr, val);
         }
         self.ensure_cache_line(addr)?;
@@ -735,7 +739,7 @@ impl Memory {
     }
 
     pub fn write_word_data(&mut self, addr: u32, val: u32, cache_bypass: bool) -> Result<(), Exception> {
-        if cache_bypass || addr & 3 != 0 || !self.dcache_enabled() {
+        if cache_bypass || addr & 3 != 0 || self.is_mmio(addr) || !self.dcache_enabled() {
             return self.write_word(addr, val);
         }
         self.ensure_cache_line(addr)?;
