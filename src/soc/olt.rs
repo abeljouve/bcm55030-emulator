@@ -301,6 +301,10 @@ pub struct Olt {
     /// match table at slot 0 (0x0100043C). Set when the OLT sends a
     /// REGISTER frame. Consumed by bank tick.
     pub pending_llid_update: Option<u16>,
+
+    /// Set when OLT sends REGISTER flags=3. Bank generates a second
+    /// auto-REGISTER_ACK to complete the handshake.
+    pub pending_final_ack: bool,
 }
 
 impl Olt {
@@ -328,6 +332,7 @@ impl Olt {
             mailbox_pending: HashMap::new(),
             trace: false,
             pending_llid_update: None,
+            pending_final_ack: false,
         }
     }
 
@@ -354,6 +359,10 @@ impl Olt {
 
     pub fn get_onu_mac(&self) -> [u8; 6] {
         self.onu_mac
+    }
+
+    pub fn assigned_llid(&self) -> u16 {
+        self.assigned_llid
     }
 
     /// Return a reference to the TX log (ONU → OLT frames).
@@ -634,6 +643,7 @@ impl Olt {
                     let confirm_frame = self.build_mpcp_register(0x03);
                     self.log_rx_frame(&confirm_frame, "REGISTER flags=3");
                     self.rx_inject_queue.push_back(confirm_frame);
+                    self.pending_final_ack = true;
                     self.mpcp_state = OltMpcpState::WaitFinalAck;
                 } else if self.mpcp_state == OltMpcpState::WaitFinalAck {
                     self.mpcp_state = OltMpcpState::Registered;

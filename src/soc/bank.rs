@@ -375,6 +375,23 @@ impl PeripheralBank {
             while ack.len() < 64 { ack.push(0); }
             self.olt.handle_tx_frame(&ack);
         }
+        if self.olt.pending_final_ack {
+            self.olt.pending_final_ack = false;
+            let onu_mac = self.olt.get_onu_mac();
+            let olt_mac = self.olt.config.mac;
+            let llid = self.olt.assigned_llid();
+            let mut ack = Vec::with_capacity(64);
+            ack.extend_from_slice(&olt_mac);
+            ack.extend_from_slice(&onu_mac);
+            ack.extend_from_slice(&0x8808u16.to_be_bytes());
+            ack.extend_from_slice(&6u16.to_be_bytes());
+            ack.extend_from_slice(&self.olt.mpcp_timestamp.to_be_bytes());
+            ack.extend_from_slice(&llid.to_be_bytes());
+            ack.push(0x03);
+            ack.extend_from_slice(&0x0032u16.to_be_bytes());
+            while ack.len() < 64 { ack.push(0); }
+            self.olt.handle_tx_frame(&ack);
+        }
         if self.olt.link_change_pending {
             self.olt.link_change_pending = false;
             self.epon_mac.set_1g_link_change_bit();

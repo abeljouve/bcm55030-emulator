@@ -169,6 +169,9 @@ pub struct EponMac {
     active_flags: u32,
     link_status_1g: u32,
     hw_state_status: u32,
+    /// Countdown for auto-clearing transient bits in hw_state_status.
+    /// On real HW, link-change bits are transient pulses, not sticky.
+    hw_state_status_autoclear: u32,
     discovery_status: u32,
     /// REG_SPECIAL_0064 backing store. Silicon power-on is zero —
     /// the previous shim returned 0x5382_FFFF unconditionally, which
@@ -199,6 +202,7 @@ impl EponMac {
             active_flags: 0,
             link_status_1g: 0,
             hw_state_status: 0,
+            hw_state_status_autoclear: 0,
             discovery_status: 0,
             special_0064: 0,
             trace: false,
@@ -217,8 +221,10 @@ impl EponMac {
     }
 
     /// Set the 10G PHY link status bit (bit 6 of REG_HW_STATE_STATUS).
+    /// On real HW this is a transient pulse — auto-clears after a few ticks.
     pub fn set_phy_link_status_bit(&mut self) {
         self.hw_state_status |= 0x40;
+        self.hw_state_status_autoclear = 50;
     }
 
     /// Set bit 2 of REG_DISCOVERY_STATUS (OLT discovery detected).
@@ -568,6 +574,12 @@ impl Peripheral for EponMac {
         // the old shim arm that unconditionally set bit 8.
         for flag in &mut self.llid_drain_flag {
             *flag = true;
+        }
+        if self.hw_state_status_autoclear > 0 {
+            self.hw_state_status_autoclear -= 1;
+            if self.hw_state_status_autoclear == 0 {
+                self.hw_state_status &= !0x40;
+            }
         }
     }
 
