@@ -234,6 +234,13 @@ impl EponMac {
         }
     }
 
+    pub fn poke_table_store(&mut self, addr: u32, val: u32) {
+        if (EPON_TABLE_BASE..EPON_TABLE_END).contains(&addr) {
+            let idx = Self::table_idx(addr);
+            self.table_store[idx] = val;
+        }
+    }
+
     /// Read a raw value from the LLID backing store.
     pub fn peek_llid_store(&self, addr: u32) -> u32 {
         if (EPON_LLID_BASE..EPON_LLID_TOP).contains(&addr) {

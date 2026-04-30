@@ -719,6 +719,9 @@ impl Memory {
     }
 
     pub fn write_byte_data(&mut self, addr: u32, val: u8, cache_bypass: bool) -> Result<(), Exception> {
+        if !self.watchpoints.is_empty() {
+            self.watchpoints.check(addr, 1, WatchMode::Write);
+        }
         if cache_bypass || self.is_mmio(addr) || !self.dcache_enabled() {
             return self.write_byte(addr, val);
         }
@@ -728,6 +731,9 @@ impl Memory {
     }
 
     pub fn write_half_data(&mut self, addr: u32, val: u16, cache_bypass: bool) -> Result<(), Exception> {
+        if !self.watchpoints.is_empty() {
+            self.watchpoints.check(addr, 2, WatchMode::Write);
+        }
         if cache_bypass || addr & 1 != 0 || self.is_mmio(addr) || !self.dcache_enabled() {
             return self.write_half(addr, val);
         }
@@ -739,6 +745,9 @@ impl Memory {
     }
 
     pub fn write_word_data(&mut self, addr: u32, val: u32, cache_bypass: bool) -> Result<(), Exception> {
+        if !self.watchpoints.is_empty() {
+            self.watchpoints.check(addr, 4, WatchMode::Write);
+        }
         if cache_bypass || addr & 3 != 0 || self.is_mmio(addr) || !self.dcache_enabled() {
             return self.write_word(addr, val);
         }

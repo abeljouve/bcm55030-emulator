@@ -346,6 +346,35 @@ impl PeripheralBank {
         // firmware issues a CMD write and the frame moves to the FIFO,
         // the bitmap clears so the firmware doesn't try to read a
         // second non-existent frame.
+        // When the OLT assigns an LLID (REGISTER frame), update the
+        // EPON MAC LLID match table so the firmware can find the slot.
+        if let Some(llid) = self.olt.pending_llid_update.take() {
+            // Update BOTH 1G and 10G LLID match tables (slot 0).
+            for &base in &[0x0100_043Cu32, 0x0100_0D00u32] {
+                let old_val = self.epon_mac.read_word(base).unwrap_or(0x0001_7FFE);
+                let new_val = (old_val & 0xFFFF_0000) | (llid as u32);
+                self.epon_mac.poke_table_store(base, new_val);
+                self.pending_cache_inv.push(
+                    DatapathOp::CacheInvalidate { addr: base },
+                );
+            }
+            // On real HW, the EPON MAC automatically sends REGISTER_ACK
+            // (opcode 6) back to the OLT after receiving REGISTER. Model
+            // this by injecting a synthetic REGISTER_ACK into the OLT TX path.
+            let onu_mac = self.olt.get_onu_mac();
+            let olt_mac = self.olt.config.mac;
+            let mut ack = Vec::with_capacity(64);
+            ack.extend_from_slice(&olt_mac);      // dst = OLT MAC
+            ack.extend_from_slice(&onu_mac);       // src = ONU MAC
+            ack.extend_from_slice(&0x8808u16.to_be_bytes()); // EtherType MPCP
+            ack.extend_from_slice(&6u16.to_be_bytes());      // opcode 6 = REGISTER_ACK
+            ack.extend_from_slice(&self.olt.mpcp_timestamp.to_be_bytes());
+            ack.extend_from_slice(&llid.to_be_bytes());      // echo assigned LLID
+            ack.push(0x03);                        // flags: register+ack
+            ack.extend_from_slice(&0x0032u16.to_be_bytes()); // sync time
+            while ack.len() < 64 { ack.push(0); }
+            self.olt.handle_tx_frame(&ack);
+        }
         if self.olt.link_change_pending {
             self.olt.link_change_pending = false;
             self.epon_mac.set_1g_link_change_bit();

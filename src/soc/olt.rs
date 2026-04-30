@@ -158,8 +158,10 @@ pub enum OltMpcpState {
     Idle,
     /// ONU sent REGISTER_REQ; OLT is preparing REGISTER response.
     Discovery,
-    /// OLT sent REGISTER, waiting for ONU REGISTER_ACK.
+    /// OLT sent REGISTER flags=1 (slot assignment), waiting for ONU REGISTER_ACK.
     WaitAck,
+    /// OLT received first REGISTER_ACK, sent REGISTER flags=3 (confirm).
+    WaitFinalAck,
     /// ONU acknowledged registration. MPCP is up.
     Registered,
 }
@@ -170,6 +172,7 @@ impl std::fmt::Display for OltMpcpState {
             OltMpcpState::Idle => write!(f, "idle"),
             OltMpcpState::Discovery => write!(f, "discovery"),
             OltMpcpState::WaitAck => write!(f, "wait_ack"),
+            OltMpcpState::WaitFinalAck => write!(f, "wait_final_ack"),
             OltMpcpState::Registered => write!(f, "registered"),
         }
     }
@@ -293,6 +296,11 @@ pub struct Olt {
     pub mailbox_pending: HashMap<u8, VecDeque<Vec<u32>>>,
 
     pub trace: bool,
+
+    /// When Some(llid), the bank should write this LLID to the EPON MAC
+    /// match table at slot 0 (0x0100043C). Set when the OLT sends a
+    /// REGISTER frame. Consumed by bank tick.
+    pub pending_llid_update: Option<u16>,
 }
 
 impl Olt {
@@ -319,6 +327,7 @@ impl Olt {
             mailbox_fifo: VecDeque::new(),
             mailbox_pending: HashMap::new(),
             trace: false,
+            pending_llid_update: None,
         }
     }
 
@@ -341,6 +350,10 @@ impl Olt {
     /// Return the current MPCP state.
     pub fn mpcp_state(&self) -> OltMpcpState {
         self.mpcp_state
+    }
+
+    pub fn get_onu_mac(&self) -> [u8; 6] {
+        self.onu_mac
     }
 
     /// Return a reference to the TX log (ONU → OLT frames).
@@ -600,8 +613,12 @@ impl Olt {
                     self.onu_mac[0], self.onu_mac[1], self.onu_mac[2],
                     self.onu_mac[3], self.onu_mac[4], self.onu_mac[5]
                 );
-                self.mpcp_state = OltMpcpState::Discovery;
-                self.register_req_tick = Some(self.ticks_elapsed);
+                // Only restart discovery if idle — ignore duplicate REQs
+                // while the handshake is in progress.
+                if self.mpcp_state == OltMpcpState::Idle {
+                    self.mpcp_state = OltMpcpState::Discovery;
+                    self.register_req_tick = Some(self.ticks_elapsed);
+                }
                 format!(
                     "REGISTER_REQ from {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
                     self.onu_mac[0], self.onu_mac[1], self.onu_mac[2],
@@ -610,9 +627,18 @@ impl Olt {
             }
             MPCP_OPCODE_REGISTER_ACK => {
                 if self.mpcp_state == OltMpcpState::WaitAck {
+                    eprintln!(
+                        "[OLT] REGISTER_ACK received — sending REGISTER flags=3 (LLID={})",
+                        self.assigned_llid
+                    );
+                    let confirm_frame = self.build_mpcp_register(0x03);
+                    self.log_rx_frame(&confirm_frame, "REGISTER flags=3");
+                    self.rx_inject_queue.push_back(confirm_frame);
+                    self.mpcp_state = OltMpcpState::WaitFinalAck;
+                } else if self.mpcp_state == OltMpcpState::WaitFinalAck {
                     self.mpcp_state = OltMpcpState::Registered;
                     eprintln!(
-                        "[OLT] REGISTER_ACK received — ONU registered (LLID={})",
+                        "[OLT] Final REGISTER_ACK received — ONU registered (LLID={})",
                         self.assigned_llid
                     );
                 }
@@ -641,9 +667,9 @@ impl Olt {
 
     // ── Frame builders ──────────────────────────────────────────────
 
-    /// Build an MPCP REGISTER frame (opcode 3) in response to
-    /// REGISTER_REQ from the ONU.
-    fn build_mpcp_register(&self) -> Vec<u8> {
+    /// Build an MPCP REGISTER frame (opcode 5).
+    /// `flags`: 0x01 = register (slot assignment), 0x03 = register+ack (confirm).
+    fn build_mpcp_register(&self, flags: u8) -> Vec<u8> {
         let mut frame = Vec::with_capacity(64);
 
         // Destination: ONU MAC (learned from REGISTER_REQ).
@@ -652,14 +678,14 @@ impl Olt {
         frame.extend_from_slice(&self.config.mac);
         // EtherType: MPCP.
         frame.extend_from_slice(&ETHERTYPE_MPCP.to_be_bytes());
-        // Opcode: REGISTER (3).
+        // Opcode: REGISTER (5).
         frame.extend_from_slice(&MPCP_OPCODE_REGISTER.to_be_bytes());
         // Timestamp (4 bytes).
         frame.extend_from_slice(&self.mpcp_timestamp.to_be_bytes());
         // Assigned LLID (2 bytes) — port + LLID.
         frame.extend_from_slice(&self.assigned_llid.to_be_bytes());
-        // Flags: register accepted (0x01).
-        frame.push(0x01);
+        // Flags.
+        frame.push(flags);
         // Sync time (2 bytes) — typical value.
         frame.extend_from_slice(&0x0032u16.to_be_bytes());
         // Pad to minimum Ethernet frame size.
@@ -765,15 +791,16 @@ impl Olt {
                 && self.ticks_elapsed >= req_tick + REGISTER_RESPONSE_DELAY_TICKS
             {
                 self.register_req_tick = None;
-                let register_frame = self.build_mpcp_register();
+                let register_frame = self.build_mpcp_register(0x01);
                 eprintln!(
-                    "[OLT] Sending REGISTER (LLID={}) to {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                    "[OLT] Sending REGISTER flags=1 (LLID={}) to {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
                     self.assigned_llid,
                     self.onu_mac[0], self.onu_mac[1], self.onu_mac[2],
                     self.onu_mac[3], self.onu_mac[4], self.onu_mac[5]
                 );
-                self.log_rx_frame(&register_frame, "REGISTER");
+                self.log_rx_frame(&register_frame, "REGISTER flags=1");
                 self.rx_inject_queue.push_back(register_frame);
+                self.pending_llid_update = Some(self.assigned_llid);
                 self.mpcp_state = OltMpcpState::WaitAck;
             }
         }
@@ -1031,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn register_ack_completes_registration() {
+    fn register_ack_triggers_two_step_flow() {
         let mut olt = Olt::new();
         olt.set_enabled(true);
         olt.mpcp_state = OltMpcpState::WaitAck;
@@ -1040,6 +1067,12 @@ mod tests {
         frame[12..14].copy_from_slice(&ETHERTYPE_MPCP.to_be_bytes());
         frame[14..16].copy_from_slice(&MPCP_OPCODE_REGISTER_ACK.to_be_bytes());
 
+        // First ACK → sends REGISTER flags=3, transitions to WaitFinalAck.
+        olt.on_tx_frame(&frame);
+        assert_eq!(olt.mpcp_state, OltMpcpState::WaitFinalAck);
+        assert!(!olt.rx_inject_queue.is_empty());
+
+        // Second ACK → transitions to Registered.
         olt.on_tx_frame(&frame);
         assert_eq!(olt.mpcp_state, OltMpcpState::Registered);
     }
