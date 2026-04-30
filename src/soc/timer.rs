@@ -1,13 +1,15 @@
-//! BCM55030 EPON free-running counter — Session 6.
+//! BCM55030 EPON free-running counter.
 //!
-//! Owns the single-register `EPON_FREE_COUNTER` at `0x01000050`,
-//! previously served by `sysreg_shim::timer_counter`. The counter
-//! increments once per bank tick scaled by a user-configurable
-//! prescaler (default `1` — every bank tick advances the counter).
+//! Owns the single-register `EPON_FREE_COUNTER` at `0x01000050`.
+//! The counter advances by 1 on each word-level read so that firmware
+//! exact-match busy-waits (`serdes_busy_wait_epon_timer_ticks`) see
+//! every consecutive value and never skip a target. Sub-word reads
+//! (byte/half) peek without advancing — only the firmware's `ld.di`
+//! word reads trigger progression.
 //!
-//! Resolves audit 3.1 — the prescaler is tunable via
-//! [`TimerEvent::SetPrescaler`] and the counter value via
-//! [`TimerEvent::SetCounter`].
+//! On real silicon the counter runs at 156.25 MHz independently of
+//! reads, but exact-match correctness is required for firmware init
+//! to complete.
 //!
 //! The ARC Timer 0 / Timer 1 live CPU-side in `src/cpu/mod.rs` and
 //! are unrelated to this peripheral — they are aux registers, not
@@ -29,7 +31,6 @@ const TIMER_RANGES: &[AddressRange] = &[AddressRange::new(
 #[derive(Clone)]
 pub struct EponTimer {
     counter: u32,
-    tick_accumulator: u32,
     prescaler: u32,
     pub trace: bool,
 }
@@ -38,7 +39,6 @@ impl EponTimer {
     pub fn new() -> Self {
         Self {
             counter: 0,
-            tick_accumulator: 0,
             prescaler: 1,
             trace: false,
         }
@@ -60,28 +60,30 @@ impl Peripheral for EponTimer {
     }
 
     fn read_word(&mut self, _addr: u32) -> Result<u32, Exception> {
-        Ok(self.counter)
+        let val = self.counter;
+        self.counter = self.counter.wrapping_add(self.prescaler);
+        Ok(val)
+    }
+
+    fn read_byte(&mut self, addr: u32) -> Result<u8, Exception> {
+        let byte_idx = addr & 3;
+        Ok((self.counter >> (24 - byte_idx * 8)) as u8)
+    }
+
+    fn read_half(&mut self, addr: u32) -> Result<u16, Exception> {
+        let half_idx = (addr >> 1) & 1;
+        Ok((self.counter >> (16 - half_idx * 16)) as u16)
     }
 
     fn write_word(&mut self, _addr: u32, val: u32) -> Result<(), Exception> {
-        // Counter is writable by software — used for calibration
-        // tests. Not a HW-verified behaviour, but it matches the
-        // old `sysreg_store` residual fallback.
         self.counter = val;
         Ok(())
     }
 
-    fn tick(&mut self, _cpu_instructions: u64) {
-        self.tick_accumulator = self.tick_accumulator.wrapping_add(1);
-        if self.tick_accumulator >= self.prescaler {
-            self.tick_accumulator = 0;
-            self.counter = self.counter.wrapping_add(1);
-        }
-    }
+    fn tick(&mut self, _cpu_instructions: u64) {}
 
     fn reset_cold(&mut self) {
         self.counter = 0;
-        self.tick_accumulator = 0;
         self.prescaler = 1;
     }
 
@@ -100,7 +102,6 @@ impl Peripheral for EponTimer {
                         return Err(PeripheralError::InvalidParameter("prescaler 0"));
                     }
                     self.prescaler = *p;
-                    self.tick_accumulator = 0;
                     Ok(())
                 }
                 TimerEvent::SetCounter(v) => {
@@ -118,23 +119,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn counter_increments_on_each_tick() {
+    fn counter_increments_on_word_read() {
         let mut t = EponTimer::new();
-        t.tick(64);
-        t.tick(64);
-        t.tick(64);
-        assert_eq!(t.read_word(REG_EPON_FREE_COUNTER).unwrap(), 3);
+        assert_eq!(t.read_word(REG_EPON_FREE_COUNTER).unwrap(), 0);
+        assert_eq!(t.read_word(REG_EPON_FREE_COUNTER).unwrap(), 1);
+        assert_eq!(t.read_word(REG_EPON_FREE_COUNTER).unwrap(), 2);
     }
 
     #[test]
-    fn prescaler_divides_tick_rate() {
+    fn byte_read_does_not_advance() {
         let mut t = EponTimer::new();
-        t.inject_event(&PeripheralEvent::Timer(TimerEvent::SetPrescaler(4)))
+        t.write_word(REG_EPON_FREE_COUNTER, 0x11223344).unwrap();
+        assert_eq!(t.read_byte(REG_EPON_FREE_COUNTER).unwrap(), 0x11);
+        assert_eq!(t.read_byte(REG_EPON_FREE_COUNTER + 3).unwrap(), 0x44);
+        assert_eq!(t.read_word(REG_EPON_FREE_COUNTER).unwrap(), 0x11223344);
+    }
+
+    #[test]
+    fn prescaler_controls_increment() {
+        let mut t = EponTimer::new();
+        t.inject_event(&PeripheralEvent::Timer(TimerEvent::SetPrescaler(10)))
             .unwrap();
-        for _ in 0..12 {
-            t.tick(64);
-        }
-        assert_eq!(t.read_word(REG_EPON_FREE_COUNTER).unwrap(), 3);
+        assert_eq!(t.read_word(REG_EPON_FREE_COUNTER).unwrap(), 0);
+        assert_eq!(t.read_word(REG_EPON_FREE_COUNTER).unwrap(), 10);
+        assert_eq!(t.read_word(REG_EPON_FREE_COUNTER).unwrap(), 20);
     }
 
     #[test]
@@ -145,10 +153,17 @@ mod tests {
     }
 
     #[test]
-    fn set_counter_event() {
+    fn busy_wait_target_always_hit() {
         let mut t = EponTimer::new();
-        t.inject_event(&PeripheralEvent::Timer(TimerEvent::SetCounter(42)))
-            .unwrap();
-        assert_eq!(t.read_word(REG_EPON_FREE_COUNTER).unwrap(), 42);
+        let start = t.read_word(REG_EPON_FREE_COUNTER).unwrap() & 0x7FFF;
+        let target = (start + 10) & 0x7FFF;
+        let mut found = false;
+        for _ in 0..200 {
+            if t.read_word(REG_EPON_FREE_COUNTER).unwrap() & 0x7FFF == target {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "exact-match target must be reachable");
     }
 }

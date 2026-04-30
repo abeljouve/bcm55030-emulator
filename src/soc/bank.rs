@@ -39,9 +39,9 @@ use crate::soc::timer::EponTimer;
 use crate::soc::uart::Uart;
 use crate::soc::vlan_lue::VlanLue;
 
-/// CPU instruction ticks between bank tick invocations. Higher = less
-/// contention but coarser peripheral advancement. The EPON free-running
-/// counter assumes 64 — keep the default here.
+/// CPU instructions between bank tick invocations. Higher = less
+/// contention but coarser peripheral advancement. The EPON timer
+/// uses per-read advancement independently of this prescaler.
 pub const BANK_TICK_PRESCALER: u64 = 64;
 
 /// Per-address last-access record for the `explain_mmio` MCP tool.
