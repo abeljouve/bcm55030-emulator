@@ -431,11 +431,25 @@ impl PeripheralBank {
         // at SRAM 0x7E3CA after the firmware consumes a mailbox frame.
         // The firmware's `epon_rx_packet_dispatch_handler` stores the
         // frame length at 0x7E3CA-0x7E3CB; the guard byte at 0x7E3CB
-        // gates Phase 1: non-zero → permanent flush mode. Without this
-        // clear, Phase 1 processes exactly ONE frame in its lifetime.
-        if self.olt.frame_consumed {
+        // gates Phase 1: non-zero → permanent flush mode.
+        //
+        // The firmware has TWO frame consumption paths:
+        // - Process path: reads CMD/DATA → OLT intercepts → frame_consumed
+        // - Flush path: writes DRAIN registers → not intercepted by OLT
+        //
+        // We clear the guard whenever the mailbox is empty (no pending
+        // frames, FIFO drained). This covers both paths and models the
+        // DMA engine's "no frames pending" signal. The 3-tick delay
+        // ensures the firmware's store to 0x7E3CA has executed before
+        // the D-cache invalidation discards it.
+        let mailbox_idle = self.olt.config.enabled
+            && !self.olt.has_any_pending()
+            && self.olt.mailbox_fifo.is_empty();
+        if self.olt.frame_consumed || mailbox_idle {
             self.olt.frame_consumed = false;
-            self.guard_clear_countdown = 3;
+            if self.guard_clear_countdown == 0 {
+                self.guard_clear_countdown = 3;
+            }
         }
         if self.guard_clear_countdown > 0 {
             self.guard_clear_countdown -= 1;
