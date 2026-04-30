@@ -199,10 +199,14 @@ pub struct PeripheralBank {
     pub trace: bool,
 
     /// Aggregated IRQ pending mask from peripherals. `Cpu::step()` ORs
-    /// this into `aux_irq_pending` after each bank tick. Session 1 only
-    /// UART contributes; other peripherals will add their bits once they
-    /// land.
+    /// this into `aux_irq_pending` after each bank tick.
     pub irq_pending: u32,
+
+    /// DMA mailbox registers (W1C semantics).
+    /// master[0] = 0x01000010, master[1] = 0x01000018
+    /// channel[0] = 0x01000014, channel[1] = 0x0100001C
+    dma_master_status: [u32; 2],
+    dma_channel_status: [u32; 2],
 
     /// Boot mode — peripherals snapshot this during construction.
     pub boot_mode: BootMode,
@@ -269,6 +273,8 @@ impl PeripheralBank {
             mmio_trace: None,
             trace: false,
             irq_pending: 0,
+            dma_master_status: [0; 2],
+            dma_channel_status: [0; 2],
             boot_mode,
             unmapped_exception: false,
             last_access: HashMap::new(),
@@ -325,7 +331,12 @@ impl PeripheralBank {
         // word_index=0 (bitmap at 0x01001438) since that's the most
         // common queue. The frames are also available from any
         // word_index via the CMD/STATUS FIFO intercept.
+        let mbox_before = self.olt.mailbox_pending.len();
         self.olt.load_frames_into_mailbox(0);
+        if self.olt.mailbox_pending.len() > mbox_before {
+            self.dma_master_status[0] |= 1 << 27;
+            self.dma_channel_status[0] |= 1;
+        }
         // Sync OLT bitmaps into the epon_mac LLID backing store.
         // Only set when mailbox_pending has unread frames. Once the
         // firmware issues a CMD write and the frame moves to the FIFO,
@@ -361,10 +372,16 @@ impl PeripheralBank {
         self.sysreg.tick(cpu_instructions);
         self.scenario.tick(cpu_instructions);
 
-        // Aggregate IRQ pending bits. UART is the only v1 contributor
-        // (IRQ 5, level 1). Other peripherals will add their bits once
-        // they land.
+        // Aggregate IRQ pending bits from all peripherals.
         self.irq_pending = self.uart.irq_pending();
+        // DMA mailbox IRQ 6: level-triggered from W1C master status.
+        // Only fires when the firmware has unmasked channels in 0x14/0x1C.
+        // Currently firmware masks all channels (0xFFFFFFFF), so this
+        // IRQ effectively never fires. Frame RX goes through the event
+        // dispatch polling path instead.
+        if (self.dma_master_status[0] | self.dma_master_status[1]) != 0 {
+            self.irq_pending |= 1 << 6;
+        }
     }
 
     /// Process deferred writes from scenario effects.
@@ -404,6 +421,8 @@ impl PeripheralBank {
         self.olt.reset_cold();
         self.sysreg.reset_cold();
         self.irq_pending = 0;
+        self.dma_master_status = [0; 2];
+        self.dma_channel_status = [0; 2];
         self.current_pc = 0;
         self.current_blink = 0;
         self.current_insn = 0;
@@ -821,6 +840,34 @@ impl PeripheralBank {
             self.seq_emit(addr, v, "r", "word", "vlan_lue");
             return Ok(v);
         }
+        // DMA mailbox status registers — intercept before sysreg.
+        match addr {
+            0x0100_0010 => {
+                let v = self.dma_master_status[0];
+                self.record_history(addr, v, "read", "word", "dma_mbox");
+                self.seq_emit(addr, v, "r", "word", "dma_mbox");
+                return Ok(v);
+            }
+            0x0100_0014 => {
+                let v = self.dma_channel_status[0];
+                self.record_history(addr, v, "read", "word", "dma_mbox");
+                self.seq_emit(addr, v, "r", "word", "dma_mbox");
+                return Ok(v);
+            }
+            0x0100_0018 => {
+                let v = self.dma_master_status[1];
+                self.record_history(addr, v, "read", "word", "dma_mbox");
+                self.seq_emit(addr, v, "r", "word", "dma_mbox");
+                return Ok(v);
+            }
+            0x0100_001C => {
+                let v = self.dma_channel_status[1];
+                self.record_history(addr, v, "read", "word", "dma_mbox");
+                self.seq_emit(addr, v, "r", "word", "dma_mbox");
+                return Ok(v);
+            }
+            _ => {}
+        }
         if self.sysreg.claims(addr) { dispatch_rw!(self.sysreg, "sysreg"); }
         if self.trace {
             eprintln!("[MMIO] read  word  0x{:08X} → 0x00000000 (unmapped)", addr);
@@ -949,6 +996,34 @@ impl PeripheralBank {
             self.record_history(addr, val, "write", "word", "vlan_lue");
             self.seq_emit(addr, val, "w", "word", "vlan_lue");
             return Ok(());
+        }
+        // DMA mailbox registers — W1C semantics.
+        match addr {
+            0x0100_0010 => {
+                self.dma_master_status[0] &= !val;
+                self.record_history(addr, val, "write", "word", "dma_mbox");
+                self.seq_emit(addr, val, "w", "word", "dma_mbox");
+                return Ok(());
+            }
+            0x0100_0014 => {
+                self.dma_channel_status[0] &= !val;
+                self.record_history(addr, val, "write", "word", "dma_mbox");
+                self.seq_emit(addr, val, "w", "word", "dma_mbox");
+                return Ok(());
+            }
+            0x0100_0018 => {
+                self.dma_master_status[1] &= !val;
+                self.record_history(addr, val, "write", "word", "dma_mbox");
+                self.seq_emit(addr, val, "w", "word", "dma_mbox");
+                return Ok(());
+            }
+            0x0100_001C => {
+                self.dma_channel_status[1] &= !val;
+                self.record_history(addr, val, "write", "word", "dma_mbox");
+                self.seq_emit(addr, val, "w", "word", "dma_mbox");
+                return Ok(());
+            }
+            _ => {}
         }
         if self.sysreg.claims(addr) { dispatch_ww!(self.sysreg, "sysreg"); }
         if self.trace {

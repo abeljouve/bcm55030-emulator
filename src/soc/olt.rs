@@ -86,10 +86,11 @@ const ETHERTYPE_MPCP: u16 = 0x8808;
 /// EtherType: Slow Protocols (OAM).
 const ETHERTYPE_OAM: u16 = 0x8809;
 
-/// MPCP opcodes (IEEE 802.3 Clause 64).
+/// MPCP opcodes (IEEE 802.3ah / Clause 64).
 const MPCP_OPCODE_GATE: u16 = 2;
-const MPCP_OPCODE_REGISTER: u16 = 3;
+const MPCP_OPCODE_REPORT: u16 = 3;
 const MPCP_OPCODE_REGISTER_REQ: u16 = 4;
+const MPCP_OPCODE_REGISTER: u16 = 5;
 const MPCP_OPCODE_REGISTER_ACK: u16 = 6;
 
 /// OAM subtype for slow-protocols.

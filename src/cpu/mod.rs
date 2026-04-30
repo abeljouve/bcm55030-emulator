@@ -423,19 +423,18 @@ impl Cpu {
         }
     }
 
-    /// Poll the UART IRQ line via the peripheral bank. Prescaled to
-    /// avoid hot-path contention on every instruction.
+    /// Poll peripheral IRQ lines via the bank. Prescaled to avoid
+    /// hot-path contention on every instruction.
     fn check_uart_irq(&mut self) {
         if self.state.instruction_count % UART_PRESCALER != 0 {
             return;
         }
-        let pending = if let Some(ref bank) = self.bank {
-            bank.read().uart.irq_pending() != 0
-        } else {
-            false
-        };
-        if pending {
-            self.state.aux_irq_pending |= 1 << UART_IRQ;
+        if let Some(ref bank) = self.bank {
+            let b = bank.read();
+            if b.uart.irq_pending() != 0 {
+                self.state.aux_irq_pending |= 1 << UART_IRQ;
+            }
+            self.state.aux_irq_pending |= b.irq_pending;
         }
     }
 
