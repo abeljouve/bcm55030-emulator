@@ -241,8 +241,9 @@ impl PeripheralBank {
                 bus.apply_init(super::mmio_init::SYSREG_INIT_VALUES);
                 // SerDes CDR calibration done bits — firmware polls
                 // indirect regs 0xBB/0xDB bit 7 via lane 8.
-                bus.set_reg(0xBB, 0x80);
-                bus.set_reg(0xDB, 0x80);
+                // Register file uses 0x100+reg_num indexing.
+                bus.set_reg(0x1BB, 0x80);
+                bus.set_reg(0x1DB, 0x80);
                 bus
             },
             serdes: SerDes::new(),
@@ -387,8 +388,8 @@ impl PeripheralBank {
         self.bsc_i2c.reset_cold();
         self.mpcp_bus.reset();
         self.mpcp_bus.apply_init(super::mmio_init::SYSREG_INIT_VALUES);
-        self.mpcp_bus.set_reg(0xBB, 0x80);
-        self.mpcp_bus.set_reg(0xDB, 0x80);
+        self.mpcp_bus.set_reg(0x1BB, 0x80);
+        self.mpcp_bus.set_reg(0x1DB, 0x80);
         self.serdes.reset_cold();
         self.epon_mac.reset_cold();
         self.macsec.reset_cold();
@@ -415,8 +416,8 @@ impl PeripheralBank {
         self.bsc_i2c.reset_warm();
         self.mpcp_bus.reset();
         self.mpcp_bus.apply_init(super::mmio_init::SYSREG_INIT_VALUES);
-        self.mpcp_bus.set_reg(0xBB, 0x80);
-        self.mpcp_bus.set_reg(0xDB, 0x80);
+        self.mpcp_bus.set_reg(0x1BB, 0x80);
+        self.mpcp_bus.set_reg(0x1DB, 0x80);
         self.serdes.reset_warm();
         self.epon_mac.reset_warm();
         self.macsec.reset_warm();
@@ -898,21 +899,7 @@ impl PeripheralBank {
         if self.mpcp_bus.claims(addr) {
             if addr == self.mpcp_bus.cmd_addr {
                 self.mpcp_bus.write_cmd(val);
-                // Immediate clear: firmware reads CMD via D-cache so the
-                // deferred clear path (on read_cmd) is never reached.
                 self.mpcp_bus.clear_cmd_bits_now();
-                // CDR calibration done: writing to control reg 0xBA/0xDA
-                // triggers calibration; set done bit (0xBB/0xDB bit 7)
-                // immediately (real HW takes ~100µs).
-                let cmd_hi = (val >> 27) & 0x1F;
-                if cmd_hi & 2 != 0 {
-                    let reg_idx = ((val >> 18) & 0x1FF) as usize;
-                    if reg_idx == 0xBA {
-                        self.mpcp_bus.set_reg(0xBB, self.mpcp_bus.reg(0xBB) | 0x80);
-                    } else if reg_idx == 0xDA {
-                        self.mpcp_bus.set_reg(0xDB, self.mpcp_bus.reg(0xDB) | 0x80);
-                    }
-                }
                 self.pending_cache_inv.push(
                     DatapathOp::CacheInvalidate { addr },
                 );
@@ -920,6 +907,16 @@ impl PeripheralBank {
                 self.mpcp_bus.write_data(val);
             } else {
                 self.mpcp_bus.write_stat(val);
+                // STAT write with read trigger (bit 22): the HW reads the
+                // SerDes register selected by regs[0] and stores the result
+                // in regs[0x100].  For CDR cal-done registers 0xBB/0xDB,
+                // return bit 7 set (calibration complete).
+                if val & (1 << 22) != 0 {
+                    let target_reg = self.mpcp_bus.reg(0) as usize;
+                    if target_reg == 0xBB || target_reg == 0xDB {
+                        self.mpcp_bus.set_reg(0x100, self.mpcp_bus.reg(0x100) | 0x80);
+                    }
+                }
             }
             self.record_history(addr, val, "write", "word", "mpcp_bus");
             self.seq_emit(addr, val, "w", "word", "mpcp_bus");
