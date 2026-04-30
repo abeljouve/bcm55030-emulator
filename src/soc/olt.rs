@@ -305,6 +305,11 @@ pub struct Olt {
     /// Set when OLT sends REGISTER flags=3. Bank generates a second
     /// auto-REGISTER_ACK to complete the handshake.
     pub pending_final_ack: bool,
+
+    /// Set when `read_data()` pops the last word from the mailbox FIFO.
+    /// The bank uses this to schedule a DMA-style clear of the firmware's
+    /// Phase 1 guard struct at SRAM 0x7E3CA.
+    pub frame_consumed: bool,
 }
 
 impl Olt {
@@ -333,6 +338,7 @@ impl Olt {
             trace: false,
             pending_llid_update: None,
             pending_final_ack: false,
+            frame_consumed: false,
         }
     }
 
@@ -428,12 +434,16 @@ impl Olt {
     }
 
     /// Determine the mailbox slot for a frame based on EtherType.
+    /// On real BCM55030, both MPCP (0x8808) and OAM (0x8809) are
+    /// control-plane frames routed to the same mailbox slot. The
+    /// firmware's Phase 1 dispatch loop processes the MPCP queue
+    /// first; routing OAM here ensures it's handled in that loop
+    /// rather than requiring a separate data-queue check.
     fn slot_for_frame(frame: &[u8]) -> u8 {
         if frame.len() >= 14 {
             let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
             match ethertype {
-                ETHERTYPE_MPCP => SLOT_MPCP,
-                ETHERTYPE_OAM => SLOT_OAM,
+                ETHERTYPE_MPCP | ETHERTYPE_OAM => SLOT_MPCP,
                 0x888E => SLOT_MACSEC,
                 _ => SLOT_OAM,
             }
@@ -483,12 +493,15 @@ impl Olt {
     }
 
     /// Handle a read of the LLID bitmap register.
+    /// Returns `Some(bitmap)` for any valid word index when the OLT is
+    /// enabled — including 0 — so the read never falls through to
+    /// epon_mac's LLID backing store, which may contain stale bits.
     pub fn read_bitmap(&self, addr: u32) -> Option<u32> {
         if !self.config.enabled { return None; }
         let offset = addr.wrapping_sub(BITMAP_BASE);
         if offset % MAILBOX_STRIDE != 0 { return None; }
         let wi = (offset / MAILBOX_STRIDE) as usize;
-        if wi < self.mailbox_bitmap.len() && self.mailbox_bitmap[wi] != 0 {
+        if wi < self.mailbox_bitmap.len() {
             Some(self.mailbox_bitmap[wi])
         } else {
             None
@@ -496,6 +509,8 @@ impl Olt {
     }
 
     /// Handle a read of the CMD/STATUS register (bit 9 = data ready).
+    /// Returns `Some(0)` when enabled but FIFO is empty, preventing
+    /// fallthrough to epon_mac which could return stale values.
     pub fn read_cmd_status(&self, addr: u32) -> Option<u32> {
         if !self.config.enabled { return None; }
         let offset = addr.wrapping_sub(CMD_STATUS_BASE);
@@ -503,16 +518,26 @@ impl Olt {
         if !self.mailbox_fifo.is_empty() {
             Some(0x200) // bit 9 = data ready
         } else {
-            None
+            Some(0)
         }
     }
 
     /// Handle a read of the DATA register (pop next word).
+    /// Returns `Some(0)` when enabled but FIFO is empty, preventing
+    /// fallthrough to epon_mac. On real HW the mailbox returns 0
+    /// when no data is pending.
     pub fn read_data(&mut self, addr: u32) -> Option<u32> {
         if !self.config.enabled { return None; }
         let offset = addr.wrapping_sub(DATA_BASE);
         if offset % MAILBOX_STRIDE != 0 { return None; }
-        self.mailbox_fifo.pop_front()
+        if let Some(word) = self.mailbox_fifo.pop_front() {
+            if self.mailbox_fifo.is_empty() {
+                self.frame_consumed = true;
+            }
+            Some(word)
+        } else {
+            Some(0)
+        }
     }
 
     /// Handle a write to the CMD/STATUS register.
@@ -1157,8 +1182,7 @@ mod tests {
         let mut olt = Olt::new();
         olt.set_enabled(true);
 
-        // Inject 3 OAMs then 1 MPCP — in single-FIFO model, MPCP
-        // would be behind 3 OAMs and unreachable via MPCP poll.
+        // OAM (0x8809) and MPCP (0x8808) share SLOT_MPCP (control plane).
         for _ in 0..3 {
             let mut oam = vec![0u8; 60];
             oam[12..14].copy_from_slice(&ETHERTYPE_OAM.to_be_bytes());
@@ -1172,22 +1196,14 @@ mod tests {
 
         assert_eq!(
             olt.mailbox_pending.get(&SLOT_MPCP).map(|q| q.len()),
-            Some(1),
-            "MPCP slot should have 1 frame"
-        );
-        assert_eq!(
-            olt.mailbox_pending.get(&SLOT_OAM).map(|q| q.len()),
-            Some(3),
-            "OAM slot should have 3 frames"
+            Some(4),
+            "MPCP slot should have 4 frames (3 OAM + 1 MPCP)"
         );
 
-        // Firmware reads MPCP first (CMD_STATUS = 0x400010)
+        // Read first frame (OAM)
         assert!(olt.write_cmd(CMD_STATUS_BASE, 0x400000 | SLOT_MPCP as u32));
-        assert!(!olt.mailbox_fifo.is_empty(), "MPCP frame should be loaded");
-
-        // MPCP slot empty, OAM still has 3
-        assert!(olt.mailbox_pending.get(&SLOT_MPCP).is_none());
-        assert_eq!(olt.mailbox_pending.get(&SLOT_OAM).map(|q| q.len()), Some(3));
+        assert!(!olt.mailbox_fifo.is_empty());
+        assert_eq!(olt.mailbox_pending.get(&SLOT_MPCP).map(|q| q.len()), Some(3));
     }
 
     #[test]
@@ -1195,6 +1211,7 @@ mod tests {
         let mut olt = Olt::new();
         olt.set_enabled(true);
 
+        // OAM and MPCP share SLOT_MPCP — only bit 16 should be set.
         let mut oam = vec![0u8; 60];
         oam[12..14].copy_from_slice(&ETHERTYPE_OAM.to_be_bytes());
         olt.inject_raw_frame(oam);
@@ -1205,22 +1222,15 @@ mod tests {
 
         olt.load_frames_into_mailbox();
 
-        // Bitmap word 0 should have bit 15 (OAM) and bit 16 (MPCP) set
-        assert_ne!(olt.mailbox_bitmap[0] & (1 << SLOT_OAM), 0, "OAM bit");
         assert_ne!(olt.mailbox_bitmap[0] & (1 << SLOT_MPCP), 0, "MPCP bit");
-        // No other bits set
-        assert_eq!(
-            olt.mailbox_bitmap[0],
-            (1 << SLOT_OAM) | (1 << SLOT_MPCP)
-        );
+        assert_eq!(olt.mailbox_bitmap[0], 1 << SLOT_MPCP);
 
-        // After reading MPCP, only OAM bit remains
+        // After reading first frame, still 1 pending → bit stays set
         olt.write_cmd(CMD_STATUS_BASE, 0x400000 | SLOT_MPCP as u32);
-        assert_ne!(olt.mailbox_bitmap[0] & (1 << SLOT_OAM), 0);
-        assert_eq!(olt.mailbox_bitmap[0] & (1 << SLOT_MPCP), 0);
+        assert_ne!(olt.mailbox_bitmap[0] & (1 << SLOT_MPCP), 0);
 
-        // After reading OAM, bitmap is clear
-        olt.write_cmd(CMD_STATUS_BASE, 0x400000 | SLOT_OAM as u32);
+        // After reading second frame, queue empty → bit clears
+        olt.write_cmd(CMD_STATUS_BASE, 0x400000 | SLOT_MPCP as u32);
         assert_eq!(olt.mailbox_bitmap[0], 0);
     }
 
@@ -1229,20 +1239,20 @@ mod tests {
         let mut olt = Olt::new();
         olt.set_enabled(true);
 
-        // Load OAM only
-        let mut oam = vec![0u8; 60];
-        oam[12..14].copy_from_slice(&ETHERTYPE_OAM.to_be_bytes());
-        olt.inject_raw_frame(oam);
+        // Load MACsec frame only (uses SLOT_MACSEC = 0x00)
+        let mut macsec = vec![0u8; 60];
+        macsec[12..14].copy_from_slice(&0x888Eu16.to_be_bytes());
+        olt.inject_raw_frame(macsec);
         olt.load_frames_into_mailbox();
 
         // Read from MPCP slot — no frame there, but CMD still intercepted
         assert!(olt.write_cmd(CMD_STATUS_BASE, 0x400000 | SLOT_MPCP as u32));
         assert!(olt.mailbox_fifo.is_empty(), "No MPCP frame to load");
 
-        // CMD_STATUS read returns None (no data ready)
-        assert!(olt.read_cmd_status(CMD_STATUS_BASE).is_none());
+        // CMD_STATUS read returns 0 (no data ready, but OLT intercepts)
+        assert_eq!(olt.read_cmd_status(CMD_STATUS_BASE), Some(0));
 
-        // OAM slot still has its frame
-        assert_eq!(olt.mailbox_pending.get(&SLOT_OAM).map(|q| q.len()), Some(1));
+        // MACsec slot still has its frame
+        assert_eq!(olt.mailbox_pending.get(&SLOT_MACSEC).map(|q| q.len()), Some(1));
     }
 }

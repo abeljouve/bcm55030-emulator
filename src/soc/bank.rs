@@ -232,6 +232,13 @@ pub struct PeripheralBank {
     /// by default — zero overhead when disabled. When present, every
     /// successful MMIO access appends a JSON Lines entry.
     pub seq_trace: Option<SeqTrace>,
+
+    /// Countdown (in bank ticks) before clearing the firmware's Phase 1
+    /// guard struct at SRAM 0x7E3CA. On real BCM55030, the DMA engine
+    /// clears this after frame consumption. Delayed by a few ticks so the
+    /// firmware's store instruction has executed before we invalidate the
+    /// D-cache line.
+    guard_clear_countdown: u32,
 }
 
 impl PeripheralBank {
@@ -282,6 +289,7 @@ impl PeripheralBank {
             mmio_history: VecDeque::with_capacity(DEFAULT_MMIO_HISTORY_SIZE),
             mmio_history_max: DEFAULT_MMIO_HISTORY_SIZE,
             seq_trace: None,
+            guard_clear_countdown: 0,
         };
         // Apply the requested reset flavour.
         match boot_mode {
@@ -418,6 +426,29 @@ impl PeripheralBank {
                 }
             }
         }
+        // Phase 1 guard struct clear — models DMA completion.
+        // On real BCM55030, the DMA engine clears the frame descriptor
+        // at SRAM 0x7E3CA after the firmware consumes a mailbox frame.
+        // The firmware's `epon_rx_packet_dispatch_handler` stores the
+        // frame length at 0x7E3CA-0x7E3CB; the guard byte at 0x7E3CB
+        // gates Phase 1: non-zero → permanent flush mode. Without this
+        // clear, Phase 1 processes exactly ONE frame in its lifetime.
+        if self.olt.frame_consumed {
+            self.olt.frame_consumed = false;
+            self.guard_clear_countdown = 3;
+        }
+        if self.guard_clear_countdown > 0 {
+            self.guard_clear_countdown -= 1;
+            if self.guard_clear_countdown == 0 {
+                self.pending_cache_inv.push(
+                    DatapathOp::SramWrite {
+                        sram_addr: 0x0007_E3CA,
+                        data: vec![0x00, 0x00],
+                    },
+                );
+            }
+        }
+
         self.sysreg.tick(cpu_instructions);
         self.scenario.tick(cpu_instructions);
 
