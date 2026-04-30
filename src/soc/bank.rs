@@ -239,6 +239,10 @@ impl PeripheralBank {
             mpcp_bus: {
                 let mut bus = LaneBus::new(0x0100_0118, 2);
                 bus.apply_init(super::mmio_init::SYSREG_INIT_VALUES);
+                // SerDes CDR calibration done bits — firmware polls
+                // indirect regs 0xBB/0xDB bit 7 via lane 8.
+                bus.set_reg(0xBB, 0x80);
+                bus.set_reg(0xDB, 0x80);
                 bus
             },
             serdes: SerDes::new(),
@@ -383,6 +387,8 @@ impl PeripheralBank {
         self.bsc_i2c.reset_cold();
         self.mpcp_bus.reset();
         self.mpcp_bus.apply_init(super::mmio_init::SYSREG_INIT_VALUES);
+        self.mpcp_bus.set_reg(0xBB, 0x80);
+        self.mpcp_bus.set_reg(0xDB, 0x80);
         self.serdes.reset_cold();
         self.epon_mac.reset_cold();
         self.macsec.reset_cold();
@@ -409,6 +415,8 @@ impl PeripheralBank {
         self.bsc_i2c.reset_warm();
         self.mpcp_bus.reset();
         self.mpcp_bus.apply_init(super::mmio_init::SYSREG_INIT_VALUES);
+        self.mpcp_bus.set_reg(0xBB, 0x80);
+        self.mpcp_bus.set_reg(0xDB, 0x80);
         self.serdes.reset_warm();
         self.epon_mac.reset_warm();
         self.macsec.reset_warm();
@@ -893,6 +901,18 @@ impl PeripheralBank {
                 // Immediate clear: firmware reads CMD via D-cache so the
                 // deferred clear path (on read_cmd) is never reached.
                 self.mpcp_bus.clear_cmd_bits_now();
+                // CDR calibration done: writing to control reg 0xBA/0xDA
+                // triggers calibration; set done bit (0xBB/0xDB bit 7)
+                // immediately (real HW takes ~100µs).
+                let cmd_hi = (val >> 27) & 0x1F;
+                if cmd_hi & 2 != 0 {
+                    let reg_idx = ((val >> 18) & 0x1FF) as usize;
+                    if reg_idx == 0xBA {
+                        self.mpcp_bus.set_reg(0xBB, self.mpcp_bus.reg(0xBB) | 0x80);
+                    } else if reg_idx == 0xDA {
+                        self.mpcp_bus.set_reg(0xDB, self.mpcp_bus.reg(0xDB) | 0x80);
+                    }
+                }
                 self.pending_cache_inv.push(
                     DatapathOp::CacheInvalidate { addr },
                 );
