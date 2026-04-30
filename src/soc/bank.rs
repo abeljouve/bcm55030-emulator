@@ -366,6 +366,9 @@ impl PeripheralBank {
                 let addr = 0x0100_1438 + wi * 0x200;
                 if addr < 0x0100_2000 {
                     self.epon_mac.poke_llid_store(addr, bmp);
+                    self.pending_cache_inv.push(
+                        DatapathOp::CacheInvalidate { addr },
+                    );
                 }
             }
         }
