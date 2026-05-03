@@ -12,6 +12,7 @@ use registers::{CpuState, DelayState, REG_BLINK, REG_ILINK1, REG_ILINK2, REG_LP_
 
 use crate::debug_info::DebugInfo;
 use crate::decoder;
+use crate::decoder::instruction::Instruction;
 use crate::executor;
 use crate::hooks::{self, HookAction, HookTable};
 use crate::memory::Memory;
@@ -37,6 +38,8 @@ pub struct Cpu {
     pub mem: Memory,
     /// Log every instruction to stderr
     pub trace: bool,
+    /// Log `sr` (AUX register write) instructions to stderr
+    pub trace_sr: bool,
     /// DWARF-based PC → source-location lookup, loaded from a
     /// separate ELF via the `--debug-elf` flag. When set, the trace
     /// output and the UI disassembly panel annotate each instruction
@@ -81,6 +84,7 @@ impl Cpu {
             state: CpuState::new(),
             mem: Memory::new(mem_size),
             trace: false,
+            trace_sr: false,
             debug_info: None,
             hooks: HookTable::new(),
             shadow_call_stack: Vec::new(),
@@ -105,6 +109,7 @@ impl Cpu {
             state,
             mem,
             trace: false,
+            trace_sr: false,
             debug_info: None,
             hooks: HookTable::new(),
             shadow_call_stack: Vec::new(),
@@ -272,6 +277,8 @@ impl Cpu {
         }
 
         // Update CPU context on the bank for watchpoint / trace output.
+        // Also set the .di flag from the current instruction so MMIO
+        // history entries record whether the access used cache bypass.
         if let Some(ref bank) = self.bank {
             let mut guard = bank.write();
             guard.update_cpu_context(
@@ -279,12 +286,32 @@ impl Cpu {
                 self.state.core_regs[31],
                 self.state.instruction_count,
             );
+            guard.current_di = match &decoded.inst {
+                Instruction::Store { cache_bypass, .. }
+                | Instruction::Load { cache_bypass, .. } => *cache_bypass,
+                _ => false,
+            };
         }
 
         // Execute
         self.state.pc_written = false;
         self.state.link_executed = false;
         executor::execute(&decoded, &mut self.state, &mut self.mem)?;
+
+        // SR trace: log AUX register writes and record in history buffer.
+        if let Instruction::StoreAux { src, addr } = &decoded.inst {
+            let addr_val = executor::resolve_value(*addr, &self.state).unwrap_or(0);
+            let val = executor::resolve_value(*src, &self.state).unwrap_or(0);
+            if self.trace_sr {
+                eprintln!(
+                    "[SR] PC=0x{:05X} sr [0x{:X}], 0x{:08X}",
+                    self.state.pc, addr_val, val
+                );
+            }
+            if let Some(ref bank) = self.bank {
+                bank.write().record_aux_write(addr_val, val);
+            }
+        }
 
         // PC update logic
         if let Some((target, _is_link)) = delay_info {

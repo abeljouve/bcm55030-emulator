@@ -382,6 +382,8 @@ pub struct MmioHistoryEntryJson {
     pub peripheral: String,
     pub name: Option<String>,
     pub block: Option<String>,
+    /// `true` when the access used a `.di` (cache bypass) instruction.
+    pub di: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -394,6 +396,33 @@ pub struct MmioHistoryResult {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SetMmioHistorySizeParams {
     pub size: usize,
+}
+
+// ---------- AUX write history DTOs ----------------------------------------
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct GetAuxWriteHistoryParams {
+    /// Filter by AUX register number.
+    pub aux_num: Option<HexU32>,
+    /// Return only the last N entries.
+    pub last: Option<usize>,
+    /// Maximum entries to return (default 200).
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AuxWriteHistoryEntryJson {
+    pub insn: u64,
+    pub pc: HexValue,
+    pub aux_num: HexValue,
+    pub value: HexValue,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AuxWriteHistoryResult {
+    pub total_in_buffer: usize,
+    pub returned: usize,
+    pub entries: Vec<AuxWriteHistoryEntryJson>,
 }
 
 // ---------- Coverage DTOs (Phase C1) --------------------------------------
@@ -1779,6 +1808,7 @@ impl EmulatorHandler {
                     peripheral: e.peripheral.to_string(),
                     name,
                     block,
+                    di: e.di,
                 }
             })
             .collect();
@@ -1812,6 +1842,53 @@ impl EmulatorHandler {
     )]
     async fn clear_mmio_history(&self) -> Json<OkResult> {
         self.handle.bank.write().mmio_history.clear();
+        Json(OkResult { ok: true })
+    }
+
+    // ---------- AUX write history tools ------------------------------------
+
+    #[tool(
+        name = "get_aux_write_history",
+        description = "Return recent AUX register writes (from `sr` instructions). Filters: `aux_num` (single register), `last` (tail N), `limit` (max returned, default 200). Use to discover AUX writes the firmware makes that don't appear in MMIO history."
+    )]
+    async fn get_aux_write_history(
+        &self,
+        Parameters(params): Parameters<GetAuxWriteHistoryParams>,
+    ) -> Json<AuxWriteHistoryResult> {
+        let guard = self.handle.bank.read();
+        let total = guard.aux_write_history.len();
+        let limit = params.limit.unwrap_or(200);
+        let iter: Box<dyn Iterator<Item = &crate::soc::bank::AuxWriteHistoryEntry> + '_> =
+            if let Some(last_n) = params.last {
+                let skip = total.saturating_sub(last_n);
+                Box::new(guard.aux_write_history.iter().skip(skip))
+            } else {
+                Box::new(guard.aux_write_history.iter())
+            };
+        let filter_aux = params.aux_num.map(|h| h.0);
+        let entries: Vec<AuxWriteHistoryEntryJson> = iter
+            .filter(|e| {
+                if let Some(a) = filter_aux { if e.aux_num != a { return false; } }
+                true
+            })
+            .take(limit)
+            .map(|e| AuxWriteHistoryEntryJson {
+                insn: e.insn,
+                pc: HexValue(e.pc),
+                aux_num: HexValue(e.aux_num),
+                value: HexValue(e.value),
+            })
+            .collect();
+        let returned = entries.len();
+        Json(AuxWriteHistoryResult { total_in_buffer: total, returned, entries })
+    }
+
+    #[tool(
+        name = "clear_aux_write_history",
+        description = "Clear all entries from the AUX write history ring buffer."
+    )]
+    async fn clear_aux_write_history(&self) -> Json<OkResult> {
+        self.handle.bank.write().aux_write_history.clear();
         Json(OkResult { ok: true })
     }
 

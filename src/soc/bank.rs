@@ -67,7 +67,21 @@ pub struct MmioHistoryEntry {
     pub direction: &'static str,
     pub width: &'static str,
     pub peripheral: &'static str,
+    /// `true` when the access used a `.di` (cache bypass) instruction.
+    /// `false` for regular `st`/`ld` (cached) or non-CPU-initiated accesses.
+    pub di: bool,
 }
+
+/// AUX register write history entry (from `sr` instructions).
+#[derive(Clone, Debug)]
+pub struct AuxWriteHistoryEntry {
+    pub insn: u64,
+    pub pc: u32,
+    pub aux_num: u32,
+    pub value: u32,
+}
+
+pub const DEFAULT_AUX_WRITE_HISTORY_SIZE: usize = 8192;
 
 pub const DEFAULT_MMIO_HISTORY_SIZE: usize = 8192;
 
@@ -120,10 +134,10 @@ impl SeqTrace {
 
     /// Write one JSON Lines entry. Never panics — silently ignores write errors.
     #[inline]
-    pub fn emit(&mut self, cycle: u64, pc: u32, addr: u32, value: u32, rw: &str, width: &str, periph: &str) {
+    pub fn emit(&mut self, cycle: u64, pc: u32, addr: u32, value: u32, rw: &str, width: &str, periph: &str, di: bool) {
         let _ = writeln!(
             self.writer,
-            r#"{{"cycle":{cycle},"pc":{pc},"addr":{addr},"value":{value},"rw":"{rw}","width":"{width}","periph":"{periph}"}}"#,
+            r#"{{"cycle":{cycle},"pc":{pc},"addr":{addr},"value":{value},"rw":"{rw}","width":"{width}","periph":"{periph}","di":{di}}}"#,
         );
     }
 
@@ -190,6 +204,13 @@ pub struct PeripheralBank {
     pub current_pc: u32,
     pub current_blink: u32,
     pub current_insn: u64,
+    /// Set by `Cpu::step()` before execute: `true` when the current
+    /// instruction uses `.di` (cache bypass). Used by `record_history`.
+    pub current_di: bool,
+
+    /// Ring buffer of recent AUX register writes (from `sr` instructions).
+    pub aux_write_history: VecDeque<AuxWriteHistoryEntry>,
+    pub aux_write_history_max: usize,
 
     /// Optional aggregated MMIO trace for `--dump-mmio-trace`.
     pub mmio_trace: Option<HashMap<u32, MmioTraceEntry>>,
@@ -278,6 +299,9 @@ impl PeripheralBank {
             current_pc: 0,
             current_blink: 0,
             current_insn: 0,
+            current_di: false,
+            aux_write_history: VecDeque::with_capacity(DEFAULT_AUX_WRITE_HISTORY_SIZE),
+            aux_write_history_max: DEFAULT_AUX_WRITE_HISTORY_SIZE,
             mmio_trace: None,
             trace: false,
             irq_pending: 0,
@@ -539,6 +563,7 @@ impl PeripheralBank {
         self.current_pc = 0;
         self.current_blink = 0;
         self.current_insn = 0;
+        self.current_di = false;
     }
 
     /// Warm reset — loads the post-boot snapshot on top of cold reset.
@@ -626,6 +651,7 @@ impl PeripheralBank {
         self.current_pc = pc;
         self.current_blink = blink;
         self.current_insn = insn;
+        self.current_di = false;
         self.sysreg.update_cpu_context(pc, insn);
     }
 
@@ -644,6 +670,21 @@ impl PeripheralBank {
             direction,
             width,
             peripheral,
+            di: self.current_di,
+        });
+    }
+
+    /// Record an AUX register write (from `sr` instruction).
+    pub fn record_aux_write(&mut self, aux_num: u32, value: u32) {
+        if self.aux_write_history_max == 0 { return; }
+        if self.aux_write_history.len() >= self.aux_write_history_max {
+            self.aux_write_history.pop_front();
+        }
+        self.aux_write_history.push_back(AuxWriteHistoryEntry {
+            insn: self.current_insn,
+            pc: self.current_pc,
+            aux_num,
+            value,
         });
     }
 
@@ -670,7 +711,7 @@ impl PeripheralBank {
     fn seq_emit(&mut self, addr: u32, value: u32, rw: &str, width: &str, periph: &str) {
         if let Some(ref mut st) = self.seq_trace {
             if st.addr_matches(addr) {
-                st.emit(self.current_insn, self.current_pc, addr, value, rw, width, periph);
+                st.emit(self.current_insn, self.current_pc, addr, value, rw, width, periph, self.current_di);
             }
         }
     }
@@ -810,6 +851,7 @@ impl PeripheralBank {
         self.current_pc = 0;
         self.current_blink = 0;
         self.current_insn = 0;
+        self.current_di = false;
     }
 
     // -------- MMIO routing --------

@@ -23,6 +23,7 @@ fn usage(prog: &str) {
     eprintln!("  --max-cycles <N>            Maximum instructions (default: unlimited)");
     eprintln!("  --trace                     Log each instruction to stderr");
     eprintln!("  --trace-mmio                Log MMIO accesses to stderr");
+    eprintln!("  --trace-sr                  Log AUX register writes (sr instructions) to stderr");
     eprintln!("  --verbose, -v               Show debug messages ([Hook], [MMIO], [Boot ROM]...)");
     eprintln!("  --break <ADDR>              Stop at address (hex)");
     eprintln!("  --dccm-dump <FILE>          Dump DCCM to file on exit");
@@ -49,6 +50,7 @@ struct Config {
     trace: bool,
     trace_from_insn: Option<u64>,
     trace_mmio: bool,
+    trace_sr: bool,
     verbose: bool,
     breakpoint: Option<u32>,
     dccm_dump: Option<String>,
@@ -103,6 +105,7 @@ fn parse_args() -> Config {
         trace: false,
         trace_from_insn: None,
         trace_mmio: false,
+        trace_sr: false,
         verbose: false,
         breakpoint: None,
         dccm_dump: None,
@@ -158,6 +161,7 @@ fn parse_args() -> Config {
                 }));
             }
             "--trace-mmio" => cfg.trace_mmio = true,
+            "--trace-sr" => cfg.trace_sr = true,
             "--verbose" | "-v" => cfg.verbose = true,
             "--break" => {
                 i += 1;
@@ -592,6 +596,7 @@ fn main() {
     boot_from_flash(&mut cpu, cfg.entry_point, cfg.boot_mode);
 
     cpu.trace = cfg.trace;
+    cpu.trace_sr = cfg.trace_sr;
     cpu.mem.dccm_watchpoint = cfg.watch_dccm;
     if let Some(ref path) = cfg.debug_elf {
         match bcm55030_emulator::debug_info::DebugInfo::load(path) {
@@ -702,6 +707,7 @@ fn main() {
                 reset_cpu_for_reboot(&mut cpu);
                 boot_from_flash(&mut cpu, cfg.entry_point, cfg.boot_mode);
                 cpu.trace = cfg.trace;
+                cpu.trace_sr = cfg.trace_sr;
                 if cfg.trace_mmio {
                     let mut bank = cpu.bank().unwrap().write();
                     bank.trace = true;

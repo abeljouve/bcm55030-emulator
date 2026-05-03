@@ -240,6 +240,7 @@ mod tests {
             direction: dir,
             width: "word",
             peripheral: "test",
+            di: false,
         }
     }
 
