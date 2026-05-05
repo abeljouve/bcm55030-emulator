@@ -198,6 +198,65 @@ impl SerDes {
         )
     }
 
+    /// Return a descriptive per-lane MDIO tag for MMIO history entries.
+    /// Per-lane MDIO controller base = 0x010023D8 + lane*0x400.
+    /// CMD at base+0x34, DATA3..DATA0 at base+0x38..+0x44.
+    /// Evidence: Ghidra 0x20035430 `phy_mdio_rw_op`, unhandled_mmio.json.
+    pub fn mdio_peripheral_tag(addr: u32) -> &'static str {
+        if !(SERDES_LANE_BASE..SERDES_LANE_END).contains(&addr) {
+            return "serdes";
+        }
+        let off = addr - SERDES_LANE_BASE;
+        // 1G bank: lanes 0-1 at offset 0x00 + lane*0x400
+        // 10G bank: lanes 0-1 at offset 0x400 + lane*0x400
+        // Per-lane MDIO registers at lane_base+0x0C..+0x1C
+        // Lane 0 1G: CMD=0x240C DATA3=0x2410 DATA2=0x2414 DATA1=0x2418 DATA0=0x241C
+        // Lane 0 1G HW_EN: 0x2420
+        // Lane 1 1G: CMD=0x2644 (stride 0x238 in the 1G bank)
+        // Lane 0 10G: CMD=0x280C DATA3=0x2810..
+        // Lane 0 10G HW_EN: 0x2820
+        match addr {
+            // 1G lane 0 MDIO
+            0x0100_240C => "serdes_l0_1g_mdio_cmd",
+            0x0100_2410 => "serdes_l0_1g_mdio_data3",
+            0x0100_2414 => "serdes_l0_1g_mdio_data2",
+            0x0100_2418 => "serdes_l0_1g_mdio_data1",
+            0x0100_241C => "serdes_l0_1g_mdio_data0",
+            0x0100_2420 => "serdes_l0_1g_hw_enable",
+            // 1G lane 1 MDIO (stride 0x238 from lane 0)
+            0x0100_2644 => "serdes_l1_1g_mdio_cmd",
+            0x0100_2648 => "serdes_l1_1g_mdio_data3",
+            0x0100_264C => "serdes_l1_1g_mdio_data2",
+            0x0100_2650 => "serdes_l1_1g_mdio_data1",
+            0x0100_2654 => "serdes_l1_1g_mdio_data0",
+            0x0100_2658 => "serdes_l1_1g_hw_enable",
+            // 10G lane 0 MDIO
+            0x0100_280C => "serdes_l0_10g_mdio_cmd",
+            0x0100_2810 => "serdes_l0_10g_mdio_data3",
+            0x0100_2814 => "serdes_l0_10g_mdio_data2",
+            0x0100_2818 => "serdes_l0_10g_mdio_data1",
+            0x0100_281C => "serdes_l0_10g_mdio_data0",
+            0x0100_2820 => "serdes_l0_10g_hw_enable",
+            // 10G lane 1 MDIO
+            0x0100_2A44 => "serdes_l1_10g_mdio_cmd",
+            0x0100_2A48 => "serdes_l1_10g_mdio_data3",
+            0x0100_2A4C => "serdes_l1_10g_mdio_data2",
+            0x0100_2A50 => "serdes_l1_10g_mdio_data1",
+            0x0100_2A54 => "serdes_l1_10g_mdio_data0",
+            _ => {
+                // Generic lane-region fallback with 0x400 stride
+                let lane = off / 0x400;
+                match lane {
+                    0 => "serdes_lane0",
+                    1 => "serdes_lane1",
+                    2 => "serdes_lane2",
+                    3 => "serdes_lane3",
+                    _ => "serdes_lane",
+                }
+            }
+        }
+    }
+
     fn main_idx(addr: u32) -> usize {
         ((addr - SERDES_MAIN_BASE) / 4) as usize
     }

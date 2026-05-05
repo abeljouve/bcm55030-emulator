@@ -1042,6 +1042,98 @@ pub struct LoadSymbolsFileResult {
     pub error: Option<String>,
 }
 
+// ---------- IND transaction decode DTOs (Todo: emu-ind-protocol-decode) ---
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct GetIndTransactionsParams {
+    /// Filter: only transactions at or after this instruction count.
+    pub from_insn: Option<u64>,
+    /// Filter: only transactions at or before this instruction count.
+    pub to_insn: Option<u64>,
+    /// Max entries to return (default 500).
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct IndTransactionJson {
+    pub insn: u64,
+    pub pc: HexValue,
+    pub direction: String,
+    pub reg_addr: HexValue,
+    pub reg_value: HexValue,
+    pub ind_cmd: HexValue,
+    pub lane_mode: Option<u32>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GetIndTransactionsResult {
+    pub total: usize,
+    pub entries: Vec<IndTransactionJson>,
+}
+
+// ---------- MMIO summary diff DTOs (Todo: emu-mmio-diff-snapshots) --------
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SaveMmioSummaryParams {
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SaveMmioSummaryResult {
+    pub ok: bool,
+    pub name: String,
+    pub address_count: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DiffMmioSummariesParams {
+    pub a: String,
+    pub b: String,
+    /// Optional address range filter: `[start, end)`.
+    pub range_start: Option<HexU32>,
+    pub range_end: Option<HexU32>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct MmioSummaryDiffEntry {
+    pub address: HexValue,
+    pub name: Option<String>,
+    pub block: Option<String>,
+    pub side: String,
+    pub write_count_a: Option<u64>,
+    pub write_count_b: Option<u64>,
+    pub last_value_a: Option<HexValue>,
+    pub last_value_b: Option<HexValue>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DiffMmioSummariesResult {
+    pub ok: bool,
+    pub only_in_a: usize,
+    pub only_in_b: usize,
+    pub different: usize,
+    pub entries: Vec<MmioSummaryDiffEntry>,
+    pub error: Option<String>,
+}
+
+// ---------- Peek MMIO at insn DTOs (Todo: emu-register-value-at-insn) -----
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct PeekMmioAtInsnParams {
+    pub address: HexU32,
+    pub insn: u64,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PeekMmioAtInsnResult {
+    pub address: HexValue,
+    pub insn: u64,
+    pub found: bool,
+    pub value: Option<HexValue>,
+    pub write_insn: Option<u64>,
+    pub write_pc: Option<HexValue>,
+}
+
 // ---------- Tool implementations -----------------------------------------
 
 #[tool_router]
@@ -1890,6 +1982,246 @@ impl EmulatorHandler {
     async fn clear_aux_write_history(&self) -> Json<OkResult> {
         self.handle.bank.write().aux_write_history.clear();
         Json(OkResult { ok: true })
+    }
+
+    // ---------- IND transaction decode (Todo: emu-ind-protocol-decode) -----
+
+    #[tool(
+        name = "get_ind_transactions",
+        description = "Reconstruct SerDes IND register transactions from MMIO history. Scans writes to IND_DATA (0x0100016C), correlates with IND_CMD (0x01000170) for direction and I2C_CTRL (0x01000040) for lane mode. Protocol: Ghidra 0x20035430 phy_mdio_rw_op, session 2026-05-05-1430."
+    )]
+    async fn get_ind_transactions(
+        &self,
+        Parameters(params): Parameters<GetIndTransactionsParams>,
+    ) -> Json<GetIndTransactionsResult> {
+        let guard = self.handle.bank.read();
+        let from = params.from_insn.unwrap_or(0);
+        let to = params.to_insn.unwrap_or(u64::MAX);
+        let limit = params.limit.unwrap_or(500);
+
+        const IND_DATA: u32 = 0x0100_016C;
+        const IND_CMD: u32 = 0x0100_0170;
+        const I2C_CTRL: u32 = 0x0100_0040;
+
+        let mut last_ind_cmd: u32 = 0;
+        let mut last_lane_mode: Option<u32> = None;
+        let mut transactions = Vec::new();
+
+        for e in guard.mmio_history.iter() {
+            if e.insn < from || e.insn > to { continue; }
+            if e.direction != "write" { continue; }
+            match e.address {
+                I2C_CTRL => {
+                    last_lane_mode = Some((e.value >> 12) & 0x3);
+                }
+                IND_CMD => {
+                    last_ind_cmd = e.value;
+                }
+                IND_DATA => {
+                    let direction = match last_ind_cmd {
+                        0x13 => "write",
+                        0x0B => "read_ptr_set",
+                        _ => "unknown",
+                    };
+                    let reg_addr = e.value & 0xFF;
+                    let reg_value = (e.value >> 8) & 0xFF;
+                    transactions.push(IndTransactionJson {
+                        insn: e.insn,
+                        pc: HexValue(e.pc),
+                        direction: direction.to_string(),
+                        reg_addr: HexValue(reg_addr),
+                        reg_value: HexValue(reg_value),
+                        ind_cmd: HexValue(last_ind_cmd),
+                        lane_mode: last_lane_mode,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        let total = transactions.len();
+        transactions.truncate(limit);
+        Json(GetIndTransactionsResult {
+            total,
+            entries: transactions,
+        })
+    }
+
+    // ---------- MMIO summary diff (Todo: emu-mmio-diff-snapshots) ---------
+
+    #[tool(
+        name = "save_mmio_summary",
+        description = "Save a summary of MMIO writes from the current history buffer. Groups by address: write count, last value, first/last instruction. Use with `diff_mmio_summaries` to compare reference vs bypass boot sequences."
+    )]
+    async fn save_mmio_summary(
+        &self,
+        Parameters(params): Parameters<SaveMmioSummaryParams>,
+    ) -> Json<SaveMmioSummaryResult> {
+        use crate::soc::bank::MmioSummaryEntry;
+        let mut guard = self.handle.bank.write();
+        let mut summary: std::collections::HashMap<u32, MmioSummaryEntry> =
+            std::collections::HashMap::new();
+        for e in guard.mmio_history.iter() {
+            if e.direction != "write" { continue; }
+            let entry = summary.entry(e.address).or_insert(MmioSummaryEntry {
+                write_count: 0,
+                last_value: 0,
+                first_insn: e.insn,
+                last_insn: e.insn,
+            });
+            entry.write_count += 1;
+            entry.last_value = e.value;
+            entry.last_insn = e.insn;
+        }
+        let count = summary.len();
+        guard.mmio_summaries.insert(params.name.clone(), summary);
+        Json(SaveMmioSummaryResult {
+            ok: true,
+            name: params.name,
+            address_count: count,
+        })
+    }
+
+    #[tool(
+        name = "diff_mmio_summaries",
+        description = "Compare two saved MMIO summaries. Returns addresses unique to each side, and addresses present in both with different write counts or values. Optional range filter."
+    )]
+    async fn diff_mmio_summaries(
+        &self,
+        Parameters(params): Parameters<DiffMmioSummariesParams>,
+    ) -> Json<DiffMmioSummariesResult> {
+        let guard = self.handle.bank.read();
+        let (sum_a, sum_b) = match (
+            guard.mmio_summaries.get(&params.a),
+            guard.mmio_summaries.get(&params.b),
+        ) {
+            (Some(a), Some(b)) => (a, b),
+            _ => {
+                return Json(DiffMmioSummariesResult {
+                    ok: false,
+                    only_in_a: 0,
+                    only_in_b: 0,
+                    different: 0,
+                    entries: Vec::new(),
+                    error: Some("summary not found".to_string()),
+                });
+            }
+        };
+
+        let lo = params.range_start.map(|h| h.0).unwrap_or(0);
+        let hi = params.range_end.map(|h| h.0).unwrap_or(u32::MAX);
+
+        let mut entries = Vec::new();
+        let mut only_a = 0usize;
+        let mut only_b = 0usize;
+        let mut different = 0usize;
+
+        let mut all_addrs: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        all_addrs.extend(sum_a.keys());
+        all_addrs.extend(sum_b.keys());
+
+        for &addr in &all_addrs {
+            if addr < lo || addr >= hi { continue; }
+            let a = sum_a.get(&addr);
+            let b = sum_b.get(&addr);
+            let (name, block) = reg_lookup(addr);
+            match (a, b) {
+                (Some(ea), None) => {
+                    only_a += 1;
+                    entries.push(MmioSummaryDiffEntry {
+                        address: HexValue(addr),
+                        name, block,
+                        side: "a_only".to_string(),
+                        write_count_a: Some(ea.write_count),
+                        write_count_b: None,
+                        last_value_a: Some(HexValue(ea.last_value)),
+                        last_value_b: None,
+                    });
+                }
+                (None, Some(eb)) => {
+                    only_b += 1;
+                    entries.push(MmioSummaryDiffEntry {
+                        address: HexValue(addr),
+                        name, block,
+                        side: "b_only".to_string(),
+                        write_count_a: None,
+                        write_count_b: Some(eb.write_count),
+                        last_value_a: None,
+                        last_value_b: Some(HexValue(eb.last_value)),
+                    });
+                }
+                (Some(ea), Some(eb)) => {
+                    if ea.write_count != eb.write_count || ea.last_value != eb.last_value {
+                        different += 1;
+                        entries.push(MmioSummaryDiffEntry {
+                            address: HexValue(addr),
+                            name, block,
+                            side: "different".to_string(),
+                            write_count_a: Some(ea.write_count),
+                            write_count_b: Some(eb.write_count),
+                            last_value_a: Some(HexValue(ea.last_value)),
+                            last_value_b: Some(HexValue(eb.last_value)),
+                        });
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+
+        Json(DiffMmioSummariesResult {
+            ok: true,
+            only_in_a: only_a,
+            only_in_b: only_b,
+            different,
+            entries,
+            error: None,
+        })
+    }
+
+    // ---------- Peek MMIO at insn (Todo: emu-register-value-at-insn) ------
+
+    #[tool(
+        name = "peek_mmio_at_insn",
+        description = "Query the value of an MMIO register at a past instruction count. Scans MMIO history for the last write to `address` at or before `insn`. Limited to history buffer contents."
+    )]
+    async fn peek_mmio_at_insn(
+        &self,
+        Parameters(params): Parameters<PeekMmioAtInsnParams>,
+    ) -> Json<PeekMmioAtInsnResult> {
+        let guard = self.handle.bank.read();
+        let addr = params.address.0;
+        let target_insn = params.insn;
+
+        let mut best: Option<&crate::soc::bank::MmioHistoryEntry> = None;
+        for e in guard.mmio_history.iter() {
+            if e.address != addr { continue; }
+            if e.direction != "write" { continue; }
+            if e.insn > target_insn { continue; }
+            match best {
+                None => best = Some(e),
+                Some(prev) if e.insn > prev.insn => best = Some(e),
+                _ => {}
+            }
+        }
+
+        match best {
+            Some(e) => Json(PeekMmioAtInsnResult {
+                address: HexValue(addr),
+                insn: target_insn,
+                found: true,
+                value: Some(HexValue(e.value)),
+                write_insn: Some(e.insn),
+                write_pc: Some(HexValue(e.pc)),
+            }),
+            None => Json(PeekMmioAtInsnResult {
+                address: HexValue(addr),
+                insn: target_insn,
+                found: false,
+                value: None,
+                write_insn: None,
+                write_pc: None,
+            }),
+        }
     }
 
     // ---------- Coverage + call stack tools (Phase C) ----------------------

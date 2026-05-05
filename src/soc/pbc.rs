@@ -65,6 +65,11 @@ pub struct Pbc {
     /// Resolves audit 5.2 — the SerDes slave path is no longer a
     /// hardcoded `0xFF` stub inside PBC.
     pending_spi_serdes: Option<(Vec<u8>, usize)>,
+
+    /// Last DMA transaction type for MMIO history annotation.
+    /// Set on REG_DMA_CTRL write based on ADDR and CMD encoding.
+    /// Evidence: session 2026-05-05-1430, PBC register analysis.
+    pub last_dma_tag: &'static str,
 }
 
 impl Pbc {
@@ -83,6 +88,7 @@ impl Pbc {
             dma_busy_counter: 0,
             pending_ops: Vec::new(),
             pending_spi_serdes: None,
+            last_dma_tag: "pbc",
         }
     }
 
@@ -168,6 +174,11 @@ impl Pbc {
             }
             REG_SPI_STATUS => {
                 if val & 1 != 0 {
+                    self.last_dma_tag = if self.spi_control & 0x40 != 0 {
+                        "pbc_spi_serdes"
+                    } else {
+                        "pbc_spi_flash"
+                    };
                     self.execute_fifo_command(val);
                     self.spi_busy_counter = SPI_BUSY_TICKS;
                 }
@@ -184,6 +195,13 @@ impl Pbc {
             REG_DMA_CTRL => {
                 self.dma_ctrl = val;
                 if val & 1 != 0 {
+                    let is_write = (val & 0x2) != 0;
+                    let addr = self.dma_flash_addr;
+                    self.last_dma_tag = if addr >= 0x40_0000 {
+                        if is_write { "pbc_mdio_write" } else { "pbc_mdio_read" }
+                    } else {
+                        if is_write { "pbc_spi_write" } else { "pbc_spi_read" }
+                    };
                     self.execute_dma(val);
                     self.dma_busy_counter = SPI_BUSY_TICKS;
                 }
@@ -354,6 +372,7 @@ impl Peripheral for Pbc {
         self.dma_busy_counter = 0;
         self.pending_ops.clear();
         self.pending_spi_serdes = None;
+        self.last_dma_tag = "pbc";
         // flash data preserved — non-volatile
     }
 

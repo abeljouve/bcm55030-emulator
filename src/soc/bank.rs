@@ -85,6 +85,16 @@ pub const DEFAULT_AUX_WRITE_HISTORY_SIZE: usize = 8192;
 
 pub const DEFAULT_MMIO_HISTORY_SIZE: usize = 8192;
 
+/// Aggregated per-address MMIO write summary for `save_mmio_summary` /
+/// `diff_mmio_summaries`.
+#[derive(Clone, Debug)]
+pub struct MmioSummaryEntry {
+    pub write_count: u64,
+    pub last_value: u32,
+    pub first_insn: u64,
+    pub last_insn: u64,
+}
+
 /// Aggregated MMIO trace entry (replaces the one previously owned by
 /// `mmio::MmioController`). Used by `--dump-mmio-trace` / cold-boot
 /// trace capture.
@@ -254,6 +264,9 @@ pub struct PeripheralBank {
     /// successful MMIO access appends a JSON Lines entry.
     pub seq_trace: Option<SeqTrace>,
 
+    /// Named MMIO write summaries for `diff_mmio_summaries`.
+    pub mmio_summaries: HashMap<String, HashMap<u32, MmioSummaryEntry>>,
+
     /// Countdown (in bank ticks) before clearing the firmware's Phase 1
     /// guard struct at SRAM 0x7E3CA. On real BCM55030, the DMA engine
     /// clears this after frame consumption. Delayed by a few ticks so the
@@ -313,6 +326,7 @@ impl PeripheralBank {
             mmio_history: VecDeque::with_capacity(DEFAULT_MMIO_HISTORY_SIZE),
             mmio_history_max: DEFAULT_MMIO_HISTORY_SIZE,
             seq_trace: None,
+            mmio_summaries: HashMap::new(),
             guard_clear_countdown: 0,
         };
         // Apply the requested reset flavour.
@@ -980,7 +994,13 @@ impl PeripheralBank {
             self.seq_emit(addr, v, "r", "word", "mpcp_bus");
             return Ok(v);
         }
-        if self.serdes.claims(addr) { dispatch_rw!(self.serdes, "serdes"); }
+        if self.serdes.claims(addr) {
+            let v = self.serdes.read_word(addr)?;
+            let tag = SerDes::mdio_peripheral_tag(addr);
+            self.record_history(addr, v, "read", "word", tag);
+            self.seq_emit(addr, v, "r", "word", tag);
+            return Ok(v);
+        }
         if self.epon_mac.claims(addr) { dispatch_rw!(self.epon_mac, "epon_mac"); }
         if self.macsec.claims(addr) { dispatch_rw!(self.macsec, "macsec"); }
         if self.dma.claims(addr) { dispatch_rw!(self.dma, "dma"); }
@@ -1087,8 +1107,9 @@ impl PeripheralBank {
                 let rx = self.serdes.spi_command(&tx, rx_len);
                 self.pbc.complete_spi_serdes(&rx);
             }
-            self.record_history(addr, val, "write", "word", "pbc");
-            self.seq_emit(addr, val, "w", "word", "pbc");
+            let tag = self.pbc.last_dma_tag;
+            self.record_history(addr, val, "write", "word", tag);
+            self.seq_emit(addr, val, "w", "word", tag);
             return Ok(());
         }
         if self.bsc_i2c.claims(addr) { dispatch_ww!(self.bsc_i2c, "bsc_i2c"); }
@@ -1128,8 +1149,9 @@ impl PeripheralBank {
             } else {
                 self.serdes.write_word(addr, val)?;
             }
-            self.record_history(addr, val, "write", "word", "serdes");
-            self.seq_emit(addr, val, "w", "word", "serdes");
+            let tag = SerDes::mdio_peripheral_tag(addr);
+            self.record_history(addr, val, "write", "word", tag);
+            self.seq_emit(addr, val, "w", "word", tag);
             return Ok(());
         }
         if self.epon_mac.claims(addr) {
