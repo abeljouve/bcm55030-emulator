@@ -1428,6 +1428,25 @@ mod tests {
     }
 
     #[test]
+    fn mov_sp_limm_p00_first_instruction() {
+        // Bug emu-mov-limm-first-instruction: MOV SP, 0x10000 au premier
+        // mot après cold boot. Encodage 24 0A 3F 80 / 00 01 00 00.
+        // P=00, sub=0x0A, B[5:3]=011 + B[2:0]=100 → B=28=SP ; C=62=LIMM.
+        let bytes: [u8; 8] = [0x24, 0x0A, 0x3F, 0x80, 0x00, 0x01, 0x00, 0x00];
+        let fetch = ByteSliceFetch::new(&bytes, 0);
+        let dec = decode_32bit(0x240A3F80, 0, &fetch).unwrap();
+        assert!(dec.has_limm, "MOV reg, LIMM en P=00 doit fetch LIMM");
+        assert_eq!(dec.total_size(), 8);
+        if let Instruction::Alu { op, dst, src2, .. } = dec.inst {
+            assert_eq!(op, AluOp::Mov);
+            assert_eq!(dst, Operand::Reg(28));
+            assert_eq!(src2, Operand::Imm(0x10000));
+        } else {
+            panic!("attendu Instruction::Alu, obtenu {:?}", dec.inst);
+        }
+    }
+
+    #[test]
     fn cmp_b62_u6_has_limm() {
         // CMP limm, 0: P=1, sub=0x0C, B=62, U6=0.
         // B=62 is source for CMP → LIMM fetch required.
