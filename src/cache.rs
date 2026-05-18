@@ -271,6 +271,33 @@ impl DCache {
         }
     }
 
+    /// Coherence action for a DMA-originated SRAM write covering this
+    /// line. On real BCM55030 a direct/DMA SRAM write does **not**
+    /// disturb a *dirty* cached line — the CPU's pending write shadows
+    /// SRAM and subsequent cached reads still return the cached value
+    /// (HW-verified, scan7b test 7; same class as a `.di` store). The
+    /// emulator previously evicted the line unconditionally, dropping
+    /// the firmware's cached saved-return slot when a flash-read
+    /// destination shared a 32-byte line with a live stack word
+    /// (bug `emu-reboot-halt-and-transfer-model-divergences` D2).
+    ///
+    /// Behaviour:
+    /// - line present and **dirty** → left intact (CPU value wins).
+    /// - line present and **clean** → invalidated, so the next cached
+    ///   read refills from the freshly DMA-written SRAM.
+    ///
+    /// Returns `true` when a dirty line was preserved (for tracing).
+    pub fn dma_sram_overwrite(&mut self, addr: u32) -> bool {
+        let (tag, set, _) = Self::decompose(addr);
+        if let Some(way) = self.find_way(set, tag) {
+            if self.lines[set][way].dirty {
+                return true;
+            }
+            self.lines[set][way] = CacheLine::empty();
+        }
+        false
+    }
+
     /// Read DC_CTRL register value (aux 0x48).
     /// Returns the raw stored value (masked by DC_CTRL_RW_MASK on write).
     pub fn read_dc_ctrl(&self) -> u32 {

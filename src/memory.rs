@@ -561,11 +561,21 @@ impl Memory {
                 if end <= self.data.len() {
                     self.data[start..end].copy_from_slice(&data);
                     if let Some(ref mut dc) = self.dcache {
+                        // A DMA SRAM write must not evict a *dirty*
+                        // D-cache line: the CPU's pending write shadows
+                        // SRAM (HW-verified, scan7b test 7). Evicting it
+                        // dropped the firmware's cached saved-return
+                        // slot when a flash-read destination shared a
+                        // 32-byte line with a live stack word
+                        // (bug emu-reboot-halt-and-transfer-model-
+                        // divergences D2 → j [blink=0] → reboot). Clean
+                        // lines are still invalidated so a later cached
+                        // read refills from the new SRAM bytes.
                         let base = sram_addr & !0x1F;
                         let last = (sram_addr + data.len() as u32).saturating_sub(1);
                         let mut addr = base;
                         while addr <= (last & !0x1F) {
-                            dc.invalidate_line(addr);
+                            dc.dma_sram_overwrite(addr);
                             addr += 32;
                         }
                     }
@@ -1102,5 +1112,64 @@ mod tests {
         assert_eq!(mem.read_word(0x300).unwrap(), 0x12345678);
         mem.dcache_invalidate_all().unwrap();
         assert_eq!(mem.read_word(0x300).unwrap(), 0x12345678);
+    }
+
+    // Regression: bug emu-reboot-halt-and-transfer-model-divergences
+    // D2. A DMA SRAM write (flash_memcpy's MDIO read into a stack
+    // local) must NOT evict a *dirty* D-cache line sharing the same
+    // 32-byte line — that line holds a caller's CPU-written saved
+    // `blink`. Pre-fix the line was evicted, the restore-millicode
+    // `ld blink` read SRAM (0), `j [blink=0]` → PC=0 → reboot.
+    #[test]
+    fn dma_sram_write_preserves_dirty_saved_blink_line() {
+        let mut mem = Memory::new_soc(0x8000, BootMode::Warm);
+        let slot = 0x1F7Cu32; // saved-blink stack slot
+        let saved_blink = 0x0003_60BEu32;
+        // Caller `st blink,[sp,N]`: cached, write-back → dirty line,
+        // SRAM still stale.
+        mem.write_word_data(slot, saved_blink, false).unwrap();
+        assert_eq!(mem.read_word_data(slot, false).unwrap(), saved_blink);
+        assert_eq!(mem.read_word_data(slot, true).unwrap(), 0x0000_0000);
+
+        // flash_memcpy head read: PBC flash/MDIO DMA writes 4 flash
+        // bytes into a stack local in the SAME 32-byte line.
+        mem.apply_datapath_op(DatapathOp::SramWrite {
+            sram_addr: 0x1F70,
+            data: vec![0xFF, 0xFF, 0xFF, 0xFF],
+        })
+        .unwrap();
+
+        // Silicon-faithful (scan7b test 7): the dirty saved-blink
+        // survives — CPU's pending write shadows the DMA SRAM write.
+        assert_eq!(
+            mem.read_word_data(slot, false).unwrap(),
+            saved_blink,
+            "DMA SRAM write must not evict the dirty saved-blink line"
+        );
+        // The DMA bytes did land in SRAM at the real destination.
+        assert_eq!(mem.read_word_data(0x1F70, true).unwrap(), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn dma_sram_write_refreshes_clean_line() {
+        let mut mem = Memory::new_soc(0x8000, BootMode::Warm);
+        let a = 0x2000u32;
+        mem.apply_datapath_op(DatapathOp::SramWrite {
+            sram_addr: a,
+            data: vec![0x11, 0x22, 0x33, 0x44],
+        })
+        .unwrap();
+        // Clean cached line (read allocates, not dirty).
+        assert_eq!(mem.read_word_data(a, false).unwrap(), 0x1122_3344);
+        mem.apply_datapath_op(DatapathOp::SramWrite {
+            sram_addr: a,
+            data: vec![0xAA, 0xBB, 0xCC, 0xDD],
+        })
+        .unwrap();
+        assert_eq!(
+            mem.read_word_data(a, false).unwrap(),
+            0xAABB_CCDD,
+            "clean line must refill from the freshly DMA-written SRAM"
+        );
     }
 }
