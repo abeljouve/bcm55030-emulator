@@ -536,6 +536,12 @@ impl Worker {
             bank.pbc.flash.data[..dma_len].to_vec()
         };
         self.cpu.mem.load_binary(0, &dma_bytes);
+        // DATASHEET §5.4: the on-chip DMA engine writes directly into
+        // SRAM and the integration layer broadcasts those writes as
+        // I/D-cache invalidations. The 64 KB boot DMA is such a write,
+        // so the caches must not retain pre-DMA lines for `0x0..0x80`.
+        self.cpu.mem.dcache_invalidate_all().ok();
+        self.cpu.mem.icache_invalidate_all();
 
         // See `src/bin/arc700.rs` for the IRQ-mask/flag handling
         // that this mirrors. The silicon resets `IENABLE` to all-

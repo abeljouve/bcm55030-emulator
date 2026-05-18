@@ -662,6 +662,25 @@ impl Memory {
         self.sram_offset(addr).is_none()
     }
 
+    /// Mirror a `.di` (uncached) store that lands in the low-memory
+    /// NCO/IVT aperture into the NCO channel table. The hardware
+    /// aliases the 16-channel NCO table over the ARC interrupt-vector
+    /// range on a separate physical bus: `.di` stores update the NCO
+    /// (the ARC interrupt unit fetches its vector from there), while
+    /// plain reads / instruction fetch still see SRAM. The SRAM write
+    /// is kept (the caller still performs it) so I-cache coherence of
+    /// any code executed from `0x0..0x80` is unchanged — only the
+    /// interrupt-vector source is added. Evidence: Ghidra
+    /// `nco_write_channel` @0x5a18 / `hw_install_irq_vector_2`
+    /// @0x20042d00 plate comments; "NCO table IS the ARC IVT" RE
+    /// swarm (live slot0 = `j @0x150`).
+    #[inline]
+    fn nco_ivt_mirror(&self, addr: u32, val: u32, size: u8) {
+        if let Some(ref bank) = self.bank {
+            bank.write().nco.ivt_di_store(addr, val, size);
+        }
+    }
+
     pub fn read_byte_data(&mut self, addr: u32, cache_bypass: bool) -> Result<u8, Exception> {
         if cache_bypass || self.is_mmio(addr) || !self.dcache_enabled() {
             return self.read_byte_backing(addr);
@@ -722,6 +741,9 @@ impl Memory {
         if !self.watchpoints.is_empty() {
             self.watchpoints.check(addr, 1, WatchMode::Write);
         }
+        if cache_bypass && crate::soc::nco::Nco::in_ivt_aperture(addr) {
+            self.nco_ivt_mirror(addr, val as u32, 1);
+        }
         if cache_bypass || self.is_mmio(addr) || !self.dcache_enabled() {
             return self.write_byte(addr, val);
         }
@@ -733,6 +755,9 @@ impl Memory {
     pub fn write_half_data(&mut self, addr: u32, val: u16, cache_bypass: bool) -> Result<(), Exception> {
         if !self.watchpoints.is_empty() {
             self.watchpoints.check(addr, 2, WatchMode::Write);
+        }
+        if cache_bypass && crate::soc::nco::Nco::in_ivt_aperture(addr) {
+            self.nco_ivt_mirror(addr, val as u32, 2);
         }
         if cache_bypass || addr & 1 != 0 || self.is_mmio(addr) || !self.dcache_enabled() {
             return self.write_half(addr, val);
@@ -747,6 +772,9 @@ impl Memory {
     pub fn write_word_data(&mut self, addr: u32, val: u32, cache_bypass: bool) -> Result<(), Exception> {
         if !self.watchpoints.is_empty() {
             self.watchpoints.check(addr, 4, WatchMode::Write);
+        }
+        if cache_bypass && crate::soc::nco::Nco::in_ivt_aperture(addr) {
+            self.nco_ivt_mirror(addr, val, 4);
         }
         if cache_bypass || addr & 3 != 0 || self.is_mmio(addr) || !self.dcache_enabled() {
             return self.write_word(addr, val);
@@ -818,6 +846,11 @@ impl Memory {
         }
     }
 
+    /// Single-line I-cache invalidate. Retained as a Memory API but
+    /// currently unused: `IC_IVIL` is a HW-verified no-op on BCM55030
+    /// (only `IC_IVIC` flushes), and DMA coherence invalidates lines
+    /// directly on the cache in `apply_datapath_op`.
+    #[allow(dead_code)]
     pub fn icache_invalidate_line(&self, addr: u32) {
         if let Some(ref ic) = self.icache {
             ic.borrow_mut().invalidate_line(addr);

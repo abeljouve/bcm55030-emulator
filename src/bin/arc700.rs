@@ -418,6 +418,11 @@ fn boot_from_flash(cpu: &mut Cpu, entry_point: u32, mode: BootMode) {
         bank.pbc.flash.data[..copy_size].to_vec()
     };
     cpu.mem.load_binary(0, &code);
+    // DATASHEET §5.4: DMA-originated SRAM writes broadcast I/D-cache
+    // invalidations. The boot DMA is one such write; invalidate so a
+    // reboot (`boot_from_flash` reused) cannot fetch stale `0x0..0x80`.
+    cpu.mem.dcache_invalidate_all().ok();
+    cpu.mem.icache_invalidate_all();
     bcm55030_emulator::vlog!(
         "[BCM55030] HW DMA: copied {} bytes (0x{:X}) from flash to SRAM",
         copy_size, copy_size

@@ -144,6 +144,17 @@ impl Cpu {
         let zeros = vec![0u8; sram_size];
         self.mem.load_binary(0, &zeros);
 
+        // A CPU reset leaves the I/D-caches invalid — silicon has no
+        // "previous life" across a power-on or watchdog reset. The
+        // `Memory` (and thus the caches) is reused in place by the GUI
+        // CPU worker, so without this an earlier firmware's stale lines
+        // would survive into the next `load_firmware` and the new
+        // bootloader's `0x0..0x80` IVT/code would be fetched stale —
+        // diverging from silicon (PC=0xFFFFFFFF crash). Mirrors
+        // `warm_reboot_from_flash`, which already does this.
+        self.mem.dcache_invalidate_all().ok();
+        self.mem.icache_invalidate_all();
+
         self.tight_loop_count = 0;
         self.tight_loop_last_pc = u32::MAX;
 
@@ -528,8 +539,28 @@ impl Cpu {
 
         self.state.aux_irq_pending &= !(1 << irq);
 
+        // Dual-aperture interrupt-vector fetch. The 16-channel NCO
+        // table is aliased over the ARC interrupt-vector range on a
+        // separate physical bus: `.di` stores program it (mirrored in
+        // `Memory::write_*_data`), and the ARC interrupt unit fetches
+        // its vector from the NCO — NOT from SRAM at `base + N*8`.
+        // Each installed slot is a `j @<absolute>` (`2020 0f80 hi lo`)
+        // so taking the interrupt jumps straight to `<hi:lo>`.
+        // Evidence: Ghidra `nco_write_channel` @0x5a18 /
+        // `hw_install_irq_vector_2` @0x20042d00; "NCO table IS the ARC
+        // IVT" RE swarm (live slot0 = `j @0x150`). When the channel
+        // was never programmed as a `j @limm` vector the model falls
+        // back to the SRAM IVT slot — covering reset, exception
+        // vectors, and any not-yet-installed channel.
         let vector = irq;
-        self.state.pc = self.state.aux_int_vector_base + vector * 8;
+        let nco_target = self
+            .bank
+            .as_ref()
+            .and_then(|b| b.read().nco.interrupt_vector(vector as u8));
+        self.state.pc = match nco_target {
+            Some(target) => target,
+            None => self.state.aux_int_vector_base + vector * 8,
+        };
         self.state.pc_written = true;
 
         if self.trace {

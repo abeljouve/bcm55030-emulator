@@ -175,9 +175,12 @@ pub fn execute(
                     mem.icache_invalidate_all();
                 }
                 0x19 => {
-                    // IC_IVIL: invalidate single I-cache line
-                    let val = resolve_value(*src, state)?;
-                    mem.icache_invalidate_line(val);
+                    // IC_IVIL: single-line I-cache invalidate. NO-OP on
+                    // BCM55030 — HW-verified (scan7d v3, DATASHEET §5.2,
+                    // CLAUDE.md). Only IC_IVIC (0x10) actually flushes.
+                    // The address operand is still resolved/consumed so a
+                    // side-effecting source register is read as on silicon.
+                    let _ = resolve_value(*src, state)?;
                 }
                 _ => {}
             }
