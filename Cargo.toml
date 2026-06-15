@@ -18,6 +18,10 @@ required-features = ["ui"]
 name = "hw-fuzzer"
 path = "src/bin/hw_fuzzer.rs"
 
+[[bin]]
+name = "diff-sweep"
+path = "src/bin/diff_sweep.rs"
+
 [features]
 default = []
 # Enable the egui/eframe GUI layer. Pulls in native windowing.
