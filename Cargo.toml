@@ -73,3 +73,7 @@ path = "src/bin/resolve_data_ptrs.rs"
 [[bin]]
 name = "boot-smoke"
 path = "src/bin/boot_smoke.rs"
+
+[[bin]]
+name = "boot-diff"
+path = "src/bin/boot_diff.rs"
