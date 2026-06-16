@@ -135,6 +135,16 @@ impl Cpu {
     /// MCP threads stay valid across a reset. The peripheral
     /// bank's non-volatile state (SPI flash contents, SFP EEPROM,
     /// eFuse snapshot) is preserved.
+    /// Clear transient watchdog tight-loop detection state without touching
+    /// architectural state (registers, SRAM, peripherals). A harness that
+    /// reuses one Cpu across many independent runs must call this between runs
+    /// (e.g. after restoring a snapshot) so a prior run's spin history cannot
+    /// bleed into the next and make its result depend on execution order.
+    pub fn reset_loop_detection(&mut self) {
+        self.tight_loop_count = 0;
+        self.tight_loop_last_pc = u32::MAX;
+    }
+
     pub fn reset_soc_in_place(&mut self, boot_mode: BootMode) {
         let saved_timer1_irq = self.state.timer1_irq;
         self.state = CpuState::new();
