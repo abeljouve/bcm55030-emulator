@@ -874,12 +874,24 @@ impl Memory {
                 return;
             }
             let line_addr = addr & !((IC_LINE_SIZE as u32) - 1);
+            // Only fill from SRAM-backed addresses. A fetch to an
+            // address outside SRAM has no defined contents on real
+            // silicon — the prior unconditional zero-fill silently
+            // turned out-of-range fetches into `b .` (opcode
+            // `0x00000000`), which the tight-loop watchdog then
+            // converted into a warm reboot, hiding the firmware's
+            // actual jump-to-garbage symptom. Returning early here
+            // lets `fetch_half`/`fetch_word` fall through to the
+            // SRAM-bounds check and raise `Exception::MemoryError`,
+            // which vectors to the firmware's instruction-error
+            // handler and surfaces the faulting PC.
+            let Some(off) = self.sram_offset(line_addr) else {
+                return;
+            };
             let mut data = [0u8; IC_LINE_SIZE];
-            if let Some(off) = self.sram_offset(line_addr) {
-                let end = (off + IC_LINE_SIZE).min(self.data.len());
-                let count = end - off;
-                data[..count].copy_from_slice(&self.data[off..end]);
-            }
+            let end = (off + IC_LINE_SIZE).min(self.data.len());
+            let count = end - off;
+            data[..count].copy_from_slice(&self.data[off..end]);
             ic.fill_line(addr, &data);
         }
     }

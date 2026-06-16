@@ -373,7 +373,10 @@ impl Peripheral for Pbc {
         self.pending_ops.clear();
         self.pending_spi_serdes = None;
         self.last_dma_tag = "pbc";
-        // flash data preserved — non-volatile
+        // flash `data` array preserved — non-volatile. Reset the volatile
+        // chip-side latches (status register, SST AAI in-flight address)
+        // so a cold boot starts from a clean state.
+        self.flash.reset_volatile();
     }
 
     fn snapshot(&self) -> PeripheralSnapshot {

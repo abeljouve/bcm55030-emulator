@@ -43,6 +43,23 @@ pub struct SpiFlash {
     /// `None` until a firmware is loaded (fresh boot with no
     /// image → nothing to diff against).
     pub baseline: Option<Vec<u8>>,
+    /// SST-style Auto-Address-Increment Program (AAI / opcode 0xAD)
+    /// internal address pointer. `Some(addr)` while the chip is in AAI
+    /// mode, i.e. between the AAI start burst (`[AD, a2, a1, a0, d0, d1]`,
+    /// tx_len=6) and the WRDI that terminates it. Each AAI continuation
+    /// burst (`[AD, di, di+1]`, tx_len=3) writes 2 bytes at this address
+    /// and advances it by 2 — there is no address in the continuation
+    /// command, the chip remembers it. Cleared by `CMD_WRDI` and by
+    /// `reset_volatile`.
+    ///
+    /// Evidence: reference firmware `fds_read_llid_flag_byte` (the decompiler
+    /// 0x20011d74) and reference bootloader `spi_flash_write_command`
+    /// (rt 0x4b54) both emit AAI start (`SPI_STATUS=0x61`) followed by
+    /// AAI continuations (`SPI_STATUS=0x31`) and terminate with WRDI
+    /// (`SPI_STATUS=0x11`). See bug
+    /// `the design notes`
+    /// section D3.
+    aai_addr: Option<u32>,
 }
 
 impl SpiFlash {
@@ -52,7 +69,16 @@ impl SpiFlash {
             status: 0x00, // not busy, write disabled
             dirty: false,
             baseline: None,
+            aai_addr: None,
         }
+    }
+
+    /// Reset volatile chip state (status latch, AAI mode). Flash array
+    /// `data` is non-volatile and intentionally preserved across power
+    /// cycles — callers that want a fresh chip must reseat `data`.
+    pub fn reset_volatile(&mut self) {
+        self.status = 0x00;
+        self.aai_addr = None;
     }
 
     /// Capture the current `data` contents as the baseline for
@@ -116,6 +142,10 @@ impl SpiFlash {
             }
             CMD_WRDI => {
                 self.status &= !SR_WEL;
+                // WRDI also terminates SST AAI mode. Real chips exit the
+                // AAI state machine and accept the next command as a
+                // normal one-shot opcode.
+                self.aai_addr = None;
             }
             CMD_WRSR => {
                 if self.status & SR_WEL != 0 && tx.len() >= 2 {
@@ -186,14 +216,48 @@ impl SpiFlash {
                 self.status &= !SR_WEL;
             }
             CMD_CP => {
-                if self.status & SR_WEL != 0 && tx.len() >= 4 {
+                // SST-style Auto-Address-Increment Program (AAI). Two
+                // distinct burst shapes, decided by tx length — see
+                // `aai_addr` doc on `SpiFlash`.
+                //
+                // - tx_len == 6: AAI START. tx = [AD, a2, a1, a0, d0, d1].
+                //   Extract the 24-bit address from tx[1..4], write the
+                //   2 data bytes (tx[4..6]), and arm `aai_addr` at
+                //   `addr + 2` for subsequent continuations.
+                // - tx_len == 3: AAI CONTINUATION. tx = [AD, di, di+1].
+                //   No address — the chip auto-increments. Write the 2
+                //   data bytes at the current `aai_addr` and advance.
+                //
+                // Both bursts require WEL set. **WEL stays set across
+                // an AAI sequence** on real silicon and is only cleared
+                // by WRDI — the reference BL/firmware firmware relies on this
+                // (their AAI-exit WRDI loop polls WEL waiting for it to
+                // clear). Do NOT clear WEL in this handler.
+                if self.status & SR_WEL == 0 {
+                    // No write-enable → real chip ignores the command.
+                } else if tx.len() == 6 {
                     let addr = Self::extract_addr(tx);
-                    for i in 4..tx.len() {
-                        let flash_addr = (addr as usize + (i - 4)) % FLASH_SIZE;
-                        self.data[flash_addr] &= tx[i];
-                    }
+                    let mut cur = addr as usize % FLASH_SIZE;
+                    self.data[cur] &= tx[4];
+                    cur = (cur + 1) % FLASH_SIZE;
+                    self.data[cur] &= tx[5];
+                    cur = (cur + 1) % FLASH_SIZE;
+                    self.aai_addr = Some(cur as u32);
                     self.dirty = true;
+                } else if tx.len() == 3 {
+                    if let Some(addr) = self.aai_addr {
+                        let mut cur = addr as usize % FLASH_SIZE;
+                        self.data[cur] &= tx[1];
+                        cur = (cur + 1) % FLASH_SIZE;
+                        self.data[cur] &= tx[2];
+                        cur = (cur + 1) % FLASH_SIZE;
+                        self.aai_addr = Some(cur as u32);
+                        self.dirty = true;
+                    }
+                    // Continuation without a prior start → ignored.
                 }
+                // Other tx lengths are not part of the AAI protocol;
+                // ignored.
             }
             _ => {
                 // Unknown command — ignore
@@ -281,5 +345,112 @@ mod tests {
         flash.execute_fifo_command(&[CMD_PP, 0x00, 0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF], 0);
         let data = flash.dma_read(0, 4);
         assert_eq!(data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    /// SST AAI: a 4-byte program issued as one start burst + one
+    /// continuation burst, exactly as reference firmware's
+    /// `flash_clear_lane_direction_record` (writing 4 zero bytes) emits
+    /// it. Pre-D3-fix this stayed `[0xFF; 4]` because the continuation
+    /// was silently dropped. See bug
+    /// `the design notes` D3.
+    #[test]
+    fn test_aai_program_4_bytes_zero() {
+        let mut flash = SpiFlash::new();
+        flash.execute_fifo_command(&[CMD_WREN], 0);
+        // Start: AAI at addr 0x100000, data bytes 0x00 0x00
+        flash.execute_fifo_command(&[CMD_CP, 0x10, 0x00, 0x00, 0x00, 0x00], 0);
+        // Continuation: 2 more zero bytes (no address)
+        flash.execute_fifo_command(&[CMD_CP, 0x00, 0x00], 0);
+        let data = flash.dma_read(0x100000, 4);
+        assert_eq!(data, vec![0x00, 0x00, 0x00, 0x00]);
+        // WRDI terminates AAI.
+        flash.execute_fifo_command(&[CMD_WRDI], 0);
+    }
+
+    /// AAI keeps WEL set across the burst chain; only WRDI clears it.
+    /// The reference firmware's AAI-exit loop polls WEL waiting for clear.
+    #[test]
+    fn test_aai_keeps_wel_until_wrdi() {
+        let mut flash = SpiFlash::new();
+        flash.execute_fifo_command(&[CMD_WREN], 0);
+        assert_eq!(
+            flash.execute_fifo_command(&[CMD_RDSR], 1)[0] & SR_WEL,
+            SR_WEL
+        );
+        flash.execute_fifo_command(&[CMD_CP, 0x00, 0x10, 0x00, 0xAA, 0xBB], 0);
+        // WEL still set after AAI start.
+        assert_eq!(
+            flash.execute_fifo_command(&[CMD_RDSR], 1)[0] & SR_WEL,
+            SR_WEL
+        );
+        flash.execute_fifo_command(&[CMD_CP, 0xCC, 0xDD], 0);
+        // WEL still set after continuation.
+        assert_eq!(
+            flash.execute_fifo_command(&[CMD_RDSR], 1)[0] & SR_WEL,
+            SR_WEL
+        );
+        flash.execute_fifo_command(&[CMD_WRDI], 0);
+        assert_eq!(
+            flash.execute_fifo_command(&[CMD_RDSR], 1)[0] & SR_WEL,
+            0
+        );
+        // Data landed correctly.
+        let data = flash.dma_read(0x001000, 4);
+        assert_eq!(data, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    /// Continuation without a prior start is a no-op.
+    #[test]
+    fn test_aai_continuation_without_start_ignored() {
+        let mut flash = SpiFlash::new();
+        flash.execute_fifo_command(&[CMD_WREN], 0);
+        flash.execute_fifo_command(&[CMD_CP, 0x11, 0x22], 0);
+        let data = flash.dma_read(0, 0x10);
+        assert_eq!(data, vec![0xFF; 0x10]);
+    }
+
+    /// AAI start without WEL is a no-op.
+    #[test]
+    fn test_aai_without_wel_ignored() {
+        let mut flash = SpiFlash::new();
+        // No WREN.
+        flash.execute_fifo_command(&[CMD_CP, 0x00, 0x00, 0x00, 0xAA, 0xBB], 0);
+        let data = flash.dma_read(0, 4);
+        assert_eq!(data, vec![0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    /// AND-semantics: AAI cannot turn `0`-bits back to `1`. Two writes
+    /// to the same address combine bit-clears.
+    #[test]
+    fn test_aai_and_semantics() {
+        let mut flash = SpiFlash::new();
+        // First write: program 0xF0 0x0F at 0x200000.
+        flash.execute_fifo_command(&[CMD_WREN], 0);
+        flash.execute_fifo_command(&[CMD_CP, 0x20, 0x00, 0x00, 0xF0, 0x0F], 0);
+        flash.execute_fifo_command(&[CMD_WRDI], 0);
+        // Second write at same addr: program 0xAA 0x55. AND semantics →
+        // result = (0xF0 & 0xAA), (0x0F & 0x55) = 0xA0, 0x05.
+        flash.execute_fifo_command(&[CMD_WREN], 0);
+        flash.execute_fifo_command(&[CMD_CP, 0x20, 0x00, 0x00, 0xAA, 0x55], 0);
+        flash.execute_fifo_command(&[CMD_WRDI], 0);
+        let data = flash.dma_read(0x200000, 2);
+        assert_eq!(data, vec![0xA0, 0x05]);
+    }
+
+    /// Volatile reset clears status latch and any in-flight AAI burst.
+    #[test]
+    fn test_reset_volatile_clears_aai_and_status() {
+        let mut flash = SpiFlash::new();
+        flash.execute_fifo_command(&[CMD_WREN], 0);
+        flash.execute_fifo_command(&[CMD_CP, 0x00, 0x00, 0x00, 0xAA, 0xBB], 0);
+        assert!(flash.aai_addr.is_some());
+        assert_ne!(flash.status & SR_WEL, 0);
+        // Data already programmed survives reset (non-volatile array).
+        let before = flash.dma_read(0, 2);
+        flash.reset_volatile();
+        assert!(flash.aai_addr.is_none());
+        assert_eq!(flash.status, 0);
+        let after = flash.dma_read(0, 2);
+        assert_eq!(before, after);
     }
 }
