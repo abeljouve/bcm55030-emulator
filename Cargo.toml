@@ -69,3 +69,7 @@ path = "src/bin/find_data_ptrs.rs"
 [[bin]]
 name = "resolve-data-ptrs"
 path = "src/bin/resolve_data_ptrs.rs"
+
+[[bin]]
+name = "boot-smoke"
+path = "src/bin/boot_smoke.rs"
