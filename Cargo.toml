@@ -22,6 +22,10 @@ path = "src/bin/hw_fuzzer.rs"
 name = "diff-sweep"
 path = "src/bin/diff_sweep.rs"
 
+[[bin]]
+name = "gen-sigs"
+path = "src/bin/gen_sigs.rs"
+
 [features]
 default = []
 # Enable the egui/eframe GUI layer. Pulls in native windowing.
@@ -55,3 +59,5 @@ egui         = { version = "0.34", optional = true }
 egui_extras  = { version = "0.34", optional = true, features = ["all_loaders"] }
 egui-phosphor = { version = "0.12", optional = true, default-features = false, features = ["regular"] }
 rfd          = { version = "0.17", optional = true }
+tree-sitter = "0.26.9"
+tree-sitter-c = "0.24.2"
