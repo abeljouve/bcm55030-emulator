@@ -40,6 +40,14 @@ pub struct PeripheralBankSaveState {
     pub olt: Olt,
     pub scenario: ScenarioEngine,
     pub sysreg: SysregShim,
+    /// Bank-level mutable state that is NOT inside any peripheral but DOES
+    /// affect execution. Omitting these made a reused-Cpu harness order-
+    /// dependent: a prior fn that touched DMA / the datapath queue / the
+    /// guard countdown left them dirty for the next fn on the same thread.
+    pub pending_cache_inv: Vec<crate::soc::peripheral::DatapathOp>,
+    pub dma_master_status: [u32; 2],
+    pub dma_channel_mask: [u32; 2],
+    pub guard_clear_countdown: u32,
 }
 
 pub struct NamedSnapshot {

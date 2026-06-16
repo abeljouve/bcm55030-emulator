@@ -228,7 +228,13 @@ impl Pbc {
         for i in 0..tx_len {
             let word_idx = i / 4;
             let byte_idx = i % 4;
-            let byte = (self.spi_fifo[word_idx] >> (byte_idx * 8)) as u8;
+            // The SPI FIFO physically holds only `spi_fifo.len()` words (8 bytes).
+            // A `tx_len` field decoded from a garbage/fuzzed command word can index
+            // past it; HW cannot read beyond the FIFO, so words past the end read
+            // as 0 rather than panicking (index-out-of-bounds would otherwise crash
+            // the worker and silently drop fuzz cases -> nondeterministic sweeps).
+            let word = self.spi_fifo.get(word_idx).copied().unwrap_or(0);
+            let byte = (word >> (byte_idx * 8)) as u8;
             tx.push(byte);
         }
 

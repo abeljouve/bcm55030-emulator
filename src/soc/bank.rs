@@ -839,6 +839,10 @@ impl PeripheralBank {
             olt: self.olt.clone(),
             scenario: self.scenario.clone(),
             sysreg: self.sysreg.clone(),
+            pending_cache_inv: self.pending_cache_inv.clone(),
+            dma_master_status: self.dma_master_status,
+            dma_channel_mask: self.dma_channel_mask,
+            guard_clear_countdown: self.guard_clear_countdown,
         }
     }
 
@@ -861,6 +865,10 @@ impl PeripheralBank {
         self.olt = state.olt;
         self.scenario = state.scenario;
         self.sysreg = state.sysreg;
+        self.pending_cache_inv = state.pending_cache_inv;
+        self.dma_master_status = state.dma_master_status;
+        self.dma_channel_mask = state.dma_channel_mask;
+        self.guard_clear_countdown = state.guard_clear_countdown;
         self.irq_pending = 0;
         self.current_pc = 0;
         self.current_blink = 0;

@@ -75,6 +75,15 @@ pub struct Cpu {
     /// enters `system_reboot_infinite_loop`.
     tight_loop_count: u32,
     tight_loop_last_pc: u32,
+
+    /// When `true`, a detected tight loop HALTS the CPU instead of issuing the
+    /// modelled watchdog warm reboot. Default `false` (real-HW behavior: reboot
+    /// from flash). The per-function differential harness sets this so a fuzzed
+    /// input that drives a function into a spin terminates that isolated run
+    /// (reached=false) rather than rebooting the whole SoC into boot code —
+    /// which both mutates shared state and (pre-fix) could panic deep in the
+    /// boot path, killing the worker and dropping fuzz cases nondeterministically.
+    pub tight_loop_halts: bool,
 }
 
 impl Cpu {
@@ -95,6 +104,7 @@ impl Cpu {
             bank_tick_accumulator: 0,
             tight_loop_count: 0,
             tight_loop_last_pc: u32::MAX,
+            tight_loop_halts: false,
         }
     }
 
@@ -120,6 +130,7 @@ impl Cpu {
             bank_tick_accumulator: 0,
             tight_loop_count: 0,
             tight_loop_last_pc: u32::MAX,
+            tight_loop_halts: false,
         }
     }
 
@@ -360,6 +371,13 @@ impl Cpu {
             if self.state.pc == self.tight_loop_last_pc {
                 self.tight_loop_count += 1;
                 if self.tight_loop_count >= TIGHT_LOOP_THRESHOLD {
+                    if self.tight_loop_halts {
+                        // Harness mode: terminate this isolated run instead of
+                        // rebooting the SoC. No log spam (spins are expected
+                        // under fuzzing), no shared-state mutation.
+                        self.state.halted = true;
+                        return Ok(());
+                    }
                     eprintln!(
                         "[BCM55030] Tight loop at PC=0x{:08X} ({} iters) — watchdog warm reboot",
                         self.state.pc, self.tight_loop_count
