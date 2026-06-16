@@ -65,3 +65,7 @@ tree-sitter-c = "0.24.2"
 [[bin]]
 name = "find-data-ptrs"
 path = "src/bin/find_data_ptrs.rs"
+
+[[bin]]
+name = "resolve-data-ptrs"
+path = "src/bin/resolve_data_ptrs.rs"
