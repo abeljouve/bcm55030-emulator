@@ -137,6 +137,24 @@ pub struct Memory {
     /// UI / MCP watchpoints. Default empty — the hot path only pays
     /// a single `is_empty()` branch when no watchpoints are set.
     pub watchpoints: WatchpointTable,
+
+    /// Optional data-read trace (diff-sweep table discovery). When `Some`,
+    /// every `read_*_data` whose address falls in `[lo,hi)` records
+    /// `(addr, size_bytes, value)`. `None` by default — the hot path pays a
+    /// single `is_some()` branch. The range filter naturally excludes MMIO
+    /// (peripheral addresses are outside the SRAM data window).
+    pub read_trace: Option<ReadTrace>,
+}
+
+/// Captured firmware data-region reads (see [`Memory::read_trace`]). The
+/// emulator is the address oracle: running a reference function with this enabled
+/// yields the exact `(addr, size, value)` of every table/global load it
+/// issues — used to reconstruct the reference `.data` stubs with real contents.
+#[derive(Default, Clone)]
+pub struct ReadTrace {
+    pub lo: u32,
+    pub hi: u32,
+    pub hits: Vec<(u32, u8, u32)>,
 }
 
 impl Memory {
@@ -151,6 +169,7 @@ impl Memory {
             icache: None,
             unmapped_exception: false,
             watchpoints: WatchpointTable::new(),
+            read_trace: None,
         }
     }
 
@@ -167,6 +186,7 @@ impl Memory {
             icache: Some(RefCell::new(ICache::new())),
             unmapped_exception: false,
             watchpoints: WatchpointTable::new(),
+            read_trace: None,
         }
     }
 
@@ -691,7 +711,28 @@ impl Memory {
         }
     }
 
+    /// Record a data-region read in the active trace (see [`ReadTrace`]).
+    /// Gated by `read_trace.is_some()` + the `[lo,hi)` range; off by default.
+    #[inline]
+    fn trace_data_read(&mut self, addr: u32, size: u8, val: u32) {
+        if let Some(rt) = self.read_trace.as_mut() {
+            if addr >= rt.lo && addr < rt.hi {
+                rt.hits.push((addr, size, val));
+            }
+        }
+    }
+
     pub fn read_byte_data(&mut self, addr: u32, cache_bypass: bool) -> Result<u8, Exception> {
+        let r = self.read_byte_data_inner(addr, cache_bypass);
+        if self.read_trace.is_some() {
+            if let Ok(v) = r {
+                self.trace_data_read(addr, 1, v as u32);
+            }
+        }
+        r
+    }
+
+    fn read_byte_data_inner(&mut self, addr: u32, cache_bypass: bool) -> Result<u8, Exception> {
         if cache_bypass || self.is_mmio(addr) || !self.dcache_enabled() {
             return self.read_byte_backing(addr);
         }
@@ -700,6 +741,16 @@ impl Memory {
     }
 
     pub fn read_half_data(&mut self, addr: u32, cache_bypass: bool) -> Result<u16, Exception> {
+        let r = self.read_half_data_inner(addr, cache_bypass);
+        if self.read_trace.is_some() {
+            if let Ok(v) = r {
+                self.trace_data_read(addr, 2, v as u32);
+            }
+        }
+        r
+    }
+
+    fn read_half_data_inner(&mut self, addr: u32, cache_bypass: bool) -> Result<u16, Exception> {
         if cache_bypass || addr & 1 != 0 || self.is_mmio(addr) || !self.dcache_enabled() {
             if self.sram_offset(addr).is_none() {
                 if let Some(ref bank) = self.bank {
@@ -719,6 +770,16 @@ impl Memory {
     }
 
     pub fn read_word_data(&mut self, addr: u32, cache_bypass: bool) -> Result<u32, Exception> {
+        let r = self.read_word_data_inner(addr, cache_bypass);
+        if self.read_trace.is_some() {
+            if let Ok(v) = r {
+                self.trace_data_read(addr, 4, v);
+            }
+        }
+        r
+    }
+
+    fn read_word_data_inner(&mut self, addr: u32, cache_bypass: bool) -> Result<u32, Exception> {
         // Audit 2.1 / deferral D5 resolved 2026-04-13: bare-metal
         // scan `tmp/hello-bare/scan_misalign.c` on a live BCM55030
         // confirmed the CPU silently fixes up misaligned word /
