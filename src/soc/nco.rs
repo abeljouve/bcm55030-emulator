@@ -139,19 +139,26 @@ impl Nco {
         }
         let off = (addr % NCO_SLOT_BYTES) as usize;
         let slot = &mut self.slots[chan];
+        // Per-byte bounds guard: a multi-byte store starting near the slot end
+        // (off+size > NCO_SLOT_BYTES) would overrun slot.raw. Real firmware only
+        // issues slot-aligned writes, but a fuzzed input can drive a size-2/4
+        // store at off=5..7; drop the out-of-slot bytes rather than panic. No
+        // cross-slot spill is modelled (unproven on silicon).
         match size {
             1 => {
                 slot.raw[off] = val as u8;
             }
             2 => {
+                let n = NCO_SLOT_BYTES as usize;
                 slot.raw[off] = (val >> 8) as u8;
-                slot.raw[off + 1] = val as u8;
+                if off + 1 < n { slot.raw[off + 1] = val as u8; }
             }
             _ => {
+                let n = NCO_SLOT_BYTES as usize;
                 slot.raw[off] = (val >> 24) as u8;
-                slot.raw[off + 1] = (val >> 16) as u8;
-                slot.raw[off + 2] = (val >> 8) as u8;
-                slot.raw[off + 3] = val as u8;
+                if off + 1 < n { slot.raw[off + 1] = (val >> 16) as u8; }
+                if off + 2 < n { slot.raw[off + 2] = (val >> 8) as u8; }
+                if off + 3 < n { slot.raw[off + 3] = val as u8; }
             }
         }
         slot.written = true;
