@@ -903,6 +903,9 @@ impl PeripheralBank {
         if self.pbc.claims(addr) { return Some("pbc"); }
         if self.bsc_i2c.claims(addr) { return Some("bsc_i2c"); }
         if self.serdes.claims(addr) { return Some("serdes"); }
+        // mpcp_tssync claims 8 exact addresses, two of which (0x0D88/
+        // 0x0D8C) fall inside epon_mac's table window — check it FIRST.
+        if self.mpcp_tssync.claims(addr) { return Some("mpcp_tssync"); }
         if self.epon_mac.claims(addr) { return Some("epon_mac"); }
         if self.macsec.claims(addr) { return Some("macsec"); }
         if self.dma.claims(addr) { return Some("dma"); }
@@ -910,7 +913,6 @@ impl PeripheralBank {
         if self.efuse_udr.claims(addr) { return Some("efuse_udr"); }
         if self.fatal_filter.claims(addr) { return Some("fatal_filter"); }
         if self.mpcp.claims(addr) { return Some("mpcp"); }
-        if self.mpcp_tssync.claims(addr) { return Some("mpcp_tssync"); }
         if self.nco.claims(addr) { return Some("nco"); }
         if self.vlan_lue.claims(addr) { return Some("vlan_lue"); }
         if self.sysreg.claims(addr) { return Some("sysreg"); }
@@ -1013,6 +1015,10 @@ impl PeripheralBank {
         if self.serdes.claims(addr) {
             return self.serdes.peek_word(addr);
         }
+        // mpcp_tssync first — 0x0D88/0x0D8C overlap epon_mac's table.
+        if self.mpcp_tssync.claims(addr) {
+            return self.mpcp_tssync.peek_word(addr);
+        }
         if self.epon_mac.claims(addr) {
             return self.epon_mac.peek_word(addr);
         }
@@ -1033,9 +1039,6 @@ impl PeripheralBank {
         }
         if self.mpcp.claims(addr) {
             return self.mpcp.peek_word(addr);
-        }
-        if self.mpcp_tssync.claims(addr) {
-            return self.mpcp_tssync.peek_word(addr);
         }
         if self.nco.claims(addr) {
             return self.nco.peek_word(addr);
@@ -1114,6 +1117,8 @@ impl PeripheralBank {
             self.seq_emit(addr, v, "r", "word", tag);
             return Ok(v);
         }
+        // mpcp_tssync first — 0x0D88/0x0D8C overlap epon_mac's table.
+        if self.mpcp_tssync.claims(addr) { dispatch_rw!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.epon_mac.claims(addr) { dispatch_rw!(self.epon_mac, "epon_mac"); }
         if self.macsec.claims(addr) { dispatch_rw!(self.macsec, "macsec"); }
         if self.dma.claims(addr) { dispatch_rw!(self.dma, "dma"); }
@@ -1121,7 +1126,6 @@ impl PeripheralBank {
         if self.efuse_udr.claims(addr) { dispatch_rw!(self.efuse_udr, "efuse_udr"); }
         if self.fatal_filter.claims(addr) { dispatch_rw!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_rw!(self.mpcp, "mpcp"); }
-        if self.mpcp_tssync.claims(addr) { dispatch_rw!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.nco.claims(addr) { dispatch_rw!(self.nco, "nco"); }
         if self.vlan_lue.claims(addr) {
             let v = self.vlan_lue.read_word(addr)?;
@@ -1272,6 +1276,8 @@ impl PeripheralBank {
             self.seq_emit(addr, val, "w", "word", tag);
             return Ok(());
         }
+        // mpcp_tssync first — 0x0D88/0x0D8C overlap epon_mac's table.
+        if self.mpcp_tssync.claims(addr) { dispatch_ww!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.epon_mac.claims(addr) {
             // When the OLT has a registered LLID, enforce it in the
             // LLID match table. The firmware reinitializes these entries
@@ -1300,7 +1306,6 @@ impl PeripheralBank {
         if self.efuse_udr.claims(addr) { dispatch_ww!(self.efuse_udr, "efuse_udr"); }
         if self.fatal_filter.claims(addr) { dispatch_ww!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_ww!(self.mpcp, "mpcp"); }
-        if self.mpcp_tssync.claims(addr) { dispatch_ww!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.nco.claims(addr) { dispatch_ww!(self.nco, "nco"); }
         if self.vlan_lue.claims(addr) {
             self.vlan_lue.write_word(addr, val)?;
@@ -1369,6 +1374,7 @@ impl PeripheralBank {
         if self.pbc.claims(addr) { dispatch_rh!(self.pbc, "pbc"); }
         if self.bsc_i2c.claims(addr) { dispatch_rh!(self.bsc_i2c, "bsc_i2c"); }
         if self.serdes.claims(addr) { dispatch_rh!(self.serdes, "serdes"); }
+        if self.mpcp_tssync.claims(addr) { dispatch_rh!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.epon_mac.claims(addr) { dispatch_rh!(self.epon_mac, "epon_mac"); }
         if self.macsec.claims(addr) { dispatch_rh!(self.macsec, "macsec"); }
         if self.dma.claims(addr) { dispatch_rh!(self.dma, "dma"); }
@@ -1376,7 +1382,6 @@ impl PeripheralBank {
         if self.efuse_udr.claims(addr) { dispatch_rh!(self.efuse_udr, "efuse_udr"); }
         if self.fatal_filter.claims(addr) { dispatch_rh!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_rh!(self.mpcp, "mpcp"); }
-        if self.mpcp_tssync.claims(addr) { dispatch_rh!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.nco.claims(addr) { dispatch_rh!(self.nco, "nco"); }
         if self.vlan_lue.claims(addr) {
             let v = self.vlan_lue.read_half(addr)?;
@@ -1403,6 +1408,7 @@ impl PeripheralBank {
         if self.pbc.claims(addr) { dispatch_wh!(self.pbc, "pbc"); }
         if self.bsc_i2c.claims(addr) { dispatch_wh!(self.bsc_i2c, "bsc_i2c"); }
         if self.serdes.claims(addr) { dispatch_wh!(self.serdes, "serdes"); }
+        if self.mpcp_tssync.claims(addr) { dispatch_wh!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.epon_mac.claims(addr) { dispatch_wh!(self.epon_mac, "epon_mac"); }
         if self.macsec.claims(addr) { dispatch_wh!(self.macsec, "macsec"); }
         if self.dma.claims(addr) { dispatch_wh!(self.dma, "dma"); }
@@ -1410,7 +1416,6 @@ impl PeripheralBank {
         if self.efuse_udr.claims(addr) { dispatch_wh!(self.efuse_udr, "efuse_udr"); }
         if self.fatal_filter.claims(addr) { dispatch_wh!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_wh!(self.mpcp, "mpcp"); }
-        if self.mpcp_tssync.claims(addr) { dispatch_wh!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.nco.claims(addr) { dispatch_wh!(self.nco, "nco"); }
         if self.vlan_lue.claims(addr) {
             self.vlan_lue.write_half(addr, val)?;
@@ -1447,6 +1452,7 @@ impl PeripheralBank {
         if self.pbc.claims(addr) { dispatch_rb!(self.pbc, "pbc"); }
         if self.bsc_i2c.claims(addr) { dispatch_rb!(self.bsc_i2c, "bsc_i2c"); }
         if self.serdes.claims(addr) { dispatch_rb!(self.serdes, "serdes"); }
+        if self.mpcp_tssync.claims(addr) { dispatch_rb!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.epon_mac.claims(addr) { dispatch_rb!(self.epon_mac, "epon_mac"); }
         if self.macsec.claims(addr) { dispatch_rb!(self.macsec, "macsec"); }
         if self.dma.claims(addr) { dispatch_rb!(self.dma, "dma"); }
@@ -1454,7 +1460,6 @@ impl PeripheralBank {
         if self.efuse_udr.claims(addr) { dispatch_rb!(self.efuse_udr, "efuse_udr"); }
         if self.fatal_filter.claims(addr) { dispatch_rb!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_rb!(self.mpcp, "mpcp"); }
-        if self.mpcp_tssync.claims(addr) { dispatch_rb!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.nco.claims(addr) { dispatch_rb!(self.nco, "nco"); }
         if self.vlan_lue.claims(addr) {
             let v = self.vlan_lue.read_byte(addr)?;
@@ -1481,6 +1486,7 @@ impl PeripheralBank {
         if self.pbc.claims(addr) { dispatch_wb!(self.pbc, "pbc"); }
         if self.bsc_i2c.claims(addr) { dispatch_wb!(self.bsc_i2c, "bsc_i2c"); }
         if self.serdes.claims(addr) { dispatch_wb!(self.serdes, "serdes"); }
+        if self.mpcp_tssync.claims(addr) { dispatch_wb!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.epon_mac.claims(addr) { dispatch_wb!(self.epon_mac, "epon_mac"); }
         if self.macsec.claims(addr) { dispatch_wb!(self.macsec, "macsec"); }
         if self.dma.claims(addr) { dispatch_wb!(self.dma, "dma"); }
@@ -1488,7 +1494,6 @@ impl PeripheralBank {
         if self.efuse_udr.claims(addr) { dispatch_wb!(self.efuse_udr, "efuse_udr"); }
         if self.fatal_filter.claims(addr) { dispatch_wb!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_wb!(self.mpcp, "mpcp"); }
-        if self.mpcp_tssync.claims(addr) { dispatch_wb!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.nco.claims(addr) { dispatch_wb!(self.nco, "nco"); }
         if self.vlan_lue.claims(addr) {
             self.vlan_lue.write_byte(addr, val)?;
