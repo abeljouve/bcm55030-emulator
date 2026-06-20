@@ -169,9 +169,6 @@ pub struct EponMac {
     active_flags: u32,
     link_status_1g: u32,
     hw_state_status: u32,
-    /// Countdown for auto-clearing transient bits in hw_state_status.
-    /// On real HW, link-change bits are transient pulses, not sticky.
-    hw_state_status_autoclear: u32,
     discovery_status: u32,
     /// REG_SPECIAL_0064 backing store. Silicon power-on is zero —
     /// the previous shim returned 0x5382_FFFF unconditionally, which
@@ -202,7 +199,6 @@ impl EponMac {
             active_flags: 0,
             link_status_1g: 0,
             hw_state_status: 0,
-            hw_state_status_autoclear: 0,
             discovery_status: 0,
             special_0064: 0,
             trace: false,
@@ -221,10 +217,30 @@ impl EponMac {
     }
 
     /// Set the 10G PHY link status bit (bit 6 of REG_HW_STATE_STATUS).
-    /// On real HW this is a transient pulse — auto-clears after a few ticks.
+    ///
+    /// G2: bit6 is a sticky LEVEL latch, NOT a 50-tick transient pulse.
+    /// On real silicon it is the 10G PCS 64b/66b block-lock status: it
+    /// re-latches every block while a valid downstream stream is present
+    /// and the lane-3 RX path is up. The firmware W1C-clears it each tick
+    /// (`mpcp_sm.rs:495-503`) and checks whether it re-latched on the
+    /// next tick — a CONTINUOUS lock re-asserts, a dropped lock does not.
+    ///
+    /// The bank calls this every tick (OLT-gated) while the OLT model is
+    /// broadcasting a valid downstream + lane-3 RX is up, so bit6
+    /// re-asserts as a level. There is NO auto-clear: the level holds
+    /// until the W1C write clears the latch history (it then re-asserts
+    /// on the next tick if the stream is still present) or the bank stops
+    /// driving it (stream gone). DO-NOT-FAKE: the VALUE comes from the
+    /// modelled downstream-present condition, never from a firmware write.
     pub fn set_phy_link_status_bit(&mut self) {
         self.hw_state_status |= 0x40;
-        self.hw_state_status_autoclear = 50;
+    }
+
+    /// Clear the 10G PHY link status bit6 level — called by the bank when
+    /// the OLT model is no longer broadcasting a valid downstream, so the
+    /// PCS block-lock drops. G2.
+    pub fn clear_phy_link_status_bit(&mut self) {
+        self.hw_state_status &= !0x40;
     }
 
     /// Set bit 2 of REG_DISCOVERY_STATUS (OLT discovery detected).
@@ -575,12 +591,11 @@ impl Peripheral for EponMac {
         for flag in &mut self.llid_drain_flag {
             *flag = true;
         }
-        if self.hw_state_status_autoclear > 0 {
-            self.hw_state_status_autoclear -= 1;
-            if self.hw_state_status_autoclear == 0 {
-                self.hw_state_status &= !0x40;
-            }
-        }
+        // G2: bit6 of REG_HW_STATE_STATUS is a sticky LEVEL latch driven
+        // by the bank (OLT-gated), not a transient pulse — no auto-clear
+        // here. The bank re-asserts it every tick while the downstream
+        // stream is present; the firmware's W1C clear is honored by
+        // write_word, and the level re-asserts on the next bank tick.
     }
 
     fn reset_cold(&mut self) {
@@ -687,6 +702,37 @@ mod tests {
         assert!(m.read_word(addr).unwrap() != 0);
         m.write_word(addr, 0xFFFF_FFFF).unwrap();
         assert_eq!(m.read_word(addr).unwrap(), 0);
+    }
+
+    #[test]
+    fn bit6_is_a_sticky_level_not_a_50_tick_pulse() {
+        // G2: bit6 of 0x01000E04 is a LEVEL latch. Once set it does NOT
+        // auto-clear after N ticks (the old 50-tick transient-pulse model
+        // is gone). It only clears on a W1C write or an explicit
+        // level-drop from the bank.
+        let mut m = EponMac::new();
+        assert_eq!(m.read_word(REG_HW_STATE_STATUS).unwrap() & 0x40, 0);
+        m.set_phy_link_status_bit();
+        assert_eq!(m.read_word(REG_HW_STATE_STATUS).unwrap() & 0x40, 0x40);
+        // Many ticks pass — the level holds (no auto-clear).
+        for _ in 0..200 {
+            m.tick(64);
+        }
+        assert_eq!(
+            m.read_word(REG_HW_STATE_STATUS).unwrap() & 0x40,
+            0x40,
+            "bit6 must stay set as a level, not pulse away after 50 ticks"
+        );
+        // W1C clears the latch history.
+        m.write_word(REG_HW_STATE_STATUS, 0x40).unwrap();
+        assert_eq!(m.read_word(REG_HW_STATE_STATUS).unwrap() & 0x40, 0);
+        // The bank re-asserts it next tick while the stream is present
+        // (modelled by calling set_phy_link_status_bit again) — continuous.
+        m.set_phy_link_status_bit();
+        assert_eq!(m.read_word(REG_HW_STATE_STATUS).unwrap() & 0x40, 0x40);
+        // Explicit level drop (downstream gone).
+        m.clear_phy_link_status_bit();
+        assert_eq!(m.read_word(REG_HW_STATE_STATUS).unwrap() & 0x40, 0);
     }
 
     #[test]

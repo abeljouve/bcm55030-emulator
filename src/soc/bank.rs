@@ -454,7 +454,10 @@ impl PeripheralBank {
         if self.olt.link_change_pending {
             self.olt.link_change_pending = false;
             self.epon_mac.set_1g_link_change_bit();
-            self.epon_mac.set_phy_link_status_bit();
+            // G2: bit6 (0x01000E04) is NO LONGER set on the link-change
+            // edge. It is a 10G PCS block-lock LEVEL driven per-tick below
+            // only once the OLT has broadcast a downstream GATE (a real
+            // stream to lock to) — not merely because the PHY link came up.
             self.epon_mac.set_discovery_status_bit();
             for &addr in &[0x0100_0410u32, 0x0100_0E04, 0x0100_1040] {
                 self.pending_cache_inv.push(
@@ -464,6 +467,33 @@ impl PeripheralBank {
         }
         if self.olt.config.enabled && self.olt.link_up {
             self.epon_mac.set_discovery_status_bit();
+        }
+        // ── G2: bit6 (0x01000E04) 10G PCS block-lock as a sticky LEVEL ─
+        // While the OLT model broadcasts a valid downstream (enabled +
+        // link up) and the lane-3 RX path is up, re-assert bit6 every
+        // tick so it behaves as a continuous block-lock level (the
+        // firmware W1C-clears it and checks re-latch — mpcp_sm.rs:495).
+        // When the downstream is gone, the level drops. This is a NO-OP
+        // when the OLT is disabled (bit6 stays 0, as before). DO-NOT-FAKE:
+        // the value tracks the modelled downstream-present condition.
+        if self.olt.config.enabled {
+            // "lane-3 RX up + valid downstream present" is modelled by the
+            // OLT having broadcast >=1 downstream GATE (a real stream the
+            // PCS can block-lock to). We do NOT model analog cal physics
+            // here (that is a scenario input — G4); bit6 reflects only the
+            // modelled downstream-present condition.
+            if self.olt.link_up && self.olt.has_broadcast_gate() {
+                self.epon_mac.set_phy_link_status_bit();
+                self.pending_cache_inv.push(
+                    DatapathOp::CacheInvalidate { addr: 0x0100_0E04 },
+                );
+            } else if !self.olt.link_up {
+                // Downstream stream gone -> PCS block-lock drops.
+                self.epon_mac.clear_phy_link_status_bit();
+                self.pending_cache_inv.push(
+                    DatapathOp::CacheInvalidate { addr: 0x0100_0E04 },
+                );
+            }
         }
         // ── G1 + G5: MPCP TS-sync register drive (OLT-gated) ──────────
         // When the OLT model is broadcasting a downstream (enabled +
