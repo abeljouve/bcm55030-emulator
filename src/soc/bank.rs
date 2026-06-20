@@ -295,11 +295,13 @@ impl PeripheralBank {
             mpcp_bus: {
                 let mut bus = LaneBus::new(0x0100_0118, 2);
                 bus.apply_init(super::mmio_init::SYSREG_INIT_VALUES);
-                // SerDes CDR calibration done bits — firmware polls
-                // indirect regs 0xBB/0xDB bit 7 via lane 8.
-                // Register file uses 0x100+reg_num indexing.
-                bus.set_reg(0x1BB, 0x80);
-                bus.set_reg(0x1DB, 0x80);
+                // G4: SerDes CDR cold-cal-done bits (lane2 0xBB / lane3
+                // 0xDB, reg-file index 0x100+reg) are NO LONGER force-
+                // seeded here. Cal convergence is an analog physics effect
+                // the emulator must NOT fake (DO-NOT-FAKE). It is now a
+                // scenario input — default not-converged (bit7=0). A
+                // scenario opts in via `set_serdes_cal_converged`, and the
+                // bank tick then seeds bit7 (see `apply_serdes_cal_seed`).
                 bus
             },
             serdes: SerDes::new(),
@@ -602,6 +604,20 @@ impl PeripheralBank {
         self.sysreg.tick(cpu_instructions);
         self.scenario.tick(cpu_instructions);
 
+        // ── G4: SerDes cold-cal-done seed (scenario opt-in) ───────────
+        // The emulator does NOT model cold-cal convergence physics
+        // (DO-NOT-FAKE). When a scenario has explicitly opted into a
+        // converged analog state, seed the cal-done bit7 for lane2
+        // (reg-file 0x1BB) and lane3 (0x1DB) — both the readback slot
+        // (0x1BB/0x1DB) and the read-result slot (0x100) so the firmware
+        // sees cal-done via either path. Idempotent. Default
+        // (not-converged) leaves these alone so the firmware's cal poll
+        // observes the real non-convergence the project hunts.
+        if self.scenario.serdes_cal_converged {
+            self.mpcp_bus.set_reg(0x1BB, self.mpcp_bus.reg(0x1BB) | 0x80);
+            self.mpcp_bus.set_reg(0x1DB, self.mpcp_bus.reg(0x1DB) | 0x80);
+        }
+
         // Aggregate IRQ pending bits from all peripherals.
         self.irq_pending = self.uart.irq_pending();
         // DMA mailbox IRQ 6: NOT generated. The firmware masks all
@@ -633,8 +649,8 @@ impl PeripheralBank {
         self.bsc_i2c.reset_cold();
         self.mpcp_bus.reset();
         self.mpcp_bus.apply_init(super::mmio_init::SYSREG_INIT_VALUES);
-        self.mpcp_bus.set_reg(0x1BB, 0x80);
-        self.mpcp_bus.set_reg(0x1DB, 0x80);
+        // G4: cal-done bit7 (0x1BB/0x1DB) NOT force-seeded on reset —
+        // default not-converged. Scenario opt-in applies it in tick().
         self.serdes.reset_cold();
         self.epon_mac.reset_cold();
         self.macsec.reset_cold();
@@ -666,8 +682,8 @@ impl PeripheralBank {
         self.bsc_i2c.reset_warm();
         self.mpcp_bus.reset();
         self.mpcp_bus.apply_init(super::mmio_init::SYSREG_INIT_VALUES);
-        self.mpcp_bus.set_reg(0x1BB, 0x80);
-        self.mpcp_bus.set_reg(0x1DB, 0x80);
+        // G4: cal-done bit7 (0x1BB/0x1DB) NOT force-seeded on reset —
+        // default not-converged. Scenario opt-in applies it in tick().
         self.serdes.reset_warm();
         self.epon_mac.reset_warm();
         self.macsec.reset_warm();
@@ -1224,9 +1240,13 @@ impl PeripheralBank {
                 self.mpcp_bus.write_stat(val);
                 // STAT write with read trigger (bit 22): the HW reads the
                 // SerDes register selected by regs[0] and stores the result
-                // in regs[0x100].  For CDR cal-done registers 0xBB/0xDB,
-                // return bit 7 set (calibration complete).
-                if val & (1 << 22) != 0 {
+                // in regs[0x100]. For CDR cal-done registers 0xBB/0xDB,
+                // bit7 (cal-done) is forced ONLY when a scenario has opted
+                // into a converged analog state (G4 — DO-NOT-FAKE the cal
+                // physics). Default not-converged -> bit7 stays whatever
+                // was actually written (0), so the firmware's cal poll
+                // observes a genuine non-convergence.
+                if val & (1 << 22) != 0 && self.scenario.serdes_cal_converged {
                     let target_reg = self.mpcp_bus.reg(0) as usize;
                     if target_reg == 0xBB || target_reg == 0xDB {
                         self.mpcp_bus.set_reg(0x100, self.mpcp_bus.reg(0x100) | 0x80);

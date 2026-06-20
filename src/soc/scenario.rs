@@ -290,6 +290,17 @@ pub struct ScenarioEngine {
 
     /// Deferred writes from effects (processed by caller).
     pub deferred_writes: Vec<DeferredWrite>,
+
+    /// G4: SerDes cold-cal convergence as a SCENARIO INPUT, default
+    /// `false` (= cal NOT converged, IND lane2/lane3 `0xBB`/`0xDB` bit7
+    /// reads 0). The emulator does NOT model the analog VCO/CDR
+    /// convergence physics (DO-NOT-FAKE — see project memories
+    /// `project_lane2_pon_core_coldcal_is_blocker`). A scenario / test
+    /// can opt into a converged analog state by setting this true; the
+    /// bank then seeds the cal-done bit7 for lanes 2/3. Defaulting to
+    /// not-converged stops the emulator from silently papering over the
+    /// project's central cal blocker.
+    pub serdes_cal_converged: bool,
 }
 
 impl ScenarioEngine {
@@ -571,6 +582,14 @@ impl ScenarioEngine {
                     let label = params.get("label").and_then(|l| l.as_str()).map(String::from);
                     self.overrides.set(addr, spec, label);
                 }
+                "set_serdes_cal_converged" => {
+                    // G4: opt into a converged SerDes cold-cal analog state.
+                    // params: { "converged": true|false } (default true).
+                    let converged = params.get("converged")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    self.serdes_cal_converged = converged;
+                }
                 "schedule_event" => {
                     let trigger = parse_trigger(params.get("trigger")
                         .ok_or_else(|| format!("event[{i}]: missing trigger"))?)
@@ -601,6 +620,7 @@ impl ScenarioEngine {
         self.watchpoints.clear();
         self.pause_requested = false;
         self.deferred_writes.clear();
+        self.serdes_cal_converged = false;
     }
 }
 
@@ -754,6 +774,25 @@ mod tests {
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].address, 0x0100_0064);
         assert_eq!(writes[0].value, 0xBEEF);
+    }
+
+    #[test]
+    fn serdes_cal_converged_defaults_false() {
+        // G4: default analog state is NOT converged.
+        let eng = ScenarioEngine::new();
+        assert!(!eng.serdes_cal_converged);
+    }
+
+    #[test]
+    fn serdes_cal_converged_opt_in_via_json() {
+        let mut eng = ScenarioEngine::new();
+        eng.load_json(
+            r#"{"events":[{"tool":"set_serdes_cal_converged","params":{"converged":true}}]}"#,
+        )
+        .unwrap();
+        assert!(eng.serdes_cal_converged);
+        eng.clear_all();
+        assert!(!eng.serdes_cal_converged);
     }
 
     #[test]
