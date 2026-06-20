@@ -10,6 +10,7 @@ use crate::soc::epon_mac::EponMac;
 use crate::soc::fatal_filter::FatalFilter;
 use crate::soc::macsec::Macsec;
 use crate::soc::mpcp::Mpcp;
+use crate::soc::mpcp_tssync::MpcpTsSync;
 use crate::soc::nco::Nco;
 use crate::soc::olt::Olt;
 use crate::soc::pbc::Pbc;
@@ -35,6 +36,7 @@ pub struct PeripheralBankSaveState {
     pub efuse_udr: EfuseUdr,
     pub fatal_filter: FatalFilter,
     pub mpcp: Mpcp,
+    pub mpcp_tssync: MpcpTsSync,
     pub nco: Nco,
     pub vlan_lue: VlanLue,
     pub olt: Olt,
@@ -48,6 +50,8 @@ pub struct PeripheralBankSaveState {
     pub dma_master_status: [u32; 2],
     pub dma_channel_mask: [u32; 2],
     pub guard_clear_countdown: u32,
+    /// Monotonic local NCO TX timestamp counter (G5).
+    pub nco_tx_ts_counter: u32,
 }
 
 pub struct NamedSnapshot {

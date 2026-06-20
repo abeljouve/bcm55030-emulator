@@ -383,6 +383,16 @@ impl Olt {
         self.assigned_llid
     }
 
+    /// True once the OLT model has broadcast at least one downstream GATE
+    /// frame. On real silicon the OLT continuously broadcasts (Discovery)
+    /// GATEs; the firmware's TS-sync HW OLT-lock (`0x01000304` bit0)
+    /// latches off the recovered downstream timestamp carried by those
+    /// GATEs. The bank uses this (OLT-gated) to drive the lock bit, so
+    /// the lock reflects a real broadcast, never a firmware action. G1.
+    pub fn has_broadcast_gate(&self) -> bool {
+        self.gate_count > 0
+    }
+
     /// Return a reference to the TX log (ONU → OLT frames).
     pub fn tx_log(&self) -> &VecDeque<OltFrame> {
         &self.tx_log
@@ -853,8 +863,13 @@ impl Olt {
             }
         }
 
-        // Periodic GATE frames once registered.
-        if self.mpcp_state == OltMpcpState::Registered
+        // Periodic GATE frames. On real silicon the OLT broadcasts
+        // (Discovery) GATEs continuously once a downstream link is up —
+        // not only after this ONU registers. The GATE carries the OLT's
+        // MPCP timestamp, which is what the ONU's TS-sync loop slaves to
+        // (and what latches HW OLT-lock at 0x01000304 bit0). So GATE
+        // emission is gated on `link_up`, regardless of MPCP state.
+        if self.link_up
             && self.ticks_elapsed >= self.last_gate_tick + self.config.gate_interval_ticks
         {
             self.last_gate_tick = self.ticks_elapsed;
@@ -1146,7 +1161,10 @@ mod tests {
     fn gate_sent_periodically() {
         let mut olt = Olt::new();
         olt.set_enabled(true);
-        olt.mpcp_state = OltMpcpState::Registered;
+        // GATE emission is now gated on link_up (HW-faithful: the OLT
+        // broadcasts GATEs continuously while the downstream is up,
+        // independent of this ONU's MPCP registration state — G1).
+        olt.set_link_up(true);
         olt.onu_mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
         olt.config.gate_interval_ticks = 50;
 
@@ -1155,6 +1173,7 @@ mod tests {
         }
 
         assert!(olt.gate_count >= 1);
+        assert!(olt.has_broadcast_gate());
     }
 
     #[test]

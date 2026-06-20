@@ -26,6 +26,7 @@ use crate::soc::epon_mac::EponMac;
 use crate::soc::fatal_filter::FatalFilter;
 use crate::soc::macsec::Macsec;
 use crate::soc::mpcp::Mpcp;
+use crate::soc::mpcp_tssync::MpcpTsSync;
 use crate::soc::nco::Nco;
 use crate::soc::olt::Olt;
 use crate::soc::pbc::Pbc;
@@ -180,9 +181,18 @@ pub struct PeripheralBank {
     pub efuse_udr: EfuseUdr,
     pub fatal_filter: FatalFilter,
     pub mpcp: Mpcp,
+    /// MPCP TS-sync register block (0x01000300/04/14/18/1C, 0x010000B4,
+    /// 0x01000D88/D8C). OLT-gated: behaves as a plain seeded store when
+    /// the OLT model is disabled. See `soc/mpcp_tssync.rs` (G1+G5).
+    pub mpcp_tssync: MpcpTsSync,
     pub nco: Nco,
     pub vlan_lue: VlanLue,
     pub olt: Olt,
+
+    /// Monotonic local NCO TX timestamp counter (bank-tick domain), used
+    /// to drive 0x01000D8C when the OLT is enabled (G5). Advances in the
+    /// same domain as the EPON free-running counter.
+    nco_tx_ts_counter: u32,
 
     pending_cache_inv: Vec<DatapathOp>,
 
@@ -301,9 +311,11 @@ impl PeripheralBank {
             efuse_udr: EfuseUdr::new(),
             fatal_filter: FatalFilter::new(),
             mpcp: Mpcp::new(),
+            mpcp_tssync: MpcpTsSync::new(),
             nco: Nco::new(),
             vlan_lue: VlanLue::new(),
             olt: Olt::new(),
+            nco_tx_ts_counter: 0,
             pending_cache_inv: Vec::new(),
             scenario: ScenarioEngine::new(),
             sysreg: SysregShim::new(),
@@ -371,6 +383,7 @@ impl PeripheralBank {
         self.efuse_udr.tick(cpu_instructions);
         self.fatal_filter.tick(cpu_instructions);
         self.mpcp.tick(cpu_instructions);
+        self.mpcp_tssync.tick(cpu_instructions);
         self.nco.tick(cpu_instructions);
         self.vlan_lue.tick(cpu_instructions);
         self.olt.tick(cpu_instructions);
@@ -451,6 +464,40 @@ impl PeripheralBank {
         }
         if self.olt.config.enabled && self.olt.link_up {
             self.epon_mac.set_discovery_status_bit();
+        }
+        // ── G1 + G5: MPCP TS-sync register drive (OLT-gated) ──────────
+        // When the OLT model is broadcasting a downstream (enabled +
+        // link up), drive the HW-status TS-sync registers from the OLT
+        // model's advancing timestamp and a local monotonic NCO counter.
+        // This whole block is a NO-OP when the OLT is disabled, so the
+        // boot path and differential harness are byte-identical.
+        if self.olt.config.enabled && self.olt.link_up {
+            // 0x010000B4 = live OLT MPCP timestamp (HW captured). On
+            // silicon the firmware treats 0xFFFFFFFF as "block not
+            // producing"; a present downstream gives a real value.
+            let olt_ts = self.olt.mpcp_timestamp;
+            self.mpcp_tssync.drive_captured_ts(olt_ts);
+            // 0x01000D8C = local NCO TX timestamp, monotonic in the
+            // bank-tick domain (G5).
+            self.nco_tx_ts_counter = self.nco_tx_ts_counter.wrapping_add(1);
+            self.mpcp_tssync.drive_nco_tx_ts(self.nco_tx_ts_counter);
+            // 0x01000320 = HW-captured OLT timestamp (block 52, owned by
+            // `mpcp`). Mirror the OLT model's advancing timestamp so the
+            // firmware's registration-independent RX-decode proof
+            // (mpcp_sm.rs:490) advances. Poke the mpcp store directly
+            // (HW-faithful: this is the EPON MAC latching the OLT TS, not
+            // a firmware write).
+            self.mpcp.poke_tx_rate(0x0100_0320, olt_ts);
+            // 0x01000304 bit0 = HW OLT-lock. Set ONLY once the OLT model
+            // has broadcast >=1 downstream GATE — models the HW timestamp
+            // lock off the recovered downstream. DO-NOT-FAKE: never set
+            // from a firmware write to 0x01000300.
+            self.mpcp_tssync.set_hw_lock(self.olt.has_broadcast_gate());
+            for &addr in &[0x0100_00B4u32, 0x0100_0304, 0x0100_0320, 0x0100_0D8C] {
+                self.pending_cache_inv.push(
+                    DatapathOp::CacheInvalidate { addr },
+                );
+            }
         }
         // LLID OAM state initialization — models the EPON MAC's
         // internal state setup after registration completes. On real
@@ -567,10 +614,12 @@ impl PeripheralBank {
         self.efuse_udr.reset_cold();
         self.fatal_filter.reset_cold();
         self.mpcp.reset_cold();
+        self.mpcp_tssync.reset_cold();
         self.nco.reset_cold();
         self.vlan_lue.reset_cold();
         self.olt.reset_cold();
         self.sysreg.reset_cold();
+        self.nco_tx_ts_counter = 0;
         self.irq_pending = 0;
         self.dma_master_status = [0; 2];
         self.dma_channel_mask = [0; 2];
@@ -598,10 +647,12 @@ impl PeripheralBank {
         self.efuse_udr.reset_warm();
         self.fatal_filter.reset_warm();
         self.mpcp.reset_warm();
+        self.mpcp_tssync.reset_warm();
         self.nco.reset_warm();
         self.vlan_lue.reset_warm();
         self.olt.reset_warm();
         self.sysreg.reset_warm();
+        self.nco_tx_ts_counter = 0;
         self.irq_pending = 0;
         self.current_pc = 0;
         self.current_blink = 0;
@@ -813,6 +864,7 @@ impl PeripheralBank {
         if self.efuse_udr.claims(addr) { return Some("efuse_udr"); }
         if self.fatal_filter.claims(addr) { return Some("fatal_filter"); }
         if self.mpcp.claims(addr) { return Some("mpcp"); }
+        if self.mpcp_tssync.claims(addr) { return Some("mpcp_tssync"); }
         if self.nco.claims(addr) { return Some("nco"); }
         if self.vlan_lue.claims(addr) { return Some("vlan_lue"); }
         if self.sysreg.claims(addr) { return Some("sysreg"); }
@@ -834,6 +886,7 @@ impl PeripheralBank {
             efuse_udr: self.efuse_udr.clone(),
             fatal_filter: self.fatal_filter.clone(),
             mpcp: self.mpcp.clone(),
+            mpcp_tssync: self.mpcp_tssync.clone(),
             nco: self.nco.clone(),
             vlan_lue: self.vlan_lue.clone(),
             olt: self.olt.clone(),
@@ -843,6 +896,7 @@ impl PeripheralBank {
             dma_master_status: self.dma_master_status,
             dma_channel_mask: self.dma_channel_mask,
             guard_clear_countdown: self.guard_clear_countdown,
+            nco_tx_ts_counter: self.nco_tx_ts_counter,
         }
     }
 
@@ -860,6 +914,7 @@ impl PeripheralBank {
         self.efuse_udr = state.efuse_udr;
         self.fatal_filter = state.fatal_filter;
         self.mpcp = state.mpcp;
+        self.mpcp_tssync = state.mpcp_tssync;
         self.nco = state.nco;
         self.vlan_lue = state.vlan_lue;
         self.olt = state.olt;
@@ -869,6 +924,7 @@ impl PeripheralBank {
         self.dma_master_status = state.dma_master_status;
         self.dma_channel_mask = state.dma_channel_mask;
         self.guard_clear_countdown = state.guard_clear_countdown;
+        self.nco_tx_ts_counter = state.nco_tx_ts_counter;
         self.irq_pending = 0;
         self.current_pc = 0;
         self.current_blink = 0;
@@ -931,6 +987,9 @@ impl PeripheralBank {
         }
         if self.mpcp.claims(addr) {
             return self.mpcp.peek_word(addr);
+        }
+        if self.mpcp_tssync.claims(addr) {
+            return self.mpcp_tssync.peek_word(addr);
         }
         if self.nco.claims(addr) {
             return self.nco.peek_word(addr);
@@ -1016,6 +1075,7 @@ impl PeripheralBank {
         if self.efuse_udr.claims(addr) { dispatch_rw!(self.efuse_udr, "efuse_udr"); }
         if self.fatal_filter.claims(addr) { dispatch_rw!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_rw!(self.mpcp, "mpcp"); }
+        if self.mpcp_tssync.claims(addr) { dispatch_rw!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.nco.claims(addr) { dispatch_rw!(self.nco, "nco"); }
         if self.vlan_lue.claims(addr) {
             let v = self.vlan_lue.read_word(addr)?;
@@ -1190,6 +1250,7 @@ impl PeripheralBank {
         if self.efuse_udr.claims(addr) { dispatch_ww!(self.efuse_udr, "efuse_udr"); }
         if self.fatal_filter.claims(addr) { dispatch_ww!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_ww!(self.mpcp, "mpcp"); }
+        if self.mpcp_tssync.claims(addr) { dispatch_ww!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.nco.claims(addr) { dispatch_ww!(self.nco, "nco"); }
         if self.vlan_lue.claims(addr) {
             self.vlan_lue.write_word(addr, val)?;
@@ -1265,6 +1326,7 @@ impl PeripheralBank {
         if self.efuse_udr.claims(addr) { dispatch_rh!(self.efuse_udr, "efuse_udr"); }
         if self.fatal_filter.claims(addr) { dispatch_rh!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_rh!(self.mpcp, "mpcp"); }
+        if self.mpcp_tssync.claims(addr) { dispatch_rh!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.nco.claims(addr) { dispatch_rh!(self.nco, "nco"); }
         if self.vlan_lue.claims(addr) {
             let v = self.vlan_lue.read_half(addr)?;
@@ -1298,6 +1360,7 @@ impl PeripheralBank {
         if self.efuse_udr.claims(addr) { dispatch_wh!(self.efuse_udr, "efuse_udr"); }
         if self.fatal_filter.claims(addr) { dispatch_wh!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_wh!(self.mpcp, "mpcp"); }
+        if self.mpcp_tssync.claims(addr) { dispatch_wh!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.nco.claims(addr) { dispatch_wh!(self.nco, "nco"); }
         if self.vlan_lue.claims(addr) {
             self.vlan_lue.write_half(addr, val)?;
@@ -1341,6 +1404,7 @@ impl PeripheralBank {
         if self.efuse_udr.claims(addr) { dispatch_rb!(self.efuse_udr, "efuse_udr"); }
         if self.fatal_filter.claims(addr) { dispatch_rb!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_rb!(self.mpcp, "mpcp"); }
+        if self.mpcp_tssync.claims(addr) { dispatch_rb!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.nco.claims(addr) { dispatch_rb!(self.nco, "nco"); }
         if self.vlan_lue.claims(addr) {
             let v = self.vlan_lue.read_byte(addr)?;
@@ -1374,6 +1438,7 @@ impl PeripheralBank {
         if self.efuse_udr.claims(addr) { dispatch_wb!(self.efuse_udr, "efuse_udr"); }
         if self.fatal_filter.claims(addr) { dispatch_wb!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_wb!(self.mpcp, "mpcp"); }
+        if self.mpcp_tssync.claims(addr) { dispatch_wb!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.nco.claims(addr) { dispatch_wb!(self.nco, "nco"); }
         if self.vlan_lue.claims(addr) {
             self.vlan_lue.write_byte(addr, val)?;

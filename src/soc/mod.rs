@@ -25,6 +25,7 @@ pub mod macsec;
 pub mod mmio_blocks;
 pub mod mmio_init;
 pub mod mpcp;
+pub mod mpcp_tssync;
 pub mod nco;
 pub mod olt;
 pub mod pbc;

@@ -98,6 +98,26 @@ impl Mpcp {
         None
     }
 
+    /// Drive a value into the block-52 TX-rate store at `addr` without
+    /// going through the normal write path. Used by the bank (OLT-gated)
+    /// to mirror the OLT model's HW-captured timestamp into `0x01000320`
+    /// — the registration-independent RX-decode proof the firmware polls
+    /// (`mpcp_sm.rs:490`). No-op when `addr` is outside the claimed
+    /// regions, so a disabled OLT never reaches this. G1.
+    pub fn poke_tx_rate(&mut self, addr: u32, val: u32) {
+        if let Some((region, idx)) = self.locate(addr) {
+            self.stores[region][idx] = val;
+        }
+    }
+
+    /// Read-only peek of the block-52 TX-rate store (for snapshot/peek).
+    pub fn peek_tx_rate(&self, addr: u32) -> u32 {
+        match self.locate(addr) {
+            Some((region, idx)) => self.stores[region][idx],
+            None => 0,
+        }
+    }
+
     fn apply_silicon_power_on(&mut self) {
         for &(off, val) in super::mmio_init::SYSREG_INIT_VALUES {
             let abs = 0x0100_0000 + off;
