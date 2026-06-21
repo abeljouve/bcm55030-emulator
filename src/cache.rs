@@ -249,6 +249,36 @@ impl DCache {
         evicted
     }
 
+    /// Write back every dirty line to memory and mark it clean, WITHOUT
+    /// invalidating (the line stays valid/resident). Returns the lines to
+    /// write back. Used when DC_CTRL clears the DC enable bit: on real
+    /// ARC700 disabling the cache makes SRAM coherent (pending write-backs
+    /// drain) so that subsequent uncached/bypassed accesses observe the
+    /// data the CPU wrote while the cache was enabled. Without this, a
+    /// dirty stack slot (e.g. a compiler-saved frame pointer) written
+    /// through the write-back cache would be lost the instant the firmware
+    /// turns the cache off, and the next bypassed load would read stale
+    /// SRAM. -- OBSERVED: reference firmware toggles DC_CTRL (0xc3) at runtime
+    /// 0x33c0c and then dereferences saved frame pointers off the stack;
+    /// the corruption (fp loaded as a stale 0x1 -> j 0x200f8000) appears
+    /// exactly 2 insns after the DC_CTRL disable.
+    pub fn flush_dirty(&mut self) -> Vec<EvictedLine> {
+        let mut evicted = Vec::new();
+        for set in 0..NUM_SETS {
+            for way in 0..NUM_WAYS {
+                let line = &mut self.lines[set][way];
+                if line.valid && line.dirty {
+                    evicted.push(EvictedLine {
+                        addr: Self::base_addr(line.tag, set),
+                        data: line.data,
+                    });
+                    line.dirty = false;
+                }
+            }
+        }
+        evicted
+    }
+
     /// Invalidate a single cache line by address.
     /// If the line is dirty and IM=1, returns it for writeback.
     pub fn invalidate_line(&mut self, addr: u32) -> Option<EvictedLine> {

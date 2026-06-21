@@ -866,6 +866,30 @@ impl Memory {
     }
 
     pub fn dcache_sync_ctrl(&mut self, val: u32) {
+        // On the enabled->disabled transition (DC_CTRL.DC bit 0: 0->1),
+        // drain pending write-backs to SRAM. On real ARC700 turning the
+        // D-cache off leaves memory coherent — dirty lines are written
+        // back so later uncached/bypassed accesses see the CPU's writes.
+        // The emulator must do the same: while disabled, read_*_data /
+        // write_*_data bypass the cache (memory.rs:789/850), so a dirty
+        // line still resident at disable time would otherwise be unseen
+        // and the bypassed load would return stale SRAM.
+        // -- OBSERVED: reference firmware (runtime 0x33c0c) writes DC_CTRL=0xc3
+        // then immediately dereferences a stack-saved frame pointer; the
+        // saved fp lived only in a dirty cache line, so without this
+        // flush it read stale SRAM (0x1) and jumped to 0x200f8000.
+        let was_enabled = self.dcache.as_ref().map(|dc| dc.is_enabled()).unwrap_or(true);
+        let will_be_enabled = val & 1 == 0;
+        if was_enabled && !will_be_enabled {
+            let evicted = if let Some(ref mut dc) = self.dcache {
+                dc.flush_dirty()
+            } else {
+                Vec::new()
+            };
+            for ev in evicted {
+                let _ = self.writeback_line(ev.addr, &ev.data);
+            }
+        }
         if let Some(ref mut dc) = self.dcache {
             dc.write_dc_ctrl(val);
         }
@@ -1185,6 +1209,32 @@ mod tests {
         assert_eq!(mem.read_word(0x300).unwrap(), 0x12345678);
         mem.dcache_invalidate_all().unwrap();
         assert_eq!(mem.read_word(0x300).unwrap(), 0x12345678);
+    }
+
+    // Regression: reference firmware 0x200f8000 fault. Turning the D-cache OFF
+    // via DC_CTRL (DC bit 0: 0->1) must write back dirty lines to SRAM so
+    // later cache-bypassed accesses (the firmware reads while the cache is
+    // off) observe the CPU's writes. Pre-fix the dirty line was stranded:
+    // a stack-saved frame pointer written through the write-back cache was
+    // lost the instant reference did `sr 0xc3,[dc_ctrl]`, and the next load
+    // read stale SRAM (0x1) -> j 0x200f8000. See cache.rs::flush_dirty.
+    #[test]
+    fn dc_ctrl_disable_flushes_dirty_to_sram() {
+        let mut mem = Memory::new_soc(0x8000, BootMode::Warm);
+        let slot = 0x1F88u32;
+        let saved_fp = 0x0003_1FB8u32;
+        // CPU `st fp,[sp,N]`: cached write-back -> dirty. The uncached
+        // (bypass) view still sees stale SRAM (0).
+        mem.write_word_data(slot, saved_fp, false).unwrap();
+        assert_eq!(mem.read_word_data(slot, true).unwrap(), 0x0000_0000);
+        // Firmware disables the D-cache (DC_CTRL = 0xC3, DC bit set).
+        mem.dcache_sync_ctrl(0xC3);
+        // SRAM is now coherent: the dirty saved-fp was written back.
+        assert_eq!(mem.read_word_data(slot, true).unwrap(), saved_fp);
+        // While disabled, a normal (now cache-bypassing) load reads the
+        // correct value instead of stale SRAM. This is the exact access
+        // the reference millicode `ld.ab fp,[sp,4]` makes post-disable.
+        assert_eq!(mem.read_word_data(slot, false).unwrap(), saved_fp);
     }
 
     // Regression: bug emu-reboot-halt-and-transfer-model-divergences
