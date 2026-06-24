@@ -77,3 +77,11 @@ path = "src/bin/boot_smoke.rs"
 [[bin]]
 name = "boot-diff"
 path = "src/bin/boot_diff.rs"
+
+[[bin]]
+name = "our-bl-firmware-diff"
+path = "src/bin/our_bl_firmware_diff.rs"
+
+[[bin]]
+name = "arm4-probe"
+path = "src/bin/arm4_probe.rs"

@@ -24,3 +24,8 @@ tmp/
 
 # Python cache
 __pycache__/
+
+# macOS / local state junk
+.DS_Store
+/firmwares
+.claude/scheduled_tasks.lock
