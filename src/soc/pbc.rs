@@ -70,6 +70,14 @@ pub struct Pbc {
     /// Set on REG_DMA_CTRL write based on ADDR and CMD encoding.
     /// Evidence: session 2026-05-05-1430, PBC register analysis.
     pub last_dma_tag: &'static str,
+
+    /// Optional DMA-flash-WRITE recorder (boot-diff DMADIFF instrumentation).
+    /// When `Some`, every `complete_flash_write` appends `(flash_addr, data)`.
+    /// The DMA write PAYLOAD is read from the SRAM buffer and is NOT in the
+    /// MMIO write stream, so this is the only way to diff FDS-record CONTENT
+    /// across reference vs reference (the  root-cause tool). Pure HW-model
+    /// observation, not a firmware hook.
+    pub dma_write_log: Option<Vec<(u32, Vec<u8>)>>,
 }
 
 impl Pbc {
@@ -89,6 +97,7 @@ impl Pbc {
             pending_ops: Vec::new(),
             pending_spi_serdes: None,
             last_dma_tag: "pbc",
+            dma_write_log: None,
         }
     }
 
@@ -128,6 +137,9 @@ impl Pbc {
                 flash_addr,
                 &data[..data.len().min(16)]
             );
+        }
+        if let Some(log) = &mut self.dma_write_log {
+            log.push((flash_addr, data.to_vec()));
         }
         self.flash.dma_write(flash_addr, data);
     }
