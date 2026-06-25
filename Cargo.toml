@@ -85,3 +85,7 @@ path = "src/bin/our_bl_firmware_diff.rs"
 [[bin]]
 name = "arm4-probe"
 path = "src/bin/arm4_probe.rs"
+
+[[bin]]
+name = "callstack"
+path = "src/bin/callstack.rs"
