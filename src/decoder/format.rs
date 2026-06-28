@@ -326,7 +326,10 @@ fn format_branch(
     if matches!(delay, DelayMode::Delay) {
         mnemonic.push_str(".d");
     }
-    let target = (pc as i64).wrapping_add(offset as i64) as u32;
+    // ARC branch offsets are relative to PCL (PC & ~3), matching the executor
+    // (executor/branch.rs). Using the raw pc shows targets +2 too high for
+    // branches at 2-mod-4 addresses (a display-only bug that misled audits).
+    let target = ((pc & !3) as i64).wrapping_add(offset as i64) as u32;
     (mnemonic, format!("0x{:08X}", target))
 }
 
@@ -352,7 +355,7 @@ fn format_br_compare(
     if matches!(delay, DelayMode::Delay) {
         mnemonic.push_str(".d");
     }
-    let target = (pc as i64).wrapping_add(offset as i64) as u32;
+    let target = ((pc & !3) as i64).wrapping_add(offset as i64) as u32; // PCL-relative (see format_branch)
     (
         mnemonic,
         format!(
@@ -476,7 +479,7 @@ fn format_loop(pc: u32, offset: u32, cc: Option<ConditionCode>) -> (String, Stri
         m.push('.');
         m.push_str(format_cond(c));
     }
-    let target = pc.wrapping_add(offset);
+    let target = (pc & !3).wrapping_add(offset); // PCL-relative (executor/special.rs uses pc & ~3)
     (m, format!("0x{:08X}", target))
 }
 
@@ -645,16 +648,16 @@ fn is_delay_slot_carrier(inst: &Instruction) -> bool {
 fn branch_target(dec: &DecodedInstruction) -> Option<u32> {
     match &dec.inst {
         Instruction::Branch { offset, .. } => {
-            Some((dec.pc as i64).wrapping_add(*offset as i64) as u32)
+            Some(((dec.pc & !3) as i64).wrapping_add(*offset as i64) as u32)
         }
         Instruction::BranchCompare { offset, .. } => {
-            Some((dec.pc as i64).wrapping_add(*offset as i64) as u32)
+            Some(((dec.pc & !3) as i64).wrapping_add(*offset as i64) as u32)
         }
         Instruction::Jump {
             target: Operand::Imm(v),
             ..
         } => Some(*v),
-        Instruction::Loop { offset, .. } => Some(dec.pc.wrapping_add(*offset)),
+        Instruction::Loop { offset, .. } => Some((dec.pc & !3).wrapping_add(*offset)),
         _ => None,
     }
 }
