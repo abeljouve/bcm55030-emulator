@@ -829,11 +829,24 @@ fn decode_jump(
                 } else {
                     return Err(Exception::InstructionError { address: pc });
                 }
+            } else if c_reg == 29 || c_reg == 30 {
+                // OBSERVED (silicon): on the BCM55030 ARC700, a bare
+                // `j [ilink1/2]` (F=0) is ACCEPTED as a valid interrupt
+                // return — silicon bisect 2026-05-18 showed a minimal ISR
+                // ending in `j [ilink]` returning cleanly (IRQ serviced, no
+                // fault), whereas textbook ARCompact would reject F=0 here.
+                // See the design notes.
+                //
+                // INFERRED: this core's bare-ILINK jump also restores STATUS32
+                // from STATUS32_L1/L2 (like the F form). The bisect proved the
+                // jump returns cleanly but did not directly measure the
+                // STATUS32 restore, and reference never emits F=0 (so it is
+                // untestable from reference — the 4 MB scan found 0 plain
+                // `j [ilink]`). We set flag_restore=true to keep interrupts
+                // correctly re-enabled on return, matching the documented
+                // silicon behavior.
+                true
             } else {
-                if c_reg == 29 || c_reg == 30 {
-                    // Using ILINK without F is an error
-                    return Err(Exception::InstructionError { address: pc });
-                }
                 false
             };
 
@@ -920,15 +933,21 @@ fn decode_jump(
                     return Err(Exception::InstructionError { address: pc });
                 }
             } else {
-                // ILINK used without F → InstructionError
+                // OBSERVED (silicon): bare `j<cc> [ilink1/2]` (F=0, REG form)
+                // is ACCEPTED as a valid interrupt return on this core, not an
+                // InstructionError. INFERRED: it also restores STATUS32 from
+                // STATUS32_L1/L2 (flag_restore=true) — same rationale as the
+                // unconditional p==0b00 arm above. See
+                // the design notes.
                 if m == 0 {
                     if let Operand::Reg(r) = target {
-                        if r == 29 || r == 30 {
-                            return Err(Exception::InstructionError { address: pc });
-                        }
+                        r == 29 || r == 30
+                    } else {
+                        false
                     }
+                } else {
+                    false
                 }
-                false
             };
 
             Ok(DecodedInstruction {
@@ -1455,5 +1474,90 @@ mod tests {
         let decoded = decode_32bit(0x264C7000, 0, &fetch).unwrap();
         assert!(decoded.has_limm, "CMP with B=62 in P=1 must fetch LIMM");
         assert_eq!(decoded.size, 4);
+    }
+
+    // BCM55030 silicon-faithful interrupt-return idiom.
+    // See the design notes.
+
+    #[test]
+    fn rtie_decodes_as_zeroop_rtie() {
+        // rtie = 0x246F003F. Decode must still LABEL it rtie (so the
+        // disassembler can render it). The EXECUTION fault (vec=2) is tested
+        // in the executor unit tests, not here.
+        let bytes: [u8; 4] = [0x24, 0x6F, 0x00, 0x3F];
+        let fetch = ByteSliceFetch::new(&bytes, 0);
+        let dec = decode_32bit(0x246F003F, 0, &fetch).unwrap();
+        assert!(
+            matches!(dec.inst, Instruction::ZeroOp(ZeroOp::Rtie)),
+            "0x246F003F must decode to ZeroOp::Rtie, got {:?}",
+            dec.inst
+        );
+    }
+
+    #[test]
+    fn j_ilink1_bare_f0_accepted_with_flag_restore() {
+        // Bare `j [ilink1]` = 0x20200740 (sub=0x20, p=00, c_reg=29, F=0).
+        // OBSERVED on BCM55030: accepted as a valid IRQ return (NOT an
+        // InstructionError). INFERRED: restores STATUS32 → flag_restore=true.
+        let bytes: [u8; 4] = [0x20, 0x20, 0x07, 0x40];
+        let fetch = ByteSliceFetch::new(&bytes, 0);
+        let dec = decode_32bit(0x20200740, 0, &fetch)
+            .expect("bare j [ilink1] (F=0) must decode, not error");
+        if let Instruction::Jump {
+            target,
+            cc,
+            link,
+            flag_restore,
+            ..
+        } = dec.inst
+        {
+            assert_eq!(target, Operand::Reg(29), "target must be ILINK1 (r29)");
+            assert!(cc.is_none(), "unconditional jump");
+            assert!(!link, "j (not jl) must not link");
+            assert!(flag_restore, "bare j [ilink1] must restore STATUS32");
+        } else {
+            panic!("expected Instruction::Jump, got {:?}", dec.inst);
+        }
+    }
+
+    #[test]
+    fn j_ilink2_bare_f0_accepted_with_flag_restore() {
+        // Bare `j [ilink2]` = 0x20200780 (c_reg=30, F=0).
+        let bytes: [u8; 4] = [0x20, 0x20, 0x07, 0x80];
+        let fetch = ByteSliceFetch::new(&bytes, 0);
+        let dec = decode_32bit(0x20200780, 0, &fetch)
+            .expect("bare j [ilink2] (F=0) must decode, not error");
+        if let Instruction::Jump {
+            target,
+            flag_restore,
+            ..
+        } = dec.inst
+        {
+            assert_eq!(target, Operand::Reg(30), "target must be ILINK2 (r30)");
+            assert!(flag_restore, "bare j [ilink2] must restore STATUS32");
+        } else {
+            panic!("expected Instruction::Jump, got {:?}", dec.inst);
+        }
+    }
+
+    #[test]
+    fn j_f_ilink1_still_works() {
+        // `j.f [ilink1]` = 0x20208740 (F=1) — the reference idiom, must be
+        // unchanged: a Jump to r29 with flag_restore.
+        let bytes: [u8; 4] = [0x20, 0x20, 0x87, 0x40];
+        let fetch = ByteSliceFetch::new(&bytes, 0);
+        let dec = decode_32bit(0x20208740, 0, &fetch)
+            .expect("j.f [ilink1] must decode");
+        if let Instruction::Jump {
+            target,
+            flag_restore,
+            ..
+        } = dec.inst
+        {
+            assert_eq!(target, Operand::Reg(29));
+            assert!(flag_restore, "j.f [ilink1] restores STATUS32");
+        } else {
+            panic!("expected Instruction::Jump, got {:?}", dec.inst);
+        }
     }
 }

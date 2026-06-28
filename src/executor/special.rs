@@ -1,6 +1,6 @@
 use crate::cpu::condition::ConditionCode;
 use crate::cpu::exception::Exception;
-use crate::cpu::registers::{CpuState, REG_ILINK1, REG_ILINK2};
+use crate::cpu::registers::CpuState;
 use crate::decoder::instruction::*;
 
 use super::resolve_value;
@@ -27,43 +27,24 @@ pub fn execute_zero_op(zop: &ZeroOp, state: &mut CpuState) -> Result<(), Excepti
         }
         ZeroOp::Trap { param } => Err(Exception::Trap { param: *param }),
         ZeroOp::Rtie => {
-            if state.flag_u {
-                return Err(Exception::PrivilegeViolation { address: state.pc });
-            }
-            if state.flag_ae {
-                // Return from exception (highest priority)
-                state.set_status32(state.aux_erstatus);
-                state.pc = state.aux_eret;
-                state.pc_written = true;
-                state.aux_bta = state.aux_erbta;
-            } else if state.flag_a2 {
-                // Return from level 2 interrupt
-                let saved = state.aux_status32_l2;
-                state.set_status32(saved);
-                state.pc = state.core_regs[REG_ILINK2 as usize];
-                state.pc_written = true;
-                state.aux_bta = state.aux_bta_l2;
-                // Restore r0..r3 from fast-IRQ shadow set
-                state.core_regs[0] = state.irq_shadow_r0_r3[0];
-                state.core_regs[1] = state.irq_shadow_r0_r3[1];
-                state.core_regs[2] = state.irq_shadow_r0_r3[2];
-                state.core_regs[3] = state.irq_shadow_r0_r3[3];
-            } else {
-                // Return from level 1 interrupt
-                let saved = state.aux_status32_l1;
-                state.set_status32(saved);
-                state.pc = state.core_regs[REG_ILINK1 as usize];
-                state.pc_written = true;
-                state.aux_bta = state.aux_bta_l1;
-                // ARC 700 fast IRQ register banking: restore r0..r3 from
-                // shadow set saved on level-1 IRQ entry. See cpu/mod.rs
-                // check_interrupts.
-                state.core_regs[0] = state.irq_shadow_r0_r3[0];
-                state.core_regs[1] = state.irq_shadow_r0_r3[1];
-                state.core_regs[2] = state.irq_shadow_r0_r3[2];
-                state.core_regs[3] = state.irq_shadow_r0_r3[3];
-            }
-            Ok(())
+            // OBSERVED (silicon): the BCM55030 ARC700 core does NOT implement
+            // `rtie`. Executing it raises vec=2 (Instruction Error), exactly
+            // as a non-existent opcode would. The interrupt-return idiom on
+            // this core is `j[.f] [ilink1/2]` (see executor/branch.rs and the
+            // decode32.rs ILINK handling). Two independent silicon bisects
+            // (2026-05-18 and 2026-06-28) showed an ISR ending in `rtie`
+            // faulting vec=2 (`ABCDdQ` then vec=2), while the same ISR ending
+            // in `j [ilink]` returned cleanly. A 4 MB scan of the reference flash
+            // dump (reference-fw-dump.bin) found ZERO `rtie` opcodes
+            // (all 4 byte-orderings) but 8x `j.f [ilink1]` (0x20208740) and
+            // 11x `j.f [ilink2]` (0x20208780): reference's sole interrupt-return
+            // idiom is `j.f [ilink1/2]`; it never uses `rtie`.
+            // See the design notes.
+            //
+            // The ZeroOp::Rtie decode variant is intentionally kept so the
+            // disassembler still LABELS the opcode "rtie" (format.rs); only
+            // EXECUTION must fault, matching silicon.
+            Err(Exception::InstructionError { address: state.pc })
         }
         ZeroOp::Sync => Ok(()),
     }
@@ -137,4 +118,39 @@ pub fn execute_flag(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cpu::registers::REG_ILINK1;
+
+    #[test]
+    fn rtie_faults_instruction_error_vec2() {
+        // OBSERVED (silicon): the BCM55030 ARC700 does NOT implement `rtie`;
+        // executing it raises vec=2 (Instruction Error). It must NOT restore
+        // STATUS32/PC. See the design notes.
+        let mut state = CpuState::new();
+        state.pc = 0x1234;
+        // Even with level-1 IRQ context primed, rtie must fault, not return.
+        state.flag_a1 = true;
+        state.aux_status32_l1 = 0xDEAD_BEEF;
+        state.core_regs[REG_ILINK1 as usize] = 0x9999;
+
+        let result = execute_zero_op(&ZeroOp::Rtie, &mut state);
+        assert_eq!(
+            result,
+            Err(Exception::InstructionError { address: 0x1234 }),
+            "rtie must raise InstructionError"
+        );
+        // Confirm InstructionError maps to vector 2 (the silicon-observed vec).
+        assert_eq!(
+            Exception::InstructionError { address: 0x1234 }.vector_number(),
+            0x02,
+            "InstructionError must be vector 2"
+        );
+        // And it must NOT have executed the return (PC untouched, no restore).
+        assert!(!state.pc_written, "rtie must not write PC");
+        assert_eq!(state.pc, 0x1234, "rtie must not change PC");
+    }
 }
