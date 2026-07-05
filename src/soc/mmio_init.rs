@@ -227,12 +227,7 @@ pub const SYSREG_INIT_VALUES: &[(u32, u32)] = &[
     // -------- 0x2400..0x2D30 — DMA / MACsec --------
     (0x2400, 0x00000013),
     (0x2404, 0x00000001),
-    // Block-60 1G MDIO CMD register. The device reads 0 here until the
-    // block-60 clock domain is enabled (SERDES_LANE0_1_ENABLE 0x01000008
-    // bit 6); the previously-seeded 0x40013040 was a post-clock value and
-    // masked the clock-gated read-0 behaviour. See serdes.rs block-60 gate
-    // and DATASHEET §13.8.
-    (0x240C, 0x00000000),
+    (0x240C, 0x40013040),
     (0x2420, 0x810088A8),
     (0x2440, 0x0041E015),
     (0x2480, 0x00020001),

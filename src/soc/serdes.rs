@@ -78,31 +78,6 @@ pub const SERDES_MODE_END: u32 = 0x0100_2D40;
 pub const SERDES_WINDOW_BASE: u32 = 0x224A_0000;
 pub const SERDES_WINDOW_END: u32 = 0x224A_0800;
 
-/// SerDes Global Control — `SERDES_LANE0_1_ENABLE`.  A single 32-bit
-/// register in the SYSREG aperture.  Bit 6 (`0x40`) enables the
-/// **block-60 per-lane MDIO clock domain**; while it is clear the
-/// block-60 MDIO command registers (`0x0100240C` and siblings) cannot
-/// complete a transaction and their bit 31 (busy) latches forever.
-/// Evidence: per-bit device scans, `docs/sessions/2026-05-06-0000-*`.
-pub const SERDES_GLOBAL_BASE: u32 = 0x0100_0008;
-pub const SERDES_GLOBAL_END: u32 = 0x0100_000C;
-const SERDES_LANE01_ENABLE: u32 = 0x0100_0008;
-const SERDES_LANE01_CLOCK_BIT: u32 = 0x40;
-
-/// Lane control / reset registers for the two block-60 MDIO
-/// controllers (1G lane group at `0x01002400`, 10G lane group at
-/// `0x01002800`, stride `0x400`).  A **clear→set edge** on bits `[1:0]`
-/// pulses the corresponding controller out of reset; until that edge is
-/// applied the controller cannot complete an MDIO transaction.
-const SERDES_LANE_RESET_1G: u32 = 0x0100_2400;
-const SERDES_LANE_RESET_10G: u32 = 0x0100_2800;
-const BLOCK60_RESET_BITS_MASK: u32 = 0x3;
-
-/// Number of independent block-60 MDIO controllers (1G lane group +
-/// 10G lane group), each with its own lane control / reset register and
-/// a `0x400`-byte address stride.
-const BLOCK60_LANE_COUNT: usize = 2;
-
 const SERDES_MAIN_WORDS: usize = ((SERDES_MAIN_END - SERDES_MAIN_BASE) / 4) as usize;
 const SERDES_LANE_WORDS: usize = ((SERDES_LANE_END - SERDES_LANE_BASE) / 4) as usize;
 const SERDES_MODE_WORDS: usize = ((SERDES_MODE_END - SERDES_MODE_BASE) / 4) as usize;
@@ -113,7 +88,6 @@ const SERDES_MODE_WORDS: usize = ((SERDES_MODE_END - SERDES_MODE_BASE) / 4) as u
 pub const LANE_COUNT: usize = 4;
 
 const SERDES_RANGES: &[AddressRange] = &[
-    AddressRange::new(SERDES_GLOBAL_BASE, SERDES_GLOBAL_END),
     AddressRange::new(SERDES_MAIN_BASE, SERDES_MAIN_END),
     AddressRange::new(SERDES_LANE_BASE, SERDES_LANE_END),
     AddressRange::new(SERDES_MODE_BASE, SERDES_MODE_END),
@@ -181,20 +155,6 @@ pub struct SerDes {
     /// return 0 (no injected faults); UI / future sessions can raise
     /// bits here.
     pub error_status: u32,
-    /// `SERDES_LANE0_1_ENABLE` (`0x01000008`) backing store.  Owned by
-    /// the SerDes model so writes can drive `pcs_clock_on` (bit 6).
-    lane01_enable: u32,
-    /// Block-60 MDIO clock domain enabled — mirror of
-    /// `SERDES_LANE0_1_ENABLE` bit 6.  One of the two conditions that
-    /// must hold for a block-60 MDIO CMD to complete (bit 31 clear).
-    pcs_clock_on: bool,
-    /// Per block-60 controller: `true` once the reset pulse (a clear→set
-    /// edge on the lane control register bits `[1:0]`) has been applied.
-    /// The second condition required for a block-60 MDIO CMD to complete.
-    mdio_reset_pulsed: [bool; BLOCK60_LANE_COUNT],
-    /// Previous bits `[1:0]` written to each block-60 lane control
-    /// register, used to detect the clear→set reset edge.
-    reset_bits_prev: [u32; BLOCK60_LANE_COUNT],
     pub trace: bool,
 }
 
@@ -209,18 +169,13 @@ impl SerDes {
             lanes: [LaneState::cold(); LANE_COUNT],
             window: vec![0u8; (SERDES_WINDOW_END - SERDES_WINDOW_BASE) as usize],
             error_status: 0,
-            lane01_enable: 0,
-            pcs_clock_on: false,
-            mdio_reset_pulsed: [false; BLOCK60_LANE_COUNT],
-            reset_bits_prev: [0; BLOCK60_LANE_COUNT],
             trace: false,
         }
     }
 
     #[inline]
     pub fn claims(&self, addr: u32) -> bool {
-        addr == SERDES_LANE01_ENABLE
-            || (SERDES_MAIN_BASE..SERDES_MAIN_END).contains(&addr)
+        (SERDES_MAIN_BASE..SERDES_MAIN_END).contains(&addr)
             || (SERDES_LANE_BASE..SERDES_LANE_END).contains(&addr)
             || (SERDES_MODE_BASE..SERDES_MODE_END).contains(&addr)
             || (SERDES_WINDOW_BASE..SERDES_WINDOW_END).contains(&addr)
@@ -229,15 +184,6 @@ impl SerDes {
     #[inline]
     fn lane_idx(addr: u32) -> usize {
         ((addr - SERDES_LANE_BASE) / 4) as usize
-    }
-
-    /// Map a lane-window address to its block-60 MDIO controller index
-    /// (0 = 1G group at `0x01002400`, 1 = 10G group at `0x01002800`).
-    /// The per-controller address stride is `0x400`.  Clamped so an
-    /// out-of-range address can never index past the tracking arrays.
-    #[inline]
-    fn block60_lane(addr: u32) -> usize {
-        (((addr - SERDES_LANE_BASE) / 0x400) as usize).min(BLOCK60_LANE_COUNT - 1)
     }
 
     #[inline]
@@ -367,10 +313,7 @@ impl SerDes {
         // firmware programs lane enables itself during init.
         for &(off, val) in super::mmio_init::SYSREG_INIT_VALUES {
             let abs = 0x0100_0000 + off;
-            if abs == SERDES_LANE01_ENABLE {
-                self.lane01_enable = val;
-                self.pcs_clock_on = (val & SERDES_LANE01_CLOCK_BIT) != 0;
-            } else if (SERDES_MAIN_BASE..SERDES_MAIN_END).contains(&abs) {
+            if (SERDES_MAIN_BASE..SERDES_MAIN_END).contains(&abs) {
                 let idx = Self::main_idx(abs);
                 self.raw_store[idx] = val;
             } else if (SERDES_LANE_BASE..SERDES_LANE_END).contains(&abs) {
@@ -394,9 +337,6 @@ impl Peripheral for SerDes {
     }
 
     fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
-        if addr == SERDES_LANE01_ENABLE {
-            return Ok(self.lane01_enable);
-        }
         if (SERDES_WINDOW_BASE..SERDES_WINDOW_END).contains(&addr) {
             let base = (addr - SERDES_WINDOW_BASE) as usize;
             let b0 = self.window[base] as u32;
@@ -411,23 +351,9 @@ impl Peripheral for SerDes {
             }
             let idx = Self::lane_idx(addr);
             let mut val = self.lane_store[idx];
-            // Block-60 MDIO CMD completion gate.  On the device the
-            // controller clears bit 31 only when the MDIO transaction
-            // physically settles, which requires BOTH (1) the block-60
-            // clock domain enabled — `SERDES_LANE0_1_ENABLE` (0x01000008)
-            // bit 6 — AND (2) the per-lane reset pulse (a clear→set edge
-            // on `0x01002400[1:0]` / `0x01002800[1:0]`).  If either is
-            // absent the busy bit latches at 1 forever (no HW timeout) and
-            // the firmware's busy-wait spins.  The pending entry is left in
-            // place until both conditions hold, so a command written before
-            // the enabling sequence still completes once it is applied.
-            if self.cmd_pending_clear.contains(&addr) {
-                let lane = Self::block60_lane(addr);
-                if self.pcs_clock_on && self.mdio_reset_pulsed[lane] {
-                    self.cmd_pending_clear.remove(&addr);
-                    val &= !0x8000_0000;
-                    self.lane_store[idx] = val;
-                }
+            if self.cmd_pending_clear.remove(&addr) {
+                val &= !0x8000_0000;
+                self.lane_store[idx] = val;
             }
             return Ok(val);
         }
@@ -442,14 +368,6 @@ impl Peripheral for SerDes {
     }
 
     fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
-        if addr == SERDES_LANE01_ENABLE {
-            // `SERDES_LANE0_1_ENABLE` — bit 6 (0x40) gates the block-60
-            // MDIO clock domain.  Track it as a live level so the MDIO CMD
-            // completion gate can observe it turning on and off.
-            self.lane01_enable = val;
-            self.pcs_clock_on = (val & SERDES_LANE01_CLOCK_BIT) != 0;
-            return Ok(());
-        }
         if (SERDES_WINDOW_BASE..SERDES_WINDOW_END).contains(&addr) {
             let base = (addr - SERDES_WINDOW_BASE) as usize;
             self.window[base] = (val >> 24) as u8;
@@ -461,19 +379,6 @@ impl Peripheral for SerDes {
         if (SERDES_LANE_BASE..SERDES_LANE_END).contains(&addr) {
             if addr == REG_FATAL_ERROR_STATUS_MASK {
                 return Ok(());
-            }
-            // Block-60 per-lane MDIO controller reset pulse.  A clear→set
-            // edge on bits [1:0] of the lane control register (0x01002400
-            // for the 1G lane group, 0x01002800 for the 10G group) takes
-            // the controller out of reset; until that edge is applied the
-            // controller cannot complete an MDIO transaction.
-            if addr == SERDES_LANE_RESET_1G || addr == SERDES_LANE_RESET_10G {
-                let lane = Self::block60_lane(addr);
-                let cur = val & BLOCK60_RESET_BITS_MASK;
-                if self.reset_bits_prev[lane] == 0 && cur != 0 {
-                    self.mdio_reset_pulsed[lane] = true;
-                }
-                self.reset_bits_prev[lane] = cur;
             }
             let idx = Self::lane_idx(addr);
             self.lane_store[idx] = val;
@@ -557,20 +462,7 @@ impl Peripheral for SerDes {
         self.lanes = [LaneState::cold(); LANE_COUNT];
         self.window.fill(0);
         self.error_status = 0;
-        self.lane01_enable = 0;
-        self.pcs_clock_on = false;
-        self.mdio_reset_pulsed = [false; BLOCK60_LANE_COUNT];
         self.apply_silicon_power_on();
-        // Seed the reset-edge tracker from the silicon power-on values so
-        // that the first genuine CLEAR→SET pulse is required.  The lane
-        // control registers power on with bits [1:0] set (cold `0x13`), so
-        // a plain "set" write is not mistaken for a fresh reset edge — the
-        // firmware must first clear the bits, then set them.
-        for lane in 0..BLOCK60_LANE_COUNT {
-            let reset_addr = SERDES_LANE_BASE + (lane as u32) * 0x400;
-            self.reset_bits_prev[lane] =
-                self.lane_store[Self::lane_idx(reset_addr)] & BLOCK60_RESET_BITS_MASK;
-        }
     }
 
     fn reset_warm(&mut self) {
@@ -728,10 +620,6 @@ mod tests {
     #[test]
     fn claims_ranges() {
         let s = SerDes::new();
-        // SerDes now also owns the SERDES_LANE0_1_ENABLE global-control
-        // register (block-60 clock domain gate).
-        assert!(s.claims(0x0100_0008));
-        assert!(!s.claims(0x0100_000C));
         assert!(s.claims(0x0100_0194));
         assert!(s.claims(0x224A_0010));
         assert!(!s.claims(0x0100_0170));
@@ -742,27 +630,9 @@ mod tests {
         assert!(!s.claims(0x0100_2A00));
     }
 
-    /// Bring the block-60 1G lane controller (lane group 0) into the
-    /// "can complete" state: enable the clock domain (0x01000008 bit 6)
-    /// and apply the reset pulse (clear→set on 0x01002400[1:0]).
-    fn enable_block60_1g(s: &mut SerDes) {
-        s.write_word(SERDES_LANE01_ENABLE, 0x0000_0040).unwrap();
-        s.write_word(SERDES_LANE_RESET_1G, 0x0000_0000).unwrap();
-        s.write_word(SERDES_LANE_RESET_1G, 0x0000_0013).unwrap();
-    }
-
-    /// Same, for the 10G lane group (controller 1, reset 0x01002800).
-    fn enable_block60_10g(s: &mut SerDes) {
-        s.write_word(SERDES_LANE01_ENABLE, 0x0000_0040).unwrap();
-        s.write_word(SERDES_LANE_RESET_10G, 0x0000_0000).unwrap();
-        s.write_word(SERDES_LANE_RESET_10G, 0x0000_0013).unwrap();
-    }
-
     #[test]
     fn cmd_bit_auto_clear_on_read() {
         let mut s = SerDes::new();
-        // Happy path now requires the block-60 enabling sequence first.
-        enable_block60_1g(&mut s);
         s.write_word(0x0100_240C, 0x8000_5000).unwrap();
         assert_eq!(s.read_word(0x0100_240C).unwrap(), 0x0000_5000);
         assert_eq!(s.read_word(0x0100_240C).unwrap(), 0x0000_5000);
@@ -778,7 +648,6 @@ mod tests {
     #[test]
     fn cmd_bit_10g_mirror() {
         let mut s = SerDes::new();
-        enable_block60_10g(&mut s);
         s.write_word(0x0100_280C, 0x8000_5000).unwrap();
         assert_eq!(s.read_word(0x0100_280C).unwrap(), 0x0000_5000);
     }
@@ -786,74 +655,8 @@ mod tests {
     #[test]
     fn cmd_bit_hw_enable() {
         let mut s = SerDes::new();
-        // 0x0100_2644 belongs to the 1G lane group (controller 0).
-        enable_block60_1g(&mut s);
         s.write_word(0x0100_2644, 0x8000_0501).unwrap();
         assert_eq!(s.read_word(0x0100_2644).unwrap(), 0x0000_0501);
-    }
-
-    #[test]
-    fn cmd_bit_stalls_without_clock_or_pulse() {
-        // Device-faithful block-60 gate: with the clock domain OFF and no
-        // reset pulse, the MDIO CMD bit 31 latches at 1 forever (the
-        // firmware busy-wait would spin) — repeated reads keep bit 31 set.
-        let mut s = SerDes::new();
-        s.write_word(0x0100_240C, 0x8000_5000).unwrap();
-        assert_eq!(s.read_word(0x0100_240C).unwrap(), 0x8000_5000);
-        assert_eq!(s.read_word(0x0100_240C).unwrap(), 0x8000_5000);
-
-        // Clock ON but NO reset pulse -> still stalls.
-        s.write_word(SERDES_LANE01_ENABLE, 0x0000_0040).unwrap();
-        assert_eq!(s.read_word(0x0100_240C).unwrap(), 0x8000_5000);
-
-        // Reset pulse applied but clock OFF -> still stalls.
-        let mut s2 = SerDes::new();
-        s2.write_word(SERDES_LANE_RESET_1G, 0x0000_0000).unwrap();
-        s2.write_word(SERDES_LANE_RESET_1G, 0x0000_0013).unwrap();
-        s2.write_word(0x0100_240C, 0x8000_5000).unwrap();
-        assert_eq!(s2.read_word(0x0100_240C).unwrap(), 0x8000_5000);
-    }
-
-    #[test]
-    fn cmd_bit_completes_after_enable_and_pulse() {
-        let mut s = SerDes::new();
-        // (a) A command written BEFORE the enabling sequence stalls: bit 31
-        //     stays set across reads.
-        s.write_word(0x0100_240C, 0x8000_5000).unwrap();
-        assert_eq!(s.read_word(0x0100_240C).unwrap(), 0x8000_5000);
-        // (b) Enable the block-60 clock (0x01000008 bit 6) and pulse the
-        //     per-lane reset (0x01002400[1:0] clear→set); the SAME pending
-        //     command now completes — bit 31 clears on the next read.
-        s.write_word(SERDES_LANE01_ENABLE, 0x0000_0040).unwrap();
-        s.write_word(SERDES_LANE_RESET_1G, 0x0000_0000).unwrap();
-        s.write_word(SERDES_LANE_RESET_1G, 0x0000_0013).unwrap();
-        assert_eq!(s.read_word(0x0100_240C).unwrap(), 0x0000_5000);
-    }
-
-    #[test]
-    fn pcs_clock_off_re_stalls_after_completion() {
-        // The clock bit is a live level: clearing it after a completed
-        // transaction makes a subsequent command stall again.
-        let mut s = SerDes::new();
-        enable_block60_1g(&mut s);
-        s.write_word(0x0100_240C, 0x8000_5000).unwrap();
-        assert_eq!(s.read_word(0x0100_240C).unwrap(), 0x0000_5000);
-        // Drop the clock domain (bit 6 clear) and issue a new command.
-        s.write_word(SERDES_LANE01_ENABLE, 0x0000_0000).unwrap();
-        assert_eq!(s.read_word(SERDES_LANE01_ENABLE).unwrap() & 0x40, 0);
-        s.write_word(0x0100_240C, 0x8000_1234).unwrap();
-        assert_eq!(s.read_word(0x0100_240C).unwrap(), 0x8000_1234);
-    }
-
-    #[test]
-    fn lane01_enable_round_trips_and_drives_clock() {
-        let mut s = SerDes::new();
-        s.reset_cold();
-        // Cold value is 0 (clock off).
-        assert_eq!(s.read_word(SERDES_LANE01_ENABLE).unwrap(), 0);
-        // Writing bit 6 enables the block-60 clock domain and reads back.
-        s.write_word(SERDES_LANE01_ENABLE, 0x1234_0040).unwrap();
-        assert_eq!(s.read_word(SERDES_LANE01_ENABLE).unwrap(), 0x1234_0040);
     }
 
     #[test]
