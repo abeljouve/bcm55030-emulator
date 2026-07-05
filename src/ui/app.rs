@@ -621,7 +621,7 @@ pub fn run(handle: EmulatorHandle) -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "arc700-emulator",
+        "bcm55030-emulator",
         options,
         Box::new(move |cc| {
             let palette = load_palette(cc);

@@ -1449,7 +1449,7 @@ mod tests {
     #[test]
     fn mov_sp_limm_p00_first_instruction() {
         // Bug emu-mov-limm-first-instruction: MOV SP, 0x10000 au premier
-        // mot après cold boot. Encodage 24 0A 3F 80 / 00 01 00 00.
+        // word after cold boot. Encoding 24 0A 3F 80 / 00 01 00 00.
         // P=00, sub=0x0A, B[5:3]=011 + B[2:0]=100 → B=28=SP ; C=62=LIMM.
         let bytes: [u8; 8] = [0x24, 0x0A, 0x3F, 0x80, 0x00, 0x01, 0x00, 0x00];
         let fetch = ByteSliceFetch::new(&bytes, 0);

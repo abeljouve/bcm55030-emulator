@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Pre-commit hook. To enable:  git config core.hooksPath .githooks
+#
+# 1. Enforce HW-faithful rule (the contributor guide) via the baseline checker.
+# 2. Cargo fmt / cargo check are NOT run here on purpose — the PostToolUse hook
+#    in .claude/settings.json already runs cargo check after every Edit/Write,
+#    so by the time you commit, the tree is known to compile.
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+if ! "$REPO_ROOT/tools/check_hw_faithful.sh"; then
+    echo ""
+    echo "Pre-commit aborted: HW-faithful violation."
+    exit 1
+fi

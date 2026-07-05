@@ -52,12 +52,12 @@ pub struct SpiFlash {
     /// command, the chip remembers it. Cleared by `CMD_WRDI` and by
     /// `reset_volatile`.
     ///
-    /// Evidence: reference firmware `fds_read_llid_flag_byte` (the decompiler
+    /// Evidence: the reference firmware `fds_read_llid_flag_byte` (the decompiler
     /// 0x20011d74) and reference bootloader `spi_flash_write_command`
     /// (rt 0x4b54) both emit AAI start (`SPI_STATUS=0x61`) followed by
     /// AAI continuations (`SPI_STATUS=0x31`) and terminate with WRDI
     /// (`SPI_STATUS=0x11`). See bug
-    /// `the design notes`
+    /// the design notes
     /// section D3.
     aai_addr: Option<u32>,
 }
@@ -230,7 +230,7 @@ impl SpiFlash {
                 //
                 // Both bursts require WEL set. **WEL stays set across
                 // an AAI sequence** on real silicon and is only cleared
-                // by WRDI — the reference BL/firmware firmware relies on this
+                // by WRDI — the the reference firmware relies on this
                 // (their AAI-exit WRDI loop polls WEL waiting for it to
                 // clear). Do NOT clear WEL in this handler.
                 if self.status & SR_WEL == 0 {
@@ -348,11 +348,11 @@ mod tests {
     }
 
     /// SST AAI: a 4-byte program issued as one start burst + one
-    /// continuation burst, exactly as reference firmware's
+    /// continuation burst, exactly as the reference firmware's
     /// `flash_clear_lane_direction_record` (writing 4 zero bytes) emits
     /// it. Pre-D3-fix this stayed `[0xFF; 4]` because the continuation
     /// was silently dropped. See bug
-    /// `the design notes` D3.
+    /// the design notes D3.
     #[test]
     fn test_aai_program_4_bytes_zero() {
         let mut flash = SpiFlash::new();
@@ -368,7 +368,7 @@ mod tests {
     }
 
     /// AAI keeps WEL set across the burst chain; only WRDI clears it.
-    /// The reference firmware's AAI-exit loop polls WEL waiting for clear.
+    /// The the reference firmware's AAI-exit loop polls WEL waiting for clear.
     #[test]
     fn test_aai_keeps_wel_until_wrdi() {
         let mut flash = SpiFlash::new();

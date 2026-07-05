@@ -381,7 +381,7 @@ fn run_emulator(cpu: &mut Cpu, cfg: &Config, uart_tx: &Sender<u8>) -> RunResult 
         // Poll stdin every 1024 steps — push bytes into the UART
         // receive channel. No firmware-specific branching: bytes typed
         // during the bootloader are consumed by the bootloader CLI,
-        // bytes typed during firmware by the firmware CLI. Hardware-faithful.
+        // bytes typed during firmware execution by the firmware CLI. Hardware-faithful.
         if step % 1024 == 0 {
             while let Some(byte) = try_read_stdin() {
                 if byte == 3 {

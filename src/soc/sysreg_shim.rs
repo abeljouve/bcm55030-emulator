@@ -74,7 +74,7 @@ impl SysregShim {
 
     /// Cold reset. Zeroes the residual backing store, then applies
     /// the silicon power-on snapshot from `SYSREG_INIT_VALUES`. The
-    /// snapshot reflects values observed by `hardware probing` immediately
+    /// snapshot observed on hardware immediately
     /// after stage-1 hands off to stage-2 — i.e. true silicon
     /// defaults, not a post-boot snapshot.
     pub fn reset_cold(&mut self) {

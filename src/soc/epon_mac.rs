@@ -59,13 +59,13 @@ use crate::soc::peripheral::{
 pub const CHIP_ID_VALUE: u32 = 0x47010203;
 pub const CHIP_REV_VALUE: u32 = 0xB2110816;
 /// Silicon power-on default for LLID_CAPTURE_MASK / PON_MODE — zero on
-/// hardware (verified 2026-04-29 via hardware probing). Bit 15 of this
+/// hardware (observed on hardware). Bit 15 of this
 /// register gates into an unclocked PCS domain, so a non-zero reset
 /// value would freeze the bus on real silicon. See
-/// `the design notes`.
+/// the design notes.
 pub const LLID_CAPTURE_MASK_RESET: u32 = 0x0000_0000;
 /// Silicon power-on default for LLID_ACTIVE_BITMAP — zero on hardware
-/// (verified 2026-04-29 via hardware probing). Reference firmware programs the
+/// (observed on hardware). The reference firmware programs the
 /// active bitmap during init.
 pub const LLID_ACTIVE_RESET: u32 = 0x0000_0000;
 pub const RX_GRANT_MASK_RESET: u32 = 0x0000_FFFF;
@@ -172,8 +172,8 @@ pub struct EponMac {
     discovery_status: u32,
     /// REG_SPECIAL_0064 backing store. Silicon power-on is zero —
     /// the previous shim returned 0x5382_FFFF unconditionally, which
-    /// did not match real silicon (verified 2026-04-29 via hardware probing).
-    /// Reference firmware programs this register during its init.
+    /// did not match real silicon (observed on hardware).
+    /// The reference firmware programs this register during its init.
     special_0064: u32,
 
     pub trace: bool,

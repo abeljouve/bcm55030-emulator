@@ -5,7 +5,7 @@
 //! SYSREG range is still served by [`sysreg_shim::SysregShim`], which
 //! will shrink as future sessions land dedicated peripheral modules.
 //!
-//! **No firmware hooks.** Per the contributor guide §1, the previous
+//! **No firmware hooks.** Per the contributor guide, the previous
 //! `register_hooks()` function at 35 firmware-PC entries is gone — the
 //! stdin replay path is replaced by the mpsc channel exposed by the
 //! bank (`PeripheralBank::uart_rx_sender()`).

@@ -1,7 +1,7 @@
 //! BCM55030 MPCP timestamp-sync (NCO slave loop) register block — G1+G5.
 //!
 //! Models the MPCP TS-sync control/status registers that the firmware's
-//! TS-sync state machine (`the reference model/src/mpcp_sm.rs::ts_sync_tick`)
+//! TS-sync state machine (the reference model)
 //! drives and reads back. On real silicon these registers live in the
 //! EPON MAC's MPCP timing block; they are NOT a dumb RAM store — three
 //! of them are HW-driven status reads:

@@ -1,8 +1,8 @@
-//! egui/eframe GUI for the ARC700 emulator. Gated behind the
+//! egui/eframe GUI for the BCM55030 emulator. Gated behind the
 //! `ui` cargo feature.
 //!
-//! The module layout follows the phase-6 plan
-//! (`the design plan`):
+//! The module layout follows the design
+//!:
 //!
 //! - `app` — `EmulatorApp` struct + `impl eframe::App`.
 //! - `theme` — colour tokens used across panels.

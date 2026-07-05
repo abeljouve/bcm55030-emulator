@@ -258,7 +258,7 @@ impl DCache {
     /// dirty stack slot (e.g. a compiler-saved frame pointer) written
     /// through the write-back cache would be lost the instant the firmware
     /// turns the cache off, and the next bypassed load would read stale
-    /// SRAM. -- OBSERVED: reference firmware toggles DC_CTRL (0xc3) at runtime
+    /// SRAM. -- OBSERVED: the reference firmware toggles DC_CTRL (0xc3) at runtime
     /// 0x33c0c and then dereferences saved frame pointers off the stack;
     /// the corruption (fp loaded as a stale 0x1 -> j 0x200f8000) appears
     /// exactly 2 insns after the DC_CTRL disable.

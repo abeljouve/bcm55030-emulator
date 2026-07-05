@@ -1,31 +1,13 @@
-target/
-.idea/
-firmwares/
-knowledge/
-unhandled_mmio.json
-NEXT_SESSION_PROMPT.md
-NEXT_SESSION.md
-CLI_REVERSE_ENGINEERING_PROMPT.md
+# Build output
+/target
 
-# Claude Code local state
-.claude/settings.json
-.claude/skills/
-.claude/worktrees/
-
-# Work-in-progress RE notes (local only)
-docs/
-.hw_faithful_baseline
-
-# Local hooks
-.githooks/
-
-# Temp files
-tmp/
-
-# Python cache
-__pycache__/
-
-# macOS / local state junk
-.DS_Store
+# Firmware images and dumps are never committed
 /firmwares
-.claude/scheduled_tasks.lock
+
+# Emulator runtime artifacts
+unhandled_mmio.json
+
+# Editor / OS
+.idea/
+.DS_Store
+__pycache__/

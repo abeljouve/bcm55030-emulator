@@ -309,7 +309,7 @@ impl SerDes {
         // remain disabled/unlocked because silicon shows
         // LANE_BUS_EN=0 and LINK_LOCK_01/23=0 at power-on (verified
         // 2026-04-29 via hardware probing — see
-        // `the design notes`). Reference
+        // the design notes). Reference
         // firmware programs lane enables itself during init.
         for &(off, val) in super::mmio_init::SYSREG_INIT_VALUES {
             let abs = 0x0100_0000 + off;
@@ -567,7 +567,7 @@ mod tests {
         let mut s = SerDes::new();
         s.reset_warm();
         // Silicon power-on shows LANE_BUS_EN=0 and LINK_LOCK_01/23=0
-        // — lanes are unlocked at power-on. Reference firmware brings
+        // — lanes are unlocked at power-on. The reference firmware brings
         // them up itself. See emu-sysreg-reset-values-wrong.
         for l in &s.lanes {
             assert!(!l.enabled);
@@ -604,7 +604,7 @@ mod tests {
         let mut s = SerDes::new();
         s.reset_warm();
         // Silicon power-on shows lanes unlocked. Bring lane 0 up
-        // first (as reference firmware would), then inject RX LOS.
+        // first (as the reference firmware would), then inject RX LOS.
         s.inject_event(&PeripheralEvent::SerDes(SerDesEvent::SetLaneEnabled(0, true)))
             .unwrap();
         s.inject_event(&PeripheralEvent::SerDes(SerDesEvent::SetLinkLocked(0, true)))

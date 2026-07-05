@@ -2,7 +2,7 @@
 //! sub-tabs. Bytes are coloured by value (zeroes muted, printable
 //! ASCII tinted green), hex ↔ ASCII hover is synchronised, and
 //! long runs of all-zero rows are folded into an ellipsis marker
-//! à la `xxd -a` so the viewer stays readable on sparse images.
+//! like `xxd -a` so the viewer stays readable on sparse images.
 
 use eframe::egui;
 use egui_phosphor::regular as ph;

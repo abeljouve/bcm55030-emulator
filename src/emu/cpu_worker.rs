@@ -423,13 +423,12 @@ impl Worker {
     /// current budget window has already issued its quota, sleep
     /// until the window elapses, then rewind the window counters.
     ///
-    /// Fenêtres dynamiques: pour ≥ 100 ips on utilise des
-    /// fenêtres fixes de `THROTTLE_WINDOW` (10 ms) et on laisse
-    /// tourner plusieurs instructions par fenêtre. Pour < 100
-    /// ips, une fenêtre 10 ms est trop courte (1 insn / 10 ms =
-    /// 100 ips minimum), donc on étire la fenêtre à
-    /// `1s / target_ips` et on n'exécute qu'une seule insn par
-    /// fenêtre — ce qui descend naturellement jusqu'à 1 ips.
+    /// Dynamic windows: for ≥ 100 ips we use fixed `THROTTLE_WINDOW`
+    /// (10 ms) windows and let several instructions run per window.
+    /// For < 100 ips a 10 ms window is too short (1 insn / 10 ms =
+    /// 100 ips minimum), so we stretch the window to
+    /// `1s / target_ips` and run a single insn per window —
+    /// which scales down naturally to 1 ips.
     fn apply_throttle(&mut self) {
         let Some(target_ips) = self.speed_limit.as_ips() else {
             return;

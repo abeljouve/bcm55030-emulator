@@ -149,7 +149,7 @@ pub struct Memory {
 /// Captured firmware data-region reads (see [`Memory::read_trace`]). The
 /// emulator is the address oracle: running a reference function with this enabled
 /// yields the exact `(addr, size, value)` of every table/global load it
-/// issues — used to reconstruct the reference `.data` stubs with real contents.
+/// issues — used to populate the `.data` region with real contents.
 #[derive(Default, Clone)]
 pub struct ReadTrace {
     pub lo: u32,
@@ -874,7 +874,7 @@ impl Memory {
         // write_*_data bypass the cache (memory.rs:789/850), so a dirty
         // line still resident at disable time would otherwise be unseen
         // and the bypassed load would return stale SRAM.
-        // -- OBSERVED: reference firmware (runtime 0x33c0c) writes DC_CTRL=0xc3
+        // -- OBSERVED: the reference firmware (runtime 0x33c0c) writes DC_CTRL=0xc3
         // then immediately dereferences a stack-saved frame pointer; the
         // saved fp lived only in a dirty cache line, so without this
         // flush it read stale SRAM (0x1) and jumped to 0x200f8000.
@@ -1211,7 +1211,7 @@ mod tests {
         assert_eq!(mem.read_word(0x300).unwrap(), 0x12345678);
     }
 
-    // Regression: reference firmware 0x200f8000 fault. Turning the D-cache OFF
+    // Regression: the reference firmware 0x200f8000 fault. Turning the D-cache OFF
     // via DC_CTRL (DC bit 0: 0->1) must write back dirty lines to SRAM so
     // later cache-bypassed accesses (the firmware reads while the cache is
     // off) observe the CPU's writes. Pre-fix the dirty line was stranded:

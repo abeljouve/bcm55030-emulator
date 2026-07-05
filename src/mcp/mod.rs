@@ -1,10 +1,10 @@
-//! Integrated rmcp + axum HTTP server for the ARC700 emulator.
+//! Integrated rmcp + axum HTTP server for the BCM55030 emulator.
 //!
 //! Gated behind the `mcp` cargo feature. Nothing in this module is
 //! compiled into the default build.
 //!
-//! The module layout follows the phase-4 plan
-//! (`the design plan`):
+//! The module layout follows the design
+//!:
 //!
 //! - `handler` — `EmulatorHandler` struct + `#[tool_router]` +
 //!   `#[tool_handler]` implementations. Phase 4 ships the

@@ -14,7 +14,7 @@
 //! # Architecture
 //!
 //! ```text
-//!   ONU firmware (firmware)
+//!   ONU firmware
 //!       ↑ RX frames        ↓ TX frames
 //!   ┌───┴──────────────────┴───┐
 //!   │   EPON MAC + MACsec      │  MMIO registers
@@ -72,7 +72,7 @@ use crate::cpu::exception::Exception;
 // ── Constants ────────────────────────────────────────────────────────
 
 /// OLT MAC address (configurable, default is a plausible Broadcom OLT).
-const DEFAULT_OLT_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x01, 0x00, 0x01];
+const DEFAULT_OLT_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 
 /// Standard EPON multicast destination for MPCP frames.
 #[cfg(test)]
@@ -136,7 +136,7 @@ const SLOT_OAM: u8 = 0x0F;
 /// Firmware reads with CMD_STATUS = 0x400000, pin = 0x00.
 const SLOT_MACSEC: u8 = 0x00;
 
-// ── DMA mailbox constants (reverse-engineered: the frame-protocol notes) ──────
+// ── DMA mailbox constants (reverse-engineered) ──────
 
 /// LLID bitmap base — firmware reads `*(BITMAP_BASE + word_idx * 0x200)`.
 const BITMAP_BASE: u32 = 0x0100_1438;

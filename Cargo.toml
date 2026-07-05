@@ -1,8 +1,10 @@
 [package]
-name = "arc700-emulator"
+name = "bcm55030-emulator"
 version = "0.1.0"
 edition = "2021"
-description = "ARC 700 ARCompact big-endian CPU emulator"
+description = "BCM55030 SoC emulator (big-endian ARC700 / ARCompact core)"
+license = "AGPL-3.0-only"
+repository = "https://github.com/abeljouve/bcm55030-emulator"
 default-run = "arc700"
 
 [[bin]]
@@ -13,18 +15,6 @@ path = "src/bin/arc700.rs"
 name = "arc700-gui"
 path = "src/bin/arc700-gui.rs"
 required-features = ["ui"]
-
-[[bin]]
-name = "hw-fuzzer"
-path = "src/bin/hw_fuzzer.rs"
-
-[[bin]]
-name = "diff-sweep"
-path = "src/bin/diff_sweep.rs"
-
-[[bin]]
-name = "gen-sigs"
-path = "src/bin/gen_sigs.rs"
 
 [features]
 default = []
@@ -59,33 +49,3 @@ egui         = { version = "0.34", optional = true }
 egui_extras  = { version = "0.34", optional = true, features = ["all_loaders"] }
 egui-phosphor = { version = "0.12", optional = true, default-features = false, features = ["regular"] }
 rfd          = { version = "0.17", optional = true }
-tree-sitter = "0.26.9"
-tree-sitter-c = "0.24.2"
-
-[[bin]]
-name = "find-data-ptrs"
-path = "src/bin/find_data_ptrs.rs"
-
-[[bin]]
-name = "resolve-data-ptrs"
-path = "src/bin/resolve_data_ptrs.rs"
-
-[[bin]]
-name = "boot-smoke"
-path = "src/bin/boot_smoke.rs"
-
-[[bin]]
-name = "boot-diff"
-path = "src/bin/boot_diff.rs"
-
-[[bin]]
-name = "our-bl-firmware-diff"
-path = "src/bin/our_bl_firmware_diff.rs"
-
-[[bin]]
-name = "arm4-probe"
-path = "src/bin/arm4_probe.rs"
-
-[[bin]]
-name = "callstack"
-path = "src/bin/callstack.rs"

@@ -4,9 +4,10 @@
 //!   - A0h = Serial ID (static) — Table 4-1
 //!   - A2h = Digital Diagnostics (DDM) — Table 4-2
 //!
-//! Captured snapshot: Generic GENERIC-BC+ (Device ONU OLT-side SFP+),
-//! read from real BCM55030 hardware on 2026-04-10 via `access/read 4 {0,1} …`.
-//! No OLT connected, so TX/RX power and bias are at their laser-off floors.
+//! The default pages below carry a synthetic placeholder identity — only the
+//! layout and the generic 10G-EPON optical parameters are meaningful. Replace
+//! the identity at runtime to model a specific transceiver. Diagnostics sit at
+//! their laser-off floors (no link partner connected).
 //!
 //! All 16-bit fields on the wire are big-endian (MSB at low address) per
 //! SFF-8472 §9.1. The struct definitions below store fields as typed scalars
@@ -307,16 +308,19 @@ impl SfpA2 {
     }
 }
 
-// ── Generic GENERIC-BC+ captured snapshot ───────────────────────────────────
+// ── Synthetic default SFP+ identity (SFF-8472/8079 layout) ──────────────────
 
-/// A0h snapshot captured from Device ONU on 2026-04-10.
+/// Synthetic default A0h page. This is NOT a real module — the vendor,
+/// part number and serial are placeholders and the identity is meant to be
+/// overridden at runtime if a specific transceiver must be modelled. Only
+/// the layout and the generic 10G-EPON optical parameters are meaningful.
 pub const GENERIC_SFP_A0: SfpA0 = SfpA0 {
     identifier: 0x03,                            // SFP/SFP+
     ext_identifier: 0x04,                        // two-wire ID
     connector: 0x01,                             // SC (SFF-8024)
     transceiver: [0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00],
     encoding: 0x03,                              // NRZ
-    br_nominal: 0x0D,                            // 1300 MBd nominal (vendor)
+    br_nominal: 0x0D,                            // 1300 MBd nominal
     rate_identifier: 0x00,
     length_smf_km: 0x14,                         // 20 km
     length_smf_100m: 0xC8,                       // 200 × 100m = 20 km
@@ -324,31 +328,31 @@ pub const GENERIC_SFP_A0: SfpA0 = SfpA0 {
     length_om1: 0x00,
     length_om4_copper: 0x00,
     length_om3: 0x00,
-    vendor_name: *b"Generic         ",
+    vendor_name: *b"ACME OPTICS     ",
     ext_compliance: 0x00,                        // none
-    vendor_oui: [0x00, 0x00, 0x00],              // Generic Broadband OUI
-    vendor_pn: *b"GENERIC-PN01    ",
+    vendor_oui: [0x00, 0x00, 0x00],              // unset (synthetic)
+    vendor_pn: *b"GENERIC-SFP-01  ",
     vendor_rev: *b"V1.0",
     wavelength: 0x051E,                          // 1310 nm
     unallocated_62: 0x00,
-    cc_base: 0xA2,                               // vendor-supplied
+    cc_base: 0x05,                               // SFF-8472 base checksum
     options: 0x001A,                             // TX_DISABLE + TX_FAULT + RX_LOS
     br_max: 0x14,                                // +20 %
     br_min: 0x14,                                // −20 %
-    vendor_sn: *b"SN000000001     ",
-    date_year: *b"23",
-    date_month: *b"10",
-    date_day: *b"21",
+    vendor_sn: *b"SN00000000000001",
+    date_year: *b"00",
+    date_month: *b"01",
+    date_day: *b"01",
     date_lot: *b"  ",
     diag_monitoring_type: 0x68,                  // DDM + internal cal + avg pwr
     enhanced_options: 0xF0,                      // alarms + soft TX_DIS/FAULT/LOS
     sff8472_compliance: 0x02,                    // Rev 9.5
-    cc_ext: 0x14,                                // vendor-supplied
-    vendor_specific: *b"GENERICSFP;00000-SN000000001-F3;",
+    cc_ext: 0x40,                                // SFF-8472 extended checksum
+    vendor_specific: *b"                                ",
     reserved_8079: [0; 128],
 };
 
-/// A2h snapshot captured from Device ONU on 2026-04-10.
+/// Synthetic default A2h page (diagnostics at laser-off floors).
 ///
 /// No OLT connected → TX/RX power and bias sit at their laser-off floors,
 /// and both the RX Power Low and TX Power Low alarms are asserted in
@@ -439,7 +443,7 @@ pub const SFP_A2: [u8; 256] = GENERIC_SFP_A2.to_bytes();
 /// `device`: 0=A0h, 1=A2h. `byte_offset` wraps modulo 256.
 ///
 /// NOTE: this const-snapshot reader is preserved for the existing
-/// checksum / golden-byte tests. Runtime access goes through
+/// checksum tests. Runtime access goes through
 /// [`SfpEeprom::read_word`] on the live struct owned by the BSC
 /// peripheral.
 pub fn read_word(device: u8, byte_offset: u16) -> u32 {
@@ -459,7 +463,7 @@ pub fn read_word(device: u8, byte_offset: u16) -> u32 {
 //
 // `SfpEeprom` is the live instance of the SFP EEPROM that sits behind
 // the BSC I²C controller. The A0h / A2h base pages start from the
-// Generic GENERIC-BC+ snapshot, but:
+// synthetic default identity, but:
 //
 //   * A2h bytes 96–109 (Real-time diagnostics) are replaced on every
 //     read by serialising the live `DdmLive` fields. This is what makes
@@ -469,7 +473,7 @@ pub fn read_word(device: u8, byte_offset: u16) -> u32 {
 //   * A0h and A2h byte pages are held as `[u8; 256]` members so the UI
 //     can mutate vendor name, serial number, etc. via events.
 //
-// The Generic snapshot is still authoritative for checksums (CC_BASE,
+// The synthetic default identity is still authoritative for checksums (CC_BASE,
 // CC_EXT, CC_DMI) at boot; UI-driven mutations may invalidate those
 // and the firmware is expected to handle that cleanly just as it does
 // on real malformed modules.
@@ -489,7 +493,7 @@ pub struct DdmLive {
 }
 
 impl DdmLive {
-    /// Default = the Generic snapshot values at 2026-04-10 capture time.
+    /// Default = the synthetic default identity values at 2026-04-10 capture time.
     pub const fn snapshot_default() -> Self {
         Self {
             temperature_c256: 0x2A71,  //  42.44 °C
@@ -512,7 +516,7 @@ pub struct SfpEeprom {
 }
 
 impl SfpEeprom {
-    /// Initialise from the Generic GENERIC-BC+ snapshot.
+    /// Initialise from the synthetic default identity.
     pub fn new_default() -> Self {
         Self {
             a0_bytes: SFP_A0,
@@ -521,7 +525,7 @@ impl SfpEeprom {
         }
     }
 
-    /// Reset to the captured snapshot, preserving no UI mutations.
+    /// Reset to the default snapshot, preserving no UI mutations.
     pub fn reset_to_snapshot(&mut self) {
         self.a0_bytes = SFP_A0;
         self.a2_bytes = SFP_A2;
@@ -603,70 +607,6 @@ impl Default for SfpEeprom {
 mod tests {
     use super::*;
 
-    /// Raw A0h bytes as captured on real BCM55030 hardware, 2026-04-10.
-    /// Source of truth — changes to the struct must keep this golden identical.
-    #[rustfmt::skip]
-    const GOLDEN_A0: [u8; 256] = [
-        0x03, 0x04, 0x01, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x03, 0x0D, 0x00, 0x14, 0xC8,
-        0x00, 0x00, 0x00, 0x00, 0x47, 0x65, 0x6E, 0x65, 0x72, 0x69, 0x63, 0x20, 0x20, 0x20, 0x20, 0x20,
-        0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x00, 0x4C, 0x54, 0x46, 0x37, 0x32, 0x31, 0x35, 0x2D,
-        0x42, 0x43, 0x2B, 0x31, 0x20, 0x20, 0x20, 0x20, 0x56, 0x31, 0x2E, 0x30, 0x05, 0x1E, 0x00, 0xA2,
-        0x00, 0x1A, 0x14, 0x14, 0x4C, 0x33, 0x39, 0x44, 0x41, 0x30, 0x35, 0x38, 0x33, 0x30, 0x32, 0x20,
-        0x20, 0x20, 0x20, 0x20, 0x32, 0x33, 0x31, 0x30, 0x32, 0x31, 0x20, 0x20, 0x68, 0xF0, 0x02, 0x14,
-        0x46, 0x2D, 0x53, 0x46, 0x50, 0x4F, 0x4E, 0x55, 0x31, 0x41, 0x3B, 0x31, 0x35, 0x34, 0x37, 0x35,
-        0x2D, 0x4C, 0x33, 0x39, 0x44, 0x41, 0x30, 0x35, 0x38, 0x33, 0x30, 0x32, 0x2D, 0x46, 0x33, 0x3B,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ];
-
-    /// Raw A2h bytes as captured on real BCM55030 hardware, 2026-04-10.
-    #[rustfmt::skip]
-    const GOLDEN_A2: [u8; 256] = [
-        0x4B, 0x00, 0xF6, 0x00, 0x46, 0x00, 0xFB, 0x00, 0x8C, 0xA0, 0x75, 0x30, 0x88, 0xB8, 0x79, 0x18,
-        0xC3, 0x50, 0x00, 0x00, 0x9C, 0x40, 0x00, 0x00, 0xB3, 0x60, 0x22, 0xFA, 0x8E, 0x7B, 0x2D, 0x0F,
-        0x04, 0xEB, 0x00, 0x0B, 0x03, 0xE8, 0x00, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x3F, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-        0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3D,
-        0x2A, 0x71, 0x7F, 0xAB, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x02, 0x00,
-        0x01, 0x40, 0x00, 0x04, 0x01, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    ];
-
-    /// Each byte of the serialised struct must match the expected serialisation.
-    /// On mismatch, the panic message points to the exact offending offset.
-    fn assert_equals_golden(label: &str, got: &[u8; 256], want: &[u8; 256]) {
-        for i in 0..256 {
-            assert_eq!(
-                got[i], want[i],
-                "{} mismatch at offset 0x{:02X}: got 0x{:02X}, want 0x{:02X}",
-                label, i, got[i], want[i]
-            );
-        }
-    }
-
-    #[test]
-    fn a0_matches_expected() {
-        assert_equals_golden("A0h", &SFP_A0, &GOLDEN_A0);
-    }
-
-    #[test]
-    fn a2_matches_expected() {
-        assert_equals_golden("A2h", &SFP_A2, &GOLDEN_A2);
-    }
 
     /// CC_BASE = low 8 bits of sum(bytes 0..62), per SFF-8472 §8.2.
     #[test]
@@ -702,3 +642,4 @@ mod tests {
             low_warn, low_warn as u16);
     }
 }
+

@@ -1,5 +1,5 @@
 //! Closes hypotheses (b) wrong-dest and (c) wrong-length of
-//! `the design notes` D2,
+//! the design notes D2,
 //! and re-checks (a) dirty-line preservation through the *real* PBC
 //! MMIO path (not just `apply_datapath_op` directly).
 //!

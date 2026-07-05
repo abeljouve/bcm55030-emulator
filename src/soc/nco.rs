@@ -12,7 +12,7 @@
 //! | `14`| `NCO_DUAL_TX_ENABLE`     | Enable dual-TX mode         |
 //!
 //! v1 is a plain backing store. The future `CLK_READY_FLAG` at
-//! `0x00FC1017` mentioned in `the design notes` section 12 is not
+//! `0x00FC1017` mentioned in the design notes section 12 is not
 //! claimed here because the boot trace shows it is not touched
 //! by the warm boot path; it will migrate in when a firmware
 //! path that reads it is identified.
@@ -33,7 +33,7 @@ pub const NCO_SLOT_BYTES: u32 = 8;
 
 /// Top of the NCO/IVT aperture when `AUX_INT_VECTOR_BASE` (AUX 0x25)
 /// is 0 — the only base ever observed on this silicon (the bootloader
-/// and firmware never write AUX 0x25; verified in the firmware-silent
+/// and the firmware never write AUX 0x25; verified in the firmware-silent
 /// session logs). `0..0x80` = 16 channels × 8 bytes.
 pub const NCO_IVT_LIMIT: u32 = (NCO_CHANNELS as u32) * NCO_SLOT_BYTES;
 

@@ -1,6 +1,6 @@
 //! Silicon power-on defaults for the BCM55030 sysreg aperture.
 //!
-//! Captured 2026-04-29 via the `hardware probing` baremetal binary, which
+//! observed on hardware, which
 //! reads MMIO registers immediately after stage-1 hands off to
 //! stage-2. Stage-1 was audited to touch ZERO SerDes/EPON registers
 //! (only UART, PBC/SPI, and CPU AUX cache regs), so these values
@@ -21,7 +21,7 @@
 //! difference is that warm pre-sets `STATUS32.E1/E2` in
 //! `boot_from_flash`. Closes deferral D6.
 //!
-//! See `the design notes` for the audit
+//! See the design notes for the audit
 //! that produced these values.
 
 /// (offset_from_0x01000000, silicon power-on value).

@@ -7,9 +7,9 @@
 //!
 //! Session 1 notes:
 //! - `held_pre_firmware` / `firmware_loaded` / `FIRMWARE_BASE` handling **removed**.
-//!   The hardware has no concept of firmware. Bytes typed during the
+//!   The hardware has no concept of the loaded firmware. Bytes typed during the
 //!   bootloader are consumed by the bootloader's own CLI prompt
-//!   (`FFFF/>`) just like on real silicon. To drive firmware, type after
+//!   (`FFFF/>`) just like on real silicon. To drive the firmware, type after
 //!   seeing the `2000/>` prompt.
 //! - Input arrives via the bank's mpsc channel; `PeripheralBank::tick`
 //!   drains the receiver and calls [`Uart::push_rx_byte`] for each byte.

@@ -35,7 +35,7 @@ pub fn execute_zero_op(zop: &ZeroOp, state: &mut CpuState) -> Result<(), Excepti
             // (2026-05-18 and 2026-06-28) showed an ISR ending in `rtie`
             // faulting vec=2 (`ABCDdQ` then vec=2), while the same ISR ending
             // in `j [ilink]` returned cleanly. A 4 MB scan of the reference flash
-            // dump (reference-fw-dump.bin) found ZERO `rtie` opcodes
+            // dump (the reference firmware dump) found ZERO `rtie` opcodes
             // (all 4 byte-orderings) but 8x `j.f [ilink1]` (0x20208740) and
             // 11x `j.f [ilink2]` (0x20208780): reference's sole interrupt-return
             // idiom is `j.f [ilink1/2]`; it never uses `rtie`.

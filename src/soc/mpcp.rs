@@ -31,7 +31,7 @@
 //! All runtime base addresses were extracted by dumping SRAM
 //! after a full `boot_to_prompt_warm` run and reading the
 //! firmware-initialised DAT_* pointers. See deferral D3 in
-//! `the design notes` for the RE notes.
+//! the design notes for the RE notes.
 //!
 //! v1 is a plain backing store — writes land in an internal
 //! `Vec<u32>` keyed by the claim region, reads round-trip the

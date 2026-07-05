@@ -1,4 +1,4 @@
-//! MCP tool handler for the ARC700 emulator. Read-only (phase 4)
+//! MCP tool handler for the BCM55030 emulator. Read-only (phase 4)
 //! plus bank-side mutations (phase 5a). CpuCommand-backed
 //! mutations (cpu_run, set_breakpoint, write_register, ...)
 //! land in phase 5b.

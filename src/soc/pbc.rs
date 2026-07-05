@@ -75,7 +75,7 @@ pub struct Pbc {
     /// When `Some`, every `complete_flash_write` appends `(flash_addr, data)`.
     /// The DMA write PAYLOAD is read from the SRAM buffer and is NOT in the
     /// MMIO write stream, so this is the only way to diff FDS-record CONTENT
-    /// across reference vs reference (the  root-cause tool). Pure HW-model
+    /// for differential MMIO tracing between two firmware builds. Pure HW-model
     /// observation, not a firmware hook.
     pub dma_write_log: Option<Vec<(u32, Vec<u8>)>>,
 }
