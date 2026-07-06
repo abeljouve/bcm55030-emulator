@@ -595,6 +595,28 @@ impl SfpEeprom {
     pub fn part_number(&self) -> String {
         String::from_utf8_lossy(&self.a0_bytes[40..56]).trim().to_string()
     }
+
+    /// Overwrite the raw page bytes from an external dump, so a caller can
+    /// model a specific transceiver at runtime without any identity being
+    /// baked into the binary. Accepts 256 bytes (A0h only) or 512 bytes
+    /// (A0h followed by A2h). The live DDM overlay (A2h bytes 96..=109) still
+    /// takes precedence on read.
+    pub fn load_pages(&mut self, bytes: &[u8]) -> Result<(), String> {
+        match bytes.len() {
+            256 => {
+                self.a0_bytes.copy_from_slice(&bytes[..256]);
+                Ok(())
+            }
+            512 => {
+                self.a0_bytes.copy_from_slice(&bytes[..256]);
+                self.a2_bytes.copy_from_slice(&bytes[256..512]);
+                Ok(())
+            }
+            n => Err(format!(
+                "expected 256 bytes (A0h) or 512 bytes (A0h+A2h), got {n}"
+            )),
+        }
+    }
 }
 
 impl Default for SfpEeprom {
@@ -607,6 +629,33 @@ impl Default for SfpEeprom {
 mod tests {
     use super::*;
 
+    /// `load_pages` with 512 bytes overwrites both A0h and A2h.
+    #[test]
+    fn load_pages_overwrites_a0_and_a2() {
+        let mut e = SfpEeprom::new_default();
+        let buf: [u8; 512] = std::array::from_fn(|i| (i & 0xFF) as u8);
+        e.load_pages(&buf).unwrap();
+        assert_eq!(e.read_byte(0, 20), 20); // A0h byte 20
+        assert_eq!(e.a2_bytes[200], 200); // A2h byte 200
+    }
+
+    /// `load_pages` with 256 bytes overwrites only A0h.
+    #[test]
+    fn load_pages_a0_only() {
+        let mut e = SfpEeprom::new_default();
+        let a2_before = e.a2_bytes;
+        e.load_pages(&[0xAB; 256]).unwrap();
+        assert_eq!(e.a0_bytes[0], 0xAB);
+        assert_eq!(e.a2_bytes, a2_before); // A2h untouched
+    }
+
+    /// `load_pages` rejects any other length.
+    #[test]
+    fn load_pages_rejects_bad_length() {
+        let mut e = SfpEeprom::new_default();
+        assert!(e.load_pages(&[0u8; 100]).is_err());
+        assert!(e.load_pages(&[0u8; 384]).is_err());
+    }
 
     /// CC_BASE = low 8 bits of sum(bytes 0..62), per SFF-8472 §8.2.
     #[test]
