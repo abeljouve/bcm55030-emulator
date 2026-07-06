@@ -55,6 +55,7 @@ Selected flags:
 | `--persist-flash` | Write modified flash back to `<firmware>.persist` |
 | `--debug-elf <FILE>` | Load DWARF info to annotate `--trace` with source file/line |
 | `--scenario <FILE>` | Apply a JSON scenario at startup |
+| `--sfp-eeprom <FILE>` | Load SFP EEPROM pages from a raw dump (256 B A0h, or 512 B A0h+A2h) |
 | `--mcp-port <PORT>` | Start an MCP server on `PORT` (enables worker mode) |
 
 Interactive mode turns on automatically when stdin is a TTY: keystrokes are fed
