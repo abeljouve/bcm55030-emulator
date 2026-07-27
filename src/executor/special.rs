@@ -31,15 +31,10 @@ pub fn execute_zero_op(zop: &ZeroOp, state: &mut CpuState) -> Result<(), Excepti
             // `rtie`. Executing it raises vec=2 (Instruction Error), exactly
             // as a non-existent opcode would. The interrupt-return idiom on
             // this core is `j[.f] [ilink1/2]` (see executor/branch.rs and the
-            // decode32.rs ILINK handling). Two independent silicon bisects
-            // (2026-05-18 and 2026-06-28) showed an ISR ending in `rtie`
-            // faulting vec=2 (`ABCDdQ` then vec=2), while the same ISR ending
-            // in `j [ilink]` returned cleanly. A 4 MB scan of the reference flash
-            // dump (the reference firmware dump) found ZERO `rtie` opcodes
-            // (all 4 byte-orderings) but 8x `j.f [ilink1]` (0x20208740) and
-            // 11x `j.f [ilink2]` (0x20208780): reference's sole interrupt-return
-            // idiom is `j.f [ilink1/2]`; it never uses `rtie`.
-            // See the design notes.
+            // decode32.rs ILINK handling). Verified against real hardware: an
+            // ISR ending in `rtie` faults vec=2, while the same ISR ending in
+            // `j [ilink]` returns cleanly; firmware uses `j.f [ilink1/2]` as
+            // its sole interrupt-return idiom and never emits `rtie`.
             //
             // The ZeroOp::Rtie decode variant is intentionally kept so the
             // disassembler still LABELS the opcode "rtie" (format.rs); only
@@ -129,7 +124,7 @@ mod tests {
     fn rtie_faults_instruction_error_vec2() {
         // OBSERVED (silicon): the BCM55030 ARC700 does NOT implement `rtie`;
         // executing it raises vec=2 (Instruction Error). It must NOT restore
-        // STATUS32/PC. See the design notes.
+        // STATUS32/PC.
         let mut state = CpuState::new();
         state.pc = 0x1234;
         // Even with level-1 IRQ context primed, rtie must fault, not return.

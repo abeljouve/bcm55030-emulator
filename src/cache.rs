@@ -47,17 +47,17 @@ pub struct DCacheLineInfo {
     pub data: [u8; LINE_SIZE],
 }
 
-/// R/W bit mask for DC_CTRL verified on real BCM55030 hardware via scan7b.
+/// R/W bit mask for DC_CTRL, verified against real BCM55030 hardware.
 /// = bits 0 (DC), 1 (reserved but writable), 2 (SB), 5 (AT), 6 (IM), 7 (LM)
 pub const DC_CTRL_RW_MASK: u32 = 0xE7;
 
-/// BCM55030 DC_CTRL reset value (verified boot read via scan7b).
+/// BCM55030 DC_CTRL reset value (verified against real hardware).
 pub const DC_CTRL_RESET: u32 = 0xC2;
 
 pub struct DCache {
     // 2-way × 64 sets = 4 KB — box to keep the DCache struct off the stack.
     lines: Box<[[CacheLine; NUM_WAYS]; NUM_SETS]>,
-    /// Per-set round-robin counter. Replacement is RR (verified scan7c v7).
+    /// Per-set round-robin counter. Replacement is RR (verified against real hardware).
     next_way: Box<[u8; NUM_SETS]>,
     // DC_CTRL decoded fields (DC_CTRL raw value preserved in ctrl_raw)
     enabled: bool,
@@ -249,35 +249,13 @@ impl DCache {
         evicted
     }
 
-    /// Write back every dirty line to memory and mark it clean, WITHOUT
-    /// invalidating (the line stays valid/resident). Returns the lines to
-    /// write back. Used when DC_CTRL clears the DC enable bit: on real
-    /// ARC700 disabling the cache makes SRAM coherent (pending write-backs
-    /// drain) so that subsequent uncached/bypassed accesses observe the
-    /// data the CPU wrote while the cache was enabled. Without this, a
-    /// dirty stack slot (e.g. a compiler-saved frame pointer) written
-    /// through the write-back cache would be lost the instant the firmware
-    /// turns the cache off, and the next bypassed load would read stale
-    /// SRAM. -- OBSERVED: the reference firmware toggles DC_CTRL (0xc3) at runtime
-    /// 0x33c0c and then dereferences saved frame pointers off the stack;
-    /// the corruption (fp loaded as a stale 0x1 -> j 0x200f8000) appears
-    /// exactly 2 insns after the DC_CTRL disable.
-    pub fn flush_dirty(&mut self) -> Vec<EvictedLine> {
-        let mut evicted = Vec::new();
-        for set in 0..NUM_SETS {
-            for way in 0..NUM_WAYS {
-                let line = &mut self.lines[set][way];
-                if line.valid && line.dirty {
-                    evicted.push(EvictedLine {
-                        addr: Self::base_addr(line.tag, set),
-                        data: line.data,
-                    });
-                    line.dirty = false;
-                }
-            }
-        }
-        evicted
-    }
+    // There is deliberately no standalone "write back every dirty line without
+    // invalidating" operation. `DC_FLSH` has no observable effect on this
+    // silicon (§5.3), and disabling the cache does not drain anything either —
+    // the only mechanism that makes SRAM coherent is `DC_IVDC` with `IM=1`,
+    // which is `invalidate_all` above. A `flush_dirty` used to exist, called
+    // from the DC_CTRL disable path; see `Memory::dcache_sync_ctrl` for why it
+    // was wrong and what it hid.
 
     /// Invalidate a single cache line by address.
     /// If the line is dirty and IM=1, returns it for writeback.
@@ -305,11 +283,10 @@ impl DCache {
     /// line. On real BCM55030 a direct/DMA SRAM write does **not**
     /// disturb a *dirty* cached line — the CPU's pending write shadows
     /// SRAM and subsequent cached reads still return the cached value
-    /// (HW-verified, scan7b test 7; same class as a `.di` store). The
+    /// (verified against real hardware; same class as a `.di` store). The
     /// emulator previously evicted the line unconditionally, dropping
     /// the firmware's cached saved-return slot when a flash-read
-    /// destination shared a 32-byte line with a live stack word
-    /// (bug `emu-reboot-halt-and-transfer-model-divergences` D2).
+    /// destination shared a 32-byte line with a live stack word.
     ///
     /// Behaviour:
     /// - line present and **dirty** → left intact (CPU value wins).
@@ -402,8 +379,19 @@ impl DCache {
     }
 }
 
-// BCM55030 I-cache: 4 KB, 1-way direct, 128 sets, 32 B lines.
+// BCM55030 I-cache: 4 KB, 1-way direct-mapped, 128 sets, 32 B lines.
 // IC_IVIL is a HW no-op — only IC_IVIC flushes. `.di` stores skip I-cache.
+//
+// OBSERVED: all three numbers are measured by execution on real hardware
+// — a cold-vs-warm cost staircase for the line size, an evictor swept in
+// distance for the capacity, and a single congruent evictor for the ways.
+// Decoding BCR 0x77 through another ARC family's field table is unreliable
+// here: the associativity field reads 0, which that decoding rejects.
+//
+// A line fill costs 24 ticks. That is NOT modelled here: this cache is
+// functional only. A tagged cache returns a miss and a correct refill, never
+// another address's bytes, so it cannot by itself produce a placement-dependent
+// RESULT — only placement-dependent TIME, which this ISS does not count.
 pub const IC_LINE_SIZE: usize = 32;
 pub const IC_NUM_WAYS: usize = 1;
 pub const IC_NUM_SETS: usize = 128;
@@ -515,7 +503,7 @@ impl ICache {
     }
 
     /// IC_IVIL (aux 0x19) single-line invalidate: NO-OP on BCM55030.
-    /// scan7d sanity test showed the cached line survives an IC_IVIL,
+    /// Verified against real hardware: the cached line survives an IC_IVIL,
     /// so we model it as a no-op to match hardware.
     pub fn invalidate_line(&mut self, addr: u32) {
         let _ = addr;
@@ -646,8 +634,8 @@ mod tests {
 
     #[test]
     fn test_write_hit_does_not_protect_line() {
-        // scan7c v7 verified: a cached_write hit on L0 does NOT save it
-        // from being the next RR victim. Touches are irrelevant.
+        // Verified against real hardware: a cached_write hit on L0 does NOT
+        // save it from being the next RR victim. Touches are irrelevant.
         let mut cache = DCache::new();
         let set_index: u32 = 5;
         let addr_for = |tag: u32| -> u32 {
@@ -787,7 +775,7 @@ mod tests {
         assert_eq!(ic.peek_half(addr), Some(0xABCD));
         assert_eq!(ic.peek_half(addr + 2), Some(0xEF12));
 
-        // IC_IVIL is a no-op per scan7d: the line must still be cached.
+        // IC_IVIL is a no-op on real hardware: the line must still be cached.
         ic.invalidate_line(addr);
         assert_eq!(ic.peek_word(addr), Some(0xABCDEF12));
 

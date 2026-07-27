@@ -832,19 +832,17 @@ fn decode_jump(
             } else if c_reg == 29 || c_reg == 30 {
                 // OBSERVED (silicon): on the BCM55030 ARC700, a bare
                 // `j [ilink1/2]` (F=0) is ACCEPTED as a valid interrupt
-                // return — silicon bisect 2026-05-18 showed a minimal ISR
-                // ending in `j [ilink]` returning cleanly (IRQ serviced, no
+                // return — verified against real hardware: a minimal ISR
+                // ending in `j [ilink]` returns cleanly (IRQ serviced, no
                 // fault), whereas textbook ARCompact would reject F=0 here.
-                // See the design notes.
                 //
                 // INFERRED: this core's bare-ILINK jump also restores STATUS32
-                // from STATUS32_L1/L2 (like the F form). The bisect proved the
+                // from STATUS32_L1/L2 (like the F form). Hardware proved the
                 // jump returns cleanly but did not directly measure the
-                // STATUS32 restore, and reference never emits F=0 (so it is
-                // untestable from reference — the 4 MB scan found 0 plain
-                // `j [ilink]`). We set flag_restore=true to keep interrupts
-                // correctly re-enabled on return, matching the documented
-                // silicon behavior.
+                // STATUS32 restore, and firmware never emits F=0 (so it is
+                // untestable in practice). We set flag_restore=true to keep
+                // interrupts correctly re-enabled on return, matching the
+                // documented silicon behavior.
                 true
             } else {
                 false
@@ -937,8 +935,7 @@ fn decode_jump(
                 // is ACCEPTED as a valid interrupt return on this core, not an
                 // InstructionError. INFERRED: it also restores STATUS32 from
                 // STATUS32_L1/L2 (flag_restore=true) — same rationale as the
-                // unconditional p==0b00 arm above. See
-                // the design notes.
+                // unconditional p==0b00 arm above.
                 if m == 0 {
                     if let Operand::Reg(r) = target {
                         r == 29 || r == 30
@@ -1477,7 +1474,6 @@ mod tests {
     }
 
     // BCM55030 silicon-faithful interrupt-return idiom.
-    // See the design notes.
 
     #[test]
     fn rtie_decodes_as_zeroop_rtie() {

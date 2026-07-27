@@ -41,6 +41,12 @@ pub const AUX_ECR: u32 = 0x403;
 pub const AUX_EFA: u32 = 0x404;
 pub const AUX_ICAUSE1: u32 = 0x40A;
 pub const AUX_ICAUSE2: u32 = 0x40B;
+/// `IENABLE` in the generic ARC 700 definition — **not implemented on this
+/// integration**. Kept as a named address so the disassembler can label it and
+/// so the absence is documented where a reader looks for the register. There is
+/// deliberately no `aux_ienable` field and no read/write arm: the address falls
+/// through to the generic absent-aux handling (read = `IDENTITY_VALUE`, write
+/// discarded). -- OBSERVED, DATASHEET §6.1.
 pub const AUX_IENABLE: u32 = 0x40C;
 pub const AUX_ITRIGGER: u32 = 0x40D;
 pub const AUX_XPU: u32 = 0x410;
@@ -50,13 +56,12 @@ pub const AUX_BTA_L2: u32 = 0x414;
 pub const AUX_IRQ_PULSE_CANCEL: u32 = 0x415;
 pub const AUX_IRQ_PENDING: u32 = 0x416;
 
-/// BCM55030 IDENTITY register value (verified on real hardware 2026-04-12).
+/// BCM55030 IDENTITY register value (verified against real hardware).
 /// ARCVER=0x24, build=0xB4. Non-existent aux regs also return this value.
 pub const IDENTITY_VALUE: u32 = 0x00B40124;
 
-// NOTE: Ghidra's `Auxregs0028` = STATUS32 (AUX 0x0A * 4 = byte offset 0x28).
-// There is NO BCM55030-custom AUX at number 0x28. See the design notes
-// for the correction history.
+// NOTE: a disassembler label `Auxregs0028` = STATUS32 (AUX 0x0A * 4 = byte
+// offset 0x28). There is NO BCM55030-custom AUX at number 0x28.
 
 // BCR addresses
 pub const AUX_BCR_VER: u32 = 0x60;
@@ -112,6 +117,16 @@ pub enum PauseReason {
     UserPause,
     /// `state.halted` was observed (CPU reached SLEEP / FLAG 1 etc.).
     Halted,
+    /// The PC stopped moving with NO watchdog armed and no interrupt able to
+    /// reach the core: a permanent hang. Carries the spinning PC. The state is
+    /// left intact deliberately — this used to be reported as a warm reboot,
+    /// which destroyed exactly the SRAM/registers needed to diagnose it.
+    SpinNoWatchdog(u32),
+    /// The optional timing overlay (`timing` feature) detected a fetch-vs-load
+    /// bus-arbitration deadlock: an uncached load starved by a fixed-priority
+    /// instruction-fetch miss stream.
+    #[cfg(feature = "timing")]
+    BusDeadlock,
 }
 
 #[derive(Debug, Clone)]
@@ -174,7 +189,9 @@ pub struct CpuState {
     pub aux_efa: u32,
     pub aux_icause1: u32,
     pub aux_icause2: u32,
-    pub aux_ienable: u32,
+    // No `aux_ienable`: aux 0x40C is unimplemented on the BCM55030 (§6.1).
+    // There is no per-line interrupt enable mask on this device; see
+    // `AUX_IENABLE` above and `Cpu::check_interrupts`.
     pub aux_itrigger: u32,
     pub aux_xpu: u32,
     pub aux_bta: u32,
@@ -217,6 +234,12 @@ pub struct CpuState {
     /// Synced to DCache via executor post-processing on StoreAux(0x48).
     /// BCM55030 reset value: 0xC2 (cache enabled, IM=1, LM=1, bit1=1).
     pub aux_dc_ctrl: u32,
+
+    /// DEBUG.LD (aux 0x05 bit 31, "Load Pending"): set by the optional
+    /// cycle-accurate timing overlay (the `timing` feature) while a load is
+    /// outstanding on the modelled bus. Always `false` in the default build —
+    /// nothing writes it — so a DEBUG read returns the same value as before.
+    pub debug_load_pending: bool,
 
 }
 
@@ -262,7 +285,6 @@ impl CpuState {
             aux_efa: 0,
             aux_icause1: 0,
             aux_icause2: 0,
-            aux_ienable: 0,
             aux_itrigger: 0,
             aux_xpu: 0,
             aux_bta: 0,
@@ -280,6 +302,7 @@ impl CpuState {
             link_executed: false,
             irq_shadow_r0_r3: [0u32; 4],
             aux_dc_ctrl: 0xC2, // BCM55030 reset: cache enabled, IM=1, LM=1
+            debug_load_pending: false,
         };
         // Set default IDENTITY: ARC 700 v1 (ARCVER = 0x31)
         state.core_regs[REG_PCL as usize] = 0;
@@ -391,7 +414,10 @@ impl CpuState {
             AUX_LP_START => Ok(self.aux_lp_start),
             AUX_LP_END => Ok(self.aux_lp_end),
             AUX_IDENTITY => Ok(IDENTITY_VALUE),
-            AUX_DEBUG => Ok(0x00400000), // bit 22 set (verified on real HW)
+            // bit 22 set (verified on real HW); bit 31 = DEBUG.LD (Load
+            // Pending), driven only by the optional `timing` overlay — false
+            // (and thus absent) in the default build.
+            AUX_DEBUG => Ok(0x00400000 | ((self.debug_load_pending as u32) << 31)),
             AUX_PC => Ok(self.pc & 0xFFFFFFFE),
             AUX_STATUS32 => Ok(self.status32()),
             AUX_STATUS32_L1 => Ok(self.aux_status32_l1),
@@ -414,7 +440,7 @@ impl CpuState {
             AUX_EFA => Ok(self.aux_efa),
             AUX_ICAUSE1 => Ok(self.aux_icause1),
             AUX_ICAUSE2 => Ok(self.aux_icause2),
-            AUX_IENABLE => Ok(self.aux_ienable),
+            // AUX_IENABLE (0x40C) intentionally absent — see the `_` arm.
             AUX_ITRIGGER => Ok(self.aux_itrigger),
             AUX_XPU => Ok(self.aux_xpu),
             AUX_BTA => Ok(self.aux_bta),
@@ -422,7 +448,7 @@ impl CpuState {
             AUX_BTA_L2 => Ok(self.aux_bta_l2),
             AUX_IRQ_PENDING => Ok(self.aux_irq_pending),
             // BCR registers (read-only build config)
-            // All values verified on real BCM55030 hardware (2026-04-12)
+            // All values verified against real BCM55030 hardware.
             AUX_BCR_VER => Ok(0x02),
             AUX_BTA_LINK_BUILD => Ok(0x00),       // absent on real HW
             AUX_EA_BUILD => Ok(0x00),              // absent on real HW
@@ -431,12 +457,18 @@ impl CpuState {
             AUX_TIMER_BUILD => Ok(0x0303),         // v3, T0+T1
             AUX_DCCM_BUILD => Ok(0x00),            // no DCCM (unified SRAM)
             AUX_ICCM_BUILD => Ok(0x00),            // no ICCM (unified SRAM)
-            // Cache control registers (D-cache 4KB 8-way, I-cache 8KB 8-way)
+            // Cache control registers. The geometry is in `cache.rs`: D-cache
+            // 4 KB / 32 B lines, I-cache 4 KB / 1-way / 128 sets / 32 B lines,
+            // the latter measured by execution on silicon (see that file).
+            // The labels here used to read "D-cache 4KB 8-way, I-cache 8KB
+            // 8-way" — both way counts and the I-cache size were wrong, and
+            // contradicted `cache.rs` sitting next to them. The VALUES below
+            // were always right; only the comments were not.
             0x47 => Ok(0x00),                      // IC_CTRL
             0x48 => Ok(self.aux_dc_ctrl),          // DC_CTRL (shadow, synced to DCache in Memory)
             0x49 => Ok(0x00),                      // CACHE_BYPASS
             AUX_D_CACHE_BUILD => Ok(0x00013001),   // 4KB D-cache present
-            AUX_I_CACHE_BUILD => Ok(0x00023001),   // 8KB I-cache present
+            AUX_I_CACHE_BUILD => Ok(0x00023001),   // 4KB I-cache present
             AUX_MULTIPLY_BUILD => Ok(0x00),        // absent on real HW
             AUX_SWAP_BUILD => Ok(0x01),
             AUX_NORM_BUILD => Ok(0x02),
@@ -461,8 +493,13 @@ impl CpuState {
         // User mode cannot write most aux regs
         if self.flag_u {
             match addr {
+                // AUX_IENABLE is not listed: an absent address is not a
+                // privileged register. A user-mode write to it is absorbed
+                // like any other absent aux. -- INFERRED: user mode is never
+                // entered in practice, so neither behaviour has been measured;
+                // consistency with the other absent addresses is the tie-breaker.
                 AUX_STATUS32 | AUX_STATUS32_L1 | AUX_STATUS32_L2 | AUX_INT_VECTOR_BASE
-                | AUX_IENABLE | AUX_ITRIGGER | AUX_IRQ_LEV | AUX_IRQ_HINT
+                | AUX_ITRIGGER | AUX_IRQ_LEV | AUX_IRQ_HINT
                 | AUX_ERET | AUX_ERBTA | AUX_ERSTATUS | AUX_EFA | AUX_IRQ_PULSE_CANCEL => {
                     return Err(Exception::PrivilegeViolation { address: self.pc });
                 }
@@ -557,10 +594,8 @@ impl CpuState {
                 self.aux_efa = val;
                 Ok(())
             }
-            AUX_IENABLE => {
-                self.aux_ienable = val;
-                Ok(())
-            }
+            // AUX_IENABLE (0x40C): unimplemented — the write is discarded by
+            // the `_` arm, exactly like any other absent auxiliary address.
             AUX_ITRIGGER => {
                 self.aux_itrigger = val;
                 Ok(())
@@ -585,7 +620,7 @@ impl CpuState {
             0x47 => Ok(()),  // DC_IVDC: write handled by executor post-processing
             0x48 => {
                 // DC_CTRL: update shadow register. Executor syncs to DCache.
-                // RW mask 0xE7 applied per HW verification (scan7b test 5).
+                // RW mask 0xE7 applied per hardware verification.
                 // Only bits 0, 1, 2, 5, 6, 7 are writable.
                 self.aux_dc_ctrl = val & 0xE7;
                 Ok(())

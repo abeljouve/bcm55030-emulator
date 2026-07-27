@@ -111,7 +111,6 @@ fn di_programmed_nco_slot_is_used_for_interrupt_vectoring() {
     // A 16-bit NOP_S at PC=0; executing it then takes the pending IRQ.
     cpu.mem.load_binary(0x0, &[0x78, 0xE0]);
     cpu.state.pc = 0x0;
-    cpu.state.aux_ienable = 0xFFFF_FFFF;
     cpu.state.aux_irq_lev = 0; // IRQ-5 = level 1
     cpu.state.flag_e1 = true;
     cpu.state.aux_irq_pending = 1 << 5;

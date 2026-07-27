@@ -21,17 +21,36 @@ use crate::soc::bank::{BootMode, PeripheralBank, BANK_TICK_PRESCALER};
 /// UART interrupt number (IRQ 5, level 1 per aux_irq_lev = 0xD7 bit 5 = 0).
 const UART_IRQ: u32 = 5;
 
-/// UART IRQ poll prescaler (audit 3.2).
+/// UART IRQ poll prescaler.
 const UART_PRESCALER: u64 = 256;
 
-/// Number of consecutive same-PC steps before the emulator treats
-/// the tight loop as a watchdog-triggered warm reset. On real
-/// BCM55030 hardware, `system_reboot_infinite_loop` configures
-/// Timer 1 for a 100 ms watchdog that resets the chip; the CPU
-/// spins on `b .` until the timer fires. Modelling this as a
-/// simple PC-stall detector avoids burning host time on millions
-/// of no-op iterations.
+/// Number of consecutive same-PC steps after which a spin is *recognised*.
+///
+/// Recognising a spin is NOT the same as deciding what it means — see
+/// [`Cpu::classify_spin`]. This threshold only says "the PC has stopped
+/// moving"; whether that ends in a watchdog reset, an interrupt, or a
+/// permanent hang is decided from the timer control registers.
 const TIGHT_LOOP_THRESHOLD: u32 = 64;
+
+/// ARC timer `CONTROL` bit 0 — IE, interrupt enable.
+/// (`docs/isa/05-registers.md`, Figure 66.)
+const TIMER_CTRL_IE: u32 = 1 << 0;
+/// ARC timer `CONTROL` bit 2 — W, "enable watchdog reset signal".
+const TIMER_CTRL_W: u32 = 1 << 2;
+
+/// What a stalled PC actually means on this SoC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpinVerdict {
+    /// A timer has its W (watchdog) bit set: the chip really will reset, at
+    /// the moment that timer reaches its limit — not before.
+    WatchdogArmed,
+    /// Interrupts can still be delivered, so something can still break the
+    /// spin. This is the ordinary "wait here until the ISR runs" idiom.
+    Interruptible,
+    /// No watchdog, no path for an interrupt: nothing in the machine can ever
+    /// change the PC again. Silicon sits here forever.
+    Hung,
+}
 
 pub struct Cpu {
     pub state: CpuState,
@@ -84,6 +103,12 @@ pub struct Cpu {
     /// which both mutates shared state and (pre-fix) could panic deep in the
     /// boot path, killing the worker and dropping fuzz cases nondeterministically.
     pub tight_loop_halts: bool,
+
+    /// Optional cycle-accurate cache + bus-contention shadow (the `timing`
+    /// feature). `None` unless explicitly enabled via [`Cpu::enable_timing`];
+    /// with the feature off this field does not exist and the ISS is unchanged.
+    #[cfg(feature = "timing")]
+    pub timing_shadow: Option<crate::timing::TimingShadow>,
 }
 
 impl Cpu {
@@ -105,6 +130,8 @@ impl Cpu {
             tight_loop_count: 0,
             tight_loop_last_pc: u32::MAX,
             tight_loop_halts: false,
+            #[cfg(feature = "timing")]
+            timing_shadow: None,
         }
     }
 
@@ -131,6 +158,8 @@ impl Cpu {
             tight_loop_count: 0,
             tight_loop_last_pc: u32::MAX,
             tight_loop_halts: false,
+            #[cfg(feature = "timing")]
+            timing_shadow: None,
         }
     }
 
@@ -138,6 +167,59 @@ impl Cpu {
     /// grab the UART mpsc sender and wire stdin → UART input.
     pub fn bank(&self) -> Option<&Arc<RwLock<PeripheralBank>>> {
         self.bank.as_ref()
+    }
+
+    /// Enable the optional cycle-accurate cache + bus-contention timing overlay
+    /// (the `timing` feature). Opt-in: with the overlay off the functional ISS
+    /// behaves exactly as before. When on, each executed uncached load runs a
+    /// contention window and the CPU halts with a `BUS_DEADLOCK` report if the
+    /// fetch-vs-load starvation invariant fires.
+    #[cfg(feature = "timing")]
+    pub fn enable_timing(&mut self, cfg: crate::timing::TimingConfig) {
+        self.timing_shadow = Some(crate::timing::TimingShadow::new(cfg));
+    }
+
+    /// Extract the timing overlay's per-instruction inputs from a decoded
+    /// instruction and the current register state: `Some((ea, mmio))` if it is
+    /// an uncached load, and whether it is a SYNC barrier. The effective
+    /// address is resolved from the current registers (loop-invariant for the
+    /// poll loops the model targets), and "uncached" is `.di` or any address
+    /// outside the D-cacheable SRAM window.
+    #[cfg(feature = "timing")]
+    fn timing_load_info(inst: &Instruction, state: &CpuState) -> (Option<(u32, bool)>, bool) {
+        use crate::decoder::instruction::{DataSize, WritebackMode, ZeroOp};
+        match inst {
+            Instruction::Load {
+                base,
+                offset,
+                cache_bypass,
+                writeback,
+                data_size,
+                ..
+            } => {
+                let base_val = executor::resolve_value(*base, state).unwrap_or(0);
+                let off_val = executor::resolve_value(*offset, state).unwrap_or(0);
+                let ea = match writeback {
+                    WritebackMode::PostWrite => base_val,
+                    WritebackMode::Scaled => {
+                        let scale = match data_size {
+                            DataSize::Word => 4u32,
+                            DataSize::HalfWord => 2,
+                            DataSize::Byte => 1,
+                        };
+                        base_val.wrapping_add(off_val.wrapping_mul(scale))
+                    }
+                    _ => base_val.wrapping_add(off_val),
+                };
+                // Any address outside the D-cacheable SRAM window bypasses the
+                // D-cache (MMIO / peripheral space) — a wide-latency bus load.
+                let mmio = ea >= crate::memory::SRAM_SIZE as u32;
+                let uncached = *cache_bypass || mmio;
+                (uncached.then_some((ea, mmio)), false)
+            }
+            Instruction::ZeroOp(ZeroOp::Sync) => (None, true),
+            _ => (None, false),
+        }
     }
 
     /// Reset CPU state, SRAM, and peripheral bank **in place**
@@ -207,7 +289,6 @@ impl Cpu {
         self.mem.dcache_invalidate_all().ok();
         self.mem.icache_invalidate_all();
 
-        self.state.aux_ienable = 0xFFFFFFFF;
         self.state.flag_e1 = true;
         self.state.flag_e2 = true;
         self.shadow_call_stack.clear();
@@ -325,6 +406,17 @@ impl Cpu {
             };
         }
 
+        // Timing overlay: capture the load's effective address / SYNC BEFORE
+        // execute, because a writeback (`.aw`/`.ab`) load mutates its base
+        // register and would give the wrong post-execute EA (and hence a wrong
+        // MMIO classification at the SRAM boundary).
+        #[cfg(feature = "timing")]
+        let timing_pre = if self.timing_shadow.is_some() {
+            Some(Self::timing_load_info(&decoded.inst, &self.state))
+        } else {
+            None
+        };
+
         // Execute
         self.state.pc_written = false;
         self.state.link_executed = false;
@@ -356,17 +448,60 @@ impl Cpu {
 
         self.state.instruction_count += 1;
 
-        // Tight-loop detection: if the PC is the same as last step,
-        // the CPU is spinning on `b .` (branch to self). After
-        // TIGHT_LOOP_THRESHOLD consecutive same-PC steps, treat this
-        // as the BCM55030 Timer 1 watchdog firing and trigger a warm
-        // reset. This models `system_reboot_infinite_loop` which
-        // configures Timer 1 for 100 ms then spins — the watchdog
-        // resets the chip on real hardware.
+        // Cycle-accurate cache + bus-contention overlay (opt-in `timing`
+        // feature). Purely observational: the instruction has already executed
+        // functionally above; the shadow only accounts for contention and, if
+        // the fetch-vs-load starvation invariant fires, halts the CPU with a
+        // BUS_DEADLOCK report. `decoded.pc` is the instruction address and
+        // `self.state.pc` is the next fetch address (the fetch-ahead origin).
+        #[cfg(feature = "timing")]
+        if let Some((load, is_sync)) = timing_pre {
+            let insn_pc = decoded.pc;
+            let next_pc = self.state.pc;
+            // Disjoint field borrows: the shadow and memory are separate fields.
+            let shadow = self.timing_shadow.as_mut().unwrap();
+            let hit_deadlock = shadow.on_instruction(insn_pc, load, next_pc, is_sync, &self.mem);
+            self.state.debug_load_pending = shadow.load_pending;
+            if hit_deadlock {
+                if let Some(rep) = shadow.deadlock {
+                    eprintln!(
+                        "[BUS_DEADLOCK] pc=0x{:08X} load_ea=0x{:08X} mmio={} \
+aliasing_fetch_line={:?} set_index={:?} starve={} cyc={} \
+(DEBUG.LD=1: load starved by fixed-priority fetch stream)",
+                        rep.pc,
+                        rep.load_ea,
+                        rep.load_mmio,
+                        rep.aliasing_fetch_line.map(|l| format!("0x{l:08X}")),
+                        rep.set_index,
+                        rep.starve_cycles,
+                        rep.cycle,
+                    );
+                }
+                self.state.halted = true;
+                self.state.pause_reason = crate::cpu::registers::PauseReason::BusDeadlock;
+                return Ok(());
+            }
+        }
+
+        // Spin detection: if the PC is the same as last step, the CPU is
+        // spinning on `b .` (branch to self).
         //
-        // Only active in SoC mode (bank present) — flat-mode tests
-        // have no watchdog to model and may legitimately reach zero-
-        // filled memory that decodes as branch-to-self.
+        // What happens next is NOT the detector's call — it is decided by the
+        // ARC timer control registers, exactly as on silicon
+        // (`classify_spin`). Previously this site rebooted the SoC
+        // unconditionally after 64 identical steps, which was wrong twice
+        // over: it rebooted even when no watchdog was armed (silicon just
+        // spins forever), and it did so ~64 instructions in rather than at the
+        // ~15.6 M instructions a 100 ms watchdog takes at 156.25 MHz — a
+        // reboot cadence ~250 000x too fast. That fabricated reboot loop is
+        // divergence D1 of `docs/bugs/emu-reboot-halt-and-transfer-model-divergences.md`,
+        // and it is the same failure shape as the D4 icache zero-fill: an
+        // emulator-invented reboot standing where the real symptom was, wiping
+        // the SRAM an investigator needed to read.
+        //
+        // Only active in SoC mode (bank present) — flat-mode tests have no
+        // timers to consult and may legitimately reach zero-filled memory that
+        // decodes as branch-to-self.
         if self.bank.is_some() {
             if self.state.pc == self.tight_loop_last_pc {
                 self.tight_loop_count += 1;
@@ -378,12 +513,41 @@ impl Cpu {
                         self.state.halted = true;
                         return Ok(());
                     }
-                    eprintln!(
-                        "[BCM55030] Tight loop at PC=0x{:08X} ({} iters) — watchdog warm reboot",
-                        self.state.pc, self.tight_loop_count
-                    );
-                    self.warm_reboot_from_flash();
-                    return Ok(());
+                    match self.classify_spin() {
+                        SpinVerdict::WatchdogArmed => {
+                            // The reset is real, but it belongs to the timer.
+                            // Skip the simulated time the CPU would burn
+                            // spinning so the host doesn't execute millions of
+                            // no-op iterations, then let the timer fire it on
+                            // its own terms (and at its own count).
+                            self.fast_forward_armed_watchdog();
+                            self.tight_loop_count = 0;
+                        }
+                        SpinVerdict::Interruptible => {
+                            // An ISR can still break this. Keep executing —
+                            // that is what the machine does. Re-arm the
+                            // counter so the classification is re-checked
+                            // periodically (the firmware may arm a watchdog,
+                            // or mask interrupts, while spinning) without
+                            // re-running it every single step.
+                            self.tight_loop_count = 0;
+                        }
+                        SpinVerdict::Hung => {
+                            // Nothing can ever move the PC again. Stop with
+                            // the state INTACT and say so: registers, SRAM and
+                            // the shadow call stack are the evidence, and a
+                            // reboot would destroy all three.
+                            eprintln!(
+                                "[BCM55030] PC=0x{:08X} spinning with no watchdog armed and \
+                                 interrupts masked -- permanent hang, halting with state intact",
+                                self.state.pc
+                            );
+                            self.state.halted = true;
+                            self.state.pause_reason =
+                                crate::cpu::registers::PauseReason::SpinNoWatchdog(self.state.pc);
+                            return Ok(());
+                        }
+                    }
                 }
             } else {
                 self.tight_loop_count = 0;
@@ -465,14 +629,71 @@ impl Cpu {
         }
     }
 
+    /// Is this timer configured as a watchdog (W bit set, and actually
+    /// counting toward a non-zero limit)?
+    fn timer_is_watchdog(control: u32, limit: u32) -> bool {
+        control & TIMER_CTRL_W != 0 && limit != 0
+    }
+
+    /// Decide what a stalled PC means, from the machine state alone.
+    ///
+    /// This is the whole point of the D1 fix: the outcome of a spin is a
+    /// property of the timer control registers and the interrupt state, not of
+    /// how many host iterations the emulator felt like running.
+    pub fn classify_spin(&self) -> SpinVerdict {
+        let s = &self.state;
+        if Self::timer_is_watchdog(s.aux_control0, s.aux_limit0)
+            || Self::timer_is_watchdog(s.aux_control1, s.aux_limit1)
+        {
+            return SpinVerdict::WatchdogArmed;
+        }
+        // Can anything still interrupt us? Both the global enables (E1/E2) and
+        // an actual source have to be there. A timer with IE set is a source;
+        // so is any already-pending or peripheral-driven line.
+        let globally_enabled = s.flag_e1 || s.flag_e2;
+        let timer_irq_source = (s.aux_control0 & TIMER_CTRL_IE != 0 && s.aux_limit0 != 0)
+            || (s.aux_control1 & TIMER_CTRL_IE != 0 && s.aux_limit1 != 0);
+        let external_source = s.aux_irq_pending != 0 || self.bank.as_ref().map(|b| b.read().irq_pending != 0).unwrap_or(false);
+        if globally_enabled && (timer_irq_source || external_source) {
+            SpinVerdict::Interruptible
+        } else {
+            SpinVerdict::Hung
+        }
+    }
+
+    /// Skip the simulated time a spinning CPU would burn before its armed
+    /// watchdog fires: advance each armed watchdog's COUNT to just below its
+    /// LIMIT, so the very next tick fires it through the normal path.
+    ///
+    /// The reset still happens in `tick_arc_timers_once`, at the count the
+    /// firmware programmed — we only decline to execute the ~15.6 M no-op
+    /// iterations in between, which no observer can distinguish (the CPU is
+    /// provably not changing any state: same PC, `b .`).
+    fn fast_forward_armed_watchdog(&mut self) {
+        if Self::timer_is_watchdog(self.state.aux_control0, self.state.aux_limit0) {
+            self.state.aux_count0 = self.state.aux_limit0.saturating_sub(1);
+        }
+        if Self::timer_is_watchdog(self.state.aux_control1, self.state.aux_limit1) {
+            self.state.aux_count1 = self.state.aux_limit1.saturating_sub(1);
+        }
+    }
+
     /// Increment ARC Timer0 and Timer1 by one tick each.
     fn tick_arc_timers_once(&mut self) {
+        let mut watchdog_reset = false;
         // Timer 0 (IRQ 3)
         self.state.aux_count0 = self.state.aux_count0.wrapping_add(1);
         if self.state.aux_limit0 != 0 && self.state.aux_count0 >= self.state.aux_limit0 {
             self.state.aux_control0 |= 0x08;
-            if self.state.aux_control0 & 0x01 != 0 {
+            if self.state.aux_control0 & TIMER_CTRL_IE != 0 {
                 self.state.aux_irq_pending |= 1 << 3;
+            }
+            // W (bit 2): "enable watchdog reset signal"
+            // (`docs/isa/05-registers.md` Figure 66). Modelled here rather
+            // than faked by the spin detector, so a watchdog resets the chip
+            // when the firmware armed one — and ONLY then.
+            if self.state.aux_control0 & TIMER_CTRL_W != 0 {
+                watchdog_reset = true;
             }
             if self.state.aux_control0 & 0x02 == 0 {
                 self.state.aux_count0 = 0;
@@ -482,10 +703,20 @@ impl Cpu {
         self.state.aux_count1 = self.state.aux_count1.wrapping_add(1);
         if self.state.aux_limit1 != 0 && self.state.aux_count1 >= self.state.aux_limit1 {
             self.state.aux_control1 |= 0x08;
-            if self.state.aux_control1 & 0x01 != 0 {
+            if self.state.aux_control1 & TIMER_CTRL_IE != 0 {
                 self.state.aux_irq_pending |= 1 << self.state.timer1_irq;
             }
+            if self.state.aux_control1 & TIMER_CTRL_W != 0 {
+                watchdog_reset = true;
+            }
             self.state.aux_count1 = 0;
+        }
+        if watchdog_reset && self.bank.is_some() {
+            eprintln!(
+                "[BCM55030] Timer watchdog (CONTROL.W) expired at PC=0x{:08X} -- warm reset",
+                self.state.pc
+            );
+            self.warm_reboot_from_flash();
         }
     }
 
@@ -510,7 +741,15 @@ impl Cpu {
             return false;
         }
 
-        let pending = self.state.aux_irq_pending & self.state.aux_ienable;
+        // No per-line enable mask. `AUX_IENABLE` (0x40C) is unimplemented on
+        // this integration: a read returns `IDENTITY` and a write is
+        // discarded, so nothing gates a line here. Delivery depends only on
+        // the peripheral asserting (which is what set the pending bit), the
+        // line's level from `AUX_IRQ_LEV` (0x200), and the matching `E1`/`E2`
+        // bit of `STATUS32`, all applied below.
+        // -- OBSERVED, DATASHEET §6.1: Timer 1 / IRQ 7 was delivered 19 001
+        // times in a run whose own `0x40C` readback showed bit 7 clear.
+        let pending = self.state.aux_irq_pending;
         if pending == 0 {
             return false;
         }
@@ -530,10 +769,9 @@ impl Cpu {
             self.state.aux_bta_l2 = self.state.aux_bta;
             self.state.core_regs[REG_ILINK2 as usize] = self.state.pc;
             self.state.aux_icause2 = irq;
-            // L2 entry: keep E1 set (matches old behaviour). Audit 2.4
-            // asked for clearing both E1 and E2 per spec, but doing so
-            // caused a boot regression at 0x4428 — needs separate RE
-            // before re-enabling. Tracked in the design notes §2.4.
+            // L2 entry: keep E1 set (matches observed behaviour). Clearing
+            // both E1 and E2 per the generic ARC spec caused a boot
+            // regression on this integration, so it is deliberately not done.
             self.state.flag_e2 = false;
             self.state.flag_a2 = true;
             self.state.flag_de = false;
@@ -573,11 +811,10 @@ impl Cpu {
         // `Memory::write_*_data`), and the ARC interrupt unit fetches
         // its vector from the NCO — NOT from SRAM at `base + N*8`.
         // Each installed slot is a `j @<absolute>` (`2020 0f80 hi lo`)
-        // so taking the interrupt jumps straight to `<hi:lo>`.
-        // Evidence: Ghidra `nco_write_channel` @0x5a18 /
-        // `hw_install_irq_vector_2` @0x20042d00; "NCO table IS the ARC
-        // IVT" RE swarm (live slot0 = `j @0x150`). When the channel
-        // was never programmed as a `j @limm` vector the model falls
+        // so taking the interrupt jumps straight to `<hi:lo>`. The NCO
+        // table serving as the ARC interrupt-vector table is verified
+        // against real hardware. When the channel was never programmed
+        // as a `j @limm` vector the model falls
         // back to the SRAM IVT slot — covering reset, exception
         // vectors, and any not-yet-installed channel.
         let vector = irq;

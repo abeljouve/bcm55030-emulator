@@ -158,9 +158,9 @@ pub fn execute(
                     let val = resolve_value(*src, state)?;
                     mem.dcache_invalidate_line(val)?;
                 }
-                // 0x4B (DC_FLSH): no handler needed — scan7b test 9 verified
-                // DC_FLSH is a no-op on real BCM55030. write_aux_reg silently
-                // absorbs the write via the default fallthrough.
+                // 0x4B (DC_FLSH): no handler needed — DC_FLSH is a no-op on
+                // real BCM55030 (verified against real hardware). write_aux_reg
+                // silently absorbs the write via the default fallthrough.
                 0x58 => {
                     // DC_RAM_ADDR: set probe address for DC_TAG/DC_DATA reads
                     let val = resolve_value(*src, state)?;
@@ -168,18 +168,17 @@ pub fn execute(
                 }
                 0x10 => {
                     // IC_IVIC: invalidate entire I-cache on any write.
-                    // Firmware `hw_auxreg_trigger_write` (ram:20042d48) writes 0
-                    // as the flush trigger, so gating on a bit value would miss
-                    // the real firmware flush path.
+                    // Firmware may write 0 as the flush trigger, so gating on a
+                    // bit value would miss the real flush path — any write flushes.
                     let _ = resolve_value(*src, state)?;
                     mem.icache_invalidate_all();
                 }
                 0x19 => {
                     // IC_IVIL: single-line I-cache invalidate. NO-OP on
-                    // BCM55030 — HW-verified (scan7d v3, DATASHEET §5.2,
-                    // CLAUDE.md). Only IC_IVIC (0x10) actually flushes.
-                    // The address operand is still resolved/consumed so a
-                    // side-effecting source register is read as on silicon.
+                    // BCM55030 — verified against real hardware (DATASHEET §5.2).
+                    // Only IC_IVIC (0x10) actually flushes. The address operand
+                    // is still resolved/consumed so a side-effecting source
+                    // register is read as on silicon.
                     let _ = resolve_value(*src, state)?;
                 }
                 _ => {}
