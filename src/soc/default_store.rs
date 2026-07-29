@@ -214,7 +214,7 @@ mod tests {
     fn store_no_autoclear_of_high_bits() {
         let mut s = DefaultRegisterStore::new(AddressRange::new(0x1000_0000, 0x1000_0100));
         s.write_word(0x1000_0000, 0xF800_0042).unwrap();
-        // Audit 5.8 guard: bits 27-31 must NOT be auto-cleared.
+        // Guard: bits 27-31 must NOT be auto-cleared.
         assert_eq!(s.read_word(0x1000_0000).unwrap(), 0xF800_0042);
         assert_eq!(s.read_word(0x1000_0000).unwrap(), 0xF800_0042);
     }

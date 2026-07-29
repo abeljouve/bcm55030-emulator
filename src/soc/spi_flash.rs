@@ -22,6 +22,32 @@ const CMD_CP: u8 = 0xAD;     // Continuously Program
 const SR_WIP: u8 = 0x01;     // Write In Progress
 const SR_WEL: u8 = 0x02;     // Write Enable Latch
 
+// ── How long a write takes ─────────────────────────────────────────────
+//
+// A program or erase is not instantaneous, and firmware knows it: every
+// driver polls `WIP` after issuing one. Leaving the bit at zero makes all
+// of those loops exit on their first iteration, so a page program can
+// report success while the page is still blank on real silicon.
+//
+// Durations are the typical figures from the part's AC characteristics
+// (Macronix MX25L3235E). They are converted to bank ticks, the only clock
+// this model has: a tick is `BANK_TICK_PRESCALER` = 64 instructions, and at
+// 156.25 MHz and the measured ~1.76 cycles per instruction that is ~0.72 µs.
+// -- INFERRED for the conversion (it inherits the average-CPI assumption);
+// OBSERVED for the durations themselves.
+const TICK_NS: u64 = 720;
+const fn ms_to_ticks(ms: u64) -> u32 {
+    ((ms * 1_000_000) / TICK_NS) as u32
+}
+/// Page program, 0.7 ms typical.
+const PP_TICKS: u32 = ms_to_ticks(1) * 7 / 10;
+/// Sector erase (4 KiB), 40 ms typical.
+const SE_TICKS: u32 = ms_to_ticks(40);
+/// Block erase (64 KiB), 0.6 s typical.
+const BE_TICKS: u32 = ms_to_ticks(600);
+/// Chip erase, 25 s typical.
+const CE_TICKS: u32 = ms_to_ticks(25_000);
+
 // JEDEC ID for MX25L3235E
 const JEDEC_MANUFACTURER: u8 = 0xC2;
 const JEDEC_MEMORY_TYPE: u8 = 0x20;
@@ -32,6 +58,10 @@ const DEVICE_ID: u8 = 0x15;
 pub struct SpiFlash {
     pub data: Vec<u8>,
     status: u8,
+    /// Bank ticks left before the current program/erase completes. While
+    /// non-zero the status register reports `WIP`, which is what firmware
+    /// polls. Zero means idle.
+    busy_ticks: u32,
     /// Set when flash contents are modified (PP, SE, BE, CE, DMA write).
     /// Used to decide whether to persist flash to disk on exit.
     pub dirty: bool,
@@ -52,21 +82,38 @@ pub struct SpiFlash {
     /// command, the chip remembers it. Cleared by `CMD_WRDI` and by
     /// `reset_volatile`.
     ///
-    /// Evidence: the reference firmware `fds_read_llid_flag_byte` (the decompiler
-    /// 0x20011d74) and reference bootloader `spi_flash_write_command`
-    /// (rt 0x4b54) both emit AAI start (`SPI_STATUS=0x61`) followed by
+    /// Firmware drivers emit AAI start (`SPI_STATUS=0x61`) followed by
     /// AAI continuations (`SPI_STATUS=0x31`) and terminate with WRDI
-    /// (`SPI_STATUS=0x11`). See bug
-    /// the design notes
-    /// section D3.
+    /// (`SPI_STATUS=0x11`).
     aai_addr: Option<u32>,
 }
 
 impl SpiFlash {
+    /// The status register as software reads it: the stored bits with the
+    /// live `WIP` overlaid.
+    pub fn read_status(&self) -> u8 {
+        if self.busy_ticks > 0 {
+            self.status | SR_WIP
+        } else {
+            self.status & !SR_WIP
+        }
+    }
+
+    /// True while a program or erase is still running.
+    pub fn is_busy(&self) -> bool {
+        self.busy_ticks > 0
+    }
+
+    /// Advance the program/erase timer by one bank tick.
+    pub fn tick(&mut self) {
+        self.busy_ticks = self.busy_ticks.saturating_sub(1);
+    }
+
     pub fn new() -> Self {
         Self {
             data: vec![0xFF; FLASH_SIZE],
             status: 0x00, // not busy, write disabled
+            busy_ticks: 0,
             dirty: false,
             baseline: None,
             aai_addr: None,
@@ -78,6 +125,7 @@ impl SpiFlash {
     /// cycles — callers that want a fresh chip must reseat `data`.
     pub fn reset_volatile(&mut self) {
         self.status = 0x00;
+        self.busy_ticks = 0;
         self.aai_addr = None;
     }
 
@@ -135,7 +183,9 @@ impl SpiFlash {
                 }
             }
             CMD_RDSR => {
-                if rx_len >= 1 { rx[0] = self.status; }
+                // WIP is an overlay on the stored status, not a stored bit:
+                // it reflects whether a program or erase is still running.
+                if rx_len >= 1 { rx[0] = self.read_status(); }
             }
             CMD_WREN => {
                 self.status |= SR_WEL;
@@ -181,6 +231,7 @@ impl SpiFlash {
                         self.data[flash_addr] &= tx[i];
                     }
                     self.dirty = true;
+                    self.busy_ticks = PP_TICKS;
                 }
                 self.status &= !SR_WEL;
             }
@@ -192,6 +243,7 @@ impl SpiFlash {
                         let end = (sector_base + 4096).min(FLASH_SIZE);
                         self.data[sector_base..end].fill(0xFF);
                         self.dirty = true;
+                        self.busy_ticks = SE_TICKS;
                     }
                 }
                 self.status &= !SR_WEL;
@@ -204,6 +256,7 @@ impl SpiFlash {
                         let end = (block_base + 65536).min(FLASH_SIZE);
                         self.data[block_base..end].fill(0xFF);
                         self.dirty = true;
+                        self.busy_ticks = BE_TICKS;
                     }
                 }
                 self.status &= !SR_WEL;
@@ -212,6 +265,7 @@ impl SpiFlash {
                 if self.status & SR_WEL != 0 {
                     self.data.fill(0xFF);
                     self.dirty = true;
+                    self.busy_ticks = CE_TICKS;
                 }
                 self.status &= !SR_WEL;
             }
@@ -230,9 +284,9 @@ impl SpiFlash {
                 //
                 // Both bursts require WEL set. **WEL stays set across
                 // an AAI sequence** on real silicon and is only cleared
-                // by WRDI — the the reference firmware relies on this
-                // (their AAI-exit WRDI loop polls WEL waiting for it to
-                // clear). Do NOT clear WEL in this handler.
+                // by WRDI — firmware drivers rely on this (their AAI-exit
+                // WRDI loop polls WEL waiting for it to clear). Do NOT
+                // clear WEL in this handler.
                 if self.status & SR_WEL == 0 {
                     // No write-enable → real chip ignores the command.
                 } else if tx.len() == 6 {
@@ -313,6 +367,56 @@ mod tests {
         assert_eq!(rx[1], 0x15);
     }
 
+    /// A program or erase is not instantaneous, and WIP is how firmware
+    /// finds out. -- OBSERVED, part AC characteristics: 0.7 ms typical
+    /// for a page program, 40 ms for a sector erase.
+    ///
+    /// If the bit is never assigned, every WIP poll in every driver exits
+    /// on its first iteration — so a page program can pass on the model
+    /// yet leave the page blank on real hardware.
+    #[test]
+    fn a_program_reports_write_in_progress_until_it_finishes() {
+        let mut flash = SpiFlash::new();
+        flash.execute_fifo_command(&[CMD_WREN], 0);
+        flash.execute_fifo_command(&[CMD_PP, 0x00, 0x10, 0x00, 0xA5], 0);
+
+        assert!(flash.is_busy(), "a page program must report busy");
+        assert_eq!(flash.execute_fifo_command(&[CMD_RDSR], 1)[0] & SR_WIP, SR_WIP);
+
+        // It takes a bounded number of ticks, and the poll ends.
+        let mut ticks = 0u32;
+        while flash.is_busy() {
+            flash.tick();
+            ticks += 1;
+            assert!(ticks < PP_TICKS + 2, "program never completed");
+        }
+        assert_eq!(ticks, PP_TICKS);
+        assert_eq!(flash.execute_fifo_command(&[CMD_RDSR], 1)[0] & SR_WIP, 0);
+    }
+
+    /// An erase is two orders of magnitude slower than a program, and the
+    /// model keeps that ratio rather than flattening both to zero.
+    #[test]
+    fn a_sector_erase_takes_far_longer_than_a_program() {
+        let mut flash = SpiFlash::new();
+        flash.execute_fifo_command(&[CMD_WREN], 0);
+        flash.execute_fifo_command(&[CMD_SE, 0x00, 0x10, 0x00], 0);
+        assert!(flash.is_busy());
+        assert!(SE_TICKS > PP_TICKS * 50, "erase/program ratio lost");
+    }
+
+    /// Reset ends any pending operation — a power cycle does not leave the
+    /// chip reporting busy forever.
+    #[test]
+    fn reset_clears_a_pending_operation() {
+        let mut flash = SpiFlash::new();
+        flash.execute_fifo_command(&[CMD_WREN], 0);
+        flash.execute_fifo_command(&[CMD_SE, 0x00, 0x10, 0x00], 0);
+        assert!(flash.is_busy());
+        flash.reset_volatile();
+        assert!(!flash.is_busy());
+    }
+
     #[test]
     fn test_status_register() {
         let mut flash = SpiFlash::new();
@@ -348,11 +452,8 @@ mod tests {
     }
 
     /// SST AAI: a 4-byte program issued as one start burst + one
-    /// continuation burst, exactly as the reference firmware's
-    /// `flash_clear_lane_direction_record` (writing 4 zero bytes) emits
-    /// it. Pre-D3-fix this stayed `[0xFF; 4]` because the continuation
-    /// was silently dropped. See bug
-    /// the design notes D3.
+    /// continuation burst (writing 4 zero bytes). If the continuation is
+    /// silently dropped, the target stays `[0xFF; 4]`.
     #[test]
     fn test_aai_program_4_bytes_zero() {
         let mut flash = SpiFlash::new();
@@ -368,7 +469,7 @@ mod tests {
     }
 
     /// AAI keeps WEL set across the burst chain; only WRDI clears it.
-    /// The the reference firmware's AAI-exit loop polls WEL waiting for clear.
+    /// A firmware AAI-exit loop polls WEL waiting for that clear.
     #[test]
     fn test_aai_keeps_wel_until_wrdi() {
         let mut flash = SpiFlash::new();

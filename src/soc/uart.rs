@@ -1,21 +1,19 @@
-//! BCM55030 UART — SFP+ console port peripheral.
+//! BCM55030 UART — console port peripheral.
 //!
 //! MMIO aperture: `0x00FC1000..0x00FC1100`. A single 16550-like controller
 //! mirrored 8× every `0x20` bytes (verified on real hardware). Per-channel
 //! registers: `DATA = +0x10`, `IER/STATUS = +0x14`, `BAUD_LO = +0x18`,
 //! `BAUD_HI = +0x1C`. Per-channel offsets `0x00..0x0F` are unclaimed.
 //!
-//! Session 1 notes:
-//! - `held_pre_firmware` / `firmware_loaded` / `FIRMWARE_BASE` handling **removed**.
-//!   The hardware has no concept of the loaded firmware. Bytes typed during the
-//!   bootloader are consumed by the bootloader's own CLI prompt
-//!   (`FFFF/>`) just like on real silicon. To drive the firmware, type after
-//!   seeing the `2000/>` prompt.
+//! The hardware has no concept of a loaded firmware: bytes typed on the
+//! console are consumed by whatever CLI is currently running, just like
+//! on real silicon.
+//!
 //! - Input arrives via the bank's mpsc channel; `PeripheralBank::tick`
 //!   drains the receiver and calls [`Uart::push_rx_byte`] for each byte.
 //! - TX bytes go to `stdout` (CLI mode) and are mirrored into a bounded
-//!   `tx_log` ring so the future UI can render the console output in a
-//!   panel without racing with stdout.
+//!   `tx_log` ring so the UI can render the console output in a panel
+//!   without racing with stdout.
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
@@ -98,8 +96,8 @@ impl Uart {
     }
 
     /// Compose the IER/STATUS register with live hardware bits overlaid.
-    /// Bit 5 = RX buffer empty, bit 7 = TX complete (always 1 in v1
-    /// because TX goes to stdout synchronously; audit 6.3 is noted).
+    /// Bit 5 = RX buffer empty, bit 7 = TX complete (always 1 because
+    /// TX goes to stdout synchronously).
     fn read_ier(&self) -> u8 {
         let mut val = self.ier;
         if self.rx_queue.is_empty() {

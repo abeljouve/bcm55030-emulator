@@ -128,8 +128,8 @@ pub enum FatalFilterEvent {
     SetLinkUp(u8, bool),
 }
 
-/// Alarm dispatch UI-driven mutations. Session 5 exposes these as
-/// a **test harness**, not a faithful HW path — the real alarm
+/// Alarm dispatch UI-driven mutations. Exposed as a **test
+/// harness**, not a faithful HW path — the real alarm
 /// events on silicon arrive through EPON MAC LLID teardown,
 /// stats-counter overflow, and GPIO/PMD pin changes. Forcing an
 /// opcode manually lets the UI drive the firmware's alarm
@@ -311,8 +311,8 @@ pub struct AlarmSnapshot {
     /// to 32 distinct opcodes can be tracked.
     pub forced_opcodes: Vec<u16>,
     /// Opcodes pulled from upstream event sources this tick. Empty
-    /// in v1 — wiring to real source peripherals lands in a later
-    /// session (stats overflow, LLID teardown, GPIO pin change).
+    /// for now — wiring to real source peripherals (stats overflow,
+    /// LLID teardown, GPIO pin change) is not yet done.
     pub live_opcodes: Vec<u16>,
 }
 

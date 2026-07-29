@@ -1,14 +1,14 @@
 //! BCM55030 SoC emulation — Peripheral models only.
 //!
-//! Session 1 layout: peripheral trait + bank + first wave of peripherals
-//! (UART, PBC, SPI flash, SFP EEPROM, BSC I²C). Everything else in the
-//! SYSREG range is still served by [`sysreg_shim::SysregShim`], which
-//! will shrink as future sessions land dedicated peripheral modules.
+//! Peripheral trait + bank + the modelled peripherals (UART, PBC, SPI
+//! flash, SFP EEPROM, BSC I²C, and the rest). Anything in the SYSREG
+//! range not yet carved into its own module is served by
+//! [`sysreg_shim::SysregShim`].
 //!
-//! **No firmware hooks.** Per the contributor guide, the previous
-//! `register_hooks()` function at 35 firmware-PC entries is gone — the
-//! stdin replay path is replaced by the mpsc channel exposed by the
-//! bank (`PeripheralBank::uart_rx_sender()`).
+//! **No firmware hooks.** The emulator models the hardware, not any
+//! particular firmware image: there are no per-PC hooks. UART input
+//! arrives through the mpsc channel exposed by the bank
+//! (`PeripheralBank::uart_rx_sender()`).
 
 pub mod alarm_events;
 pub mod lane_bus;
@@ -37,4 +37,5 @@ pub mod spi_flash;
 pub mod sysreg_shim;
 pub mod timer;
 pub mod uart;
-pub mod vlan_lue;
+pub mod lue;
+pub mod mac_filter;

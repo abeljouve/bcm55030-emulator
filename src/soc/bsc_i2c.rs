@@ -11,8 +11,8 @@
 //! are used by the firmware for SerDes PHY indirect register access
 //! (descriptors 0x0411 / 0x0412). Their CMD/DATA addresses overlap
 //! with lane 0 STAT; a `last_cmd_lane` tracker resolves ambiguity.
-//! Calibration done bits (regs 0xBB/0xDB bit 7) are pre-set so that
-//! `serdes_lane_check_calibration_done_bit` returns immediately.
+//! The RX calibration these lanes carry converges as a consequence of
+//! the arming sequence software programs; see `LaneBus`.
 //!
 //! Uses the shared `LaneBus` for CMD/DATA/STAT protocol.
 
@@ -36,9 +36,6 @@ const LANE1_CMD: u32 = LANE1_BASE + 0x48; // 0x01000144
 const LANE2_CMD: u32 = LANE2_BASE + 0x48; // 0x01000148
 const LANE1_DATA: u32 = LANE1_BASE + 0x54; // 0x01000150 (overlaps lane 0 STAT)
 const LANE2_DATA: u32 = LANE2_BASE + 0x54; // 0x01000154
-
-/// SerDes CDR calibration done bit (bit 7 of indirect regs 0xBB/0xDB).
-const CAL_DONE_BIT: u32 = 0x80;
 
 const BSC_RANGES: &[AddressRange] = &[AddressRange::new(BSC_BASE, BSC_END)];
 
@@ -71,10 +68,8 @@ pub struct BscI2c {
 
 impl BscI2c {
     pub fn new() -> Self {
-        let mut lane1 = LaneBus::new(LANE1_BASE, 0);
-        let mut lane2 = LaneBus::new(LANE2_BASE, 0);
-        Self::init_cal_done_bits(&mut lane1);
-        Self::init_cal_done_bits(&mut lane2);
+        let lane1 = LaneBus::new(LANE1_BASE, 0);
+        let lane2 = LaneBus::new(LANE2_BASE, 0);
         Self {
             sfp: SfpEeprom::new_default(),
             bus: LaneBus::new(LANE0_BASE, BSC_BUSY_TICKS),
@@ -93,10 +88,23 @@ impl BscI2c {
         }
     }
 
-    fn init_cal_done_bits(bus: &mut LaneBus) {
-        bus.set_reg(0xBB, CAL_DONE_BIT);
-        bus.set_reg(0xDB, CAL_DONE_BIT);
-    }
+    // WRONG per silicon characterization: an `init_cal_done_bits` used to
+    // force `regs[0xBB] = regs[0xDB] = CAL_DONE_BIT` here, at construction
+    // and on every cold reset.
+    //
+    // previously believed: "Calibration done bits (regs 0xBB/0xDB bit 7)
+    // are pre-set so that a firmware calibration-done check returns
+    // immediately."
+    //
+    // Two things were wrong with it. It fabricated an analog result the
+    // hardware only produces after software arms a calibration. And it
+    // wrote the flat transport reg file at index 0xBB, which is not where a
+    // lane register lives: the register number rides in the staged word and
+    // the file is indexed by the transport's own 9-bit index, so it did not
+    // even place the bit where a firmware read would find it.
+    //
+    // Calibration now converges in `LaneBus` as a consequence of the arming
+    // write, for every bus, this one included.
 
     #[inline]
     pub fn claims(&self, addr: u32) -> bool {
@@ -272,8 +280,6 @@ impl Peripheral for BscI2c {
         self.bus.reset();
         self.lane1.reset();
         self.lane2.reset();
-        Self::init_cal_done_bits(&mut self.lane1);
-        Self::init_cal_done_bits(&mut self.lane2);
         self.last_cmd_lane = 0;
         self.protocol = ProtocolState::Idle;
         self.pending_sub_addr = 0;

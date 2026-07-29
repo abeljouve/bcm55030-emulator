@@ -1,4 +1,4 @@
-//! BCM55030 alarm / event dispatch — Session 5 UI test harness.
+//! BCM55030 alarm / event dispatch — UI test harness.
 //!
 //! This peripheral **does not model hardware**. The real BCM55030
 //! alarm pipeline is driven by upstream event sources:
@@ -6,32 +6,24 @@
 //!   * **LLID teardown events (opcodes 193, 199, 201)** — raised
 //!     by the EPON MAC when a deregister or link-down happens.
 //!   * **Stats counter overflow events (opcodes 23, 64)** — raised
-//!     when a per-LLID counter in the stats file crosses its
-//!     high-water threshold (block 75).
+//!     when a per-LLID counter crosses its high-water threshold
+//!     (block 75).
 //!   * **GPIO / PMD pin-change events (opcodes 28, 131)** — raised
 //!     by physical I/O events not yet modelled.
 //!
-//! Session 5 removes the old `alarm.rs` which synthesised
-//! quiescent-ONU alarm state by writing directly into the
-//! firmware's in-SRAM pending-bit mask table on every tick. That
-//! behaviour violated the contributor guide (no firmware-mode emulation).
-//! Its replacement is this peripheral, which:
+//! This peripheral does not write into firmware SRAM. It:
 //!
 //!   1.  Claims no MMIO range — it has no HW decoder of its own.
-//!   2.  Stores a **UI-forced** pending-opcode set that the user
-//!       can poke via [`AlarmEvent::ForcePending`] /
-//!       [`AlarmEvent::ClearPending`]. The UI snapshot exposes it.
-//!   3.  Does nothing on `tick()` — the firmware now handles the
-//!       alarm flow natively.
+//!   2.  Stores a **UI-forced** pending-opcode set that can be poked
+//!       via [`AlarmEvent::ForcePending`] / [`AlarmEvent::ClearPending`];
+//!       the UI snapshot exposes it.
+//!   3.  Does nothing on `tick()`.
 //!
-//! **Known regression:** without the synthetic seeder, the
-//! `alm/info` and `alm/gpio` CLI commands on a quiescent emulator
-//! will show fewer persistent opcodes than a live ONU capture.
-//! Opcodes 28 and 131 in particular have no current upstream
-//! source in the model; they remain TODO and must be driven
-//! explicitly from the UI through [`AlarmEvent::ForcePending`].
-//! This is audit item 7.1 — remaining partial until every event
-//! source is either modelled or explicitly injected.
+//! **Limitation:** with no synthetic seeder, the `alm/info` and
+//! `alm/gpio` CLI commands on a quiescent emulator show fewer
+//! persistent opcodes than real hardware would. Opcodes 28 and 131 in
+//! particular have no upstream source in the model yet and must be
+//! driven explicitly from the UI through [`AlarmEvent::ForcePending`].
 
 use crate::cpu::exception::Exception;
 use crate::soc::peripheral::{

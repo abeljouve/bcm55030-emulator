@@ -30,12 +30,16 @@ const REG_SPI_CONFIG: u32 = 0x34;
 const REG_DMA_CTRL: u32 = 0x38;
 const REG_DMA_ADDR: u32 = 0x3C;
 const REG_DMA_DATA_ADDR: u32 = 0x40;
+/// Flash address mask, read-only. -- OBSERVED: `0x000FFFFF` on a running
+/// device, the address mask of the 4 MB part.
+const REG_FLASH_SIZE_MASK: u32 = 0x48;
+const FLASH_SIZE_MASK_VALUE: u32 = 0x000F_FFFF;
 
 const PBC_RANGES: &[AddressRange] = &[AddressRange::new(PBC_BASE, PBC_END)];
 
 /// How many bank ticks the SPI busy bit stays set after a command.
-/// Audit 6.1: real hardware is slower than a single CPU step — the
-/// firmware polling loop must see `busy=1` at least once.
+/// Real hardware is slower than a single CPU step — the firmware
+/// polling loop must see `busy=1` at least once.
 const SPI_BUSY_TICKS: u8 = 2;
 
 #[derive(Clone)]
@@ -48,6 +52,9 @@ pub struct Pbc {
     spi_fifo: [u32; 2],
     spi_rx: [u32; 2],
     spi_busy_counter: u8,
+    /// Last command word armed through SPI_STATUS. The register reads it
+    /// back with the go bit cleared once the command has completed.
+    spi_command: u32,
 
     dma_ctrl: u32,
     dma_flash_addr: u32,
@@ -61,22 +68,20 @@ pub struct Pbc {
     /// Pending SerDes SPI slave command — set when `SPI_CONTROL & 0x40`
     /// routed a FIFO command to the SerDes target. The bank dispatches
     /// the stored `(tx, rx_len)` pair to `SerDes::spi_command` and
-    /// feeds the response back via [`Pbc::complete_spi_serdes`].
-    /// Resolves audit 5.2 — the SerDes slave path is no longer a
+    /// feeds the response back via [`Pbc::complete_spi_serdes`]. The
+    /// SerDes slave path is owned by the SerDes peripheral, not a
     /// hardcoded `0xFF` stub inside PBC.
     pending_spi_serdes: Option<(Vec<u8>, usize)>,
 
     /// Last DMA transaction type for MMIO history annotation.
     /// Set on REG_DMA_CTRL write based on ADDR and CMD encoding.
-    /// Evidence: session 2026-05-05-1430, PBC register analysis.
     pub last_dma_tag: &'static str,
 
-    /// Optional DMA-flash-WRITE recorder (boot-diff DMADIFF instrumentation).
-    /// When `Some`, every `complete_flash_write` appends `(flash_addr, data)`.
-    /// The DMA write PAYLOAD is read from the SRAM buffer and is NOT in the
-    /// MMIO write stream, so this is the only way to diff FDS-record CONTENT
-    /// for differential MMIO tracing between two firmware builds. Pure HW-model
-    /// observation, not a firmware hook.
+    /// Optional DMA-flash-write recorder. When `Some`, every
+    /// `complete_flash_write` appends `(flash_addr, data)`. The DMA
+    /// write payload is read from the SRAM buffer and is NOT in the MMIO
+    /// write stream, so this recorder is the only way to observe flash-
+    /// write content. Pure HW-model observation, not a firmware hook.
     pub dma_write_log: Option<Vec<(u32, Vec<u8>)>>,
 }
 
@@ -86,6 +91,7 @@ impl Pbc {
             flash: SpiFlash::new(),
             trace: false,
             spi_control: 0,
+            spi_command: 0,
             spi_config: 0,
             spi_fifo: [0; 2],
             spi_rx: [0; 2],
@@ -147,29 +153,42 @@ impl Pbc {
     fn read_reg_word(&mut self, offset: u32) -> u32 {
         match offset {
             REG_SPI_CONTROL => self.spi_control,
+            // The command word reads back with the go bit reflecting busy,
+            // not as a bare 0/1. -- OBSERVED, live snapshot of a running
+            // device: this register holds `0x00000110` at rest, which is the
+            // last command armed (`0x111`) with bit 0 cleared. Firmware only
+            // tests bit 0, so the old bare 0/1 was functionally equivalent
+            // for it — but it made every diagnostic read of this register a
+            // lie, and a firmware that read back the command to reuse it
+            // would have got nothing.
             REG_SPI_STATUS => {
-                if self.spi_busy_counter > 0 {
+                let busy = self.spi_busy_counter > 0;
+                if busy {
                     self.spi_busy_counter -= 1;
-                    1
-                } else {
-                    0
                 }
+                (self.spi_command & !1) | (busy as u32)
             }
             REG_SPI_FIFO_DATA => self.spi_fifo[0],
             REG_SPI_FIFO_DATA1 => self.spi_fifo[1],
             REG_SPI_READ_DATA => self.spi_rx[0],
             REG_SPI_READ_DATA1 => self.spi_rx[1],
             REG_SPI_CONFIG => self.spi_config,
+            // Same shape as SPI_STATUS above. -- OBSERVED: `0x00000040` at
+            // rest on a running device, i.e. the last armed transfer
+            // (length 4 in bits[21:4]) with the go bit cleared.
             REG_DMA_CTRL => {
-                if self.dma_busy_counter > 0 {
+                let busy = self.dma_busy_counter > 0;
+                if busy {
                     self.dma_busy_counter -= 1;
-                    1
-                } else {
-                    0
                 }
+                (self.dma_ctrl & !1) | (busy as u32)
             }
             REG_DMA_ADDR => self.dma_flash_addr,
             REG_DMA_DATA_ADDR => self.dma_data_addr,
+            // -- OBSERVED: reads `0x000FFFFF` on a running device, the
+            // address mask of the 4 MB part. The model used to return 0,
+            // which reads as "no flash addressable".
+            REG_FLASH_SIZE_MASK => FLASH_SIZE_MASK_VALUE,
             _ => {
                 if self.trace {
                     eprintln!("[PBC] read  unknown offset 0x{:02X}", offset);
@@ -185,6 +204,7 @@ impl Pbc {
                 self.spi_control = val;
             }
             REG_SPI_STATUS => {
+                self.spi_command = val;
                 if val & 1 != 0 {
                     self.last_dma_tag = if self.spi_control & 0x40 != 0 {
                         "pbc_spi_serdes"
@@ -368,6 +388,9 @@ impl Peripheral for Pbc {
     }
 
     fn tick(&mut self, _cpu_instructions: u64) {
+        // Advance the flash's program/erase timer. Firmware polls WIP after
+        // every write, so this is what makes those loops iterate.
+        self.flash.tick();
         // Busy bits also decrement on bank tick so they can clear
         // between polling loop iterations.
         if self.spi_busy_counter > 0 {
@@ -443,5 +466,44 @@ impl Peripheral for Pbc {
             },
             _ => Err(PeripheralError::UnsupportedEvent),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// -- OBSERVED, live snapshot of a running device: `0x0100020C` reads
+    /// `0x00000110` and `0x01000228` reads `0x00000040`. Both are the last
+    /// command armed, with the go bit cleared — not a bare busy flag.
+    #[test]
+    fn status_registers_read_back_the_armed_command() {
+        let mut pbc = Pbc::new();
+
+        // Arm a FIFO command: mode 1, one byte to transmit, go.
+        pbc.write_reg_word(REG_SPI_STATUS, 0x111);
+        // Busy while the command is in flight, and the command word is
+        // already visible around the go bit.
+        assert_eq!(pbc.read_reg_word(REG_SPI_STATUS) & 1, 1);
+        while pbc.read_reg_word(REG_SPI_STATUS) & 1 != 0 {}
+        assert_eq!(pbc.read_reg_word(REG_SPI_STATUS), 0x110);
+
+        // Arm a 4-byte DMA read: length 4 in bits[21:4], go in bit 0.
+        pbc.write_reg_word(REG_DMA_ADDR, 0x8_B981);
+        pbc.write_reg_word(REG_DMA_DATA_ADDR, 0x3_1F20);
+        pbc.write_reg_word(REG_DMA_CTRL, 0x41);
+        while pbc.read_reg_word(REG_DMA_CTRL) & 1 != 0 {}
+        assert_eq!(pbc.read_reg_word(REG_DMA_CTRL), 0x40);
+
+        // The address registers keep what was armed — they are not
+        // progress counters, and nothing in the map is.
+        assert_eq!(pbc.read_reg_word(REG_DMA_ADDR), 0x8_B981);
+        assert_eq!(pbc.read_reg_word(REG_DMA_DATA_ADDR), 0x3_1F20);
+    }
+
+    #[test]
+    fn flash_size_mask_reads_the_part_size() {
+        let mut pbc = Pbc::new();
+        assert_eq!(pbc.read_reg_word(REG_FLASH_SIZE_MASK), 0x000F_FFFF);
     }
 }

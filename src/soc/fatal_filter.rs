@@ -1,24 +1,15 @@
-//! BCM55030 filter / fatal error monitor — Session 6.
+//! BCM55030 filter / fatal error monitor.
 //!
 //! Owns the filter error aggregator at `0x01003604`. The register
-//! is read-as-zero by hardware when no fatal condition is latched
-//! — the firmware polls it from its idle loop and triggers a
-//! rollback boot on any non-zero value.
+//! reads as zero when no fatal condition is latched; firmware polls it
+//! from its idle loop and triggers a rollback boot on any non-zero
+//! value.
 //!
-//! This peripheral also owns the carveout at `0x01003600`–
-//! `0x01003610` that was reserved by the DMA peripheral for
-//! Session 7, consolidating the filter / fatal arms into a
-//! single module. Additional fatal-monitor registers (block 5601
-//! at runtime `0x010027B8`, block 5602 at `0x010027EC`) are
-//! inside the MACsec range and continue to be served from there
-//! — the firmware reads them through MACsec's backing store.
-//!
-//! Audit items resolved:
-//!
-//!   * **5.5 (finish)** — the `0x3604` hardcoded arm is gone from
-//!     `sysreg_shim`; fatal reads are driven by real state.
-//!   * **5.6** — filter / fatal window has a dedicated owner.
-//!   * **5.12 (finish)** — no more residual sysreg special arms.
+//! This peripheral also owns the carveout at `0x01003600`–`0x01003610`.
+//! Additional fatal-monitor registers (block 5601 at runtime
+//! `0x010027B8`, block 5602 at `0x010027EC`) fall inside the MACsec
+//! range and are served from there — firmware reads them through
+//! MACsec's backing store.
 
 use crate::cpu::exception::Exception;
 use crate::soc::peripheral::{

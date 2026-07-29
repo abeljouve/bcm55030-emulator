@@ -1,4 +1,4 @@
-//! BCM55030 DMA channel controller — Session 4.
+//! BCM55030 DMA channel controller.
 //!
 //! Owns the DMA channel file at `0x01002000..0x01004000`. The file
 //! is organised as a set of stride-`0x200` channel slots (one per
@@ -22,22 +22,13 @@
 //!
 //! v1 models the queue-drain `bit 8 = ready` flag that every
 //! firmware polling loop depends on: reads return bit 8 set, a
-//! write with bit 8 set clears it, the next tick re-arms it. This
-//! matches the residual arm previously in `sysreg_shim` (audit
-//! 5.7 — already resolved inside `epon_mac.rs` for the LLID
-//! sub-range `0x1400..0x2000`; this file resolves the rest).
+//! write with bit 8 set clears it, the next tick re-arms it. The
+//! LLID sub-range `0x1400..0x2000` is handled in `epon_mac.rs`; this
+//! file handles the rest.
 //!
-//! All other offsets route through a flat backing store with the
-//! same bits `27..31` auto-clear semantic MACsec uses.
-//!
-//! Audit items resolved:
-//!
-//!   * **5.8 (finish)** — the generic sysreg auto-clear arm is
-//!     fully removed. Each peripheral with a real command-bit
-//!     semantic now owns the clear behaviour locally.
-//!   * **5.7 (finish)** — DMA queue drain no longer served by a
-//!     shim fallback.
-//!   * **5.12 (part)** — residual `SYSREG_INIT_VALUES` shrink.
+//! All other offsets route through a flat backing store with the same
+//! bits `27..31` auto-clear semantic MACsec uses. Each peripheral with
+//! a real command-bit semantic owns the clear behaviour locally.
 
 use crate::cpu::exception::Exception;
 use crate::soc::peripheral::{
@@ -55,8 +46,8 @@ pub const DMA_END: u32 = 0x0100_4000;
 /// ever changes.
 ///
 /// `0x01003604` is the filter / fatal error aggregator carved out
-/// from the DMA window until Session 7 lands `fatal_filter.rs`;
-/// it stays in `sysreg_shim` with a hardcoded `=> 0` arm.
+/// from the DMA window until `fatal_filter.rs` lands; it stays in
+/// `sysreg_shim` with a hardcoded `=> 0` arm.
 const MACSEC_CARVEOUTS: &[(u32, u32)] = &[
     (0x0100_2400, 0x0100_2D40),
     (0x0100_3000, 0x0100_3080),

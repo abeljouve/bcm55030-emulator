@@ -1,28 +1,22 @@
 //! Silicon power-on defaults for the BCM55030 sysreg aperture.
 //!
-//! observed on hardware, which
-//! reads MMIO registers immediately after stage-1 hands off to
-//! stage-2. Stage-1 was audited to touch ZERO SerDes/EPON registers
-//! (only UART, PBC/SPI, and CPU AUX cache regs), so these values
-//! are the true silicon power-on defaults.
+//! Observed on real hardware, read immediately after stage-1 hands off
+//! to stage-2. Stage-1 touches ZERO SerDes/EPON registers (only UART,
+//! PBC/SPI, and CPU AUX cache regs), so these are the true silicon
+//! power-on defaults.
 //!
-//! Coverage of `[0x01000000..0x01000300]` and
-//! `[0x01001000..0x01001100]` is exhaustive — both ranges were
-//! brute-scanned and any address not listed below reads zero on
-//! silicon. Values outside those ranges remain best-effort
-//! observations (typically post-boot snapshots from earlier
-//! sessions); they are kept verbatim until hardware probing is extended.
+//! Coverage of `[0x01000000..0x01000300]` and `[0x01001000..0x01001100]`
+//! is exhaustive — both ranges were brute-scanned and any address not
+//! listed below reads zero on silicon. Values outside those ranges are
+//! best-effort observations (typically post-boot snapshots), kept
+//! verbatim until hardware probing is extended.
 //!
-//! Every peripheral with a `reset_cold` path iterates this list
-//! and applies the slice that falls inside its claim set
-//! (`epon_mac`, `serdes`, `macsec`, `dma`, `efuse_udr`,
-//! `fatal_filter`, `mpcp`, `bsc_i2c`, `sysreg_shim` for the
-//! residual). Cold and warm reset both apply this seed — the only
-//! difference is that warm pre-sets `STATUS32.E1/E2` in
-//! `boot_from_flash`. Closes deferral D6.
-//!
-//! See the design notes for the audit
-//! that produced these values.
+//! Every peripheral with a `reset_cold` path iterates this list and
+//! applies the slice that falls inside its claim set (`epon_mac`,
+//! `serdes`, `macsec`, `dma`, `efuse_udr`, `fatal_filter`, `mpcp`,
+//! `bsc_i2c`, `sysreg_shim` for the residual). Cold and warm reset both
+//! apply this seed — the only difference is that warm pre-sets
+//! `STATUS32.E1/E2` in `boot_from_flash`.
 
 /// (offset_from_0x01000000, silicon power-on value).
 pub const SYSREG_INIT_VALUES: &[(u32, u32)] = &[

@@ -1,8 +1,6 @@
-//! BCM55030 Numerically Controlled Oscillator (NCO) — D1.
+//! BCM55030 Numerically Controlled Oscillator (NCO).
 //!
-//! Owns the single `NCO_TX_MODE_SECONDARY` register at
-//! `0x01000F80`, identified by dumping SRAM after a full boot and
-//! reading the runtime-initialised `DAT_ram_2003e924` pointer
+//! Owns the single `NCO_TX_MODE_SECONDARY` register at `0x01000F80`
 //! (hwregs block 23). The firmware uses this register to toggle
 //! dual-TX mode on the SerDes TX path:
 //!
@@ -11,11 +9,9 @@
 //! | `9` | `NCO_TX_MODE_SECONDARY`  | Set in mode 2               |
 //! | `14`| `NCO_DUAL_TX_ENABLE`     | Enable dual-TX mode         |
 //!
-//! v1 is a plain backing store. The future `CLK_READY_FLAG` at
-//! `0x00FC1017` mentioned in the design notes section 12 is not
-//! claimed here because the boot trace shows it is not touched
-//! by the warm boot path; it will migrate in when a firmware
-//! path that reads it is identified.
+//! v1 is a plain backing store. `CLK_READY_FLAG` at `0x00FC1017` is
+//! not claimed here because the warm boot path never touches it; it
+//! can migrate in when a firmware path that reads it is identified.
 
 use crate::cpu::exception::Exception;
 use crate::soc::peripheral::{AddressRange, Peripheral, PeripheralSnapshot};
@@ -33,8 +29,8 @@ pub const NCO_SLOT_BYTES: u32 = 8;
 
 /// Top of the NCO/IVT aperture when `AUX_INT_VECTOR_BASE` (AUX 0x25)
 /// is 0 — the only base ever observed on this silicon (the bootloader
-/// and the firmware never write AUX 0x25; verified in the firmware-silent
-/// session logs). `0..0x80` = 16 channels × 8 bytes.
+/// and the firmware never write AUX 0x25). `0..0x80` = 16 channels × 8
+/// bytes.
 pub const NCO_IVT_LIMIT: u32 = (NCO_CHANNELS as u32) * NCO_SLOT_BYTES;
 
 /// The ARCompact `j @<limm>` opcode word that prefixes every
@@ -50,9 +46,7 @@ pub const NCO_J_LIMM_OPCODE: u32 = 0x2020_0F80;
 /// range on a separate physical bus: `.di` (uncached) stores land
 /// here, while plain CPU reads / instruction fetch see SRAM. The ARC
 /// interrupt unit fetches its vector from this table, not from SRAM.
-/// (Evidence: Ghidra `nco_write_channel` @0x5a18 /
-/// `hw_install_irq_vector_2` @0x20042d00 plate comments;
-/// "NCO table IS the ARC IVT" RE swarm, live slot0 = `j @0x150`.)
+/// (The NCO table IS the ARC IVT; live-silicon slot0 = `j @0x150`.)
 #[derive(Clone, Copy)]
 pub struct NcoSlot {
     /// Raw 8 bytes exactly as written by the `stw.di` field stores
@@ -131,7 +125,7 @@ impl Nco {
     /// Route a `.di` (uncached) store in the IVT aperture to the NCO
     /// table. `addr` is the CPU address (`0..0x80`); `size` is 1/2/4.
     /// Writes are big-endian, matching the on-chip byte order and the
-    /// `stw.di` field order used by `nco_write_channel`.
+    /// `stw.di` field order the firmware uses.
     pub fn ivt_di_store(&mut self, addr: u32, val: u32, size: u8) {
         let chan = (addr / NCO_SLOT_BYTES) as usize;
         if chan >= NCO_CHANNELS {
@@ -260,9 +254,9 @@ mod tests {
     #[test]
     fn di_store_builds_j_limm_vector_slot() {
         let mut n = Nco::new();
-        // Reproduce `nco_write_channel(5, 0x0004_8120)`: four 16-bit
-        // `stw.di` fields — CONFIG, PRESCALE, FREQ_HI, FREQ_LO — at
-        // channel 5 (CPU addr 5*8 = 0x28).
+        // Reproduce a channel-5 vector install (target 0x0004_8120):
+        // four 16-bit `stw.di` fields — CONFIG, PRESCALE, FREQ_HI,
+        // FREQ_LO — at channel 5 (CPU addr 5*8 = 0x28).
         let base = 5 * NCO_SLOT_BYTES;
         n.ivt_di_store(base, 0x2020, 2);
         n.ivt_di_store(base + 2, 0x0F80, 2);

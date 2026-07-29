@@ -1,4 +1,4 @@
-//! BCM55030 eFuse / UDR serial bus — Session 6.
+//! BCM55030 eFuse / UDR serial bus.
 //!
 //! Claims the three-register I²C-like bit-bang window at
 //! `0x01000040`, `0x01000048`, `0x0100004C`. The BCM55030
@@ -17,13 +17,12 @@
 //!     `0x8000` set clears the SCL edge-counter. Writing `0x04C`
 //!     with bit 0 rising counts an SCL edge.
 //!
-//! This peripheral preserves that exact behaviour — resolves
-//! audit 5.11 without drifting HW fidelity, and removes the last
-//! special arms from `sysreg_shim`.
+//! This peripheral preserves that exact behaviour and removes the
+//! last special arms from `sysreg_shim`.
 //!
-//! The eFuse blob itself lives in SRAM at runtime `0x00031F18`
-//! (80 bytes). It is not modelled as MMIO here — the firmware
-//! already copies it into SRAM during its own init sequence.
+//! The eFuse blob itself lives in SRAM (80 bytes). It is not
+//! modelled as MMIO here — the firmware already copies it into
+//! SRAM during its own init sequence.
 
 use crate::cpu::exception::Exception;
 use crate::soc::peripheral::{

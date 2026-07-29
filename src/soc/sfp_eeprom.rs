@@ -493,7 +493,7 @@ pub struct DdmLive {
 }
 
 impl DdmLive {
-    /// Default = the synthetic default identity values at 2026-04-10 capture time.
+    /// Default = the synthetic placeholder diagnostic values (laser-off floors).
     pub const fn snapshot_default() -> Self {
         Self {
             temperature_c256: 0x2A71,  //  42.44 °C

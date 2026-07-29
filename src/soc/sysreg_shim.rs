@@ -1,20 +1,11 @@
-//! Transitional SYSREG fallback — hosts the legacy hardcoded arms from
-//! the old `MmioController::sysreg_read_word` / `sysreg_write_word` plus
-//! a word-wide backing store. Everything in `0x01000000..0x01003800`
-//! that has not yet been carved into its own peripheral file is handled
-//! here.
+//! Transitional SYSREG fallback — a word-wide backing store for the
+//! sysreg aperture. Everything in `0x01000000..0x01003800` that has not
+//! yet been carved into its own peripheral file is handled here.
 //!
-//! **This file shrinks as sessions land.** Session 2 carves SerDes out,
-//! Session 3 carves EPON MAC + MPCP, Session 4 carves MACsec + DMA,
-//! Session 6 carves timer + NCO + clock_pll + efuse_udr + fatal_filter.
-//! Once all subsystems are modelled natively, `sysreg_shim` should be
-//! deleted entirely along with `SYSREG_INIT_VALUES`.
-//!
-//! Session 1 intentionally preserves the existing stub behaviour —
-//! including the generic "bits 27–31 auto-clear" mechanism — so the
-//! firmware boot-to-prompt path is not regressed by the refactor.
-//! Audit 5.8 remains open here until each peripheral claims its
-//! command-bit registers individually.
+//! This file shrinks as subsystems (SerDes, EPON MAC + MPCP, MACsec,
+//! DMA, timer, NCO, clock PLL, efuse_udr, fatal_filter) gain dedicated
+//! peripheral modules. Once all of them are modelled natively,
+//! `sysreg_shim` and `SYSREG_INIT_VALUES` can be removed entirely.
 
 use std::collections::{HashMap, HashSet};
 
@@ -97,9 +88,8 @@ impl SysregShim {
         self.reset_cold();
     }
 
-    /// No-op tick. The shim no longer owns any tick-driven state
-    /// — Session 6 migrated the EPON free-running counter to
-    /// `src/soc/timer.rs`.
+    /// No-op tick. The shim owns no tick-driven state; the EPON
+    /// free-running counter lives in `src/soc/timer.rs`.
     pub fn tick(&mut self, _cpu_instructions: u64) {}
 
     fn log_unhandled_read(&mut self, offset: u32, val: u32) {
@@ -165,12 +155,10 @@ impl SysregShim {
     }
 
     fn sysreg_read_word(&mut self, offset: u32) -> u32 {
-        // Pure residual fallback. Deferral D7 bisected the
-        // previously-required bits `[31:27]` auto-clear and
-        // identified a single dependent register (`0x01000160`),
-        // now owned by `epon_mac.rs::REG_MPCP_CMD_LATCH`. The
-        // shim is a plain backing store for everything else.
-        // Audit 5.8 finally resolved.
+        // Pure residual fallback: a plain backing store. The one
+        // register that previously needed a `[31:27]` auto-clear arm
+        // (`0x01000160`) is now owned by
+        // `epon_mac.rs::REG_MPCP_CMD_LATCH`.
         let val = self.store_read(offset);
         self.log_unhandled_read(offset, val);
         val
