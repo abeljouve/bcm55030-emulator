@@ -1,4 +1,9 @@
-//! VLAN / EtherType / LUE indirect access table (block 8).
+//! MAC filter table — VLAN / EtherType indirect access (block 8).
+//!
+//! Despite an earlier name, this is **not** the packet classifier. The
+//! classifier is a separate indirect port in the lane register file at
+//! `0x0100240C` / `0x0100280C` (see `soc/lue`); this block filters on
+//! MAC addresses and VLAN tags and has its own 96-bit table.
 //!
 //! Registers `0x01003000..0x01003020`:
 //!   * `0x01003000` — VLAN_CTRL (RMW)
@@ -9,8 +14,7 @@
 //!   * `0x0100301C` — INDIRECT_DATA_0 (RW, LSB of 96-bit payload)
 //!
 //! Pattern 3 (indirect access): write index + direction to CMD,
-//! then read/write DATA registers. The firmware programs classifier
-//! rules during init and reads them back via `lue/print`.
+//! then read/write DATA registers.
 
 use crate::cpu::exception::Exception;
 
@@ -35,7 +39,7 @@ struct TableEntry {
 }
 
 #[derive(Clone)]
-pub struct VlanLue {
+pub struct MacFilter {
     vlan_ctrl: u32,
     custom_ethertype: u32,
     cmd: u32,
@@ -48,7 +52,7 @@ pub struct VlanLue {
     extended: Vec<u32>,
 }
 
-impl VlanLue {
+impl MacFilter {
     pub fn new() -> Self {
         Self {
             vlan_ctrl: 0,
@@ -233,7 +237,7 @@ mod tests {
 
     #[test]
     fn indirect_write_then_read() {
-        let mut v = VlanLue::new();
+        let mut v = MacFilter::new();
         v.write_word(BASE + OFF_DATA2, 0xAAAA_BBBB).unwrap();
         v.write_word(BASE + OFF_DATA1, 0xCCCC_DDDD).unwrap();
         v.write_word(BASE + OFF_DATA0, 0xEEEE_FFFF).unwrap();
@@ -254,7 +258,7 @@ mod tests {
 
     #[test]
     fn cmd_bits_clear_immediately() {
-        let mut v = VlanLue::new();
+        let mut v = MacFilter::new();
         v.write_word(BASE + OFF_CMD, 0x8000_0000).unwrap();
         let cmd = v.read_word(BASE + OFF_CMD).unwrap();
         assert_eq!(cmd & 0xC000_0000, 0);
@@ -262,7 +266,7 @@ mod tests {
 
     #[test]
     fn different_indices_independent() {
-        let mut v = VlanLue::new();
+        let mut v = MacFilter::new();
 
         v.write_word(BASE + OFF_DATA0, 0x1111).unwrap();
         v.write_word(BASE + OFF_CMD, 0x4000_000A).unwrap();

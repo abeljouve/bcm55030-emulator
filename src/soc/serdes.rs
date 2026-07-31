@@ -1,51 +1,40 @@
-//! BCM55030 SerDes peripheral — Session 2 scaffold.
+//! BCM55030 SerDes peripheral.
 //!
-//! Claims two MMIO windows that were previously handled by stubs in
-//! `src/soc/mmio.rs`:
+//! Claims the SerDes MMIO windows:
 //!
-//!   * **`0x01000180..0x010001F8`** — SerDes Lane Configuration + Link
-//!     Status + PHY Status. Hosts registers `PON_LANE_INDEX`,
-//!     `LANE0_LINK_LOCK`, `LANE2_LINK_LOCK`, `UNI_LANE_INDEX`, etc.
-//!     (block 5 "SerDes Lane Configuration" + block 44 "SerDes Link
-//!     Status MMIO" per `hwregs`).
+//!   * **`0x01000174..0x010001F8`** — SerDes Lane Configuration + Link
+//!     Status + PHY Status. One register file with the two directions
+//!     a fixed `0x40` apart; hosts `PON_LANE_INDEX`, the lane-present
+//!     masks, the link-arm registers, `UNI_LANE_INDEX`, etc. (block 5
+//!     "SerDes Lane Configuration" + block 44 "SerDes Link Status
+//!     MMIO" per `hwregs`).
 //!
 //!   * **`0x224A0000..0x224A0800`** — SerDes Lane Status File. A 256-
-//!     entry × 8-byte window that the firmware scans at startup.
-//!     Previous stub returned `0x01` unconditionally; this peripheral
-//!     now serves a lane-indexed register file so per-lane state is
-//!     coherent (audit 5.1).
+//!     entry × 8-byte window that the firmware scans at startup, served
+//!     as a lane-indexed register file so per-lane state is coherent.
 //!
-//! Claimed as of Phase 4a (scenario plan):
 //!   * **`0x01002400..0x01002A00`** — Lane HW Reset / Enable / Mode +
-//!     10G mirror.  Contains MDIO command registers with bit-31 "go"
-//!     semantics: firmware writes `val | 0x80000000`, then polls until
-//!     bit 31 clears.  The emulator auto-clears bit 31 on the next
-//!     read (matching `REG_MPCP_CMD_LATCH` in `epon_mac.rs`).
-//!     Evidence: `unhandled_mmio.json` — 5 addresses with command-bit
-//!     pattern (`0x0100240C`, `0x01002420`, `0x01002644`, `0x0100280C`,
-//!     `0x01002820`).
+//!     10G mirror. Contains indirect command registers with bit-31
+//!     "go" semantics: firmware writes `val | 0x80000000`, then polls
+//!     until bit 31 clears. The emulator auto-clears bit 31 on the
+//!     next read. Three addresses carry that handshake: `0x0100240C`,
+//!     `0x01002644`, `0x0100280C`. `+0x20` in each bank does **not**
+//!     — see `is_cmd_bit_register`.
+//!
 //!   * **`0x01002D00..0x01002D40`** — Lane Mode Controller.
 //!
-//! Not yet claimed (left to sysreg_shim for now):
-//!   * Extended SerDes config (`0x01003500..`)
+//! SerDes link lock is a derived bit that depends on the per-lane
+//! `locked` state, which the UI can toggle via
+//! [`SerDesEvent::SetLinkLocked`].
 //!
-//! Audit items resolved in this session:
-//!   * **5.1** — SerDes indirect range returns 1. Replaced by a proper
-//!     per-lane register file (see `serdes_window_read`).
-//!   * **5.3** — SerDes link lock forced set. Replaced by a derived
-//!     bit that depends on the per-lane `locked` state, which the UI
-//!     can toggle via [`SerDesEvent::SetLinkLocked`].
+//! The SerDes SPI slave is reached via cross-peripheral dispatch from
+//! `pbc.rs`: when `SPI_CONTROL & 0x40` is set, PBC calls
+//! [`SerDes::spi_command`]. This still returns an all-`0xFF` response —
+//! the behavioural calibration data path is not modelled yet.
 //!
-//! Audit 5.2 (SerDes SPI slave returns `0xFF`) is resolved via the
-//! cross-peripheral dispatch from `pbc.rs`: when `SPI_CONTROL & 0x40`
-//! is set, PBC calls [`SerDes::spi_command`] instead of returning the
-//! old stub value. For v1 this still returns an all-`0xFF` response
-//! — the behavioural calibration data path arrives in a later pass.
-//!
-//! Audit 5.6 (SerDes error status forced 0) stays in `sysreg_shim`
-//! because the affected register (`0x01003604`) belongs to block 46
-//! (Filter/Mask Controller) per `hwregs`, not to the SerDes. It will
-//! migrate to `fatal_filter.rs` in Session 7.
+//! SerDes error status (`0x01003604`) is not claimed here: it belongs
+//! to block 46 (Filter/Mask Controller) per `hwregs`, not to the
+//! SerDes.
 
 use std::collections::HashSet;
 
@@ -56,7 +45,14 @@ use crate::soc::peripheral::{
 };
 
 /// Main SerDes MMIO window (lane configuration + link status).
-pub const SERDES_MAIN_BASE: u32 = 0x0100_0180;
+///
+/// The base is the start of the lane configuration file, not of the
+/// first register with a handler: software addresses this block as one
+/// file with the transmit direction at a fixed `+0x40` from the receive
+/// one (index `+0x0C`/`+0x4C`, link arm `+0x24`/`+0x64`, config word
+/// `+0x38`/`+0x78`). Starting the window three words later would leave
+/// the head of that file with a different servant.
+pub const SERDES_MAIN_BASE: u32 = 0x0100_0174;
 pub const SERDES_MAIN_END: u32 = 0x0100_01F8;
 
 /// SerDes Lane MDIO / HW Enable / Mode window (1G + 10G banks).
@@ -98,13 +94,33 @@ const SERDES_RANGES: &[AddressRange] = &[
 /// the full 32-bit address makes debugging easier and avoids one more
 /// level of subtraction inside the fast path).
 const REG_PON_LANE_INDEX: u32 = 0x0100_0180;
-const REG_LANE0_LINK_LOCK: u32 = 0x0100_0194;
+const REG_LANE01_PRESENT_MASK: u32 = 0x0100_0194;
 const REG_UNI_LANE_INDEX: u32 = 0x0100_01C0;
-const REG_LANE2_LINK_LOCK: u32 = 0x0100_01D4;
+const REG_LANE23_PRESENT_MASK: u32 = 0x0100_01D4;
 
-/// Bit mask applied to the `LANE{0,2}_LINK_LOCK` registers when the
-/// corresponding lanes are locked. Bit 1 = lane 0/2 locked, bit 3 =
-/// lane 1/3 locked (per `hwregs` block 44 documentation).
+/// Link-arm registers, one per direction (`+0x24` / `+0x64` from the
+/// lane configuration base). Software arms `(1 << 24) << lane` and
+/// reads the same word back to learn whether the lane came up.
+///
+/// -- OBSERVED on silicon: the armed bit **never** holds, on either
+/// register, including on a lane that is registered and transmitting.
+/// The read-back is always zero for these four bits. A model that let
+/// them round-trip would report a link the hardware never reported.
+const REG_LANE01_LINK_ARM: u32 = 0x0100_0198;
+const REG_LANE23_LINK_ARM: u32 = 0x0100_01D8;
+
+/// The four lane bits inside a link-arm register.
+const LANE_ARM_MASK: u32 = 0x0F00_0000;
+
+/// Bit mask applied to the lane-present registers when the
+/// corresponding lanes are locked. Bit 1 = lane 0/2, bit 3 = lane 1/3.
+///
+/// -- INFERRED, and contradicted by hardware: those registers read a
+/// constant `0xF` and `0x3` there, and the second one does not move
+/// when the far end stops transmitting — so they carry which lanes
+/// exist, not whether they are up. Deriving the bits from lane state
+/// is kept for now because nothing measures the difference; the name
+/// no longer claims it is a lock.
 const LANE_LOCK_MASK_01: u32 = 0b1010;
 
 #[derive(Clone, Copy, Debug)]
@@ -151,9 +167,8 @@ pub struct SerDes {
     pub lanes: [LaneState; LANE_COUNT],
     /// Per-lane status file at `0x224A0000 + lane*8`.
     window: Vec<u8>,
-    /// Latched error status — W1C by software. Session 2 reads always
-    /// return 0 (no injected faults); UI / future sessions can raise
-    /// bits here.
+    /// Latched error status — W1C by software. Reads return 0 with no
+    /// injected faults; the UI can raise bits here.
     pub error_status: u32,
     pub trace: bool,
 }
@@ -191,17 +206,21 @@ impl SerDes {
         ((addr - SERDES_MODE_BASE) / 4) as usize
     }
 
+    /// Registers whose bit 31 is a "go/busy" handshake: firmware writes
+    /// it set, then spins on the same address until it reads back clear.
+    ///
+    /// OBSERVED: `+0x20` in each bank is **not** one of them. It holds the
+    /// VLAN EtherType, which is written as `0x8100_XXXX` — bit 31 belongs
+    /// to the 0x8100 tag protocol identifier, not to a command. Clearing
+    /// it made the firmware read back `0x0100_XXXX`, and the read-modify-
+    /// write that followed persisted the truncated value.
     fn is_cmd_bit_register(addr: u32) -> bool {
-        matches!(
-            addr,
-            0x0100_240C | 0x0100_2420 | 0x0100_2644 | 0x0100_280C | 0x0100_2820
-        )
+        matches!(addr, 0x0100_240C | 0x0100_2644 | 0x0100_280C)
     }
 
     /// Return a descriptive per-lane MDIO tag for MMIO history entries.
     /// Per-lane MDIO controller base = 0x010023D8 + lane*0x400.
     /// CMD at base+0x34, DATA3..DATA0 at base+0x38..+0x44.
-    /// Evidence: Ghidra 0x20035430 `phy_mdio_rw_op`, unhandled_mmio.json.
     pub fn mdio_peripheral_tag(addr: u32) -> &'static str {
         if !(SERDES_LANE_BASE..SERDES_LANE_END).contains(&addr) {
             return "serdes";
@@ -222,7 +241,7 @@ impl SerDes {
             0x0100_2414 => "serdes_l0_1g_mdio_data2",
             0x0100_2418 => "serdes_l0_1g_mdio_data1",
             0x0100_241C => "serdes_l0_1g_mdio_data0",
-            0x0100_2420 => "serdes_l0_1g_hw_enable",
+            0x0100_2420 => "serdes_l0_1g_vlan_ethertype",
             // 1G lane 1 MDIO (stride 0x238 from lane 0)
             0x0100_2644 => "serdes_l1_1g_mdio_cmd",
             0x0100_2648 => "serdes_l1_1g_mdio_data3",
@@ -236,7 +255,7 @@ impl SerDes {
             0x0100_2814 => "serdes_l0_10g_mdio_data2",
             0x0100_2818 => "serdes_l0_10g_mdio_data1",
             0x0100_281C => "serdes_l0_10g_mdio_data0",
-            0x0100_2820 => "serdes_l0_10g_hw_enable",
+            0x0100_2820 => "serdes_l0_10g_vlan_ethertype",
             // 10G lane 1 MDIO
             0x0100_2A44 => "serdes_l1_10g_mdio_cmd",
             0x0100_2A48 => "serdes_l1_10g_mdio_data3",
@@ -268,9 +287,9 @@ impl SerDes {
         let idx0 = lane_pair * 2;
         let idx1 = lane_pair * 2 + 1;
         let addr = if lane_pair == 0 {
-            REG_LANE0_LINK_LOCK
+            REG_LANE01_PRESENT_MASK
         } else {
-            REG_LANE2_LINK_LOCK
+            REG_LANE23_PRESENT_MASK
         };
         let mut val = self.raw_store[Self::main_idx(addr)];
         // Clear the lock bits and re-derive them from lane state.
@@ -296,10 +315,8 @@ impl SerDes {
 
     /// Cross-peripheral SPI slave stub — called from PBC when
     /// `SPI_CONTROL & 0x40` routes a FIFO command to the SerDes SPI
-    /// slave. Session 2 returns an all-`0xFF` response (matching the
-    /// old behaviour); calibration / ack responses land in a later
-    /// session. The distinct entry point addresses audit 5.2 by
-    /// giving the SerDes ownership of this path.
+    /// slave. Returns an all-`0xFF` response; calibration / ack
+    /// responses are not modelled yet.
     pub fn spi_command(&mut self, _tx: &[u8], rx_len: usize) -> Vec<u8> {
         vec![0xFFu8; rx_len]
     }
@@ -307,10 +324,9 @@ impl SerDes {
     fn apply_silicon_power_on(&mut self) {
         // Silicon power-on values land in the backing stores; lanes
         // remain disabled/unlocked because silicon shows
-        // LANE_BUS_EN=0 and LINK_LOCK_01/23=0 at power-on (verified
-        // 2026-04-29 via hardware probing — see
-        // the design notes). Reference
-        // firmware programs lane enables itself during init.
+        // LANE_BUS_EN=0 and LINK_LOCK_01/23=0 at power-on (verified via
+        // hardware probing). Firmware programs lane enables itself
+        // during init.
         for &(off, val) in super::mmio_init::SYSREG_INIT_VALUES {
             let abs = 0x0100_0000 + off;
             if (SERDES_MAIN_BASE..SERDES_MAIN_END).contains(&abs) {
@@ -361,8 +377,8 @@ impl Peripheral for SerDes {
             return Ok(self.mode_store[Self::mode_idx(addr)]);
         }
         match addr {
-            REG_LANE0_LINK_LOCK => Ok(self.compute_lane_lock(0)),
-            REG_LANE2_LINK_LOCK => Ok(self.compute_lane_lock(1)),
+            REG_LANE01_PRESENT_MASK => Ok(self.compute_lane_lock(0)),
+            REG_LANE23_PRESENT_MASK => Ok(self.compute_lane_lock(1)),
             _ => Ok(self.raw_store[Self::main_idx(addr)]),
         }
     }
@@ -393,6 +409,12 @@ impl Peripheral for SerDes {
         }
         let idx = Self::main_idx(addr);
         match addr {
+            // The arm bits do not stick: keep the rest of the word, drop
+            // the four lane bits so a read-back never reports a link.
+            REG_LANE01_LINK_ARM | REG_LANE23_LINK_ARM => {
+                self.raw_store[idx] = val & !LANE_ARM_MASK;
+                return Ok(());
+            }
             REG_PON_LANE_INDEX => {
                 let lane_idx = (val & 0x3) as usize;
                 if lane_idx < LANE_COUNT {
@@ -567,8 +589,8 @@ mod tests {
         let mut s = SerDes::new();
         s.reset_warm();
         // Silicon power-on shows LANE_BUS_EN=0 and LINK_LOCK_01/23=0
-        // — lanes are unlocked at power-on. The reference firmware brings
-        // them up itself. See emu-sysreg-reset-values-wrong.
+        // — lanes are unlocked at power-on. Firmware brings them up
+        // itself.
         for l in &s.lanes {
             assert!(!l.enabled);
             assert!(!l.locked);
@@ -604,7 +626,7 @@ mod tests {
         let mut s = SerDes::new();
         s.reset_warm();
         // Silicon power-on shows lanes unlocked. Bring lane 0 up
-        // first (as the reference firmware would), then inject RX LOS.
+        // first (as firmware would), then inject RX LOS.
         s.inject_event(&PeripheralEvent::SerDes(SerDesEvent::SetLaneEnabled(0, true)))
             .unwrap();
         s.inject_event(&PeripheralEvent::SerDes(SerDesEvent::SetLinkLocked(0, true)))
@@ -657,6 +679,47 @@ mod tests {
         let mut s = SerDes::new();
         s.write_word(0x0100_2644, 0x8000_0501).unwrap();
         assert_eq!(s.read_word(0x0100_2644).unwrap(), 0x0000_0501);
+    }
+
+    /// Arming a lane must not manufacture a link the hardware never
+    /// reports — and must not swallow the rest of the word either, which
+    /// is the negative control that tells the two apart.
+    #[test]
+    fn link_arm_bits_never_latch_but_the_word_round_trips() {
+        for addr in [REG_LANE01_LINK_ARM, REG_LANE23_LINK_ARM] {
+            let mut s = SerDes::new();
+            s.reset_cold();
+            for lane in 0..LANE_COUNT {
+                s.write_word(addr, (1 << 24) << lane).unwrap();
+                assert_eq!(s.read_word(addr).unwrap() & LANE_ARM_MASK, 0);
+            }
+            s.write_word(addr, 0x0F00_1234).unwrap();
+            assert_eq!(s.read_word(addr).unwrap(), 0x0000_1234);
+        }
+    }
+
+    #[test]
+    fn main_window_starts_at_the_lane_config_base() {
+        let s = SerDes::new();
+        assert!(s.claims(0x0100_0174));
+        assert!(!s.claims(0x0100_0170));
+    }
+
+    /// The VLAN EtherType register keeps bit 31: the value written is a
+    /// tag protocol identifier (`0x8100`), not a command. A firmware that
+    /// reads it back and rewrites the result must see what it wrote.
+    #[test]
+    fn vlan_ethertype_keeps_bit31_across_read_modify_write() {
+        for addr in [0x0100_2420u32, 0x0100_2820] {
+            let mut s = SerDes::new();
+            s.write_word(addr, 0x8100_88A8).unwrap();
+            // First read is the one the firmware branches on...
+            assert_eq!(s.read_word(addr).unwrap(), 0x8100_88A8);
+            // ...and the read-modify-write that follows must not truncate.
+            let v = s.read_word(addr).unwrap();
+            s.write_word(addr, v).unwrap();
+            assert_eq!(s.read_word(addr).unwrap(), 0x8100_88A8);
+        }
     }
 
     #[test]

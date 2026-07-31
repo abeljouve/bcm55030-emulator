@@ -1,54 +1,44 @@
-//! BCM55030 EPON MAC peripheral — Session 3.
+//! BCM55030 EPON MAC peripheral.
 //!
-//! Hosts the core EPON MAC register surface that was previously
-//! hardcoded inside `sysreg_shim`. The peripheral owns a **sparse**
-//! claim set rather than one contiguous MMIO range, because the
-//! BCM55030 interleaves EPON MAC registers with unrelated subsystems
-//! (I²C/eFuse control at `0x040/0x048/0x04C`, the free-running
-//! counter at `0x050`, BSC at `0x140..0x158`, SerDes at `0x180..0x1F8`,
-//! PBC at `0x1F0..0x240`) inside the same `0x01000000..0x01002000`
-//! window. A contiguous range would steal those offsets.
+//! Hosts the core EPON MAC register surface. The peripheral owns a
+//! **sparse** claim set rather than one contiguous MMIO range, because
+//! the BCM55030 interleaves EPON MAC registers with unrelated
+//! subsystems (I2C/eFuse control at `0x040/0x048/0x04C`, the
+//! free-running counter at `0x050`, BSC at `0x140..0x158`, SerDes at
+//! `0x180..0x1F8`, PBC at `0x1F0..0x240`) inside the same
+//! `0x01000000..0x01002000` window. A contiguous range would steal
+//! those offsets.
 //!
 //! The peripheral claims, by predicate:
 //!
 //!   * Sparse core registers — CHIP_ID, CHIP_REV, LLID masks, active
-//!     bitmap, grant masks, IRQ mask, EPON status, active flags,
-//!     plus the `0x0064` special half-`FFFF` read arm. Note: the
-//!     `0x01002804` register previously claimed here as a fatal-
-//!     error aggregator moved to `macsec.rs` in Session 4 — it sits
-//!     inside the MACsec 10G SA programming bank.
-//!   * `0x01000400..0x01000E80` — LLID grant / enable tables,
-//!     per-LLID config (anchors 0x043C, 0x04B8, 0x0D00, 0x0D7C
-//!     clear bit 0 on write — audit 5.9).
+//!     bitmap, grant masks, IRQ mask, EPON status, active flags, plus
+//!     the `0x0064` special half-`FFFF` read arm.
+//!   * `0x01000400..0x01000E80` — LLID grant / enable tables, per-LLID
+//!     config (anchors 0x043C, 0x04B8, 0x0D00, 0x0D7C clear bit 0 on
+//!     write).
 //!   * `0x01001400..0x01002000` — LLID IRQ status + counter stats +
 //!     queue drain. Six stride-`0x200` blocks, one per LLID slot:
-//!       - `0x1X04` IRQ status — always 0, W1C (audit 5.4).
+//!       - `0x1X04` IRQ status — always 0, W1C.
 //!       - `0x1XD8` counter result slot — always 0.
-//!       - `0x1X3C` queue drain — bit 8 permanently set with
-//!         per-offset auto-clear (audit 5.7).
-//!   * `0x01002804` — fatal error aggregator, always 0 W1C (audit
-//!     5.5 partial; the rest lands in Session 7 `fatal_filter.rs`).
+//!       - `0x1X3C` queue drain — bit 8 permanently set with per-offset
+//!         auto-clear.
 //!
-//! Audit items resolved in this session:
+//! Behaviour notes:
 //!
-//!   * **5.4** — LLID IRQ status forced to 0 moved from a generic
-//!     shim arm into a proper peripheral with per-LLID IRQ state.
-//!   * **5.5 (part)** — Fatal error register `0x2804` returns 0.
-//!   * **5.7** — DMA queue drain bit 8 is now driven by real per-LLID
-//!     state with targeted auto-clear, not a blanket sysreg arm.
-//!   * **5.9** — LLID 0/31 anchor registers clear bit 0 on write in
-//!     the peripheral that owns them.
-//!   * **5.12 (part)** — `SYSREG_INIT_VALUES` residual shrinks: every
-//!     offset in the EPON MAC claim set is now loaded by this
-//!     peripheral's `reset_warm()`, not by the shim.
+//!   * LLID IRQ status is forced to 0, backed by per-LLID IRQ state.
+//!   * DMA queue drain bit 8 is driven by real per-LLID state with a
+//!     targeted auto-clear.
+//!   * LLID 0/31 anchor registers clear bit 0 on write.
 //!
-//! Not yet owned (left to `sysreg_shim` or future sessions):
+//! Not owned here:
 //!
 //!   * `0x01000080..0x010000BC` — queue priority / DPoE flavour
-//!     registers. No special semantics needed yet, backing store
-//!     is enough (sysreg generic path).
-//!   * `0x01002000..0x01002800` — MACsec / DMA (Session 4).
-//!   * `0x01002820..0x01003600` — fatal + filter tail (Session 7).
+//!     registers (generic backing store elsewhere).
+//!   * `0x01002000..0x01002800` — MACsec / DMA.
+//!   * `0x01002804` — fatal error aggregator; lives in `macsec.rs`,
+//!     inside the MACsec 10G SA programming bank.
+//!   * `0x01002820..0x01003600` — fatal + filter tail.
 
 use crate::cpu::exception::Exception;
 use crate::soc::peripheral::{
@@ -58,15 +48,12 @@ use crate::soc::peripheral::{
 
 pub const CHIP_ID_VALUE: u32 = 0x47010203;
 pub const CHIP_REV_VALUE: u32 = 0xB2110816;
-/// Silicon power-on default for LLID_CAPTURE_MASK / PON_MODE — zero on
-/// hardware (observed on hardware). Bit 15 of this
-/// register gates into an unclocked PCS domain, so a non-zero reset
-/// value would freeze the bus on real silicon. See
-/// the design notes.
+/// Silicon power-on default for LLID_CAPTURE_MASK / PON_MODE — zero,
+/// observed on hardware. Bit 15 gates into an unclocked PCS domain, so
+/// a non-zero reset value would freeze the bus on real silicon.
 pub const LLID_CAPTURE_MASK_RESET: u32 = 0x0000_0000;
-/// Silicon power-on default for LLID_ACTIVE_BITMAP — zero on hardware
-/// (observed on hardware). The reference firmware programs the
-/// active bitmap during init.
+/// Silicon power-on default for LLID_ACTIVE_BITMAP — zero, observed on
+/// hardware. Firmware programs the active bitmap during init.
 pub const LLID_ACTIVE_RESET: u32 = 0x0000_0000;
 pub const RX_GRANT_MASK_RESET: u32 = 0x0000_FFFF;
 /// Silicon power-on default for LLID_COUNTER_MASK at +0x024.
@@ -83,6 +70,11 @@ pub const LLID_SLOT_COUNT: usize = 6;
 const EPON_LLID_BASE: u32 = 0x0100_1400;
 const EPON_LLID_STRIDE: u32 = 0x0000_0200;
 const EPON_LLID_TOP: u32 = EPON_LLID_BASE + (LLID_SLOT_COUNT as u32) * EPON_LLID_STRIDE; // 0x0100_2000
+
+/// Report frame template: length in the high half, a timestamp delta in
+/// the low half. The firmware writes both from the registration exchange.
+const REG_REPORT_FRAME_PARAMS: u32 = 0x0100_04D8;
+const REG_REPORT_FRAME_LEN: u32 = 0x0100_052C;
 
 const EPON_TABLE_BASE: u32 = 0x0100_0400;
 const EPON_TABLE_END: u32 = 0x0100_0E80;
@@ -103,14 +95,10 @@ const REG_MDIO_COMMAND: u32 = 0x0100_0060;
 const REG_1G_LINK_STATUS: u32 = 0x0100_0410;
 const REG_HW_STATE_STATUS: u32 = 0x0100_0E04;
 const REG_SPECIAL_0064: u32 = 0x0100_0064;
-/// MPCP-adjacent command latch. The firmware writes a value with
-/// bits `[31:27]` set (command opcode) and polls the register for
-/// those bits to clear. Identified by bisecting the sysreg residual
-/// auto-clear region during deferral D7 — this is the one register
-/// in the whole `0x01000000..0x01003800` window that still depends
-/// on the command-bit semantic. Not yet in `hwregs`; the access
-/// pattern matches MPCP LLID control (block 22) but the offset is
-/// not documented.
+/// MPCP-adjacent command latch. The firmware writes a value with bits
+/// `[31:27]` set (command opcode) and polls the register for those bits
+/// to clear. The access pattern matches MPCP LLID control (block 22)
+/// but the offset is not documented in `hwregs`.
 // MPCP CMD LATCH moved to LaneBus mpcp_bus (lane 8) in bank.rs.
 /// EPON discovery status. Bit 2 = OLT discovery detected, bit 1 =
 /// discovery change. W1C for bits[2:1]. `mpcp_epon_get_status` returns
@@ -158,6 +146,17 @@ pub struct EponMac {
     /// auto-clear resets it the instant the firmware polls.
     llid_drain_flag: [bool; LLID_SLOT_COUNT],
 
+    /// Frames that have arrived in each queue since reset, indexed by
+    /// `(channel, queue)`. The datapath reports arrivals here; nothing
+    /// in this peripheral invents them.
+    queue_arrivals: std::collections::HashMap<(usize, u32), u64>,
+    /// Last command written to each channel's counter-latch port, with
+    /// the busy bit already cleared.
+    latch_cmd: [u32; LLID_SLOT_COUNT],
+    /// Counter reads whose selector names something this model cannot
+    /// tell apart. Counted rather than silently answered with zero.
+    pub unattributed_counter_reads: u64,
+
     llid_capture_mask: u32,
     llid_active_bitmap: u32,
     llid_mask_control: u32,
@@ -170,10 +169,9 @@ pub struct EponMac {
     link_status_1g: u32,
     hw_state_status: u32,
     discovery_status: u32,
-    /// REG_SPECIAL_0064 backing store. Silicon power-on is zero —
-    /// the previous shim returned 0x5382_FFFF unconditionally, which
-    /// did not match real silicon (observed on hardware).
-    /// The reference firmware programs this register during its init.
+    /// REG_SPECIAL_0064 backing store. Silicon power-on is zero
+    /// (observed on hardware); firmware programs this register during
+    /// its init.
     special_0064: u32,
 
     pub trace: bool,
@@ -188,6 +186,9 @@ impl EponMac {
             llid_store: vec![0u32; llid_words],
             llid_irq_pending: [0; LLID_SLOT_COUNT],
             llid_drain_flag: [true; LLID_SLOT_COUNT],
+            queue_arrivals: std::collections::HashMap::new(),
+            latch_cmd: [0; LLID_SLOT_COUNT],
+            unattributed_counter_reads: 0,
             llid_capture_mask: LLID_CAPTURE_MASK_RESET,
             llid_active_bitmap: LLID_ACTIVE_RESET,
             llid_mask_control: 0,
@@ -218,12 +219,12 @@ impl EponMac {
 
     /// Set the 10G PHY link status bit (bit 6 of REG_HW_STATE_STATUS).
     ///
-    /// G2: bit6 is a sticky LEVEL latch, NOT a 50-tick transient pulse.
-    /// On real silicon it is the 10G PCS 64b/66b block-lock status: it
-    /// re-latches every block while a valid downstream stream is present
-    /// and the lane-3 RX path is up. The firmware W1C-clears it each tick
-    /// (`mpcp_sm.rs:495-503`) and checks whether it re-latched on the
-    /// next tick — a CONTINUOUS lock re-asserts, a dropped lock does not.
+    /// bit6 is a sticky LEVEL latch, NOT a transient pulse. On real
+    /// silicon it is the 10G PCS 64b/66b block-lock status: it re-latches
+    /// every block while a valid downstream stream is present and the
+    /// lane-3 RX path is up. The firmware W1C-clears it each tick and
+    /// checks whether it re-latched on the next tick — a CONTINUOUS lock
+    /// re-asserts, a dropped lock does not.
     ///
     /// The bank calls this every tick (OLT-gated) while the OLT model is
     /// broadcasting a valid downstream + lane-3 RX is up, so bit6
@@ -238,7 +239,7 @@ impl EponMac {
 
     /// Clear the 10G PHY link status bit6 level — called by the bank when
     /// the OLT model is no longer broadcasting a valid downstream, so the
-    /// PCS block-lock drops. G2.
+    /// PCS block-lock drops.
     pub fn clear_phy_link_status_bit(&mut self) {
         self.hw_state_status &= !0x40;
     }
@@ -301,6 +302,100 @@ impl EponMac {
 
     fn llid_idx(addr: u32) -> usize {
         ((addr - EPON_LLID_BASE) / 4) as usize
+    }
+
+    /// The queue pointer register, as the hardware presents it.
+    ///
+    /// The same address is a selector on write and a pointer on read.
+    /// Software writes `(queue & 0x1F) | (mode << 5)` to say which queue
+    /// and which of the two pointers it wants, then reads bits [26:9]
+    /// back. Inside that field the pointer sits at bits [15:6], which is
+    /// how the readback prints `0:028:00` for a queue starting at 0x028.
+    ///
+    /// A queue nothing has consumed reads back at its own start address:
+    /// both pointers begin at the head of the ring. The start comes from
+    /// the queue's own configuration word — the same one the readback
+    /// prints as `S` — so this is derived, never stored.
+    ///
+    /// ⚠ Bit 8 stays **derived**. Software writes this word with bit 8
+    /// clear, and a model that stored the written value back would leave
+    /// the firmware spinning on a drain-done bit that never comes.
+
+    /// The report template the firmware programmed, read without side
+    /// effects: `(length, length_plus_four)`.
+    ///
+    /// The firmware computes both from fields the far end put in its
+    /// REGISTER frame and writes them here; the MAC is what turns them
+    /// into a frame. Reading them back is what makes a report an oracle
+    /// rather than a frame the model invented.
+    pub fn report_template(&self) -> (u16, u16) {
+        let head = self.peek_word(REG_REPORT_FRAME_PARAMS).unwrap_or(0);
+        let tail = self.peek_word(REG_REPORT_FRAME_LEN).unwrap_or(0);
+        ((head >> 16) as u16, tail as u16)
+    }
+
+    /// Record frames arriving in a queue. Called by the datapath, which
+    /// is the only thing that knows a frame landed; this peripheral just
+    /// holds the number so software can latch it.
+    pub fn record_queue_arrivals(&mut self, slot: u8, frames: u64) {
+        if frames == 0 {
+            return;
+        }
+        let chan = (slot >> 5) as usize;
+        let queue = (slot & 0x1F) as u32;
+        *self.queue_arrivals.entry((chan, queue)).or_insert(0) += frames;
+    }
+
+    /// Arrivals recorded for a queue, for tests and inspection.
+    pub fn queue_arrivals(&self, chan: usize, queue: u32) -> u64 {
+        self.queue_arrivals.get(&(chan, queue)).copied().unwrap_or(0)
+    }
+
+    /// The counter-latch command port.
+    ///
+    /// Software writes `((extra & 7) << 9) | ((queue & 0x1F) << 4) | op`
+    /// here — `0xC` latches a counter for reading, `0x4` writes one — and
+    /// then **spins on this same address** until bit 31 clears. That wait
+    /// has no timeout, so the busy bit is never left set, whatever the
+    /// command asked for.
+    fn write_latch_cmd(&mut self, slot: usize, val: u32) {
+        self.latch_cmd[slot] = val & !0x8000_0000;
+    }
+
+    /// The latched counter word.
+    ///
+    /// The queue comes from the command written just before, bits [8:4].
+    ///
+    /// ⚠ The selector at bits [11:9] chooses **which** counter of the
+    /// several a queue has, and which is which is **not established** —
+    /// the readback prints six per channel and none of them is pinned to
+    /// a quantity. This model knows exactly one number about a queue: how
+    /// many frames arrived in it. It returns that for every selector, and
+    /// counts the reads it cannot attribute, so the ambiguity is visible
+    /// rather than hidden behind a plausible zero.
+    fn peek_latched_counter(&self, slot: usize) -> u32 {
+        let queue = (self.latch_cmd[slot] >> 4) & 0x1F;
+        self.queue_arrivals.get(&(slot, queue)).copied().unwrap_or(0) as u32
+    }
+
+    /// Same value, but counted. `peek` must stay free of side effects —
+    /// the bank peeks a word before writing it.
+    fn latched_counter(&mut self, slot: usize) -> u32 {
+        self.unattributed_counter_reads += 1;
+        self.peek_latched_counter(slot)
+    }
+
+    fn queue_pointer_word(&self, slot: usize, addr: u32) -> u32 {
+        let idx = Self::llid_idx(addr);
+        let selector = self.llid_store[idx] & 0x3F;
+        let queue = selector & 0x1F;
+        // Queue configuration words live at +0x80 in the same slot, one
+        // per queue; the start address is their low eleven bits.
+        let cfg_addr = EPON_LLID_BASE + (slot as u32) * EPON_LLID_STRIDE + 0x80 + queue * 4;
+        let start = self.llid_store[Self::llid_idx(cfg_addr)] & 0x7FF;
+        let pointer_field = (start << 6) & 0x3_FFFF;
+        let drain = if self.llid_drain_flag[slot] { 0x100 } else { 0 };
+        (pointer_field << 9) | drain | selector
     }
 
     /// Classify an LLID-window address into `(slot, offset_within_slot)`.
@@ -396,13 +491,8 @@ impl Peripheral for EponMac {
             if slot < LLID_SLOT_COUNT {
                 match within {
                     0x04 => return Ok(self.llid_irq_pending[slot]),
-                    0x3C => {
-                        let idx = Self::llid_idx(addr);
-                        let base = self.llid_store[idx] & !0x100;
-                        let set = if self.llid_drain_flag[slot] { 0x100 } else { 0 };
-                        return Ok(base | set);
-                    }
-                    0x1D8 => return Ok(0),
+                    0x3C => return Ok(self.queue_pointer_word(slot, addr)),
+                    0x1D8 => return Ok(self.peek_latched_counter(slot)),
                     _ => {
                         let idx = Self::llid_idx(addr);
                         return Ok(self.llid_store[idx]);
@@ -447,17 +537,8 @@ impl Peripheral for EponMac {
             if slot < LLID_SLOT_COUNT {
                 match within {
                     0x04 => return Ok(self.llid_irq_pending[slot]),
-                    0x3C => {
-                        // Queue drain register — bit 8 reflects the
-                        // per-slot "has entries" flag, rest of the
-                        // bits come from the backing store so the
-                        // firmware's other config bits round-trip.
-                        let idx = Self::llid_idx(addr);
-                        let base = self.llid_store[idx] & !0x100;
-                        let set = if self.llid_drain_flag[slot] { 0x100 } else { 0 };
-                        return Ok(base | set);
-                    }
-                    0x1D8 => return Ok(0), // counter result — always 0
+                    0x3C => return Ok(self.queue_pointer_word(slot, addr)),
+                    0x1D8 => return Ok(self.latched_counter(slot)),
                     _ => {
                         let idx = Self::llid_idx(addr);
                         return Ok(self.llid_store[idx]);
@@ -552,6 +633,13 @@ impl Peripheral for EponMac {
                         self.llid_irq_pending[slot] &= !val;
                         return Ok(());
                     }
+                    0x1D4 => {
+                        // Counter-latch command. The firmware spins on
+                        // this same address for bit 31 with no timeout,
+                        // so the busy bit never survives the write.
+                        self.write_latch_cmd(slot, val);
+                        return Ok(());
+                    }
                     0x3C => {
                         // Queue drain — writing bit 8 clears the flag.
                         if val & 0x100 != 0 {
@@ -591,8 +679,8 @@ impl Peripheral for EponMac {
         for flag in &mut self.llid_drain_flag {
             *flag = true;
         }
-        // G2: bit6 of REG_HW_STATE_STATUS is a sticky LEVEL latch driven
-        // by the bank (OLT-gated), not a transient pulse — no auto-clear
+        // bit6 of REG_HW_STATE_STATUS is a sticky LEVEL latch driven by
+        // the bank (OLT-gated), not a transient pulse — no auto-clear
         // here. The bank re-asserts it every tick while the downstream
         // stream is present; the firmware's W1C clear is honored by
         // write_word, and the level re-asserts on the next bank tick.
@@ -603,6 +691,9 @@ impl Peripheral for EponMac {
         self.llid_store.fill(0);
         self.llid_irq_pending = [0; LLID_SLOT_COUNT];
         self.llid_drain_flag = [true; LLID_SLOT_COUNT];
+        self.queue_arrivals.clear();
+        self.latch_cmd = [0; LLID_SLOT_COUNT];
+        self.unattributed_counter_reads = 0;
         self.llid_capture_mask = LLID_CAPTURE_MASK_RESET;
         self.llid_active_bitmap = LLID_ACTIVE_RESET;
         self.llid_mask_control = 0;
@@ -624,7 +715,7 @@ impl Peripheral for EponMac {
     fn reset_warm(&mut self) {
         // Silicon power-on snapshot already covers warm reset state —
         // the only difference is `STATUS32.E1/E2`, set in
-        // `boot_from_flash`. Closes deferral D6.
+        // `boot_from_flash`.
         self.reset_cold();
     }
 
@@ -706,10 +797,9 @@ mod tests {
 
     #[test]
     fn bit6_is_a_sticky_level_not_a_50_tick_pulse() {
-        // G2: bit6 of 0x01000E04 is a LEVEL latch. Once set it does NOT
-        // auto-clear after N ticks (the old 50-tick transient-pulse model
-        // is gone). It only clears on a W1C write or an explicit
-        // level-drop from the bank.
+        // bit6 of 0x01000E04 is a LEVEL latch. Once set it does NOT
+        // auto-clear after N ticks. It only clears on a W1C write or an
+        // explicit level-drop from the bank.
         let mut m = EponMac::new();
         assert_eq!(m.read_word(REG_HW_STATE_STATUS).unwrap() & 0x40, 0);
         m.set_phy_link_status_bit();
@@ -748,13 +838,63 @@ mod tests {
         assert_eq!(m.read_word(addr).unwrap() & 0x100, 0x100);
     }
 
+    /// A queue nothing has arrived in reads zero — and that zero is a
+    /// measurement, not a hardcoded answer: the same port returns the
+    /// arrivals once the datapath reports some.
+    ///
+    /// This replaces a test that asserted the port is *always* zero. It
+    /// passed for the wrong reason: two read paths returned a literal
+    /// zero, so the assertion could not fail and the port had no
+    /// denominator at all.
     #[test]
-    fn counter_result_slots_always_zero() {
+    fn a_latched_counter_answers_the_arrivals_of_the_selected_queue() {
         let mut m = EponMac::new();
-        for slot in 0..LLID_SLOT_COUNT as u32 {
-            let addr = EPON_LLID_BASE + slot * EPON_LLID_STRIDE + 0x1D8;
-            assert_eq!(m.read_word(addr).unwrap(), 0);
+        m.reset_cold();
+        let cmd = EPON_LLID_BASE + 0x1D4;
+        let data = EPON_LLID_BASE + 0x1D8;
+
+        // Nothing has arrived anywhere yet.
+        for queue in [0x00u32, 0x0F, 0x10] {
+            m.write_word(cmd, (queue << 4) | 0xC).unwrap();
+            assert_eq!(m.read_word(data).unwrap(), 0);
         }
+
+        // The datapath reports three frames into queue 0x10 and one into
+        // 0x0F; each queue answers for itself.
+        m.record_queue_arrivals(0x10, 3);
+        m.record_queue_arrivals(0x0F, 1);
+
+        m.write_word(cmd, (0x10 << 4) | 0xC).unwrap();
+        assert_eq!(m.read_word(data).unwrap(), 3);
+        m.write_word(cmd, (0x0F << 4) | 0xC).unwrap();
+        assert_eq!(m.read_word(data).unwrap(), 1);
+        m.write_word(cmd, 0xC).unwrap();
+        assert_eq!(m.read_word(data).unwrap(), 0, "queue 0 saw nothing");
+    }
+
+    /// The wait on the command port has no timeout, so the busy bit must
+    /// never survive a write — whatever the command asked for.
+    #[test]
+    fn the_counter_latch_never_stays_busy() {
+        let mut m = EponMac::new();
+        m.reset_cold();
+        for val in [0x8000_000Cu32, 0x8000_0FFC, 0xFFFF_FFFF, 0x0000_0004] {
+            m.write_word(EPON_LLID_BASE + 0x1D4, val).unwrap();
+            assert_eq!(m.read_word(EPON_LLID_BASE + 0x1D4).unwrap() & 0x8000_0000, 0);
+        }
+    }
+
+    /// Peeking must not move a counter of reads — the bank peeks a word
+    /// before writing it.
+    #[test]
+    fn peeking_the_counter_port_has_no_side_effect() {
+        let mut m = EponMac::new();
+        m.reset_cold();
+        m.record_queue_arrivals(0x10, 2);
+        m.write_word(EPON_LLID_BASE + 0x1D4, (0x10 << 4) | 0xC).unwrap();
+        let before = m.unattributed_counter_reads;
+        assert_eq!(m.peek_word(EPON_LLID_BASE + 0x1D8).unwrap(), 2);
+        assert_eq!(m.unattributed_counter_reads, before);
     }
 
     #[test]
@@ -790,14 +930,50 @@ mod tests {
         assert!(!m.claims(0x0100_0180));
         // PBC SPI.
         assert!(!m.claims(0x0100_0200));
-        // MACsec (Session 4).
+        // MACsec.
         assert!(!m.claims(0x0100_2400));
         // EPON-owned.
         assert!(m.claims(0x0100_0000));
         assert!(m.claims(0x0100_0030));
         assert!(m.claims(0x0100_043C));
         assert!(m.claims(0x0100_1404));
-        // 0x0100_2804 moved to MACsec in Session 4.
+        // 0x0100_2804 is owned by MACsec.
         assert!(!m.claims(0x0100_2804));
+    }
+
+    /// The queue pointer register answers with the queue's own start
+    /// address, cadred the way the readback path decodes it: bits [26:9]
+    /// of the word, pointer at [15:6] inside that field.
+    ///
+    /// Real hardware prints `Rd:0:028:00` for a queue whose start is
+    /// `0x028` and `Rd:0:038:00` for one starting at `0x038`; a model
+    /// returning the stored selector printed `0:000:00` for both.
+    #[test]
+    fn a_queue_pointer_reads_back_at_the_start_of_its_queue() {
+        let mut m = EponMac::new();
+        m.reset_cold();
+        for (queue, start, end) in [(0x0Eu32, 0x000u32, 0x027u32), (0x0F, 0x028, 0x037), (0x10, 0x038, 0x047)] {
+            // The queue configuration word, as software programs it.
+            m.write_word(0x0100_1480 + queue * 4, (end << 12) | start).unwrap();
+            // Select that queue, read pointer 0 then pointer 1.
+            for mode in 0..2u32 {
+                m.write_word(0x0100_143C, queue | (mode << 5)).unwrap();
+                let word = m.read_word(0x0100_143C).unwrap();
+                let field = (word >> 9) & 0x3_FFFF;
+                assert_eq!((field & 0xFFC0) >> 6, start, "queue {queue:#04x} pointer {mode}");
+                assert_eq!(field & 0x3F, 0);
+            }
+        }
+    }
+
+    /// Bit 8 is derived, never stored. Software writes this word with
+    /// bit 8 clear; storing that back would leave the firmware spinning
+    /// on a drain-done bit that never arrives — its wait has no timeout.
+    #[test]
+    fn the_drain_done_bit_survives_a_selector_write() {
+        let mut m = EponMac::new();
+        m.reset_cold();
+        m.write_word(0x0100_143C, 0x0F).unwrap();
+        assert_ne!(m.read_word(0x0100_143C).unwrap() & 0x100, 0);
     }
 }

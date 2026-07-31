@@ -1,4 +1,4 @@
-//! BCM55030 MPCP / Multi-Point Control Protocol — D3.
+//! BCM55030 MPCP / Multi-Point Control Protocol.
 //!
 //! Carves the MPCP-owned register regions out of the sysreg_shim
 //! residual store. The MPCP controller's HW blocks are documented
@@ -20,24 +20,18 @@
 //! |   28  | Slot Table               | `0x01001180`..`0x010011C0`             |
 //! | 21+51 | Dir/Lane + BW End / MAC  | `0x01001268`..`0x01001390`             |
 //!
-//! Block 17 "MPCP Speed Configuration" is an SRAM data structure
-//! (runtime `0x0007E6CC`) — not MMIO, not modelled here. Block 22
-//! "MPCP LLID Control" is inside the SerDes lane configuration
-//! range; the SerDes peripheral round-trips it correctly.
-//! Block 61 "MPCP Slot HW Command Engine" (runtime `0x01002644`,
-//! stride `0x400`) is inside the MACsec SA programming range and
-//! is served by the MACsec command-bit shadow mechanism.
+//! Block 17 "MPCP Speed Configuration" is an SRAM data structure —
+//! not MMIO, not modelled here. Block 22 "MPCP LLID Control" is
+//! inside the SerDes lane configuration range; the SerDes peripheral
+//! round-trips it correctly. Block 61 "MPCP Slot HW Command Engine"
+//! (`0x01002644`, stride `0x400`) is inside the MACsec SA programming
+//! range and is served by the MACsec command-bit shadow mechanism.
 //!
-//! All runtime base addresses were extracted by dumping SRAM
-//! after a full `boot_to_prompt_warm` run and reading the
-//! firmware-initialised DAT_* pointers. See deferral D3 in
-//! the design notes for the RE notes.
-//!
-//! v1 is a plain backing store — writes land in an internal
+//! This is a plain backing store — writes land in an internal
 //! `Vec<u32>` keyed by the claim region, reads round-trip the
-//! stored value. Warm snapshot pre-seeds from `mmio_init.rs`. A
-//! future session can layer MPCP semantics on top once the CLI
-//! exposes MPCP state.
+//! stored value. Warm snapshot pre-seeds from `mmio_init.rs`. MPCP
+//! semantics can be layered on top later once the CLI exposes MPCP
+//! state.
 
 use crate::cpu::exception::Exception;
 use crate::soc::peripheral::{
@@ -101,9 +95,9 @@ impl Mpcp {
     /// Drive a value into the block-52 TX-rate store at `addr` without
     /// going through the normal write path. Used by the bank (OLT-gated)
     /// to mirror the OLT model's HW-captured timestamp into `0x01000320`
-    /// — the registration-independent RX-decode proof the firmware polls
-    /// (`mpcp_sm.rs:490`). No-op when `addr` is outside the claimed
-    /// regions, so a disabled OLT never reaches this. G1.
+    /// — the registration-independent RX-decode proof the firmware polls.
+    /// No-op when `addr` is outside the claimed regions, so a disabled
+    /// OLT never reaches this.
     pub fn poke_tx_rate(&mut self, addr: u32, val: u32) {
         if let Some((region, idx)) = self.locate(addr) {
             self.stores[region][idx] = val;

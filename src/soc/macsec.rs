@@ -1,4 +1,4 @@
-//! BCM55030 MACsec cryptographic engine — Session 4.
+//! BCM55030 MACsec cryptographic engine.
 //!
 //! Claims the MACsec 1G and 10G Security Association programming
 //! windows plus the key table tail:
@@ -12,11 +12,9 @@
 //!   * `0x01003500..0x01003540` — MACsec key table tail (block
 //!     3501 per `hwregs`).
 //!
-//! The peripheral is a register file with command-bit auto-clear
-//! for bits `27..31` — the same mechanism the old `sysreg_shim`
-//! applied as a generic rule (audit 5.8) is now scoped to the
-//! MACsec claim set, which is where the firmware actually polls
-//! on busy bits (key engine, PN threshold).
+//! The peripheral is a register file with command-bit auto-clear for
+//! bits `27..31`, scoped to the MACsec claim set — which is where the
+//! firmware actually polls on busy bits (key engine, PN threshold).
 //!
 //! v1 is state-machine level only: the key engine / PN threshold
 //! busy bits clear after one tick so the firmware polling loop
@@ -25,13 +23,6 @@
 //! backing store untouched. The UI can force a PN overflow via
 //! [`MacsecEvent::InjectPnOverflow`] and reset the SA table via
 //! [`MacsecEvent::ResetSaTable`].
-//!
-//! Audit items resolved:
-//!
-//!   * **5.8 (part)** — the generic "bits 27-31 auto-clear" in the
-//!     sysreg_shim is narrowed to this peripheral's claim set.
-//!   * **5.12 (part)** — MACsec's slice of `SYSREG_INIT_VALUES`
-//!     is now loaded by `reset_warm()`.
 
 use crate::cpu::exception::Exception;
 use crate::soc::peripheral::{
@@ -56,19 +47,20 @@ const CMD_BIT: u32 = 0x8000_0000;
 /// bit-31 command / busy protocol. Any other offset is a plain
 /// backing store.
 ///
-///   * `0x0100240C` — MDIO PHY command register, 1 Gb bank
-///     (`DAT_ram_2003550c + 0x34`, `phy_mdio_rw_op`).
-///   * `0x0100280C` — same, 10 Gb bank (`+ 0x400`).
-///   * `0x01002644` — MPCP HW Command Engine slot 0
-///     (`DAT_ram_20035e4c`, `mpcp_slot_hw_dispatch_command_and_wait`).
-///   * `0x01002A44` — MPCP HW Command Engine slot 1 (`+ 0x400`).
+///   * `0x01002A44` — MPCP HW command engine, second bank (`+ 0x400`).
+///     Its busy-wait has no timeout, so the bit must always clear.
 ///
-/// Identified by tracing each busy-wait loop in Ghidra after a
-/// naive "clear bits [31:27] on every write" broke UART interactivity
-/// via false-positive state-change detections in
-/// `epon_poll_hw_state_changes`. Documented in the design notes as the D8
-/// investigation.
-const CMD_REGS: &[u32] = &[0x0100_240C, 0x0100_280C, 0x0100_2644, 0x0100_2A44];
+/// This claim range overlaps the SerDes lane window
+/// (`0x01002400..0x01002A00`), which every dispatch chain tests
+/// **first**. Only offsets at or above `0x01002A00` ever reach this
+/// peripheral, so the three command registers below that boundary
+/// (`0x0100240C`, `0x0100280C`, `0x01002644`) are served by
+/// `serdes::is_cmd_bit_register` and were dead weight here.
+///
+/// Identified by tracing each busy-wait loop after a naive "clear bits
+/// [31:27] on every write" broke UART interactivity via false-positive
+/// state-change detections in the hardware state poller.
+const CMD_REGS: &[u32] = &[0x0100_2A44];
 
 const MACSEC_SA_RANGES: &[AddressRange] = &[
     AddressRange::new(MACSEC_SA_BASE, MACSEC_SA_END),
@@ -180,10 +172,9 @@ impl Peripheral for Macsec {
         //     the fatal-error bit mask, typically 0x105C)
         //   * Read path  → block 5601 FATAL_ERROR_STATUS, which on
         //     silicon returns 0 when no fatal condition is latched
-        // A shared backing store would let the MASK write poison
-        // the STATUS read, which is exactly what Session 8's UART
-        // interactivity bug was — `epon_poll_hw_state_changes`
-        // saw bits 0x105C flipping and triggered a shutdown loop.
+        // A shared backing store would let the MASK write poison the
+        // STATUS read: the firmware's hardware-state poller would see
+        // bits 0x105C flipping and trigger a shutdown loop.
         if addr == 0x0100_2804 {
             return Ok(0);
         }
@@ -213,8 +204,8 @@ impl Peripheral for Macsec {
             // FATAL_ERROR_MASK write (see the matching read arm
             // above). Stash the value so the UI snapshot can
             // surface it, but do not let it alias the STATUS
-            // read. A shared backing-store array would cause
-            // `epon_poll_hw_state_changes` to see bits flipping
+            // read. A shared backing-store array would cause the
+            // firmware's hardware-state poller to see bits flipping
             // and fire an unexpected shutdown.
             if addr == 0x0100_2804 {
                 self.fatal_error_mask = val;
@@ -318,18 +309,16 @@ mod tests {
         assert_eq!(m.read_word(0x0100_2480).unwrap(), 0x8000_00AA);
     }
 
+    /// `0x01002A44` is the only command register this peripheral is ever
+    /// asked to serve: the addresses below `0x01002A00` are taken by the
+    /// SerDes lane window, which every dispatch chain tests first.
     #[test]
-    fn mdio_command_register_clears_bit31_on_read() {
+    fn command_register_clears_bit31_on_read() {
         let mut m = Macsec::new();
-        // 0x0100240C is the 1 Gb MDIO PHY command register.
-        m.write_word(0x0100_240C, 0x8000_1234).unwrap();
-        assert_eq!(m.read_word(0x0100_240C).unwrap(), 0x8000_1234);
+        m.write_word(0x0100_2A44, 0x8000_1234).unwrap();
+        assert_eq!(m.read_word(0x0100_2A44).unwrap(), 0x8000_1234);
         // Second read: bit 31 cleared (operation complete).
-        assert_eq!(m.read_word(0x0100_240C).unwrap(), 0x0000_1234);
-        // Same semantic for the 10 Gb bank.
-        m.write_word(0x0100_280C, 0x8000_5678).unwrap();
-        assert_eq!(m.read_word(0x0100_280C).unwrap(), 0x8000_5678);
-        assert_eq!(m.read_word(0x0100_280C).unwrap(), 0x0000_5678);
+        assert_eq!(m.read_word(0x0100_2A44).unwrap(), 0x0000_1234);
     }
 
     #[test]

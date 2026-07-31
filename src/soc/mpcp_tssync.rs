@@ -1,10 +1,9 @@
-//! BCM55030 MPCP timestamp-sync (NCO slave loop) register block — G1+G5.
+//! BCM55030 MPCP timestamp-sync (NCO slave loop) register block.
 //!
 //! Models the MPCP TS-sync control/status registers that the firmware's
-//! TS-sync state machine (the reference model)
-//! drives and reads back. On real silicon these registers live in the
-//! EPON MAC's MPCP timing block; they are NOT a dumb RAM store — three
-//! of them are HW-driven status reads:
+//! TS-sync state machine drives and reads back. On real silicon these
+//! registers live in the EPON MAC's MPCP timing block; they are NOT a
+//! dumb RAM store — three of them are HW-driven status reads:
 //!
 //! | Addr         | Name (firmware contract)                | R/W on silicon |
 //! |:-------------|:----------------------------------------|:---------------|
@@ -36,7 +35,7 @@
 //!
 //! When the OLT model is ENABLED, the bank drives:
 //!   * `0x010000B4` / `0x01000D8C` from the OLT's advancing
-//!     `mpcp_timestamp` / a monotonic local NCO counter (G5);
+//!     `mpcp_timestamp` / a monotonic local NCO counter;
 //!   * `0x01000304` bit0 (OLT-lock) = 1 only once the OLT model has
 //!     broadcast ≥1 downstream GATE — modelling HW timestamp lock off
 //!     the recovered downstream, NOT a firmware write to `0x01000300`.
@@ -46,14 +45,14 @@
 //! `0x01000304`) round-trip through the backing store in BOTH modes.
 //!
 //! Datasheet basis: §14.6 (MPCP TX-rate `0x01000320`); the bit-level
-//! TS-sync semantics of `0x01000304`/`0x010000B4` are NEEDS-RE-FIRST and
-//! taken here from the firmware's documented expectation in
-//! `mpcp_sm.rs::ts_sync_tick` (INFERRED contract, marked below).
+//! TS-sync semantics of `0x01000304`/`0x010000B4` are an INFERRED
+//! contract taken from the firmware's expected behaviour (marked
+//! below), not yet verified against silicon.
 
 use crate::cpu::exception::Exception;
 use crate::soc::peripheral::{AddressRange, Peripheral, PeripheralSnapshot};
 
-// OBSERVED (mpcp_sm.rs:51): MPCP_TS_BLK = 0x010002E8, +0x18 = 0x01000300.
+// OBSERVED: MPCP_TS_BLK = 0x010002E8, +0x18 = 0x01000300.
 pub const REG_TS_ARM: u32 = 0x0100_0300; // MPCP_TS_BLK + 0x18, bit0 = firmware arm
 pub const REG_TS_LOCK: u32 = 0x0100_0304; // MPCP_TS_BLK + 0x1c, bit0 = HW OLT-lock
 pub const REG_TS_FREQ_ERR: u32 = 0x0100_0314; // freq-error high word (firmware write)
@@ -97,7 +96,7 @@ pub struct MpcpTsSync {
 
     /// HW OLT-lock level — set by the bank (OLT-gated) once the OLT model
     /// has broadcast a downstream GATE. OR-ed into `0x01000304` bit0 on
-    /// read. INFERRED contract from `mpcp_sm.rs` (HW sets bit0 when synced).
+    /// read. INFERRED contract (HW sets bit0 when synced).
     hw_lock: bool,
 
     pub trace: bool,
@@ -157,18 +156,18 @@ impl MpcpTsSync {
     // ── OLT-gated driver methods (called by bank ONLY when OLT enabled) ──
 
     /// Drive the live OLT MPCP timestamp (`0x010000B4`) from the OLT
-    /// model's advancing `mpcp_timestamp`. G1.
+    /// model's advancing `mpcp_timestamp`.
     pub fn drive_captured_ts(&mut self, ts: u32) {
         self.captured_ts = ts;
     }
 
     /// Drive the local NCO TX timestamp (`0x01000D8C`) — a monotonic
-    /// counter in the bank-tick domain. G5.
+    /// counter in the bank-tick domain.
     pub fn drive_nco_tx_ts(&mut self, ts: u32) {
         self.nco_tx_ts = ts;
     }
 
-    /// Set the HW OLT-lock level (`0x01000304` bit0). G1. Driven by the
+    /// Set the HW OLT-lock level (`0x01000304` bit0). Driven by the
     /// bank once the OLT model has broadcast a downstream GATE — models
     /// HW timestamp lock off the recovered downstream, never a firmware
     /// write to `0x01000300`.
@@ -221,11 +220,11 @@ impl Peripheral for MpcpTsSync {
         match addr & !0x3 {
             REG_TS_ARM => self.ts_arm = val,
             REG_TS_LOCK => {
-                // Firmware arm write (`mpcp_ts_sync_set_active`). Store the
-                // firmware-written bits; the HW OLT-lock level is a separate
-                // input OR-ed in on read and is NOT created by this write
-                // (DO-NOT-FAKE: lock must come from the OLT model, never
-                // from the firmware arming the register).
+                // Firmware arm write. Store the firmware-written bits; the
+                // HW OLT-lock level is a separate input OR-ed in on read and
+                // is NOT created by this write (DO-NOT-FAKE: lock must come
+                // from the OLT model, never from the firmware arming the
+                // register).
                 self.ts_lock_fw = val;
             }
             REG_TS_FREQ_ERR => self.ts_freq_err = val,
