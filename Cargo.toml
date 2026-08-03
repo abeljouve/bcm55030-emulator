@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/epon-olt"]
+
 [package]
 name = "bcm55030-emulator"
 version = "0.1.0"
@@ -20,8 +23,14 @@ required-features = ["ui"]
 default = []
 # Enable the egui/eframe GUI layer. Pulls in native windowing.
 ui  = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:egui-phosphor", "dep:rfd"]
+# Enable the cycle-approximate cache + bus-contention timing overlay on the
+# ISS (Phase B). OFF by default: with it off the functional ISS behaves
+# exactly as before. The Phase-A standalone `timing` module is always
+# available and does not require this feature.
+timing = []
 
 [dependencies]
+epon-olt = { path = "crates/epon-olt" }
 libc = "0.2"
 parking_lot = "0.12"
 gimli = { version = "0.32", default-features = false, features = ["read", "std"] }

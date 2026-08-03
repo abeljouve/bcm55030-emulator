@@ -1,0 +1,14 @@
+[package]
+name = "epon-olt"
+version = "0.1.0"
+edition = "2021"
+description = "An EPON OLT peer that runs its own loop: MPCP, OAM and the fibre between the two ends"
+license = "AGPL-3.0-only"
+
+[[bin]]
+name = "olt"
+path = "src/bin/olt.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+schemars = "1"
