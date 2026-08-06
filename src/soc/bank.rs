@@ -20,6 +20,7 @@ use crate::cpu::exception::Exception;
 use crate::soc::alarm_events::AlarmEvents;
 use crate::soc::bsc_i2c::BscI2c;
 use crate::soc::lane_bus::LaneBus;
+use crate::soc::lue::Lue;
 use crate::soc::dma::DmaChannelController;
 use crate::soc::efuse_udr::EfuseUdr;
 use crate::soc::epon_mac::EponMac;
@@ -28,7 +29,7 @@ use crate::soc::macsec::Macsec;
 use crate::soc::mpcp::Mpcp;
 use crate::soc::mpcp_tssync::MpcpTsSync;
 use crate::soc::nco::Nco;
-use crate::soc::olt::Olt;
+use crate::soc::olt::{self, Olt};
 use crate::soc::pbc::Pbc;
 use crate::soc::peripheral::{
     DatapathOp, Peripheral, PeripheralEvent, PeripheralId, PeripheralSnapshot,
@@ -38,7 +39,7 @@ use crate::soc::serdes::SerDes;
 use crate::soc::sysreg_shim::SysregShim;
 use crate::soc::timer::EponTimer;
 use crate::soc::uart::Uart;
-use crate::soc::vlan_lue::VlanLue;
+use crate::soc::mac_filter::MacFilter;
 
 /// CPU instructions between bank tick invocations. Higher = less
 /// contention but coarser peripheral advancement. The EPON timer
@@ -56,6 +57,15 @@ pub struct LastAccessInfo {
 }
 
 const LAST_ACCESS_MAX: usize = 4096;
+
+/// Source address of a synthesized uplink frame, used until the firmware's
+/// own transmission supplies the real one.
+const SYNTHETIC_ONU_MAC: olt::types::MacAddr =
+    olt::types::MacAddr::new([0x02, 0x00, 0x00, 0x01, 0x02, 0x03]);
+/// Discovery windows the synthesized frame claims: the 10/1 Gbit/s row.
+const SYNTHETIC_DISCOVERY_INFORMATION: u16 = 0x0011;
+/// Laser on and off times the synthesized frame declares.
+const SYNTHETIC_LASER_TQ: u8 = 32;
 
 /// Per-access MMIO history entry for the ring buffer.
 #[derive(Clone, Debug)]
@@ -172,6 +182,17 @@ pub struct PeripheralBank {
     pub bsc_i2c: BscI2c,
     /// Lane 8 indirect bus — MPCP SerDes register file.
     pub mpcp_bus: LaneBus,
+    /// Packet classifier: two latched indirect ports into the rule
+    /// tables. Ten addresses inside the SerDes lane window, so it is
+    /// tested before the SerDes on every dispatch chain.
+    pub lue: Lue,
+    /// Whether the classifier decides downstream routing.
+    ///
+    /// Shut by default. The step from a rule verdict to a mailbox queue
+    /// is not established, and an open gate would put that guess on the
+    /// only path every downstream frame takes.
+    pub use_classifier: bool,
+    pub classifier_binding: crate::soc::lue::ClassifierBinding,
     pub serdes: SerDes,
     pub epon_mac: EponMac,
     pub macsec: Macsec,
@@ -186,7 +207,7 @@ pub struct PeripheralBank {
     /// the OLT model is disabled. See `soc/mpcp_tssync.rs` (G1+G5).
     pub mpcp_tssync: MpcpTsSync,
     pub nco: Nco,
-    pub vlan_lue: VlanLue,
+    pub mac_filter: MacFilter,
     pub olt: Olt,
 
     /// Monotonic local NCO TX timestamp counter (bank-tick domain), used
@@ -201,12 +222,12 @@ pub struct PeripheralBank {
     /// dispatch chain.  All stimulus is HW-level, never firmware.
     pub scenario: ScenarioEngine,
 
-    /// Temporary residual-plus-legacy-arms for the SYSREG range
-    /// (`0x01000000..0x01003800`). Hosts every stub that has not yet been
-    /// carved into its own peripheral file — CHIP_ID, LLID IRQ forced 0,
-    /// SerDes forced bits, I²C UDR bit-bang, DMA queue drain, alarm
-    /// counters, etc. This struct shrinks as Sessions 2–7 land their
-    /// dedicated peripherals.
+    /// Transitional backing store for the SYSREG range
+    /// (`0x01000000..0x01003800`). Hosts every register that has not yet
+    /// been carved into its own peripheral file — CHIP_ID, LLID IRQ
+    /// forced 0, SerDes forced bits, I²C UDR bit-bang, DMA queue drain,
+    /// alarm counters, etc. This struct shrinks as subsystems gain
+    /// dedicated peripheral modules.
     pub sysreg: SysregShim,
 
     uart_rx_sender: mpsc::Sender<u8>,
@@ -253,11 +274,10 @@ pub struct PeripheralBank {
     /// Boot mode — peripherals snapshot this during construction.
     pub boot_mode: BootMode,
 
-    /// Audit 2.2: when `true`, MMIO accesses that no peripheral
-    /// claims return [`Exception::MemoryError`] instead of silently
-    /// reading as zero. Off by default; opt in via
-    /// `--unmapped-exception` on the main binary to surface
-    /// unmodelled firmware probes.
+    /// When `true`, MMIO accesses that no peripheral claims return
+    /// [`Exception::MemoryError`] instead of silently reading as zero.
+    /// Off by default; opt in via `--unmapped-exception` on the main
+    /// binary to surface unmodelled firmware probes.
     pub unmapped_exception: bool,
 
     /// Per-address last-access cache for `explain_mmio`. Bounded to
@@ -310,12 +330,15 @@ impl PeripheralBank {
             dma: DmaChannelController::new(),
             alarm_events: AlarmEvents::new(),
             timer: EponTimer::new(),
+            lue: Lue::new(),
+            use_classifier: false,
+            classifier_binding: Default::default(),
             efuse_udr: EfuseUdr::new(),
             fatal_filter: FatalFilter::new(),
             mpcp: Mpcp::new(),
             mpcp_tssync: MpcpTsSync::new(),
             nco: Nco::new(),
-            vlan_lue: VlanLue::new(),
+            mac_filter: MacFilter::new(),
             olt: Olt::new(),
             nco_tx_ts_counter: 0,
             pending_cache_inv: Vec::new(),
@@ -387,12 +410,23 @@ impl PeripheralBank {
         self.mpcp.tick(cpu_instructions);
         self.mpcp_tssync.tick(cpu_instructions);
         self.nco.tick(cpu_instructions);
-        self.vlan_lue.tick(cpu_instructions);
+        self.mac_filter.tick(cpu_instructions);
         self.olt.tick(cpu_instructions);
         // Drain OLT RX frames into per-slot mailbox FIFOs. Each frame
         // is routed by EtherType: MPCP→slot 0x10, OAM→slot 0x0F, etc.
         let mbox_before = self.olt.total_pending_count();
-        self.olt.load_frames_into_mailbox();
+        // The classifier decides only when its gate is open. Shut, the
+        // routing is byte-for-byte what it was before it existed.
+        let classifier = self
+            .use_classifier
+            .then_some((&self.lue, self.classifier_binding));
+        self.olt.load_frames_into_mailbox(classifier);
+        // The MAC holds the counters software latches; the OLT is where a
+        // frame is known to have landed. Carrying the number across is the
+        // datapath's job, and it is the bank that owns the datapath.
+        for (slot, frames) in self.olt.drain_arrivals() {
+            self.epon_mac.record_queue_arrivals(slot, frames);
+        }
         if self.olt.total_pending_count() > mbox_before {
             self.dma_master_status[0] |= 1 << 27;
             self.dma_channel_mask[0] |= 1;
@@ -419,39 +453,6 @@ impl PeripheralBank {
                     DatapathOp::CacheInvalidate { addr: base },
                 );
             }
-            // On real HW, the EPON MAC automatically sends REGISTER_ACK
-            // (opcode 6) back to the OLT after receiving REGISTER. Model
-            // this by injecting a synthetic REGISTER_ACK into the OLT TX path.
-            let onu_mac = self.olt.get_onu_mac();
-            let olt_mac = self.olt.config.mac;
-            let mut ack = Vec::with_capacity(64);
-            ack.extend_from_slice(&olt_mac);      // dst = OLT MAC
-            ack.extend_from_slice(&onu_mac);       // src = ONU MAC
-            ack.extend_from_slice(&0x8808u16.to_be_bytes()); // EtherType MPCP
-            ack.extend_from_slice(&6u16.to_be_bytes());      // opcode 6 = REGISTER_ACK
-            ack.extend_from_slice(&self.olt.mpcp_timestamp.to_be_bytes());
-            ack.extend_from_slice(&llid.to_be_bytes());      // echo assigned LLID
-            ack.push(0x03);                        // flags: register+ack
-            ack.extend_from_slice(&0x0032u16.to_be_bytes()); // sync time
-            while ack.len() < 64 { ack.push(0); }
-            self.olt.handle_tx_frame(&ack);
-        }
-        if self.olt.pending_final_ack {
-            self.olt.pending_final_ack = false;
-            let onu_mac = self.olt.get_onu_mac();
-            let olt_mac = self.olt.config.mac;
-            let llid = self.olt.assigned_llid();
-            let mut ack = Vec::with_capacity(64);
-            ack.extend_from_slice(&olt_mac);
-            ack.extend_from_slice(&onu_mac);
-            ack.extend_from_slice(&0x8808u16.to_be_bytes());
-            ack.extend_from_slice(&6u16.to_be_bytes());
-            ack.extend_from_slice(&self.olt.mpcp_timestamp.to_be_bytes());
-            ack.extend_from_slice(&llid.to_be_bytes());
-            ack.push(0x03);
-            ack.extend_from_slice(&0x0032u16.to_be_bytes());
-            while ack.len() < 64 { ack.push(0); }
-            self.olt.handle_tx_frame(&ack);
         }
         if self.olt.link_change_pending {
             self.olt.link_change_pending = false;
@@ -467,7 +468,7 @@ impl PeripheralBank {
                 );
             }
         }
-        if self.olt.config.enabled && self.olt.link_up {
+        if self.olt.link_up {
             self.epon_mac.set_discovery_status_bit();
         }
         // ── G2: bit6 (0x01000E04) 10G PCS block-lock as a sticky LEVEL ─
@@ -478,32 +479,30 @@ impl PeripheralBank {
         // When the downstream is gone, the level drops. This is a NO-OP
         // when the OLT is disabled (bit6 stays 0, as before). DO-NOT-FAKE:
         // the value tracks the modelled downstream-present condition.
-        if self.olt.config.enabled {
-            // "lane-3 RX up + valid downstream present" is modelled by the
-            // OLT having broadcast >=1 downstream GATE (a real stream the
-            // PCS can block-lock to). We do NOT model analog cal physics
-            // here (that is a scenario input — G4); bit6 reflects only the
-            // modelled downstream-present condition.
-            if self.olt.link_up && self.olt.has_broadcast_gate() {
-                self.epon_mac.set_phy_link_status_bit();
-                self.pending_cache_inv.push(
-                    DatapathOp::CacheInvalidate { addr: 0x0100_0E04 },
-                );
-            } else if !self.olt.link_up {
-                // Downstream stream gone -> PCS block-lock drops.
-                self.epon_mac.clear_phy_link_status_bit();
-                self.pending_cache_inv.push(
-                    DatapathOp::CacheInvalidate { addr: 0x0100_0E04 },
-                );
-            }
+        // "lane-3 RX up + valid downstream present" is modelled by the
+        // OLT having broadcast >=1 downstream GATE (a real stream the
+        // PCS can block-lock to). We do NOT model analog cal physics
+        // here (that is a scenario input — G4); bit6 reflects only the
+        // modelled downstream-present condition.
+        if self.olt.link_up && self.olt.has_broadcast_gate() {
+            self.epon_mac.set_phy_link_status_bit();
+            self.pending_cache_inv.push(
+                DatapathOp::CacheInvalidate { addr: 0x0100_0E04 },
+            );
+        } else if !self.olt.link_up {
+            // Downstream stream gone -> PCS block-lock drops.
+            self.epon_mac.clear_phy_link_status_bit();
+            self.pending_cache_inv.push(
+                DatapathOp::CacheInvalidate { addr: 0x0100_0E04 },
+            );
         }
         // ── G1 + G5: MPCP TS-sync register drive (OLT-gated) ──────────
         // When the OLT model is broadcasting a downstream (enabled +
         // link up), drive the HW-status TS-sync registers from the OLT
         // model's advancing timestamp and a local monotonic NCO counter.
         // This whole block is a NO-OP when the OLT is disabled, so the
-        // boot path and differential harness are byte-identical.
-        if self.olt.config.enabled && self.olt.link_up {
+        // boot path is byte-identical in that case.
+        if self.olt.link_up {
             // 0x010000B4 = live OLT MPCP timestamp (HW captured). On
             // silicon the firmware treats 0xFFFFFFFF as "block not
             // producing"; a present downstream gives a real value.
@@ -552,16 +551,14 @@ impl PeripheralBank {
                 );
             }
         }
-        if self.olt.config.enabled {
-            for wi in 0..6u32 {
-                let addr = 0x0100_1438 + wi * 0x200;
-                if addr < 0x0100_2000 {
-                    let bmp = self.olt.mailbox_bitmap[wi as usize];
-                    self.epon_mac.poke_llid_store(addr, bmp);
-                    self.pending_cache_inv.push(
-                        DatapathOp::CacheInvalidate { addr },
-                    );
-                }
+        for wi in 0..6u32 {
+            let addr = 0x0100_1438 + wi * 0x200;
+            if addr < 0x0100_2000 {
+                let bmp = self.olt.mailbox_bitmap[wi as usize];
+                self.epon_mac.poke_llid_store(addr, bmp);
+                self.pending_cache_inv.push(
+                    DatapathOp::CacheInvalidate { addr },
+                );
             }
         }
         // Phase 1 guard struct clear — models DMA completion.
@@ -580,8 +577,7 @@ impl PeripheralBank {
         // DMA engine's "no frames pending" signal. The 3-tick delay
         // ensures the firmware's store to 0x7E3CA has executed before
         // the D-cache invalidation discards it.
-        let mailbox_idle = self.olt.config.enabled
-            && !self.olt.has_any_pending()
+        let mailbox_idle = !self.olt.has_any_pending()
             && self.olt.mailbox_fifo.is_empty();
         if self.olt.frame_consumed || mailbox_idle {
             self.olt.frame_consumed = false;
@@ -604,18 +600,14 @@ impl PeripheralBank {
         self.sysreg.tick(cpu_instructions);
         self.scenario.tick(cpu_instructions);
 
-        // ── G4: SerDes cold-cal-done seed (scenario opt-in) ───────────
-        // The emulator does NOT model cold-cal convergence physics
-        // (DO-NOT-FAKE). When a scenario has explicitly opted into a
-        // converged analog state, seed the cal-done bit7 for lane2
-        // (reg-file 0x1BB) and lane3 (0x1DB) — both the readback slot
-        // (0x1BB/0x1DB) and the read-result slot (0x100) so the firmware
-        // sees cal-done via either path. Idempotent. Default
-        // (not-converged) leaves these alone so the firmware's cal poll
-        // observes the real non-convergence the project hunts.
+        // The RX calibration is no longer seeded from here. It converges as
+        // a consequence of the sequence software programs — arming the
+        // control register starts it, and it completes after the measured
+        // number of status reads (`LaneBus::arm_transaction`). A scenario
+        // that opts into a converged analog state now means "skip the
+        // wait", not "fabricate the bit".
         if self.scenario.serdes_cal_converged {
-            self.mpcp_bus.set_reg(0x1BB, self.mpcp_bus.reg(0x1BB) | 0x80);
-            self.mpcp_bus.set_reg(0x1DB, self.mpcp_bus.reg(0x1DB) | 0x80);
+            self.mpcp_bus.set_cal_immediate(true);
         }
 
         // Aggregate IRQ pending bits from all peripherals.
@@ -657,12 +649,13 @@ impl PeripheralBank {
         self.dma.reset_cold();
         self.alarm_events.reset_cold();
         self.timer.reset_cold();
+        self.lue.reset_cold();
         self.efuse_udr.reset_cold();
         self.fatal_filter.reset_cold();
         self.mpcp.reset_cold();
         self.mpcp_tssync.reset_cold();
         self.nco.reset_cold();
-        self.vlan_lue.reset_cold();
+        self.mac_filter.reset_cold();
         self.olt.reset_cold();
         self.sysreg.reset_cold();
         self.nco_tx_ts_counter = 0;
@@ -690,12 +683,13 @@ impl PeripheralBank {
         self.dma.reset_warm();
         self.alarm_events.reset_warm();
         self.timer.reset_warm();
+        self.lue.reset_warm();
         self.efuse_udr.reset_warm();
         self.fatal_filter.reset_warm();
         self.mpcp.reset_warm();
         self.mpcp_tssync.reset_warm();
         self.nco.reset_warm();
-        self.vlan_lue.reset_warm();
+        self.mac_filter.reset_warm();
         self.olt.reset_warm();
         self.sysreg.reset_warm();
         self.nco_tx_ts_counter = 0;
@@ -716,44 +710,37 @@ impl PeripheralBank {
         if !self.olt.link_up {
             return;
         }
-        // Read MPCP TX config from lane 8 indirect register file.
-        // Regs 0x50-0x53 are programmed by mpcp_build_register_frame.
-        let reg50 = self.mpcp_bus.reg(0x50);
-        let reg51 = self.mpcp_bus.reg(0x51);
-        let _reg52 = self.mpcp_bus.reg(0x52);
-
-        // Determine MPCP opcode from reg 0x51 grant flags.
-        // Bit 4 = discovery_info present → REGISTER_REQ (opcode 4).
-        // Otherwise default to REGISTER_REQ for now.
-        let opcode: u16 = if reg51 & 0x10 != 0 || reg50 == 0 { 0x0004 } else { 0x0004 };
-
-        let onu_mac = self.olt.config.onu_mac_override
-            .unwrap_or([0x02, 0x00, 0x00, 0x01, 0x02, 0x03]);
-        let ts = self.olt.mpcp_timestamp;
-
-        let mut frame = Vec::with_capacity(64);
-        // DA: slow protocol multicast (IEEE 802.3ah)
-        frame.extend_from_slice(&[0x01, 0x80, 0xC2, 0x00, 0x00, 0x01]);
-        // SA: ONU MAC
-        frame.extend_from_slice(&onu_mac);
-        // EtherType: 0x8808 (MPCP)
-        frame.extend_from_slice(&[0x88, 0x08]);
-        // Opcode
-        frame.extend_from_slice(&opcode.to_be_bytes());
-        // Timestamp (4 bytes BE)
-        frame.extend_from_slice(&ts.to_be_bytes());
-        // Pending grants + flags + padding to 64 bytes
-        while frame.len() < 64 {
-            frame.push(0x00);
+        // The firmware pushes its own frames through the transmit port. Once
+        // one has been captured there, this synthetic frame is not a stand-in
+        // any more — it is a second, competing source for the same state
+        // machine, and it reports a registration the firmware never earned.
+        if self.olt.real_tx_seen() {
+            return;
         }
-
-        eprintln!(
-            "[BCM55030] MPCP burst trigger — opcode 0x{:04X}, reg50=0x{:02X} reg51=0x{:02X}, ONU MAC {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            opcode, reg50, reg51,
-            onu_mac[0], onu_mac[1], onu_mac[2], onu_mac[3], onu_mac[4], onu_mac[5]
+        let onu_mac = self
+            .olt
+            .config
+            .onu_mac_override
+            .unwrap_or(SYNTHETIC_ONU_MAC);
+        let frame = olt::mpcp::register_req(
+            olt::mpcp::Header {
+                dst: olt::types::MacAddr::MPCP_MULTICAST,
+                src: onu_mac,
+                opcode: olt::mpcp::Opcode::RegisterReq,
+                timestamp: self.olt.mpcp_timestamp,
+            },
+            olt::mpcp::RegisterReqBody {
+                flag: olt::mpcp::RegisterReqFlag::Register,
+                pending_grants: 0,
+                discovery_information: SYNTHETIC_DISCOVERY_INFORMATION,
+                laser_on: SYNTHETIC_LASER_TQ,
+                laser_off: SYNTHETIC_LASER_TQ,
+            },
         );
+        eprintln!("[BCM55030] MPCP burst trigger — synthetic REGISTER_REQ from {onu_mac}");
         self.olt.handle_tx_frame(&frame);
     }
+
 
     /// Update the CPU context fields in one shot. Called by `Cpu::step()`
     /// before every MMIO access so trace entries can show the touching
@@ -902,6 +889,7 @@ impl PeripheralBank {
         if self.uart.claims(addr) { return Some("uart"); }
         if self.pbc.claims(addr) { return Some("pbc"); }
         if self.bsc_i2c.claims(addr) { return Some("bsc_i2c"); }
+        if self.lue.claims(addr) { return Some("lue"); }
         if self.serdes.claims(addr) { return Some("serdes"); }
         // mpcp_tssync claims 8 exact addresses, two of which (0x0D88/
         // 0x0D8C) fall inside epon_mac's table window — check it FIRST.
@@ -914,7 +902,7 @@ impl PeripheralBank {
         if self.fatal_filter.claims(addr) { return Some("fatal_filter"); }
         if self.mpcp.claims(addr) { return Some("mpcp"); }
         if self.nco.claims(addr) { return Some("nco"); }
-        if self.vlan_lue.claims(addr) { return Some("vlan_lue"); }
+        if self.mac_filter.claims(addr) { return Some("mac_filter"); }
         if self.sysreg.claims(addr) { return Some("sysreg"); }
         None
     }
@@ -925,6 +913,9 @@ impl PeripheralBank {
             pbc: self.pbc.clone(),
             bsc_i2c: self.bsc_i2c.clone(),
             mpcp_bus: self.mpcp_bus.clone(),
+            lue: self.lue.clone(),
+            use_classifier: self.use_classifier,
+            classifier_binding: self.classifier_binding,
             serdes: self.serdes.clone(),
             epon_mac: self.epon_mac.clone(),
             macsec: self.macsec.clone(),
@@ -936,7 +927,7 @@ impl PeripheralBank {
             mpcp: self.mpcp.clone(),
             mpcp_tssync: self.mpcp_tssync.clone(),
             nco: self.nco.clone(),
-            vlan_lue: self.vlan_lue.clone(),
+            mac_filter: self.mac_filter.clone(),
             olt: self.olt.clone(),
             scenario: self.scenario.clone(),
             sysreg: self.sysreg.clone(),
@@ -953,6 +944,9 @@ impl PeripheralBank {
         self.pbc = state.pbc;
         self.bsc_i2c = state.bsc_i2c;
         self.mpcp_bus = state.mpcp_bus;
+        self.lue = state.lue;
+        self.use_classifier = state.use_classifier;
+        self.classifier_binding = state.classifier_binding;
         self.serdes = state.serdes;
         self.epon_mac = state.epon_mac;
         self.macsec = state.macsec;
@@ -964,7 +958,7 @@ impl PeripheralBank {
         self.mpcp = state.mpcp;
         self.mpcp_tssync = state.mpcp_tssync;
         self.nco = state.nco;
-        self.vlan_lue = state.vlan_lue;
+        self.mac_filter = state.mac_filter;
         self.olt = state.olt;
         self.scenario = state.scenario;
         self.sysreg = state.sysreg;
@@ -1012,6 +1006,9 @@ impl PeripheralBank {
             };
             return Ok(v);
         }
+        if self.lue.claims(addr) {
+            return Ok(self.lue.peek_word(addr).unwrap_or(0));
+        }
         if self.serdes.claims(addr) {
             return self.serdes.peek_word(addr);
         }
@@ -1043,8 +1040,8 @@ impl PeripheralBank {
         if self.nco.claims(addr) {
             return self.nco.peek_word(addr);
         }
-        if self.vlan_lue.claims(addr) {
-            return self.vlan_lue.peek_word(addr);
+        if self.mac_filter.claims(addr) {
+            return self.mac_filter.peek_word(addr);
         }
         // SysregShim residual has no peek path yet.
         Ok(0)
@@ -1110,6 +1107,7 @@ impl PeripheralBank {
             self.seq_emit(addr, v, "r", "word", "mpcp_bus");
             return Ok(v);
         }
+        if self.lue.claims(addr) { dispatch_rw!(self.lue, "lue"); }
         if self.serdes.claims(addr) {
             let v = self.serdes.read_word(addr)?;
             let tag = SerDes::mdio_peripheral_tag(addr);
@@ -1127,10 +1125,10 @@ impl PeripheralBank {
         if self.fatal_filter.claims(addr) { dispatch_rw!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_rw!(self.mpcp, "mpcp"); }
         if self.nco.claims(addr) { dispatch_rw!(self.nco, "nco"); }
-        if self.vlan_lue.claims(addr) {
-            let v = self.vlan_lue.read_word(addr)?;
-            self.record_history(addr, v, "read", "word", "vlan_lue");
-            self.seq_emit(addr, v, "r", "word", "vlan_lue");
+        if self.mac_filter.claims(addr) {
+            let v = self.mac_filter.read_word(addr)?;
+            self.record_history(addr, v, "read", "word", "mac_filter");
+            self.seq_emit(addr, v, "r", "word", "mac_filter");
             return Ok(v);
         }
         // DMA mailbox status registers — intercept before sysreg.
@@ -1202,16 +1200,23 @@ impl PeripheralBank {
                 return Ok(());
             }};
         }
+        // The MAC's report template. Observational: the write still reaches
+        // the table store that serves it back.
+        self.olt.observe_report_template(addr, val);
+        // Uplink capture. Observational only: it consumes nothing and
+        // changes no read-back, so the write still reaches whichever
+        // peripheral claims it below.
+        if crate::soc::olt::Olt::claims_mailbox(addr) {
+            self.olt.observe_write(addr, val);
+        }
         // OLT CMD write intercept — must be before epon_mac.
         if crate::soc::olt::Olt::claims_mailbox(addr) && self.olt.write_cmd(addr, val) {
             // Immediately sync per-slot bitmap into epon_mac so the
             // firmware's next bitmap read sees the updated value.
-            if self.olt.config.enabled {
-                for wi in 0..6u32 {
-                    let a = 0x0100_1438 + wi * 0x200;
-                    if a < 0x0100_2000 {
-                        self.epon_mac.poke_llid_store(a, self.olt.mailbox_bitmap[wi as usize]);
-                    }
+            for wi in 0..6u32 {
+                let a = 0x0100_1438 + wi * 0x200;
+                if a < 0x0100_2000 {
+                    self.epon_mac.poke_llid_store(a, self.olt.mailbox_bitmap[wi as usize]);
                 }
             }
             self.record_history(addr, val, "write", "word", "olt_cmd");
@@ -1242,27 +1247,21 @@ impl PeripheralBank {
                 self.mpcp_bus.write_data(val);
             } else {
                 self.mpcp_bus.write_stat(val);
-                // STAT write with read trigger (bit 22): the HW reads the
-                // SerDes register selected by regs[0] and stores the result
-                // in regs[0x100]. For CDR cal-done registers 0xBB/0xDB,
-                // bit7 (cal-done) is forced ONLY when a scenario has opted
-                // into a converged analog state (G4 — DO-NOT-FAKE the cal
-                // physics). Default not-converged -> bit7 stays whatever
-                // was actually written (0), so the firmware's cal poll
-                // observes a genuine non-convergence.
-                if val & (1 << 22) != 0 && self.scenario.serdes_cal_converged {
-                    let target_reg = self.mpcp_bus.reg(0) as usize;
-                    if target_reg == 0xBB || target_reg == 0xDB {
-                        self.mpcp_bus.set_reg(0x100, self.mpcp_bus.reg(0x100) | 0x80);
-                    }
-                }
+                // A STAT write is what arms a lane-register transaction:
+                // the operand is already staged in the reg file and this
+                // word says whether to read it, write it, or only move the
+                // pointer. `arm_transaction` carries out the access against
+                // the lane registers, which is where the RX calibration
+                // engine lives.
+                self.mpcp_bus.arm_transaction(val);
             }
             self.record_history(addr, val, "write", "word", "mpcp_bus");
             self.seq_emit(addr, val, "w", "word", "mpcp_bus");
             return Ok(());
         }
+        if self.lue.claims(addr) { dispatch_ww!(self.lue, "lue"); }
         if self.serdes.claims(addr) {
-            if addr == 0x0100_01B0 && self.olt.config.enabled {
+            if addr == 0x0100_01B0 {
                 let old = self.serdes.peek_word(addr).unwrap_or(0);
                 self.serdes.write_word(addr, val)?;
                 if (val & 0x800) != 0 && (old & 0x800) == 0 {
@@ -1286,8 +1285,7 @@ impl PeripheralBank {
             // registered LLID — the firmware's table writes program
             // the match value, but slot 0 always reflects the OLT's
             // assigned LLID once registration completes.
-            if self.olt.config.enabled
-                && self.olt.mpcp_state() != crate::soc::olt::OltMpcpState::Idle
+            if self.olt.mpcp_state() != crate::soc::olt::OltMpcpState::Idle
                 && (addr == 0x0100_043C || addr == 0x0100_0D00)
                 && val != 0
             {
@@ -1303,14 +1301,25 @@ impl PeripheralBank {
         if self.macsec.claims(addr) { dispatch_ww!(self.macsec, "macsec"); }
         if self.dma.claims(addr) { dispatch_ww!(self.dma, "dma"); }
         if self.timer.claims(addr) { dispatch_ww!(self.timer, "timer"); }
-        if self.efuse_udr.claims(addr) { dispatch_ww!(self.efuse_udr, "efuse_udr"); }
+        if self.efuse_udr.claims(addr) {
+            // The lane register file has one instance per context, and
+            // which one a transaction reaches is decided *here*, not on
+            // the lane bus: software re-arms bits [13:12] of this word
+            // before every transaction. The bus cannot see the selector,
+            // so route it across explicitly — without this, both contexts
+            // share one file and each overwrites the other's registers.
+            if addr == crate::soc::efuse_udr::REG_I2C_UDR_CLK_RESET {
+                self.mpcp_bus.set_page(((val >> 12) & 3) as usize);
+            }
+            dispatch_ww!(self.efuse_udr, "efuse_udr");
+        }
         if self.fatal_filter.claims(addr) { dispatch_ww!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_ww!(self.mpcp, "mpcp"); }
         if self.nco.claims(addr) { dispatch_ww!(self.nco, "nco"); }
-        if self.vlan_lue.claims(addr) {
-            self.vlan_lue.write_word(addr, val)?;
-            self.record_history(addr, val, "write", "word", "vlan_lue");
-            self.seq_emit(addr, val, "w", "word", "vlan_lue");
+        if self.mac_filter.claims(addr) {
+            self.mac_filter.write_word(addr, val)?;
+            self.record_history(addr, val, "write", "word", "mac_filter");
+            self.seq_emit(addr, val, "w", "word", "mac_filter");
             return Ok(());
         }
         // DMA mailbox registers — W1C semantics.
@@ -1373,6 +1382,7 @@ impl PeripheralBank {
         if self.uart.claims(addr) { dispatch_rh!(self.uart, "uart"); }
         if self.pbc.claims(addr) { dispatch_rh!(self.pbc, "pbc"); }
         if self.bsc_i2c.claims(addr) { dispatch_rh!(self.bsc_i2c, "bsc_i2c"); }
+        if self.lue.claims(addr) { dispatch_rh!(self.lue, "lue"); }
         if self.serdes.claims(addr) { dispatch_rh!(self.serdes, "serdes"); }
         if self.mpcp_tssync.claims(addr) { dispatch_rh!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.epon_mac.claims(addr) { dispatch_rh!(self.epon_mac, "epon_mac"); }
@@ -1383,9 +1393,9 @@ impl PeripheralBank {
         if self.fatal_filter.claims(addr) { dispatch_rh!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_rh!(self.mpcp, "mpcp"); }
         if self.nco.claims(addr) { dispatch_rh!(self.nco, "nco"); }
-        if self.vlan_lue.claims(addr) {
-            let v = self.vlan_lue.read_half(addr)?;
-            self.seq_emit(addr, v as u32, "r", "half", "vlan_lue");
+        if self.mac_filter.claims(addr) {
+            let v = self.mac_filter.read_half(addr)?;
+            self.seq_emit(addr, v as u32, "r", "half", "mac_filter");
             return Ok(v);
         }
         if self.sysreg.claims(addr) { dispatch_rh!(self.sysreg, "sysreg"); }
@@ -1407,6 +1417,7 @@ impl PeripheralBank {
         if self.uart.claims(addr) { dispatch_wh!(self.uart, "uart"); }
         if self.pbc.claims(addr) { dispatch_wh!(self.pbc, "pbc"); }
         if self.bsc_i2c.claims(addr) { dispatch_wh!(self.bsc_i2c, "bsc_i2c"); }
+        if self.lue.claims(addr) { dispatch_wh!(self.lue, "lue"); }
         if self.serdes.claims(addr) { dispatch_wh!(self.serdes, "serdes"); }
         if self.mpcp_tssync.claims(addr) { dispatch_wh!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.epon_mac.claims(addr) { dispatch_wh!(self.epon_mac, "epon_mac"); }
@@ -1417,9 +1428,9 @@ impl PeripheralBank {
         if self.fatal_filter.claims(addr) { dispatch_wh!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_wh!(self.mpcp, "mpcp"); }
         if self.nco.claims(addr) { dispatch_wh!(self.nco, "nco"); }
-        if self.vlan_lue.claims(addr) {
-            self.vlan_lue.write_half(addr, val)?;
-            self.seq_emit(addr, val as u32, "w", "half", "vlan_lue");
+        if self.mac_filter.claims(addr) {
+            self.mac_filter.write_half(addr, val)?;
+            self.seq_emit(addr, val as u32, "w", "half", "mac_filter");
             return Ok(());
         }
         if self.sysreg.claims(addr) { dispatch_wh!(self.sysreg, "sysreg"); }
@@ -1451,6 +1462,7 @@ impl PeripheralBank {
         if self.uart.claims(addr) { dispatch_rb!(self.uart, "uart"); }
         if self.pbc.claims(addr) { dispatch_rb!(self.pbc, "pbc"); }
         if self.bsc_i2c.claims(addr) { dispatch_rb!(self.bsc_i2c, "bsc_i2c"); }
+        if self.lue.claims(addr) { dispatch_rb!(self.lue, "lue"); }
         if self.serdes.claims(addr) { dispatch_rb!(self.serdes, "serdes"); }
         if self.mpcp_tssync.claims(addr) { dispatch_rb!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.epon_mac.claims(addr) { dispatch_rb!(self.epon_mac, "epon_mac"); }
@@ -1461,9 +1473,9 @@ impl PeripheralBank {
         if self.fatal_filter.claims(addr) { dispatch_rb!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_rb!(self.mpcp, "mpcp"); }
         if self.nco.claims(addr) { dispatch_rb!(self.nco, "nco"); }
-        if self.vlan_lue.claims(addr) {
-            let v = self.vlan_lue.read_byte(addr)?;
-            self.seq_emit(addr, v as u32, "r", "byte", "vlan_lue");
+        if self.mac_filter.claims(addr) {
+            let v = self.mac_filter.read_byte(addr)?;
+            self.seq_emit(addr, v as u32, "r", "byte", "mac_filter");
             return Ok(v);
         }
         if self.sysreg.claims(addr) { dispatch_rb!(self.sysreg, "sysreg"); }
@@ -1485,6 +1497,7 @@ impl PeripheralBank {
         if self.uart.claims(addr) { dispatch_wb!(self.uart, "uart"); }
         if self.pbc.claims(addr) { dispatch_wb!(self.pbc, "pbc"); }
         if self.bsc_i2c.claims(addr) { dispatch_wb!(self.bsc_i2c, "bsc_i2c"); }
+        if self.lue.claims(addr) { dispatch_wb!(self.lue, "lue"); }
         if self.serdes.claims(addr) { dispatch_wb!(self.serdes, "serdes"); }
         if self.mpcp_tssync.claims(addr) { dispatch_wb!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.epon_mac.claims(addr) { dispatch_wb!(self.epon_mac, "epon_mac"); }
@@ -1495,9 +1508,9 @@ impl PeripheralBank {
         if self.fatal_filter.claims(addr) { dispatch_wb!(self.fatal_filter, "fatal_filter"); }
         if self.mpcp.claims(addr) { dispatch_wb!(self.mpcp, "mpcp"); }
         if self.nco.claims(addr) { dispatch_wb!(self.nco, "nco"); }
-        if self.vlan_lue.claims(addr) {
-            self.vlan_lue.write_byte(addr, val)?;
-            self.seq_emit(addr, val as u32, "w", "byte", "vlan_lue");
+        if self.mac_filter.claims(addr) {
+            self.mac_filter.write_byte(addr, val)?;
+            self.seq_emit(addr, val as u32, "w", "byte", "mac_filter");
             return Ok(());
         }
         if self.sysreg.claims(addr) { dispatch_wb!(self.sysreg, "sysreg"); }

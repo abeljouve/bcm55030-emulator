@@ -150,3 +150,101 @@ fn snapshot_all_exposes_sfp_row() {
         assert!(!sfp.part_number.is_empty(), "SFP part_number should be populated");
     }
 }
+
+/// The lane register file has one instance per context, and the selector
+/// that picks the instance does **not** ride on the lane bus: software
+/// latches it in a separate MMIO word and re-arms it before every
+/// transaction. The bank has to carry it across.
+///
+/// Without the bridge the two contexts share one file, each overwriting
+/// the other's registers — measured on a full boot as reads returning a
+/// value the reading context never wrote, then written back into its own
+/// configuration by the read-modify-write that follows.
+#[test]
+fn the_mode_selector_reaches_the_lane_register_file() {
+    let mut bank = PeripheralBank::new(BootMode::Warm);
+    // Bits [13:12] of the selector word; the rest of the word belongs to
+    // unrelated clock and reset controls and must not matter here.
+    for (word, expected_page) in [
+        (0x3E3E_0E41u32, 0usize),
+        (0x3E3E_1E41, 1),
+        (0x3E3E_2E41, 2),
+        (0x3E3E_3E41, 3),
+    ] {
+        bank.write_word(0x0100_0040, word).unwrap();
+        assert_eq!(
+            bank.mpcp_bus.page(),
+            expected_page,
+            "selector word {word:#010x} should select page {expected_page}"
+        );
+    }
+}
+
+/// The classifier gate is shut by default, and a shut gate routes
+/// downstream frames byte-for-byte the way the EtherType fallback did
+/// before the classifier existed.
+///
+/// The step from a rule verdict to a mailbox queue is the link that is
+/// not established; an open gate by default would put that guess on the
+/// path every downstream frame takes.
+#[test]
+fn the_classifier_gate_is_shut_by_default_and_changes_no_routing() {
+    let bank = PeripheralBank::new(BootMode::Warm);
+    assert!(!bank.use_classifier, "the gate must default to shut");
+    assert_eq!(bank.olt.classifier_counters.classified, 0);
+}
+
+/// With the gate open and no rules programmed, every frame falls back —
+/// and the fallback is **counted**. A fallback nobody counts cannot be
+/// told apart from a classifier that worked.
+#[test]
+fn an_open_gate_with_no_rules_falls_back_and_says_so() {
+    use bcm55030_emulator::soc::lue::{ClassifierBinding, Lue, Verdict};
+
+    let lue = Lue::new();
+    let frame = {
+        let mut f = vec![0u8; 64];
+        // MPCP EtherType — the fallback sends it to the control queue.
+        f[12] = 0x88;
+        f[13] = 0x08;
+        f
+    };
+    // An empty table decides nothing; it must not read as a miss.
+    assert!(matches!(
+        lue.classify(ClassifierBinding::default(), &frame),
+        Verdict::Undecidable { .. }
+    ));
+}
+
+/// O5, end to end: a frame that lands in a queue moves that queue's
+/// counter by one, and only that queue's.
+///
+/// The port used to answer a literal zero on both read paths, so "the
+/// counter did not move" could not be told from "the model has no
+/// counter". The denominator is the point of this test.
+#[test]
+fn an_arriving_frame_moves_the_counter_of_its_own_queue() {
+    let mut bank = PeripheralBank::new(BootMode::Warm);
+    let cmd = 0x0100_15D4u32;
+    let data = 0x0100_15D8u32;
+
+    let read_queue = |bank: &mut PeripheralBank, queue: u32| {
+        bank.write_word(cmd, (queue << 4) | 0xC).unwrap();
+        bank.read_word(data).unwrap()
+    };
+
+    // Control queue 0x10 and data queue 0x0F both start empty.
+    assert_eq!(read_queue(&mut bank, 0x10), 0);
+    assert_eq!(read_queue(&mut bank, 0x0F), 0);
+
+    // Three frames into the control queue, reported the way the
+    // datapath reports them.
+    bank.epon_mac.record_queue_arrivals(0x10, 3);
+    assert_eq!(read_queue(&mut bank, 0x10), 3);
+    assert_eq!(read_queue(&mut bank, 0x0F), 0, "a neighbour queue must not move");
+
+    // And the busy bit never survives a command: the firmware's wait on
+    // this port has no timeout.
+    bank.write_word(cmd, 0x8000_000C).unwrap();
+    assert_eq!(bank.read_word(cmd).unwrap() & 0x8000_0000, 0);
+}

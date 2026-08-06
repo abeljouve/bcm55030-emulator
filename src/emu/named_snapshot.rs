@@ -19,7 +19,8 @@ use crate::soc::serdes::SerDes;
 use crate::soc::sysreg_shim::SysregShim;
 use crate::soc::timer::EponTimer;
 use crate::soc::uart::Uart;
-use crate::soc::vlan_lue::VlanLue;
+use crate::soc::lue::Lue;
+use crate::soc::mac_filter::MacFilter;
 
 #[derive(Clone)]
 pub struct PeripheralBankSaveState {
@@ -27,6 +28,9 @@ pub struct PeripheralBankSaveState {
     pub pbc: Pbc,
     pub bsc_i2c: BscI2c,
     pub mpcp_bus: crate::soc::lane_bus::LaneBus,
+    pub lue: Lue,
+    pub use_classifier: bool,
+    pub classifier_binding: crate::soc::lue::ClassifierBinding,
     pub serdes: SerDes,
     pub epon_mac: EponMac,
     pub macsec: Macsec,
@@ -38,7 +42,7 @@ pub struct PeripheralBankSaveState {
     pub mpcp: Mpcp,
     pub mpcp_tssync: MpcpTsSync,
     pub nco: Nco,
-    pub vlan_lue: VlanLue,
+    pub mac_filter: MacFilter,
     pub olt: Olt,
     pub scenario: ScenarioEngine,
     pub sysreg: SysregShim,
