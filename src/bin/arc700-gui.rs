@@ -28,7 +28,6 @@ fn usage(prog: &str) {
     eprintln!("  --mcp-port <PORT>   TCP port for the MCP server (default: {DEFAULT_MCP_PORT}, 0 = random)");
     eprintln!("  --no-mcp            Disable the integrated MCP server");
     eprintln!("  --cold-boot         Use cold-boot mode on reset (default: warm)");
-    eprintln!("  --olt-enable                Enable EPON OLT emulation");
     eprintln!("  --olt-mac <MAC>             OLT MAC address (AA:BB:CC:DD:EE:FF)");
     eprintln!("  --verbose, -v       Enable [BCM55030] / [Hook] stderr trace");
     eprintln!("  --help, -h          This help");
@@ -40,7 +39,6 @@ struct GuiConfig {
     mcp_enabled: bool,
     mcp_port: u16,
     boot_mode: BootMode,
-    olt_enable: bool,
     olt_mac: Option<[u8; 6]>,
 }
 
@@ -51,7 +49,6 @@ fn parse_args() -> GuiConfig {
         mcp_enabled: true,
         mcp_port: DEFAULT_MCP_PORT,
         boot_mode: BootMode::Warm,
-        olt_enable: false,
         olt_mac: None,
     };
     let mut i = 1;
@@ -71,7 +68,6 @@ fn parse_args() -> GuiConfig {
             "--no-mcp" => cfg.mcp_enabled = false,
             "--cold-boot" => cfg.boot_mode = BootMode::Cold,
             "--warm-boot" => cfg.boot_mode = BootMode::Warm,
-            "--olt-enable" => cfg.olt_enable = true,
             "--olt-mac" => {
                 i += 1;
                 if i >= args.len() {
@@ -135,13 +131,11 @@ fn main() {
     // load_firmware.
     bank.write().uart.stdout_passthrough = false;
 
-    if cfg.olt_enable {
+    {
         let mut b = bank.write();
-        b.olt.set_enabled(true);
-        if let Some(mac) = cfg.olt_mac {
-            b.olt.config.mac = mac;
+                if let Some(mac) = cfg.olt_mac {
+            b.olt.config.mac = mac.into();
         }
-        b.olt.set_link_up(true);
     }
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<CpuCommand>();

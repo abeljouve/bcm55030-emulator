@@ -81,6 +81,7 @@ pub struct EmulatorApp {
     pub bottom_tab: panels::BottomTab,
     /// Scratch buffers for peripheral inspector input widgets.
     pub periph_scratch: panels::peripherals::PeripheralScratch,
+    pub packet_scratch: panels::packets::PacketScratch,
 
     /// Active Catppuccin flavour. Persisted via eframe storage.
     pub palette: Palette,
@@ -192,6 +193,7 @@ impl EmulatorApp {
             peripheral_tab: panels::peripherals::PeripheralTab::Uart,
             bottom_tab: panels::BottomTab::Uart,
             periph_scratch: panels::peripherals::PeripheralScratch::default(),
+            packet_scratch: panels::packets::PacketScratch::default(),
             palette,
             accents: AccentTokens::from_palette(palette),
             ips_history: std::collections::VecDeque::with_capacity(120),
@@ -541,12 +543,18 @@ impl eframe::App for EmulatorApp {
                     panels::CentralTab::Strings,
                     format!("{} Strings", egui_phosphor::regular::TEXT_AA),
                 );
+                ui.selectable_value(
+                    &mut self.central_tab,
+                    panels::CentralTab::Packets,
+                    format!("{} Packets", egui_phosphor::regular::SHARE_NETWORK),
+                );
             });
             ui.separator();
             match self.central_tab {
                 panels::CentralTab::Memory => panels::memory::draw(ui, self),
                 panels::CentralTab::Peripherals => panels::peripherals::draw(ui, self),
                 panels::CentralTab::Strings => panels::strings::draw(ui, self),
+                panels::CentralTab::Packets => panels::packets::draw(ui, self),
             }
         });
 

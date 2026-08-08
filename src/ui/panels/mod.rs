@@ -4,6 +4,7 @@ pub mod debug_panel;
 pub mod disassembly;
 pub mod mcp_log;
 pub mod memory;
+pub mod packets;
 pub mod peripherals;
 pub mod registers;
 pub mod status_bar;
@@ -18,6 +19,8 @@ pub enum CentralTab {
     Memory,
     Peripherals,
     Strings,
+    /// Frames exchanged with the EPON peer.
+    Packets,
 }
 
 /// Bottom panel tab selection: UART terminal, MCP activity log,

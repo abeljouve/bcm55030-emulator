@@ -21,6 +21,8 @@ fn usage(prog: &str) {
     eprintln!("Options:");
     eprintln!("  --entry <ADDR>              Entry point (hex, default: 0x0000)");
     eprintln!("  --max-cycles <N>            Maximum instructions (default: unlimited)");
+    #[cfg(feature = "timing")]
+    eprintln!("  --timing                    Enable the cycle-accurate cache+bus contention overlay");
     eprintln!("  --trace                     Log each instruction to stderr");
     eprintln!("  --trace-mmio                Log MMIO accesses to stderr");
     eprintln!("  --trace-sr                  Log AUX register writes (sr instructions) to stderr");
@@ -28,17 +30,17 @@ fn usage(prog: &str) {
     eprintln!("  --break <ADDR>              Stop at address (hex)");
     eprintln!("  --dccm-dump <FILE>          Dump DCCM to file on exit");
     eprintln!("  --persist-flash             Save modified flash to <flash.bin>.persist on exit");
-    eprintln!("  --cold-boot                 Start with zero sysreg / no IENABLE preset");
+    eprintln!("  --cold-boot                 Start with zero sysreg / interrupts disabled (E1=E2=0)");
     eprintln!("  --warm-boot                 Start with SYSREG_INIT_VALUES (default)");
     eprintln!("  --dump-mmio-trace-cold <F>  Cold-boot + dump MMIO trace catalog to <F>");
-    eprintln!("  --unmapped-exception        Trap unclaimed MMIO as MemoryError (audit 2.2)");
+    eprintln!("  --unmapped-exception        Trap unclaimed MMIO as MemoryError");
     eprintln!("  --trace-mmio-seq <FILE>     Write per-access MMIO trace as JSON Lines to FILE");
     eprintln!("  --trace-mmio-range S:E      Restrict --trace-mmio-seq to [S,E) (hex, repeatable)");
     eprintln!("  --scenario <FILE>           Load a JSON scenario file at startup");
     eprintln!("  --sfp-eeprom <FILE>         Load SFP EEPROM pages from a raw dump (256B A0h, or 512B A0h+A2h)");
     eprintln!("  --mcp-port <PORT>           Start MCP server on PORT (enables worker mode)");
-    eprintln!("  --olt-enable                Enable EPON OLT emulation");
     eprintln!("  --olt-mac <MAC>             OLT MAC address (AA:BB:CC:DD:EE:FF)");
+    eprintln!("  --olt-attributes <L,L,..>   Attribute leaves the peer reads, hex (e.g. 3,6,e)");
     eprintln!();
     eprintln!("For the egui GUI, build with --features ui:");
     eprintln!("  cargo run --release --features ui --bin arc700-gui");
@@ -58,7 +60,7 @@ struct Config {
     persist_flash: bool,
     watch_dccm: Option<u32>,
     dump_mmio_trace: Option<String>,
-    /// Audit 2.2: trap unclaimed MMIO reads / writes as
+    /// Trap unclaimed MMIO reads / writes as
     /// `MemoryError` exceptions instead of returning zero.
     unmapped_exception: bool,
     boot_mode: BootMode,
@@ -75,8 +77,14 @@ struct Config {
     scenario_path: Option<String>,
     sfp_eeprom_path: Option<String>,
     mcp_port: Option<u16>,
-    olt_enable: bool,
     olt_mac: Option<[u8; 6]>,
+    /// `--olt-attributes`: leaves the peer reads in rotation. Widen it to
+    /// survey which attributes the firmware answers, and with what width.
+    olt_attributes: Option<Vec<u16>>,
+    /// `--timing`: enable the cycle-accurate cache + bus-contention overlay
+    /// (the `timing` feature). Off by default; the ISS is unchanged without it.
+    #[cfg(feature = "timing")]
+    timing: bool,
 }
 
 fn parse_hex(s: &str) -> Option<u32> {
@@ -122,8 +130,10 @@ fn parse_args() -> Config {
         scenario_path: None,
         sfp_eeprom_path: None,
         mcp_port: None,
-        olt_enable: false,
         olt_mac: None,
+        olt_attributes: None,
+        #[cfg(feature = "timing")]
+        timing: false,
     };
 
     let mut i = 1;
@@ -151,6 +161,8 @@ fn parse_args() -> Config {
                     process::exit(1);
                 });
             }
+            #[cfg(feature = "timing")]
+            "--timing" => cfg.timing = true,
             "--trace" => cfg.trace = true,
             "--trace-from-insn" => {
                 i += 1;
@@ -282,7 +294,25 @@ fn parse_args() -> Config {
                     process::exit(1);
                 }));
             }
-            "--olt-enable" => cfg.olt_enable = true,
+            "--olt-attributes" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --olt-attributes requires a comma-separated list");
+                    process::exit(1);
+                }
+                cfg.olt_attributes = Some(
+                    args[i]
+                        .split(',')
+                        .filter_map(|t| {
+                            u16::from_str_radix(
+                                t.trim().trim_start_matches("0x").trim_start_matches("0X"),
+                                16,
+                            )
+                            .ok()
+                        })
+                        .collect(),
+                );
+            }
             "--olt-mac" => {
                 i += 1;
                 if i >= args.len() {
@@ -439,15 +469,10 @@ fn boot_from_flash(cpu: &mut Cpu, entry_point: u32, mode: BootMode) {
         copy_size, copy_size
     );
 
-    // Audit 1.1 revised after D6 diagnosis: `aux_ienable` is preset
-    // unconditionally because the BCM55030 silicon appears to reset
-    // the IRQ enable mask to `0xFFFFFFFF` — the firmware never
-    // programs it explicitly and the bootloader's TX path depends
-    // on IRQ 5 firing once STATUS32 bits E1 / E2 are set. E1 / E2
-    // themselves still only ship pre-set in warm mode because the
-    // firmware's FLAG instruction at `uart_enable_interrupts`
-    // (runtime `0x59F4`) drives them in both warm and cold.
-    cpu.state.aux_ienable = 0xFFFFFFFF;
+    // Nothing to preset on the interrupt-mask side: `AUX_IENABLE` (0x40C) is
+    // unimplemented on this silicon, so a line is never masked at the core.
+    // E1 / E2 still ship pre-set in warm mode only, because firmware enables
+    // interrupts via a FLAG instruction in both warm and cold boots.
     if mode == BootMode::Warm {
         cpu.state.flag_e1 = true;
         cpu.state.flag_e2 = true;
@@ -613,6 +638,11 @@ fn main() {
 
     cpu.trace = cfg.trace;
     cpu.trace_sr = cfg.trace_sr;
+    #[cfg(feature = "timing")]
+    if cfg.timing {
+        cpu.enable_timing(bcm55030_emulator::timing::TimingConfig::default());
+        eprintln!("[BCM55030] cycle-accurate cache+bus contention overlay ENABLED");
+    }
     cpu.mem.dccm_watchpoint = cfg.watch_dccm;
     if let Some(ref path) = cfg.debug_elf {
         match bcm55030_emulator::debug_info::DebugInfo::load(path) {
@@ -642,7 +672,7 @@ fn main() {
     }
     if cfg.unmapped_exception {
         cpu.bank().unwrap().write().unmapped_exception = true;
-        bcm55030_emulator::vlog!("[BCM55030] Unmapped-access policy = Exception (audit 2.2)");
+        bcm55030_emulator::vlog!("[BCM55030] Unmapped-access policy = Exception");
     }
     if let Some(ref path) = cfg.trace_mmio_seq {
         match bcm55030_emulator::soc::bank::SeqTrace::open(path, cfg.trace_mmio_ranges.clone()) {
@@ -701,16 +731,18 @@ fn main() {
         }
     }
 
-    // Configure OLT emulation.
-    if cfg.olt_enable {
+    // Configure the EPON peer. The link comes up on its own after the
+    // boot delay; forcing it here would let frames pile up before the
+    // firmware can drain them.
+    {
         let mut bank = cpu.bank().unwrap().write();
-        bank.olt.set_enabled(true);
-        if let Some(mac) = cfg.olt_mac {
-            bank.olt.config.mac = mac;
+        if let Some(ref leaves) = cfg.olt_attributes {
+            eprintln!("[OLT] reading {} attributes in rotation", leaves.len());
+            bank.olt.config.polled_attributes = leaves.clone();
         }
-        // Automatically set the link as up so the OLT starts
-        // MPCP discovery once the firmware reaches the event loop.
-        bank.olt.set_link_up(true);
+        if let Some(mac) = cfg.olt_mac {
+            bank.olt.config.mac = mac.into();
+        }
     }
 
     if let Some(port) = cfg.mcp_port {
@@ -721,8 +753,8 @@ fn main() {
     let orig_termios = setup_raw_terminal();
 
     // Safety rail: infinite-loop firmware gets N chances before we give
-    // up. Raised from 5 → u32::MAX (audit 8.3 — the old 5-reboot cap
-    // was an arbitrary development fence, not hardware behaviour).
+    // up. Raised to u32::MAX — a small reboot cap is an arbitrary
+    // development fence, not hardware behaviour.
     const MAX_REBOOTS: u32 = u32::MAX;
     let mut reboot_count: u32 = 0;
     let final_result;

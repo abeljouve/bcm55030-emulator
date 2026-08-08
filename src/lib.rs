@@ -8,6 +8,10 @@ pub mod hooks;
 pub mod mcp;
 pub mod memory;
 pub mod soc;
+/// Cycle-approximate cache + bus-contention timing model (Phase A standalone
+/// machine always compiled; the Phase-B ISS overlay is gated on the `timing`
+/// feature). Off the hot path unless explicitly driven.
+pub mod timing;
 #[cfg(feature = "ui")]
 pub mod ui;
 

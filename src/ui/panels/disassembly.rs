@@ -1,4 +1,4 @@
-//! Disassembly panel: Ghidra-like linear sweep with free
+//! Disassembly panel: linear sweep with free
 //! scrolling, branch arcs in the left gutter, PC highlight, and
 //! syntax-coloured operands.
 //!
@@ -506,7 +506,7 @@ fn classify_token(
     accents.muted
 }
 
-/// Draw Ghidra-style branch arcs inside the left gutter. Every
+/// Draw branch arcs inside the left gutter. Every
 /// `branch_target` lights up a vertical segment at a depth
 /// proportional to the index of the arc (so longer arcs sit
 /// further left). Arcs whose target is off-screen terminate in

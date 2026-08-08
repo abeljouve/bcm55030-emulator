@@ -542,10 +542,9 @@ impl Worker {
         self.cpu.mem.dcache_invalidate_all().ok();
         self.cpu.mem.icache_invalidate_all();
 
-        // See `src/bin/arc700.rs` for the IRQ-mask/flag handling
-        // that this mirrors. The silicon resets `IENABLE` to all-
-        // ones; the `E1`/`E2` presets only apply in warm mode.
-        self.cpu.state.aux_ienable = 0xFFFFFFFF;
+        // There is no IRQ enable mask to preset: `AUX_IENABLE` (0x40C) is
+        // unimplemented on this silicon (DATASHEET §6.1). The `E1`/`E2`
+        // presets only apply in warm mode.
         if boot_mode == BootMode::Warm {
             self.cpu.state.flag_e1 = true;
             self.cpu.state.flag_e2 = true;

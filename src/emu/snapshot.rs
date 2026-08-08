@@ -60,7 +60,10 @@ pub struct AuxSnapshot {
     pub lp_start: u32,
     pub lp_end: u32,
     pub int_vector_base: u32,
-    pub ienable: u32,
+    // No `ienable`: aux 0x40C is unimplemented (DATASHEET §6.1). A read of it
+    // returns `IDENTITY`, which the `identity` field above already reports —
+    // publishing a second copy under an enable-mask name would invite exactly
+    // the misreading the datasheet warns against.
     pub ipending: u32,
     /// Timer 0: COUNT, CONTROL, LIMIT (IRQ 3).
     pub count0: u32,
@@ -100,7 +103,6 @@ impl CpuSnapshot {
             lp_start: state.aux_lp_start,
             lp_end: state.aux_lp_end,
             int_vector_base: state.aux_int_vector_base,
-            ienable: state.aux_ienable,
             ipending: state.aux_irq_pending,
             count0: state.aux_count0,
             control0: state.aux_control0,

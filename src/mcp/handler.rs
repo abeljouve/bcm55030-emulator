@@ -511,7 +511,6 @@ pub struct LastAccessJson {
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct OltStateResult {
-    pub enabled: bool,
     pub mpcp_state: String,
     pub olt_mac: String,
     pub onu_mac: String,
@@ -523,24 +522,197 @@ pub struct OltStateResult {
     pub gate_count: u64,
 }
 
+/// The seven bits of an OAM flags field, named.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OamFlagsView {
+    pub raw: String,
+    pub link_fault: bool,
+    pub dying_gasp: bool,
+    pub critical_event: bool,
+    pub local_evaluating: bool,
+    pub local_stable: bool,
+    pub remote_evaluating: bool,
+    pub remote_stable: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OltDiscoveryView {
+    /// `local_evaluating`, `local_stable` or `converged`.
+    pub state: String,
+    /// True once extended OAMPDUs may be exchanged in either direction.
+    pub converged: bool,
+    pub local_flags: OamFlagsView,
+    /// Flags last seen from the ONU, if it has sent any.
+    pub peer_flags: Option<OamFlagsView>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OltVariableView {
+    pub branch: String,
+    pub leaf: String,
+    /// `full`, `bytes` or `status`.
+    pub length_kind: String,
+    pub length_raw: u8,
+    pub value_len: usize,
+    pub value_hex: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OltProtocolStateResult {
+    pub link_up: bool,
+    pub mpcp_state: String,
+    pub registration_complete: bool,
+    pub onu_mac: String,
+    pub assigned_llid: u16,
+    pub mpcp_timestamp: String,
+    /// Bank ticks elapsed: the host's clock.
+    pub ticks_elapsed: u64,
+    /// Link time elapsed, in milliseconds: the peer's clock.
+    pub wire_ms: f64,
+    pub discovery: OltDiscoveryView,
+    /// True once a frame has been reassembled from the transmit port. While
+    /// false, nothing the model reports came from the firmware.
+    pub real_tx_seen: bool,
+    pub tx_dropped: u64,
+    pub tx_assembling: bool,
+    pub gate_count: u64,
+    pub oam_keepalive_count: u64,
+    pub pending_frames: usize,
+    /// Everything the peer did with what it was handed, including the paths
+    /// that refused a frame. `register_req_seen` equals the sum of the ways
+    /// a request was disposed of; if it does not, a path is uncounted.
+    pub counters: crate::soc::olt::OltCounters,
+    /// Frames lost because a direction of the fibre was full. A downstream
+    /// nothing drains loses frames; one that never does is not modelling a
+    /// link.
+    pub dropped_downstream: u64,
+    pub dropped_upstream: u64,
+    /// Variables the ONU has answered with, most recent last.
+    pub attribute_replies: Vec<OltVariableView>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OltLinkParams {
+    /// Bring the peer's link up or down.
+    pub up: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OltLinkResult {
+    pub link_up: bool,
+    pub link_change_pending: bool,
+    pub link_up_delay_ticks: u64,
+    pub mpcp_state: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OltTraceParams {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OltTraceResult {
+    pub trace: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OltSendExtendedParams {
+    /// Attribute leaf to read, e.g. `3` for firmware info. Takes precedence
+    /// over `payload_hex` when both are given.
+    pub attribute_leaf: Option<u16>,
+    /// Raw bytes placed after the vendor opcode, when building the request
+    /// by hand.
+    pub payload_hex: Option<String>,
+    /// Vendor opcode. Default 1 (get-request).
+    pub opcode: Option<u8>,
+    /// OUI as `00-10-00` or `001000`. Default `00-10-00`.
+    pub oui: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OltSendExtendedResult {
+    pub ok: bool,
+    pub frame_hex: String,
+    pub length: usize,
+    /// False when discovery has not converged: a conforming receiver
+    /// discards extended OAMPDUs until both ends report stable.
+    pub gate_open: bool,
+    pub discovery_state: String,
+    /// Frames already in the uplink log; pass to olt_get_frames to see only
+    /// what arrives after this request.
+    pub tx_index_before: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OltFramesParams {
+    /// `tx` (ONU to peer), `rx` (peer to ONU) or `both`. Default `both`.
+    pub direction: Option<String>,
+    /// Most recent N frames. Default 50.
+    pub last: Option<usize>,
+    /// Keep only frames whose protocol contains this, e.g. `MPCP`, `OAM`,
+    /// `extended`.
+    pub protocol: Option<String>,
+    /// Include the raw bytes. Off by default; the dissection is usually
+    /// what you want.
+    pub include_hex: Option<bool>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OltFrameView {
+    pub index: usize,
+    /// `tx` = ONU to peer, `rx` = peer to ONU.
+    pub direction: String,
+    /// Instant on the link clock, in milliseconds.
+    pub wire_ms: f64,
+    pub length: usize,
+    /// What the model called this frame when it logged it.
+    pub label: String,
+    pub dst: String,
+    pub src: String,
+    pub ethertype: String,
+    pub protocol: String,
+    pub summary: String,
+    /// Dissection tree, flattened; `depth` gives the nesting.
+    pub fields: Vec<crate::soc::olt::decode::Field>,
+    pub hex: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OltFramesResult {
+    pub total_tx: usize,
+    pub total_rx: usize,
+    pub returned: usize,
+    pub frames: Vec<OltFrameView>,
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct OltConfigParams {
-    /// OLT MAC address (e.g. `"00:0A:F7:01:00:01"`).
+    /// OLT MAC address (e.g. `"AA:BB:CC:DD:EE:FF"`).
     pub mac: Option<String>,
     /// Starting LLID for ONU registration.
     pub llid_start: Option<u16>,
-    /// OAM keepalive interval in bank ticks.
-    pub oam_interval_ticks: Option<u64>,
-    /// GATE interval in bank ticks.
-    pub gate_interval_ticks: Option<u64>,
+    /// OAM keepalive interval, in milliseconds of link time.
+    pub oam_interval_ms: Option<u64>,
+    /// GATE interval, in milliseconds of link time.
+    pub gate_interval_ms: Option<u64>,
+    /// Multiplies how much link time a bank tick is worth; 1 runs the link at
+    /// its own cadence.
+    pub time_scale: Option<u64>,
+    /// LLID granted to the next ONU that registers.
+    pub assigned_llid: Option<u16>,
+    /// Attribute leaves read in rotation. Widen it to survey what the ONU
+    /// answers to; an empty list stops the reads.
+    pub polled_attributes: Option<Vec<u16>>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct OltConfigResult {
     pub mac: String,
     pub llid_start: u16,
-    pub oam_interval_ticks: u64,
-    pub gate_interval_ticks: u64,
+    pub oam_interval_ms: u64,
+    pub gate_interval_ms: u64,
+    pub time_scale: u64,
+    pub polled_attributes: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -557,7 +729,8 @@ pub struct OltInjectFrameParams {
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct OltFrameLogEntry {
-    pub tick: u64,
+    /// Instant on the link clock, in milliseconds.
+    pub wire_ms: f64,
     pub description: String,
     pub hex: String,
     pub length: usize,
@@ -1042,7 +1215,7 @@ pub struct LoadSymbolsFileResult {
     pub error: Option<String>,
 }
 
-// ---------- IND transaction decode DTOs (Todo: emu-ind-protocol-decode) ---
+// ---------- IND transaction decode DTOs -----------------------------------
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct GetIndTransactionsParams {
@@ -1071,7 +1244,7 @@ pub struct GetIndTransactionsResult {
     pub entries: Vec<IndTransactionJson>,
 }
 
-// ---------- MMIO summary diff DTOs (Todo: emu-mmio-diff-snapshots) --------
+// ---------- MMIO summary diff DTOs ----------------------------------------
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SaveMmioSummaryParams {
@@ -1116,7 +1289,7 @@ pub struct DiffMmioSummariesResult {
     pub error: Option<String>,
 }
 
-// ---------- Peek MMIO at insn DTOs (Todo: emu-register-value-at-insn) -----
+// ---------- Peek MMIO at insn DTOs ----------------------------------------
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct PeekMmioAtInsnParams {
@@ -1187,7 +1360,7 @@ impl EmulatorHandler {
                 out.insert("blink".into(), HexValue(snap.cpu.core_regs[31]));
                 out.insert("lp_count".into(), HexValue(snap.cpu.core_regs[60]));
                 out.insert("status32".into(), HexValue(snap.cpu.flags.status32));
-                out.insert("ienable".into(), HexValue(snap.cpu.aux.ienable));
+                // No "ienable": aux 0x40C is unimplemented (DATASHEET §6.1).
                 out.insert("ipending".into(), HexValue(snap.cpu.aux.ipending));
             }
         }
@@ -1984,11 +2157,11 @@ impl EmulatorHandler {
         Json(OkResult { ok: true })
     }
 
-    // ---------- IND transaction decode (Todo: emu-ind-protocol-decode) -----
+    // ---------- IND transaction decode -----
 
     #[tool(
         name = "get_ind_transactions",
-        description = "Reconstruct SerDes IND register transactions from MMIO history. Scans writes to IND_DATA (0x0100016C), correlates with IND_CMD (0x01000170) for direction and I2C_CTRL (0x01000040) for lane mode. Protocol: Ghidra 0x20035430 phy_mdio_rw_op, session 2026-05-05-1430."
+        description = "Reconstruct SerDes IND register transactions from MMIO history. Scans writes to IND_DATA (0x0100016C), correlates with IND_CMD (0x01000170) for direction and I2C_CTRL (0x01000040) for lane mode."
     )]
     async fn get_ind_transactions(
         &self,
@@ -2047,7 +2220,7 @@ impl EmulatorHandler {
         })
     }
 
-    // ---------- MMIO summary diff (Todo: emu-mmio-diff-snapshots) ---------
+    // ---------- MMIO summary diff -----------------------------------------
 
     #[tool(
         name = "save_mmio_summary",
@@ -2178,7 +2351,7 @@ impl EmulatorHandler {
         })
     }
 
-    // ---------- Peek MMIO at insn (Todo: emu-register-value-at-insn) ------
+    // ---------- Peek MMIO at insn -----------------------------------------
 
     #[tool(
         name = "peek_mmio_at_insn",
@@ -3157,7 +3330,6 @@ impl EmulatorHandler {
         });
         match olt_snap {
             Some(s) => Json(OltStateResult {
-                enabled: s.enabled,
                 mpcp_state: s.mpcp_state,
                 olt_mac: s.olt_mac,
                 onu_mac: s.onu_mac,
@@ -3169,7 +3341,6 @@ impl EmulatorHandler {
                 gate_count: s.gate_count,
             }),
             None => Json(OltStateResult {
-                enabled: false,
                 mpcp_state: "unknown".into(),
                 olt_mac: "00:00:00:00:00:00".into(),
                 onu_mac: "00:00:00:00:00:00".into(),
@@ -3184,6 +3355,208 @@ impl EmulatorHandler {
     }
 
     #[tool(
+        name = "olt_set_link",
+        description = "Bring the peer's link up or down. Down clears the MPCP session; up re-runs discovery."
+    )]
+    async fn olt_set_link(
+        &self,
+        Parameters(params): Parameters<OltLinkParams>,
+    ) -> Json<OltLinkResult> {
+        let mut bank = self.handle.bank.write();
+        bank.olt.link_up_delay = 0;
+        bank.olt.set_link_up(params.up);
+        Json(OltLinkResult {
+            link_up: bank.olt.link_up,
+            link_change_pending: bank.olt.link_change_pending,
+            link_up_delay_ticks: bank.olt.link_up_delay,
+            mpcp_state: bank.olt.mpcp_state().to_string(),
+        })
+    }
+
+    #[tool(
+        name = "olt_set_trace",
+        description = "Toggle per-frame OLT tracing on stderr."
+    )]
+    async fn olt_set_trace(
+        &self,
+        Parameters(params): Parameters<OltTraceParams>,
+    ) -> Json<OltTraceResult> {
+        let mut bank = self.handle.bank.write();
+        bank.olt.trace = params.enabled;
+        Json(OltTraceResult { trace: bank.olt.trace })
+    }
+
+    #[tool(
+        name = "olt_reset_session",
+        description = "Reset the peer's session without rebooting the SoC: MPCP state, queues and logs are cleared, configuration and link liveness survive."
+    )]
+    async fn olt_reset_session(&self) -> Json<OltLinkResult> {
+        let mut bank = self.handle.bank.write();
+        crate::soc::peripheral::Peripheral::reset_cold(&mut bank.olt);
+        Json(OltLinkResult {
+            link_up: bank.olt.link_up,
+            link_change_pending: bank.olt.link_change_pending,
+            link_up_delay_ticks: bank.olt.link_up_delay,
+            mpcp_state: bank.olt.mpcp_state().to_string(),
+        })
+    }
+
+    #[tool(
+        name = "olt_send_extended",
+        description = "Send an extended (organization-specific) OAMPDU to the ONU — typically an attribute read. Read the answer with olt_get_frames after letting the CPU run."
+    )]
+    async fn olt_send_extended(
+        &self,
+        Parameters(params): Parameters<OltSendExtendedParams>,
+    ) -> Json<OltSendExtendedResult> {
+        use crate::soc::olt::{extended, oam};
+        let mut bank = self.handle.bank.write();
+        let tx_index_before = bank.olt.tx_log().len();
+        let oui = params
+            .oui
+            .as_deref()
+            .and_then(parse_oui)
+            .map(oam::Oui)
+            .unwrap_or(oam::Oui::DPOE);
+
+        let frame = if let Some(leaf) = params.attribute_leaf {
+            bank.olt.request_attribute(leaf)
+        } else {
+            let payload = params
+                .payload_hex
+                .as_deref()
+                .and_then(hex_decode)
+                .unwrap_or_default();
+            let opcode = extended::Opcode::from(params.opcode.unwrap_or(1));
+            bank.olt.send_extended(oui, opcode, &payload)
+        };
+
+        let d = bank.olt.discovery();
+        Json(OltSendExtendedResult {
+            ok: true,
+            frame_hex: bytes_to_hex(&frame),
+            length: frame.len(),
+            gate_open: d.converged(),
+            discovery_state: format!("{:?}", d.state()),
+            tx_index_before,
+        })
+    }
+
+    #[tool(
+        name = "olt_get_frames",
+        description = "Frames exchanged with the OLT peer, dissected: Ethernet, MPCP or OAM, and the extended-OAM variables. Each field carries its byte offset. Prefer this over olt_get_tx_log/olt_get_rx_log, which return raw hex."
+    )]
+    async fn olt_get_frames(
+        &self,
+        Parameters(params): Parameters<OltFramesParams>,
+    ) -> Json<OltFramesResult> {
+        use crate::soc::olt::decode;
+        let bank = self.handle.bank.read();
+        let olt = &bank.olt;
+        let want = params.direction.as_deref().unwrap_or("both");
+        let last = params.last.unwrap_or(50);
+        let with_hex = params.include_hex.unwrap_or(false);
+        let filter = params.protocol.as_deref().map(str::to_ascii_lowercase);
+
+        let mut frames: Vec<(&'static str, usize, &crate::soc::olt::OltFrame)> = Vec::new();
+        if want != "rx" {
+            frames.extend(olt.tx_log().iter().enumerate().map(|(i, f)| ("tx", i, f)));
+        }
+        if want != "tx" {
+            frames.extend(olt.rx_log().iter().enumerate().map(|(i, f)| ("rx", i, f)));
+        }
+        frames.sort_by_key(|(_, _, f)| f.at);
+
+        let views: Vec<OltFrameView> = frames
+            .iter()
+            .map(|(dir, index, f)| {
+                let d = decode::dissect(&f.data);
+                OltFrameView {
+                    index: *index,
+                    direction: (*dir).into(),
+                    wire_ms: f.at.as_ps() as f64 / 1e9,
+                    length: f.data.len(),
+                    label: f.description.clone(),
+                    dst: d.dst,
+                    src: d.src,
+                    ethertype: d.ethertype,
+                    protocol: d.protocol,
+                    summary: d.summary,
+                    fields: d.fields,
+                    hex: with_hex.then(|| bytes_to_hex(&f.data)),
+                }
+            })
+            .filter(|v| {
+                filter
+                    .as_ref()
+                    .is_none_or(|p| v.protocol.to_ascii_lowercase().contains(p))
+            })
+            .collect();
+
+        let start = views.len().saturating_sub(last);
+        let frames: Vec<_> = views.into_iter().skip(start).collect();
+        Json(OltFramesResult {
+            total_tx: olt.tx_log().len(),
+            total_rx: olt.rx_log().len(),
+            returned: frames.len(),
+            frames,
+        })
+    }
+
+    #[tool(
+        name = "olt_get_protocol_state",
+        description = "Full protocol state of the OLT peer model: MPCP registration, OAM discovery (which gates extended OAM), whether the firmware has actually transmitted, and the variables it has answered with."
+    )]
+    async fn olt_get_protocol_state(&self) -> Json<OltProtocolStateResult> {
+        use crate::soc::olt::extended::Length;
+        let bank = self.handle.bank.read();
+        let olt = &bank.olt;
+        let d = olt.discovery();
+        Json(OltProtocolStateResult {
+            link_up: olt.link_up,
+            mpcp_state: olt.mpcp_state().to_string(),
+            registration_complete: olt.registration_complete,
+            onu_mac: crate::soc::olt::types::MacAddr::new(olt.get_onu_mac()).to_string(),
+            assigned_llid: olt.assigned_llid(),
+            mpcp_timestamp: format!("0x{:08X}", olt.mpcp_timestamp),
+            ticks_elapsed: olt.ticks_elapsed(),
+            wire_ms: olt.wire_now().as_ps() as f64 / 1e9,
+            discovery: OltDiscoveryView {
+                state: format!("{:?}", d.state()),
+                converged: d.converged(),
+                local_flags: oam_flags_view(d.flags()),
+                peer_flags: d.peer_flags().map(oam_flags_view),
+            },
+            real_tx_seen: olt.real_tx_seen(),
+            tx_dropped: olt.tx_dropped(),
+            tx_assembling: olt.tx_assembling(),
+            gate_count: olt.counters().gates_sent,
+            oam_keepalive_count: olt.counters().oam_keepalives_sent,
+            pending_frames: olt.total_pending_count(),
+            counters: *olt.counters(),
+            dropped_downstream: olt.dropped_downstream(),
+            dropped_upstream: olt.dropped_upstream(),
+            attribute_replies: olt
+                .attribute_replies()
+                .iter()
+                .map(|c| OltVariableView {
+                    branch: c.descriptor.branch.to_string(),
+                    leaf: format!("0x{:04X}", c.descriptor.leaf),
+                    length_kind: match c.length {
+                        Length::Full => "full",
+                        Length::Bytes(_) => "bytes",
+                        Length::Status(_) => "status",
+                    }
+                    .into(),
+                    length_raw: c.length.as_u8(),
+                    value_len: c.value.len(),
+                    value_hex: bytes_to_hex(&c.value),
+                })
+                .collect(),
+        })
+    }
+
+    #[tool(
         name = "olt_get_config",
         description = "Return the OLT emulator configuration: MAC address, LLID range, timing parameters."
     )]
@@ -3191,10 +3564,12 @@ impl EmulatorHandler {
         let bank = self.handle.bank.read();
         let cfg = &bank.olt.config;
         Json(OltConfigResult {
-            mac: format_mac(&cfg.mac),
-            llid_start: cfg.llid_start,
-            oam_interval_ticks: cfg.oam_interval_ticks,
-            gate_interval_ticks: cfg.gate_interval_ticks,
+            mac: cfg.mac.to_string(),
+            llid_start: cfg.llid_start.as_u16(),
+            oam_interval_ms: cfg.oam_interval_ms,
+            gate_interval_ms: cfg.gate_interval_ms,
+            time_scale: cfg.time_scale,
+            polled_attributes: cfg.polled_attributes.clone(),
         })
     }
 
@@ -3209,41 +3584,36 @@ impl EmulatorHandler {
         let mut bank = self.handle.bank.write();
         if let Some(ref mac_str) = params.mac {
             if let Some(mac) = parse_mac_str(mac_str) {
-                bank.olt.config.mac = mac;
+                bank.olt.config.mac = mac.into();
             }
         }
         if let Some(llid) = params.llid_start {
-            bank.olt.config.llid_start = llid;
+            bank.olt.config.llid_start = crate::soc::olt::types::Llid(llid);
         }
-        if let Some(interval) = params.oam_interval_ticks {
-            bank.olt.config.oam_interval_ticks = interval;
+        if let Some(interval) = params.oam_interval_ms {
+            bank.olt.config.oam_interval_ms = interval;
         }
-        if let Some(interval) = params.gate_interval_ticks {
-            bank.olt.config.gate_interval_ticks = interval;
+        if let Some(interval) = params.gate_interval_ms {
+            bank.olt.config.gate_interval_ms = interval;
+        }
+        if let Some(scale) = params.time_scale {
+            bank.olt.config.time_scale = scale.max(1);
+        }
+        if let Some(ref leaves) = params.polled_attributes {
+            bank.olt.config.polled_attributes = leaves.clone();
+        }
+        if let Some(llid) = params.assigned_llid {
+            bank.olt.set_assigned_llid(crate::soc::olt::types::Llid(llid));
         }
         let cfg = &bank.olt.config;
         Json(OltConfigResult {
-            mac: format_mac(&cfg.mac),
-            llid_start: cfg.llid_start,
-            oam_interval_ticks: cfg.oam_interval_ticks,
-            gate_interval_ticks: cfg.gate_interval_ticks,
+            mac: cfg.mac.to_string(),
+            llid_start: cfg.llid_start.as_u16(),
+            oam_interval_ms: cfg.oam_interval_ms,
+            gate_interval_ms: cfg.gate_interval_ms,
+            time_scale: cfg.time_scale,
+            polled_attributes: cfg.polled_attributes.clone(),
         })
-    }
-
-    #[tool(
-        name = "olt_enable",
-        description = "Enable or disable OLT emulation. When enabled, the OLT auto-starts MPCP discovery and OAM keepalive."
-    )]
-    async fn olt_enable(
-        &self,
-        Parameters(params): Parameters<OltEnableParams>,
-    ) -> Json<OkResult> {
-        let mut bank = self.handle.bank.write();
-        bank.olt.set_enabled(params.enabled);
-        if params.enabled {
-            bank.olt.set_link_up(true);
-        }
-        Json(OkResult { ok: true })
     }
 
     #[tool(
@@ -3279,7 +3649,7 @@ impl EmulatorHandler {
             .iter()
             .skip(start)
             .map(|f| OltFrameLogEntry {
-                tick: f.tick,
+                wire_ms: f.at.as_ps() as f64 / 1e9,
                 description: f.description.clone(),
                 hex: bytes_to_hex(&f.data),
                 length: f.data.len(),
@@ -3307,7 +3677,7 @@ impl EmulatorHandler {
             .iter()
             .skip(start)
             .map(|f| OltFrameLogEntry {
-                tick: f.tick,
+                wire_ms: f.at.as_ps() as f64 / 1e9,
                 description: f.description.clone(),
                 hex: bytes_to_hex(&f.data),
                 length: f.data.len(),
@@ -3320,11 +3690,31 @@ impl EmulatorHandler {
     }
 }
 
-fn format_mac(mac: &[u8; 6]) -> String {
-    format!(
-        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-    )
+
+/// Parse an OUI written `00-10-00`, `00:10:00` or `001000`.
+fn parse_oui(s: &str) -> Option<[u8; 3]> {
+    let clean: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if clean.len() != 6 {
+        return None;
+    }
+    let mut out = [0u8; 3];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn oam_flags_view(f: crate::soc::olt::oam::Flags) -> OamFlagsView {
+    OamFlagsView {
+        raw: format!("0x{:04X}", f.as_u16()),
+        link_fault: f.link_fault,
+        dying_gasp: f.dying_gasp,
+        critical_event: f.critical_event,
+        local_evaluating: f.local_evaluating,
+        local_stable: f.local_stable,
+        remote_evaluating: f.remote_evaluating,
+        remote_stable: f.remote_stable,
+    }
 }
 
 fn parse_mac_str(s: &str) -> Option<[u8; 6]> {
@@ -3503,8 +3893,11 @@ fn is_mutation_tool(name: &str) -> bool {
             | "restore_snapshot"
             | "delete_snapshot"
             | "load_symbols_file"
-            | "olt_enable"
             | "olt_set_config"
+            | "olt_set_link"
+            | "olt_set_trace"
+            | "olt_reset_session"
+            | "olt_send_extended"
             | "olt_inject_frame"
     )
 }
@@ -3536,7 +3929,9 @@ fn reg_by_name(cpu: &crate::emu::snapshot::CpuSnapshot, name: &str) -> Option<u3
         "lp_count" | "lpcount" => Some(cpu.core_regs[60]),
         "ilink1" => Some(cpu.core_regs[29]),
         "ilink2" => Some(cpu.core_regs[30]),
-        "ienable" => Some(cpu.aux.ienable),
+        // "ienable" resolves to the absent-register value, not to a mask:
+        // aux 0x40C is unimplemented and reads back IDENTITY (§6.1).
+        "ienable" => Some(crate::cpu::registers::IDENTITY_VALUE),
         "ipending" => Some(cpu.aux.ipending),
         "identity" => Some(cpu.aux.identity),
         _ => {
