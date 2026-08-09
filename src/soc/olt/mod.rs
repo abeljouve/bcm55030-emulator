@@ -167,10 +167,6 @@ pub struct Olt {
     /// frame is known to have landed, and drained rather than read so a
     /// count is reported exactly once.
     arrivals: HashMap<u8, u64>,
-    /// Normal GATEs that landed since the datapath last looked. Each one
-    /// is a grant window, and it is the MAC — not the CPU — that answers
-    /// one: the firmware discards a non-discovery GATE at its first test.
-    normal_gates_landed: u32,
     pub config: OltConfig,
     /// The peer and the fibre either side of it.
     link: Link,
@@ -224,7 +220,6 @@ impl Olt {
         Self {
             classifier_counters: ClassifierRouting::default(),
             arrivals: HashMap::new(),
-            normal_gates_landed: 0,
             link: Link::new(
                 peer_config(&config),
                 FibreConfig::downstream(),
@@ -423,9 +418,6 @@ impl Olt {
             let words = mailbox::encode_frame(&landed.frame);
             self.mailbox_pending.entry(slot.0).or_default().push_back(words);
             *self.arrivals.entry(slot.0).or_insert(0) += 1;
-            if Self::is_normal_gate(&landed.frame) {
-                self.normal_gates_landed += 1;
-            }
         }
         self.refresh_bitmap();
     }
@@ -469,23 +461,6 @@ impl Olt {
                 Slot::for_frame(frame)
             }
         }
-    }
-
-    /// A GATE without the discovery flag: a real grant window.
-    fn is_normal_gate(frame: &[u8]) -> bool {
-        epon_olt::mpcp::Pdu::parse(frame).is_some_and(|p| {
-            matches!(p.body, epon_olt::mpcp::Body::Gate { flags, .. } if !flags.discovery)
-        })
-    }
-
-    /// Take the grant windows that landed since the last call.
-    pub fn drain_normal_gates(&mut self) -> u32 {
-        std::mem::take(&mut self.normal_gates_landed)
-    }
-
-    /// Send a frame upstream, as the MAC would.
-    pub fn send_upstream_frame(&mut self, frame: Vec<u8>) {
-        self.on_tx_frame(&frame);
     }
 
     /// Take the arrivals recorded since the last call. Draining rather
