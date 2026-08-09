@@ -68,7 +68,7 @@ cargo run --release --features ui --bin arc700-gui                 # GUI + MCP o
 cargo run --release --features ui --bin arc700-gui -- --no-mcp     # GUI only
 ```
 
-Panels: an interactive disassembler with Ghidra-style branch arcs and symbol
+Panels: an interactive disassembler with branch arcs and symbol
 resolution; a register grid (r0–r31, special and Aux registers, STATUS32 flags);
 a hex/ASCII memory viewer for SRAM/Flash/D-cache with dirty-byte highlighting; a
 peripheral inspector with per-block sub-tabs and event injection; a UART

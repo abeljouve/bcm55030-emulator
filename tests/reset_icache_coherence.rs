@@ -1,4 +1,4 @@
-//! Regression for the design notes.
+//! Regression for cache/reset coherence.
 //!
 //! `reset_soc_in_place` (used by the GUI/MCP `load_firmware` and
 //! `Reset` paths) reuses the same `Memory` — and therefore the same

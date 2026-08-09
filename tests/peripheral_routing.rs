@@ -1,10 +1,9 @@
-//! Peripheral routing invariants — Session 8 polish.
+//! Peripheral routing invariants.
 //!
 //! Guards against two classes of regression:
 //!
-//! 1. **Residual has no auto-clear** (audit 5.8 — fully resolved
-//!    by deferral D7). The typed peripherals own their own bits
-//!    `[31:27]` auto-clear. The sysreg residual path is a plain
+//! 1. **Residual has no auto-clear**. The typed peripherals own their
+//!    own bits `[31:27]` auto-clear. The sysreg residual path is a plain
 //!    backing store: writes land untouched and reads return the
 //!    stored value forever. The only register that still needs
 //!    the command-bit semantic (`0x01000160`) is now claimed by
