@@ -53,6 +53,21 @@ fn extract_field(field: Field, frame: &[u8]) -> Option<u64> {
         // a unicast address. Consistent with the source address, and not
         // pinned by anything the way the code above is.
         Field::Observed(0x01) | Field::Unknown(0x01) => Some(be(&frame[6..12])),
+        // -- INFERRED, and falsifiable the same way the extractor code is:
+        // the frame's length in bytes.
+        //
+        // The rule set pins the shape hard. One table holds eighty rules
+        // built from one four-rule group repeated: `== 0x40`,
+        // `>= 0x41 && <= 0x7F`, `>= 0x80`, `>= 0x100` — 64, 65..127, 128,
+        // 256, the size buckets every Ethernet counter block keeps. Each
+        // group ends in a different result index, counting up across the
+        // groups, which is what a bucketed counter looks like and is not
+        // what a routing table looks like: not one of the eighty names a
+        // queue.
+        //
+        // Read as anything but a length, those four comparands are a
+        // coincidence four times over.
+        Field::Observed(FRAME_LENGTH) | Field::Unknown(FRAME_LENGTH) => Some(frame.len() as u64),
         Field::Observed(DEFAULT_EXTRACTOR) | Field::Unknown(DEFAULT_EXTRACTOR) => {
             // A tagged frame moves everything after the type field, and
             // the model has no established offset to move it by.
@@ -107,6 +122,13 @@ fn extract_field(field: Field, frame: &[u8]) -> Option<u64> {
 /// picks independently and none to a different one. That is an outcome
 /// this reading could have failed and did not.
 const DEFAULT_EXTRACTOR: u8 = 0x10;
+
+/// The code the size-bucket rules compare against frame-length boundaries.
+///
+/// Unlike [`DEFAULT_EXTRACTOR`] this one is not an extractor slot — it is
+/// outside the `0x10..=0x16` slot range, so it names a field the hardware
+/// knows on its own.
+const FRAME_LENGTH: u8 = 0x24;
 
 /// The EtherTypes that mark a tagged frame.
 ///
@@ -864,6 +886,26 @@ mod tests {
         assert_eq!(Slot::for_frame(&data), Slot::DATA);
         assert_eq!(Engine::classify(&port, &rules, &data, &mut c), Verdict::NoMatch);
         assert!(c.verdicts_accounted_for(), "{c:?}");
+    }
+
+    /// The size-bucket field reads the frame's own length.
+    ///
+    /// The boundaries are the ones the live rule set compares against —
+    /// 64, 65..127, 128, 256 — so a frame of each size must land in its
+    /// own bucket and nowhere else. Read as anything but a length, the
+    /// four comparands stop lining up.
+    #[test]
+    fn the_size_bucket_field_is_the_frame_length() {
+        for len in [ETHERNET_HEADER_LEN, 0x40, 0x41, 0x7F, 0x80, 0x100] {
+            let frame = vec![0u8; len];
+            assert_eq!(
+                extract_field(Field::from_code(FRAME_LENGTH), &frame),
+                Some(len as u64),
+                "length {len}"
+            );
+        }
+        // Below an Ethernet header there is no frame to measure.
+        assert_eq!(extract_field(Field::from_code(FRAME_LENGTH), &[0u8; 8]), None);
     }
 
     /// The port must round-trip whatever it is given, so an entry the
