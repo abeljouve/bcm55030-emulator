@@ -296,13 +296,6 @@ pub struct PeripheralBank {
 
     /// Named MMIO write summaries for `diff_mmio_summaries`.
     pub mmio_summaries: HashMap<String, HashMap<u32, MmioSummaryEntry>>,
-
-    /// Countdown (in bank ticks) before clearing the firmware's Phase 1
-    /// guard struct at SRAM 0x7E3CA. On real BCM55030, the DMA engine
-    /// clears this after frame consumption. Delayed by a few ticks so the
-    /// firmware's store instruction has executed before we invalidate the
-    /// D-cache line.
-    guard_clear_countdown: u32,
 }
 
 impl PeripheralBank {
@@ -364,7 +357,7 @@ impl PeripheralBank {
             mmio_history_max: DEFAULT_MMIO_HISTORY_SIZE,
             seq_trace: None,
             mmio_summaries: HashMap::new(),
-            guard_clear_countdown: 0,
+
         };
         // Apply the requested reset flavour.
         match boot_mode {
@@ -561,40 +554,22 @@ impl PeripheralBank {
                 );
             }
         }
-        // Phase 1 guard struct clear — models DMA completion.
-        // On real BCM55030, the DMA engine clears the frame descriptor
-        // at SRAM 0x7E3CA after the firmware consumes a mailbox frame.
-        // The firmware's `epon_rx_packet_dispatch_handler` stores the
-        // frame length at 0x7E3CA-0x7E3CB; the guard byte at 0x7E3CB
-        // gates Phase 1: non-zero → permanent flush mode.
+        // A frame the software side has taken is no longer pending. Nothing is
+        // written back on its behalf: this word is software's own, and the
+        // datapath has no business reaching into it.
         //
-        // The firmware has TWO frame consumption paths:
-        // - Process path: reads CMD/DATA → OLT intercepts → frame_consumed
-        // - Flush path: writes DRAIN registers → not intercepted by OLT
-        //
-        // We clear the guard whenever the mailbox is empty (no pending
-        // frames, FIFO drained). This covers both paths and models the
-        // DMA engine's "no frames pending" signal. The 3-tick delay
-        // ensures the firmware's store to 0x7E3CA has executed before
-        // the D-cache invalidation discards it.
-        let mailbox_idle = !self.olt.has_any_pending()
-            && self.olt.mailbox_fifo.is_empty();
-        if self.olt.frame_consumed || mailbox_idle {
+        // It used to. A timed SramWrite zeroed two bytes at a fixed SRAM address
+        // a few ticks after the mailbox went idle, described as a DMA clearing a
+        // "frame descriptor guard". That address is not a descriptor — it is the
+        // received-frame length the receive path stores and the OAM code reads
+        // back as the upper bound of its TLV walk. Zeroing it made every list
+        // end before its first entry, so an entire class of downstream frame
+        // handling silently did nothing and looked like firmware that ignores
+        // the frame. Removing it changes no counter on a plain boot, which is
+        // the whole indictment: it was never modelling anything observable, only
+        // writing over a variable it did not own.
+        if self.olt.frame_consumed {
             self.olt.frame_consumed = false;
-            if self.guard_clear_countdown == 0 {
-                self.guard_clear_countdown = 3;
-            }
-        }
-        if self.guard_clear_countdown > 0 {
-            self.guard_clear_countdown -= 1;
-            if self.guard_clear_countdown == 0 {
-                self.pending_cache_inv.push(
-                    DatapathOp::SramWrite {
-                        sram_addr: 0x0007_E3CA,
-                        data: vec![0x00, 0x00],
-                    },
-                );
-            }
         }
 
         self.sysreg.tick(cpu_instructions);
@@ -740,7 +715,6 @@ impl PeripheralBank {
         eprintln!("[BCM55030] MPCP burst trigger — synthetic REGISTER_REQ from {onu_mac}");
         self.olt.handle_tx_frame(&frame);
     }
-
 
     /// Update the CPU context fields in one shot. Called by `Cpu::step()`
     /// before every MMIO access so trace entries can show the touching
@@ -934,7 +908,7 @@ impl PeripheralBank {
             pending_cache_inv: self.pending_cache_inv.clone(),
             dma_master_status: self.dma_master_status,
             dma_channel_mask: self.dma_channel_mask,
-            guard_clear_countdown: self.guard_clear_countdown,
+
             nco_tx_ts_counter: self.nco_tx_ts_counter,
         }
     }
@@ -965,7 +939,7 @@ impl PeripheralBank {
         self.pending_cache_inv = state.pending_cache_inv;
         self.dma_master_status = state.dma_master_status;
         self.dma_channel_mask = state.dma_channel_mask;
-        self.guard_clear_countdown = state.guard_clear_countdown;
+
         self.nco_tx_ts_counter = state.nco_tx_ts_counter;
         self.irq_pending = 0;
         self.current_pc = 0;
