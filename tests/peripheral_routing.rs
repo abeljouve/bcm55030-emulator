@@ -22,9 +22,8 @@ use bcm55030_emulator::soc::peripheral::PeripheralSnapshot;
 
 /// Residual sysreg addresses are a plain backing store — writes
 /// round-trip unmodified. The bits `[31:27]` command-bit auto-
-/// clear used to live here (audit 5.8) and regressed deferral
-/// D7. The single dependent register `0x01000160` now lives in
-/// `epon_mac.rs` with its own semantic.
+/// clear used to live here. The single dependent register
+/// `0x01000160` now lives in `epon_mac.rs` with its own semantic.
 #[test]
 fn residual_sysreg_is_plain_backing_store() {
     let mut bank = PeripheralBank::new(BootMode::Cold);
