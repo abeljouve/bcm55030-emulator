@@ -143,6 +143,13 @@ pub struct Clause {
     /// clause decodes to something coherent under that reading and to
     /// nothing under an anchor of zero.
     ///
+    /// The pairing is not an inference over hard-coded constants any
+    /// more. The one site that builds a clause from a descriptor loads
+    /// one byte of it, passes it as the left-shift that positions the
+    /// comparand, loads the **same** byte again and passes it as this
+    /// field — two loads of one offset, four instructions apart. Whatever
+    /// the anchor is, it is the position software put the comparand at.
+    ///
     /// ⛔ **The window's high end is NOT established.** Two readings
     /// survive every clause the firmware emits:
     ///
@@ -165,6 +172,23 @@ pub struct Clause {
     /// `shift 0x39, anchor 6` from another, so the two readings assign
     /// that one field widths of 6 and 7 bits respectively, and a value
     /// with bit 6 set answers differently under them.
+    ///
+    /// A second separator, cheaper to reach because it needs no probe of
+    /// a live device: the one site that computes both numbers instead of
+    /// hard-coding them emits `shift = 64 - W + narrowing` — `W` read
+    /// from the field-width table in the image — and passes **the same
+    /// byte** as the anchor and as the amount the comparand is shifted
+    /// up by. Feed it a descriptor whose value is exactly `W - narrowing`
+    /// bits wide with a non-zero anchor and the first reading's window
+    /// falls short of the comparand's own top by the anchor, so the
+    /// clause could never match the value it was built from; the second
+    /// fits exactly.
+    ///
+    /// ⚠ That same site is **not** a separator on its own, and it looks
+    /// like one. For every descriptor where `W` is wider than the value,
+    /// both windows cover the value and differ only over bits above it,
+    /// which are zero — same verdict. Only the exact-fit case above
+    /// separates them.
     ///
     /// One thing does lean, and it is a design argument rather than an
     /// observation, so it settles nothing: every hard-coded pair software
@@ -276,9 +300,9 @@ impl Action {
     ///   recomputed, and this one lands in the group and sub-index used
     ///   here.
     /// * At every call site that emits this type, the value handed to it
-    ///   is written `pin & 0x1F`, and those pin numbers are the ones the
+    ///   is written `idx & 0x1F`, and those index values are the ones the
     ///   receive path polls its queues by. Queue numbers are gathered
-    ///   elsewhere into `1 << (pin & 0x1F)` bitmaps, which is where the
+    ///   elsewhere into `1 << (idx & 0x1F)` bitmaps, which is where the
     ///   five bits come from.
     /// * Read back over a boot, the rules carrying this type are exactly
     ///   the ones software builds for its user-facing port, and all of
