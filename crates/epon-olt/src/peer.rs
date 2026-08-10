@@ -817,15 +817,13 @@ impl Peer {
             .bytes(&oui.0)
             .u8(opcode.as_u8())
             .bytes(payload);
-        let frame = w.pad_to(crate::types::MIN_FRAME_LEN);
-        self.emit(frame.clone(), "extended request");
-        frame
+        self.emit(w.pad_to(crate::types::MIN_FRAME_LEN), "extended request")
     }
 
     /// Read one attribute now, rather than waiting for the rotation.
     pub fn request_attribute(&mut self, leaf: u16) -> Vec<u8> {
-        let frame = self.build_attribute_request(leaf);
-        self.emit(frame.clone(), "attribute request");
+        let request = self.build_attribute_request(leaf);
+        let frame = self.emit(request, "attribute request");
         self.counters.attribute_requests_sent += 1;
         frame
     }
@@ -958,15 +956,27 @@ impl Peer {
 
     // ── Bookkeeping ─────────────────────────────────────────────────
 
-    fn emit(&mut self, frame: Vec<u8>, description: &str) {
+    /// Put a built PDU on the line, and hand back what actually went there.
+    ///
+    /// The FCS is appended here rather than by each builder because this is
+    /// the one place a frame becomes a thing on the wire. A receiving MAC
+    /// deposits those four octets in its buffer with the rest, and software
+    /// reading that buffer neutralises them and shortens its length by four --
+    /// so a frame that reaches the fibre without one loses four octets of
+    /// payload at the far end. The builders keep padding to `MIN_FRAME_LEN`,
+    /// which is the minimum *excluding* the FCS, so the shortest frame on the
+    /// line is the 64 octets IEEE 802.3 asks for.
+    fn emit(&mut self, frame: Vec<u8>, description: &str) -> Vec<u8> {
+        let frame = crate::fcs::appended(frame);
         let entry = self.frame_entry(&frame, description);
         push_capped(&mut self.rx_log, entry);
         self.counters.frames_sent += 1;
         self.downstream.push_back(Emitted {
             at: self.now,
-            frame,
+            frame: frame.clone(),
             description: description.to_string(),
         });
+        frame
     }
 
     fn frame_entry(&self, frame: &[u8], description: &str) -> LoggedFrame {

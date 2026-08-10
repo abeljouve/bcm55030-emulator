@@ -31,11 +31,13 @@
 //! - [`oam`] OAMPDU encode/decode (clause 57)
 //! - [`extended`] organization-specific OAMPDUs and their variables
 //! - [`decode`] frame dissection, for a packet view or a log
+//! - [`fcs`] the frame check sequence a frame carries on the wire
 //! - [`state`] MPCP registration state
 
 pub mod clock;
 pub mod decode;
 pub mod extended;
+pub mod fcs;
 pub mod fibre;
 pub mod link;
 pub mod mpcp;
