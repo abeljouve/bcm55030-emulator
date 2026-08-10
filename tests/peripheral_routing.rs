@@ -208,10 +208,10 @@ fn an_open_gate_with_no_rules_falls_back_and_says_so() {
         f
     };
     // An empty table decides nothing; it must not read as a miss.
-    assert!(matches!(
-        lue.classify(ClassifierBinding::default(), &frame),
-        Verdict::Undecidable { .. }
-    ));
+    let (verdict, refusals) = lue.classify(ClassifierBinding::default(), &frame);
+    assert!(matches!(verdict, Verdict::Undecidable { .. }));
+    assert_eq!(refusals.no_rules, 1, "and the refusal is counted, not silent");
+    assert!(refusals.verdicts_accounted_for(), "{refusals:?}");
 }
 
 /// O5, end to end: a frame that lands in a queue moves that queue's

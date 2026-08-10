@@ -100,7 +100,11 @@ pub enum Field {
 
 impl Field {
     /// Codes a live rule set uses, beyond the one that is pinned.
-    const OBSERVED_CODES: [u8; 4] = [0x03, 0x04, 0x0F, 0x10];
+    ///
+    /// `0x00` and `0x01` are here because rules do compare them against
+    /// addresses; `0x00` is pinned by the group addresses it is matched
+    /// against — see [`super::engine`]. The rest are seen and unexplained.
+    const OBSERVED_CODES: [u8; 9] = [0x00, 0x01, 0x03, 0x04, 0x0F, 0x10, 0x18, 0x19, 0x1B];
 
     pub fn from_code(code: u8) -> Self {
         let code = code & 0x3F;
@@ -156,9 +160,17 @@ pub struct Clause {
     /// branches as if both ran. Do not restore that claim.
     ///
     /// What separates them: a clause over a field that can carry bits
-    /// above `anchor + 64 - shift` — field `0x1B` is tested at
-    /// `shift 0x3A, anchor 5`, so a value with bit 6 set answers
-    /// differently under the two.
+    /// above `anchor + 64 - shift`. Field `0x1B` is the one — software
+    /// emits it at `shift 0x3A, anchor 5` from one site and at
+    /// `shift 0x39, anchor 6` from another, so the two readings assign
+    /// that one field widths of 6 and 7 bits respectively, and a value
+    /// with bit 6 set answers differently under them.
+    ///
+    /// One thing does lean, and it is a design argument rather than an
+    /// observation, so it settles nothing: every hard-coded pair software
+    /// emits sums to at most `0x3F`, and it spends shift budget to test a
+    /// single bit at a variable position — a bound the first reading
+    /// needs and the second has no use for.
     ///
     /// ⛔ Also not established: whether the hardware masks the bits
     /// below the anchor in place or right-aligns both sides. The two
@@ -204,7 +216,8 @@ impl Clause {
 pub enum Link {
     /// Another clause follows at the next index; both must match.
     AndNext,
-    /// The rule ends here and this word is its first action word.
+    /// The rule ends here and this word is its **first** action word. The
+    /// rest, if any, are in the entries that follow — see [`Rule`].
     Terminal(Action),
 }
 
@@ -235,6 +248,11 @@ pub enum ActionPayload {
     Simple { type_code: u8 },
     /// Types 0x08..=0x5B: a selector in the top nibble, a sub-index, and
     /// a field whose width depends on the selector.
+    ///
+    /// Software walks the type in groups of fourteen — eleven "wide"
+    /// entries then three "narrow" ones — and the group number lands in
+    /// the top nibble as `2 + group` or `8 + group`. Six groups gives
+    /// selectors `2..=7` wide and `8..=0xD` narrow.
     Selected { sel: u8, sub: u8, field: u16, wide: bool },
     /// Anything else. Kept verbatim so it round-trips.
     Raw(u32),
@@ -316,7 +334,7 @@ impl Action {
             ActionPayload::Broadcast
         } else if sel == 0 && word & 0x000F_FFFF == 0 && simple != 0 {
             ActionPayload::Simple { type_code: simple ^ 1 }
-        } else if (2..=9).contains(&sel) {
+        } else if (2..=0xD).contains(&sel) {
             // The two widths differ in where the sub-index sits; a
             // selector below 8 is the wide form.
             let wide = sel < 8;
@@ -375,6 +393,151 @@ impl Entry {
             ]),
             Entry::Raw(q) => *q,
         }
+    }
+}
+
+/// A whole rule: a chain of clauses, then the actions to take.
+///
+/// A rule does **not** fit in one entry, and it does not occupy a whole
+/// number of them either. Software lays it out like this:
+///
+/// ```text
+///  entry n     [ clause  | operand hi | operand lo | link 0x10000000 ]
+///  entry n+1   [ clause  | operand hi | operand lo | ACTION 0        ]  <- last clause
+///  entry n+2   [ ACTION 1| ACTION 2   | 0          | 0               ]  <- spill + padding
+/// ```
+///
+/// The link word of **every** clause is written, then the first action
+/// word overwrites the last one's; the remaining actions run on through
+/// the following entries in word order and are zero-padded out to a whole
+/// entry. So a rule spans `clauses + ceil((actions - 1) / 4)` entries.
+///
+/// -- OBSERVED, from the builder itself rather than from the shape of a
+/// table: it writes the link word into every clause, backs up by one
+/// word, writes the action words, and pads with
+/// `(4 - ((actions - 1) & 3)) & 3` zeros. A second function computes the
+/// entry count the allocator reserves, and it is the same number by a
+/// different route.
+///
+/// ⛔ **The padding is not a terminator.** With `actions % 4 == 1` there
+/// is none: one action fits in the link word and spills nothing at all,
+/// five fill a spill entry exactly. What bounds the list in that case is
+/// [`Rule::decode`]'s other stop — an entry carrying the clause tag,
+/// which no action word ever can (see [`ActionPayload::Selected`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rule {
+    pub clauses: Vec<Clause>,
+    pub actions: Vec<Action>,
+}
+
+/// Why a run of entries is not a rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleError {
+    /// An entry in the clause chain is not a clause.
+    NotAClause,
+    /// The chain reached an index nothing was ever written to.
+    RanPastTheEnd,
+    /// The chain ran longer than any rule this hardware can hold.
+    TooLong,
+}
+
+/// What reading a rule produced, and how many entries it covered.
+///
+/// The span is reported **even when the read failed**, so a caller
+/// walking a table does not turn one broken rule into several.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuleRead {
+    pub result: Result<Rule, RuleError>,
+    pub span: u16,
+}
+
+/// How far a rule may run before the decoder calls it corrupt. Well above
+/// anything observed; it is there so a damaged table cannot loop.
+pub const MAX_RULE_ENTRIES: u16 = 64;
+
+impl Rule {
+    /// The entries this rule occupies, in index order.
+    pub fn encode(&self) -> Vec<Quad> {
+        if self.clauses.is_empty() {
+            return Vec::new();
+        }
+        let mut words: Vec<u32> = Vec::with_capacity(self.clauses.len() * 4 + 4);
+        for clause in &self.clauses {
+            words.push(clause.header());
+            words.push((clause.operand >> 32) as u32);
+            words.push(clause.operand as u32);
+            words.push(LINK_AND_NEXT);
+        }
+        if !self.actions.is_empty() {
+            // The first action word takes the last clause's link word.
+            words.truncate(words.len() - 1);
+            words.extend(self.actions.iter().map(Action::encode));
+            while words.len() % 4 != 0 {
+                words.push(0);
+            }
+        }
+        words
+            .chunks_exact(4)
+            .map(|c| Quad::new([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    /// Read the rule starting at `start`. `fetch` answers with the entry
+    /// at an index, or `None` for one nothing ever wrote.
+    pub fn decode(mut fetch: impl FnMut(u16) -> Option<Quad>, start: u16) -> RuleRead {
+        let mut clauses = Vec::new();
+        let mut actions = Vec::new();
+        let mut span = 0u16;
+
+        let fail = |result, span| RuleRead { result: Err(result), span };
+        loop {
+            if span >= MAX_RULE_ENTRIES {
+                return fail(RuleError::TooLong, span);
+            }
+            let Some(quad) = fetch(start.wrapping_add(span)) else {
+                return fail(RuleError::RanPastTheEnd, span);
+            };
+            span += 1;
+            let Entry::Clause { clause, link } = Entry::decode(quad) else {
+                return fail(RuleError::NotAClause, span);
+            };
+            clauses.push(clause);
+            match link {
+                Link::AndNext => continue,
+                Link::Terminal(first) => {
+                    actions.push(first);
+                    break;
+                }
+            }
+        }
+
+        // Actions past the first, in word order, until the padding — or
+        // until an entry that is a clause, which is the next rule.
+        'spill: while span < MAX_RULE_ENTRIES {
+            let Some(quad) = fetch(start.wrapping_add(span)) else { break };
+            if quad.words[0] >> 28 == CLAUSE_TAG {
+                break;
+            }
+            span += 1;
+            for word in quad.words {
+                if word == 0 {
+                    break 'spill;
+                }
+                actions.push(Action::decode(word));
+            }
+        }
+
+        RuleRead { result: Ok(Self { clauses, actions }), span }
+    }
+
+    /// The queue this rule sends a matching frame to.
+    ///
+    /// A rule carries several actions and at most one of them names a
+    /// queue; the others edit tags, forward, or discard. Looking only at
+    /// the first would miss it — the queue result is the **last** of the
+    /// three in every rule software builds for its user-facing port.
+    pub fn destination_queue(&self) -> Option<u8> {
+        self.actions.iter().find_map(Action::destination_queue)
     }
 }
 

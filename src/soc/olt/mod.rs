@@ -149,6 +149,17 @@ pub struct ClassifierRouting {
     /// The rules could not decide. Counted separately from a miss,
     /// because they are different facts.
     pub undecidable: u64,
+    /// Why the rules could not decide, summed over every frame. A bare
+    /// `undecidable` says the classifier is blocked; this says on what,
+    /// which is the difference between a number and a direction.
+    pub refusals: crate::soc::lue::EngineCounters,
+    /// Of the matched frames, the ones the EtherType fallback would have
+    /// sent to the same queue.
+    pub matched_agrees_with_fallback: u64,
+    /// And the ones it would not. Two independent readings of where a
+    /// frame belongs; counting only the agreements would make the check
+    /// unable to fail.
+    pub matched_differs_from_fallback: u64,
 }
 
 impl ClassifierRouting {
@@ -439,10 +450,18 @@ impl Olt {
             return Slot::for_frame(frame);
         };
         self.classifier_counters.classified += 1;
-        match lue.classify(binding, frame) {
-            Verdict::Match { action, .. } => match action.destination_queue() {
+        let (verdict, refusals) = lue.classify(binding, frame);
+        self.classifier_counters.refusals.add(&refusals);
+        match verdict {
+            Verdict::Match { actions, .. } => match actions.iter().find_map(|a| a.destination_queue())
+            {
                 Some(queue) => {
                     self.classifier_counters.matched += 1;
+                    if Slot(queue) == Slot::for_frame(frame) {
+                        self.classifier_counters.matched_agrees_with_fallback += 1;
+                    } else {
+                        self.classifier_counters.matched_differs_from_fallback += 1;
+                    }
                     Slot(queue)
                 }
                 None => {

@@ -30,7 +30,7 @@ pub mod port;
 pub mod rule;
 
 pub use engine::{Engine, EngineCounters, RuleStart, Verdict};
-pub use rule::{Action, ActionPayload, Clause, Entry, Field, Link, Op};
+pub use rule::{Action, ActionPayload, Clause, Entry, Field, Link, Op, Rule, RuleError, RuleRead};
 pub use port::{Cmd, LuePort, PortCounters, Quad, CMD_ERROR, CMD_GO, CMD_WRITE};
 
 use crate::cpu::exception::Exception;
@@ -44,16 +44,24 @@ const WORDS_PER_INSTANCE: u32 = 5;
 
 /// Which port and which table the downstream path consults.
 ///
-/// ⛔ **Not established.** Software programs both instances and several
-/// tables, and nothing in the firmware ever reads a classification
-/// result back — so there is no observation that says which of them
-/// decides where a downstream frame goes. The binding is therefore a
-/// setting, named and defaulted rather than hidden in the matching code,
-/// so that changing it is one line and refuting it does not mean
-/// rewriting the engine.
+/// ⛔ **Still not established, and the shape is probably wrong too.**
+/// Nothing in the firmware ever reads a classification result back, so no
+/// observation says which port and table decide where a downstream frame
+/// goes. Worse, the table index software uses when it *writes* a rule is
+/// derived per queue descriptor rather than fixed — a queue of type 0
+/// goes to table 3, type 1 to table 1, type 2 to table 2, and anything
+/// else to `queue_count + 4` — so a single pair may not be able to
+/// express what the hardware does. The binding stays a named setting for
+/// exactly that reason: changing it is one line, and refuting it does not
+/// mean rewriting the engine.
 ///
-/// The default names the instance and table the readback path prints,
-/// which is the only pair with any evidence attached at all.
+/// The default names the pair that holds the rules which name a queue.
+/// Read back over a boot, instance 1 table 8 holds five rules and every
+/// one of them ends in a queue result; the pair the readback path prints
+/// (instance 1, table 3) holds five rules and **not one** queue result —
+/// it is the least informative table of the fourteen software programs.
+/// The old default named it only because it was the one that could be
+/// read off a running device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClassifierBinding {
     pub instance: usize,
@@ -62,7 +70,7 @@ pub struct ClassifierBinding {
 
 impl Default for ClassifierBinding {
     fn default() -> Self {
-        Self { instance: 1, table: 3 }
+        Self { instance: 1, table: 8 }
     }
 }
 
@@ -158,20 +166,31 @@ impl Lue {
     /// verdict into a queue is **not** done here: that step is the
     /// unestablished link, and keeping it in a separate, named function
     /// is what lets it be refuted without touching the engine.
-    pub fn classify(&self, binding: ClassifierBinding, frame: &[u8]) -> Verdict {
+    /// The counters come back with the verdict rather than being dropped:
+    /// "undecidable" is a number, "undecidable because a field code has
+    /// no frame field behind it" is a direction, and only the second one
+    /// says what to work on next.
+    pub fn classify(
+        &self,
+        binding: ClassifierBinding,
+        frame: &[u8],
+    ) -> (Verdict, EngineCounters) {
         let port = &self.inst[binding.instance & 1];
         let starts: Vec<RuleStart> = port
             .rule_starts(binding.table)
             .into_iter()
             .map(|index| RuleStart { table: binding.table, index })
             .collect();
+        let mut counters = EngineCounters::default();
         if starts.is_empty() {
             // An empty table has nothing to say. It is not a miss, and
             // the caller must not read it as one.
-            return Verdict::Undecidable { reason: "no rules programmed" };
+            counters.frames_classified += 1;
+            counters.no_rules += 1;
+            return (Verdict::Undecidable { reason: "no rules programmed" }, counters);
         }
-        let mut counters = EngineCounters::default();
-        Engine::classify(port, &starts, frame, &mut counters)
+        let verdict = Engine::classify(port, &starts, frame, &mut counters);
+        (verdict, counters)
     }
 
     /// Power-on state: empty tables, zero registers.

@@ -188,22 +188,38 @@ impl LuePort {
 
     /// Where each rule in a table begins.
     ///
-    /// A rule is a run of consecutive indices, so one begins wherever the
-    /// index below it is either absent or terminal. Derived from the
-    /// table rather than from a list, because software keeps that list in
-    /// its own memory and never writes it here.
+    /// A rule occupies a run of consecutive indices — its clauses, then
+    /// the entries its action list spills into. Both are found by reading
+    /// the rules forward from the lowest index and skipping what each one
+    /// covers, because software keeps its own list of rules in memory and
+    /// never writes it here.
+    ///
+    /// ⚠ Counting an index as a start whenever the entry below it is
+    /// terminal is **not** the same thing: it reports every spill entry as
+    /// a rule of its own. Over a boot that turns five rules into ten, and
+    /// the five phantoms are exactly the entries holding the queue result.
     pub fn rule_starts(&self, table: u8) -> Vec<u16> {
         let t = &self.tables[table as usize & (TABLE_COUNT - 1)];
-        let mut starts: Vec<u16> = t
-            .keys()
-            .copied()
-            .filter(|&i| match i.checked_sub(1).and_then(|p| t.get(&p)) {
-                None => true,
-                Some(prev) => prev.words[3] != super::rule::LINK_AND_NEXT,
-            })
-            .collect();
-        starts.sort_unstable();
+        let mut keys: Vec<u16> = t.keys().copied().collect();
+        keys.sort_unstable();
+
+        let mut starts = Vec::new();
+        let mut covered_through: Option<u16> = None;
+        for index in keys {
+            if covered_through.is_some_and(|end| index <= end) {
+                continue;
+            }
+            starts.push(index);
+            let span = super::rule::Rule::decode(|i| t.get(&i).copied(), index).span.max(1);
+            covered_through = Some(index.saturating_add(span - 1));
+        }
         starts
+    }
+
+    /// Read the rule that starts at `index`, spill entries included.
+    pub fn rule(&self, table: u8, index: u16) -> super::rule::RuleRead {
+        let t = &self.tables[table as usize & (TABLE_COUNT - 1)];
+        super::rule::Rule::decode(|i| t.get(&i).copied(), index)
     }
 
     /// Number of entries held in a table.

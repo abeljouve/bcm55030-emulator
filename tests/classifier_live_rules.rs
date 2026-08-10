@@ -284,25 +284,75 @@ fn every_live_rule_is_undecidable_so_no_frame_can_be_routed_by_one() {
 
 /// Rule by rule, so the reason is attributed rather than aggregated.
 ///
-/// Every one of the six stops on the same thing: a field code with no
-/// established frame field. **One** gap, not two — the anchor used to be
-/// a second refusal, and is not one any more.
+/// The six no longer stop on the same thing, and the split is the whole
+/// measurement. Four are now answerable: three ask only for an absent tag
+/// and an EtherType, and the fourth — the MPCP one — asks in addition for
+/// a control opcode in `[2, 6]`, which is the extractor field. It
+/// **matches** a real GATE, which is the outcome that could have failed.
+/// The two that still refuse both ask for the link's own metadata, which
+/// no frame carries.
+///
+/// ⚠ A rule moving between these lists is the signal this fixture exists
+/// to give. It is not a regression to be papered over.
 #[test]
-fn every_rule_stops_on_the_same_single_gap() {
+fn a_rule_stops_only_where_a_field_code_is_still_unexplained() {
     let lue = programmed();
     let frame = gate_frame();
 
-    for start in starts() {
+    // The MPCP rule, on the frame it was written for: it decides, and it
+    // decides yes. Under a wrong reading of the extractor it could not.
+    let mut c = EngineCounters::default();
+    let verdict =
+        Engine::evaluate_rule(&lue.inst[1], RuleStart { table: TABLE, index: 0x36 }, &frame, &mut c);
+    assert!(matches!(verdict, Verdict::Match { .. }), "the MPCP rule on a GATE: {verdict:?}");
+
+    // Its negative control: the same rule, an opcode outside the range.
+    let mut out_of_range = frame.clone();
+    out_of_range[15] = 0x07;
+    let mut c = EngineCounters::default();
+    let verdict = Engine::evaluate_rule(
+        &lue.inst[1],
+        RuleStart { table: TABLE, index: 0x36 },
+        &out_of_range,
+        &mut c,
+    );
+    assert_eq!(verdict, Verdict::NoMatch, "opcode 7 is outside [2, 6]");
+
+    // Those whose every clause the model can now answer, and which this
+    // frame does not satisfy.
+    for index in [0x2F, 0x32, 0x3B] {
         let mut c = EngineCounters::default();
+        let start = RuleStart { table: TABLE, index };
         let verdict = Engine::evaluate_rule(&lue.inst[1], start, &frame, &mut c);
-        assert!(
-            matches!(verdict, Verdict::Undecidable { .. }),
-            "rule {:#06X}: {verdict:?}",
-            start.index
-        );
-        assert_eq!(c.undecidable_field, 1, "rule {:#06X}", start.index);
+        assert_eq!(verdict, Verdict::NoMatch, "rule {index:#06X}");
+        assert_eq!(c.undecidable_presence, 0, "an untagged frame settles both tag codes");
+        assert_eq!(c.no_match, 1, "rule {index:#06X}");
+    }
+
+    // The two that still cannot be read, and the single reason each: they
+    // compare the link's LLID index, which is not in the frame at all.
+    for index in [0x2E, 0x35] {
+        let mut c = EngineCounters::default();
+        let start = RuleStart { table: TABLE, index };
+        let verdict = Engine::evaluate_rule(&lue.inst[1], start, &frame, &mut c);
+        assert!(matches!(verdict, Verdict::Undecidable { .. }), "rule {index:#06X}: {verdict:?}");
+        assert_eq!(c.undecidable_field, 1, "rule {index:#06X}");
+        assert_eq!(c.undecidable_presence, 0, "rule {index:#06X}");
         assert_eq!(c.undecidable_window, 0, "the window is no longer a refusal");
-        assert_eq!(c.undecidable_operator, 0, "rule {:#06X}", start.index);
+        assert_eq!(c.undecidable_operator, 0, "rule {index:#06X}");
+    }
+
+    // A tagged frame is the case the open attribution does bite on: the
+    // model must refuse it rather than pick one of the two codes.
+    for tpid in [0x8100u16, 0x88A8] {
+        let mut tagged = gate_frame();
+        tagged[12] = (tpid >> 8) as u8;
+        tagged[13] = tpid as u8;
+        let mut c = EngineCounters::default();
+        let start = RuleStart { table: TABLE, index: 0x2F };
+        let verdict = Engine::evaluate_rule(&lue.inst[1], start, &tagged, &mut c);
+        assert!(matches!(verdict, Verdict::Undecidable { .. }), "{tpid:#06x}: {verdict:?}");
+        assert_eq!(c.undecidable_presence, 1, "{tpid:#06x}");
     }
 
     // The shape of rule 0x3B's last clause, over a field the model can
@@ -487,8 +537,9 @@ fn a_selected_action_that_is_not_the_queue_result_names_no_queue() {
 /// slot. There is not one in this table.
 ///
 /// So the queue-selecting rules are not the ones the readback path
-/// prints — which makes the instance/table binding, not the verdict-to-
-/// queue step, the thing to establish next.
+/// prints. They are in another table entirely — see
+/// [`the_routing_rule_encodes_to_the_entries_hardware_returned`], whose
+/// fixture comes from the table the readback path never shows.
 #[test]
 fn no_rule_in_this_table_names_a_queue() {
     for rule in live_rules() {
@@ -508,4 +559,133 @@ fn no_rule_in_this_table_names_a_queue() {
             action.payload
         );
     }
+}
+
+// ── The table that DOES route, and the layout that hid it ───────────
+
+/// The rule a running system programs for MPCP, byte for byte.
+///
+/// Six clauses and three actions, read back off a boot of the real
+/// firmware image. Every word here was measured; the fixture is built
+/// from the constructors and checked against them, so a codec change
+/// breaks the anchor rather than moving both sides at once.
+///
+/// The addresses in it are the reserved multicast ones the standard
+/// assigns to MAC control, so this fixture carries no device identity —
+/// unlike its neighbour in the same table, which matches an address
+/// block and is deliberately not reproduced here.
+fn mpcp_routing_rule() -> bcm55030_emulator::soc::lue::Rule {
+    let queue = Action {
+        priority: 1,
+        payload: ActionPayload::Selected { sel: 2, sub: 0, field: 0x010, wide: true },
+    };
+    bcm55030_emulator::soc::lue::Rule {
+        clauses: vec![
+            clause(0x00, Op::Eq, 0x10, 0x0180_C200_0001),
+            clause(0x02, Op::Eq, 0x30, 0x8808),
+            clause(0x03, Op::NotExists, 0x3F, 0),
+            clause(0x04, Op::NotExists, 0x3F, 0),
+            clause(0x10, Op::Ge, 0x30, 2),
+            clause(0x10, Op::Le, 0x30, 6),
+        ],
+        actions: vec![
+            Action { priority: 1, payload: ActionPayload::Simple { type_code: 7 } },
+            Action { priority: 1, payload: ActionPayload::Simple { type_code: 3 } },
+            queue,
+        ],
+    }
+}
+
+/// The seven entries that rule occupies, exactly as they were read back.
+///
+/// The shape is the point: six clauses would be six entries, and there
+/// are seven. The first action word sits where the sixth clause's link
+/// word would be, and the other two are in an entry of their own —
+/// **which is where the queue result is**. An entry-at-a-time reading
+/// finds two rules here, and the second one it invents is the one
+/// carrying the routing decision.
+const MPCP_RULE_ENTRIES: [[u32; 4]; 7] = [
+    [0xF010_0001, 0x0000_0180, 0xC200_0001, 0x1000_0000],
+    [0xF030_0021, 0x0000_0000, 0x0000_8808, 0x1000_0000],
+    [0xF03F_0036, 0x0000_0000, 0x0000_0000, 0x1000_0000],
+    [0xF03F_0046, 0x0000_0000, 0x0000_0000, 0x1000_0000],
+    [0xF030_0104, 0x0000_0000, 0x0000_0002, 0x1000_0000],
+    [0xF030_0103, 0x0000_0000, 0x0000_0006, 0x0160_0000],
+    [0x0120_0000, 0x2100_0010, 0x0000_0000, 0x0000_0000],
+];
+
+#[test]
+fn the_routing_rule_encodes_to_the_entries_hardware_returned() {
+    let encoded = mpcp_routing_rule().encode();
+    assert_eq!(encoded.len(), MPCP_RULE_ENTRIES.len(), "six clauses, three actions, seven entries");
+    for (i, (got, want)) in encoded.iter().zip(MPCP_RULE_ENTRIES).enumerate() {
+        assert_eq!(got.words, want, "entry {i}");
+    }
+}
+
+/// A rule spans `clauses + ceil((actions - 1) / 4)` entries: the first
+/// action takes the last clause's link word, the rest spill, and the
+/// spill is padded out to a whole entry.
+///
+/// ⛔ The padding is **not** a terminator. At one, five or nine actions
+/// there is none — one action spills nothing at all, five fill an entry
+/// exactly. This case is why the decoder also stops at the clause tag,
+/// which no action word can carry.
+#[test]
+fn a_rules_span_follows_from_its_action_count() {
+    for (actions, extra) in [(1usize, 0u16), (2, 1), (3, 1), (4, 1), (5, 1), (6, 2), (9, 2)] {
+        let rule = bcm55030_emulator::soc::lue::Rule {
+            clauses: vec![clause(0x02, Op::Eq, 0x30, 0x8808), clause(0x00, Op::Eq, 0x10, 1)],
+            actions: (0..actions)
+                .map(|n| Action {
+                    priority: 1,
+                    payload: ActionPayload::Selected {
+                        sel: 2,
+                        sub: 0,
+                        field: 0x10 + n as u16,
+                        wide: true,
+                    },
+                })
+                .collect(),
+        };
+        let quads = rule.encode();
+        assert_eq!(quads.len() as u16, 2 + extra, "{actions} actions");
+
+        // And it reads back as one rule, not as a rule plus its spill.
+        let read = bcm55030_emulator::soc::lue::Rule::decode(
+            |i| quads.get(i as usize).copied(),
+            0,
+        );
+        assert_eq!(read.span, 2 + extra, "{actions} actions");
+        assert_eq!(read.result.as_ref().map(|r| r.actions.len()), Ok(actions), "{actions} actions");
+        assert_eq!(read.result, Ok(rule), "{actions} actions: round trip");
+    }
+}
+
+/// The whole point, in one measurement: reading an entry at a time finds
+/// the wrong number of rules **and** misses the queue.
+#[test]
+fn reading_one_entry_at_a_time_loses_the_queue_and_invents_a_rule() {
+    let mut lue = Lue::new();
+    for (step, quad) in mpcp_routing_rule().encode().iter().enumerate() {
+        for (i, w) in quad.to_regs().iter().enumerate() {
+            lue.write_word(DATA + i as u32 * 4, *w).unwrap();
+        }
+        lue.write_word(CMD, CMD_GO | CMD_WRITE | (8 << 12) | (0x34 + step as u32)).unwrap();
+    }
+    let port = &lue.inst[1];
+
+    assert_eq!(port.entry_count(8), 7);
+    assert_eq!(port.rule_starts(8), vec![0x34], "one rule, not two");
+
+    let read = port.rule(8, 0x34);
+    let rule = read.result.expect("the entries decode as a rule");
+    assert_eq!(read.span, 7);
+    assert_eq!(rule.destination_queue(), Some(0x10));
+
+    // What an entry-at-a-time reading would have concluded: the terminal
+    // clause's link word is the *first* action, and it names no queue.
+    let first = rule.actions[0];
+    assert_eq!(first.encode(), 0x0160_0000);
+    assert_eq!(first.destination_queue(), None, "the first action is not the queue result");
 }
