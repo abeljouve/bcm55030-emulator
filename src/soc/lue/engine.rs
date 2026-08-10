@@ -76,6 +76,11 @@ fn extract_field(field: Field, frame: &[u8]) -> Option<u64> {
             }
             frame.get(ETHERNET_HEADER_LEN..ETHERNET_HEADER_LEN + 2).map(be)
         }
+        // The link index. Its meaning IS established — see [`LINK_INDEX`]
+        // — and it is still refused, because the value is link metadata
+        // and this function is handed frame bytes. Spelled out rather
+        // than left to the catch-all so the refusal reads as a decision.
+        Field::Observed(LINK_INDEX) | Field::Unknown(LINK_INDEX) => None,
         _ => None,
     }
 }
@@ -129,6 +134,41 @@ const DEFAULT_EXTRACTOR: u8 = 0x10;
 /// outside the `0x10..=0x16` slot range, so it names a field the hardware
 /// knows on its own.
 const FRAME_LENGTH: u8 = 0x24;
+
+/// The code the per-link tables compare against a link index.
+///
+/// -- OBSERVED, and from software's own code rather than from a table of
+/// field names: the batch-commit helper **appends this clause itself**.
+/// When a batch is finalised and the first byte of its header is zero, it
+/// pushes one more clause — this code, equality, operand `header[2] + 1`
+/// — before handing the batch to the rule writer. `header[2]` is the
+/// link index the batch is being programmed for, so the operand is that
+/// index plus one, and nothing else in a batch can produce this code.
+///
+/// The rule set corroborates the reading independently and was not
+/// consulted to reach it. Instance 0 tables 4 through 7 each hold three
+/// rules naming *other* operands and one terminal rule naming their own:
+/// the table whose terminal is `== 1` carries rules for 2, 3 and 4, the
+/// one with `== 2` carries 1, 3 and 4, and so on. That is a per-link
+/// discrimination table, one table per link, and it fixes the table index
+/// too: `header[2] + 4`. Seeding a persistent configuration record so
+/// that a batch is programmed with `header[2] = 0` put the new rule in
+/// table 4 with the clause `== 1` — what this reading predicts, and what
+/// a wrong one could not have produced.
+///
+/// ⛔ **The engine still refuses it, and deliberately.** The value is not
+/// in the frame: it is the index of the link the frame arrived on, and
+/// [`Engine::classify`] is handed bytes and nothing else. Two things
+/// would have to be settled before answering it — which index a frame
+/// carrying the broadcast link identifier takes, and whether the operand
+/// is the index plus one or a separate numbering that merely starts at
+/// one. Guessing either would turn a refusal into a wrong match.
+///
+/// The denominator of what answering it would unblock is measured: over a
+/// boot plus four injected frames, binding the classifier to instance 0
+/// tables 4 through 8 yields **592 field refusals out of 600 frames** and
+/// not one verdict. Every one of those refusals is this code.
+const LINK_INDEX: u8 = 0x0F;
 
 /// The EtherTypes that mark a tagged frame.
 ///
@@ -543,16 +583,21 @@ mod tests {
         assert_eq!(Engine::classify(&port, &rules, &bad, &mut c), Verdict::NoMatch);
     }
 
-    /// A field code nobody has explained must not be guessed at, and the
+    /// A field a frame does not carry must not be guessed at, and the
     /// refusal must leave a number behind. This is the state a live rule
-    /// set is actually in: its clauses use codes `0x03`, `0x04`, `0x0F`
-    /// and `0x10`, none of which is pinned to a frame field.
+    /// set is actually in for codes `0x03`, `0x04` and `0x0F`.
+    ///
+    /// The three are refused for two different reasons, and the
+    /// difference matters: `0x03`/`0x04` are refused because *which tag
+    /// is which* is unexplained, `0x0F` because its meaning IS explained
+    /// (see [`LINK_INDEX`]) and the value simply is not in the bytes.
+    /// Both are refusals; only the second one names its missing input.
     #[test]
-    fn an_unexplained_field_is_undecidable_and_counted() {
+    fn a_field_the_frame_does_not_carry_is_undecidable_and_counted() {
         let mut port = LuePort::new();
         // `0x03` and `0x04` have a presence but no value: a rule may ask
         // whether a tag is there, and this model will not invent what is
-        // in it. `0x0F` is link metadata a frame does not carry at all.
+        // in it. `0x0F` is the link index, which is link metadata.
         for code in [0x03u8, 0x04, 0x0F] {
             program(&mut port, 3, 0x20, Entry::Clause {
                 clause: Clause {

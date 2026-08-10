@@ -62,6 +62,30 @@ const WORDS_PER_INSTANCE: u32 = 5;
 /// it is the least informative table of the fourteen software programs.
 /// The old default named it only because it was the one that could be
 /// read off a running device.
+///
+/// Three measurements since then say the default is not merely the least
+/// bad choice, without saying it is what the hardware consults:
+///
+/// * **All fourteen populated pairs were swept** under one stimulus (a
+///   boot plus four injected frames, 600 classified). Instance 1 table 8
+///   is the only one that returns a verdict *and* a queue for every
+///   frame: 592 matched, 0 missed, 0 refused. Instance 0 tables 4..8 and
+///   instance 1 table 3 refuse on a field; instance 0 table 2 misses 591
+///   of 592; instance 0 table 3 and instance 1 table 2 match nearly
+///   everything and name no queue at all.
+/// * **Instance 0 tables 4..7 are per-link tables**, not alternatives to
+///   table 8 — each carries one terminal clause on its own link index and
+///   three on the others (see `engine::LINK_INDEX`). A pair cannot
+///   express "the table follows the frame's link", which is the concrete
+///   form the wrong shape takes.
+/// * The one rule in the whole image that names the **data** queue lands
+///   in instance 1 table 8. It is programmed from a persistent
+///   configuration record, and seeding that record is what made it
+///   appear; without the record the boot programs no rule naming that
+///   queue anywhere, which is why the pair looked control-only.
+///
+/// ⛔ None of this reads a classification result back, so "the only pair
+/// that decides" still is not "the pair the hardware consults".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClassifierBinding {
     pub instance: usize,
