@@ -6,16 +6,19 @@
 //! fourth word is something else ends the rule, and that word is its
 //! first action word.
 //!
-//! Three things this engine deliberately refuses to do:
+//! Two things this engine deliberately refuses to do:
 //!
 //! * **Guess a field.** Only three field codes have a frame field behind
 //!   them. The other codes a live rule set uses are real but unexplained,
 //!   and a clause over one of them returns [`Verdict::Undecidable`] —
 //!   never a match, never a silent miss.
-//! * **Evaluate a non-zero anchor.** Two anchor values occur and neither
-//!   is explained. Decoding one is safe; acting on one is not.
 //! * **Fall through.** A frame that matches nothing is a miss with a
 //!   counter, not an implicit default.
+//!
+//! A clause compares over a window, not over the whole field: `shift`
+//! and `anchor` are its two ends, and both are honoured here. See
+//! [`super::rule::Clause::anchor`] for what establishes that, and for
+//! the one thing about it that is still open.
 
 use super::port::LuePort;
 use super::rule::{Action, Clause, Entry, Field, Link, Op};
@@ -42,12 +45,21 @@ fn extract_field(field: Field, frame: &[u8]) -> Option<u64> {
     }
 }
 
-/// Compare, on the low `compared_bits` of both sides.
+/// Compare, over the clause's window: `bits` bits starting at `anchor`.
+///
+/// Both sides are brought down to the window before comparing. ⛔ Whether
+/// the hardware does that or masks the bits below the anchor in place is
+/// **not established** — the two agree on `==` and `!=`, which is the
+/// only pairing any observed clause makes with a non-zero anchor. What
+/// would separate them: a rule over the EtherType with an ordered
+/// operator and an anchor of 8, against two frames whose EtherTypes
+/// differ only in their low octet.
 ///
 /// Returns `None` for an operator the model will not act on.
-fn compare(op: Op, value: u64, operand: u64, bits: u32) -> Option<bool> {
+fn compare(op: Op, value: u64, operand: u64, anchor: u32, bits: u32) -> Option<bool> {
     let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
-    let (v, o) = (value & mask, operand & mask);
+    let window = |x: u64| (x >> anchor.min(63)) & mask;
+    let (v, o) = (window(value), window(operand));
     match op {
         Op::Never => Some(false),
         Op::Always => Some(true),
@@ -85,8 +97,8 @@ pub struct EngineCounters {
     pub no_match: u64,
     /// A clause over a field code with no established frame field.
     pub undecidable_field: u64,
-    /// A clause with a non-zero anchor.
-    pub undecidable_anchor: u64,
+    /// A clause whose two window boundaries leave no bits to compare.
+    pub undecidable_window: u64,
     /// A clause with an operator the model will not act on.
     pub undecidable_operator: u64,
     /// An entry the decoder could not read as a clause.
@@ -102,7 +114,7 @@ impl EngineCounters {
             == self.matched
                 + self.no_match
                 + self.undecidable_field
-                + self.undecidable_anchor
+                + self.undecidable_window
                 + self.undecidable_operator
                 + self.undecidable_entry
                 + self.unterminated_rules
@@ -154,7 +166,7 @@ impl Engine {
                 Err(reason) => {
                     match reason {
                         "field has no established frame field" => counters.undecidable_field += 1,
-                        "clause anchor is not understood" => counters.undecidable_anchor += 1,
+                        "clause window is empty" => counters.undecidable_window += 1,
                         _ => counters.undecidable_operator += 1,
                     }
                     return Verdict::Undecidable { reason };
@@ -182,13 +194,22 @@ impl Engine {
     /// One clause against one frame. `Err` carries why it could not be
     /// decided — the caller turns that into a counter.
     fn test_clause(clause: &Clause, frame: &[u8]) -> Result<bool, &'static str> {
-        if clause.anchor != 0 {
-            return Err("clause anchor is not understood");
+        // Two boundaries that meet or cross leave nothing to compare.
+        // No observed clause is shaped that way; one that is describes
+        // no comparison, and answering would be inventing one.
+        if clause.compared_bits() == 0 {
+            return Err("clause window is empty");
         }
         let value = extract_field(clause.field, frame)
             .ok_or("field has no established frame field")?;
-        compare(clause.op, value, clause.operand, clause.compared_bits())
-            .ok_or("operator is not one the model acts on")
+        compare(
+            clause.op,
+            value,
+            clause.operand,
+            clause.anchor as u32,
+            clause.compared_bits(),
+        )
+        .ok_or("operator is not one the model acts on")
     }
 
     /// Evaluate every rule and take the highest priority that matched.
@@ -216,7 +237,7 @@ impl Engine {
                 Verdict::Undecidable { reason } => {
                     // Carry the per-rule tally so the reason survives.
                     counters.undecidable_field += per_rule.undecidable_field;
-                    counters.undecidable_anchor += per_rule.undecidable_anchor;
+                    counters.undecidable_window += per_rule.undecidable_window;
                     counters.undecidable_operator += per_rule.undecidable_operator;
                     counters.undecidable_entry += per_rule.undecidable_entry;
                     counters.unterminated_rules += per_rule.unterminated_rules;
@@ -369,16 +390,111 @@ mod tests {
         }
     }
 
-    /// The anchor is decoded but never acted on.
+    /// The two window ends, against the clauses that establish them.
+    ///
+    /// These are address matches software programs, and each decodes to
+    /// a textbook mapping and to nothing else — which is what pins the
+    /// window to `[63 - shift : anchor]` rather than to any other
+    /// reading of the same two numbers.
     #[test]
-    fn a_non_zero_anchor_is_undecidable_and_counted() {
+    fn the_window_ends_reproduce_the_address_blocks_they_encode() {
+        // IPv4 multicast: the 01:00:5E block with its low 23 bits free.
+        let v4 = Clause {
+            field: Field::from_code(0x00),
+            op: Op::Eq,
+            shift: 0,
+            anchor: 23,
+            operand: 0x0000_0100_5E00_0100,
+        };
+        assert_eq!(v4.compared_bits(), 41);
+        // IPv6 multicast: the 33:33 prefix with its low 32 bits free.
+        let v6 = Clause { anchor: 32, operand: 0x0000_3333_0000_0100, ..v4 };
+        assert_eq!(v6.compared_bits(), 32);
+        // The group bit of the first octet, on its own.
+        let group = Clause { shift: 23, anchor: 40, operand: 0x0000_0100_0000_0000, ..v4 };
+        assert_eq!(group.compared_bits(), 1);
+
+        let mac = |m: [u8; 6]| m.iter().fold(0u64, |a, &b| (a << 8) | b as u64);
+        for (clause, addr, expected, what) in [
+            (v4, [0x01, 0x00, 0x5E, 0x00, 0x00, 0x00], true, "block start"),
+            (v4, [0x01, 0x00, 0x5E, 0x7F, 0xFF, 0xFF], true, "block end"),
+            (v4, [0x01, 0x00, 0x5E, 0x80, 0x00, 0x00], false, "just past the block"),
+            (v4, [0x01, 0x00, 0x5F, 0x00, 0x00, 0x00], false, "neighbouring prefix"),
+            (v6, [0x33, 0x33, 0x00, 0x00, 0x00, 0x01], true, "IPv6 block"),
+            (v6, [0x33, 0x33, 0xFF, 0xFF, 0xFF, 0xFF], true, "IPv6 block end"),
+            (v6, [0x33, 0x34, 0x00, 0x00, 0x00, 0x00], false, "IPv6 neighbour"),
+            (group, [0x01, 0x00, 0x00, 0x00, 0x00, 0x00], true, "group bit set"),
+            (group, [0x00, 0x00, 0x00, 0x00, 0x00, 0x00], false, "group bit clear"),
+            (group, [0xFF; 6], true, "broadcast is a group address"),
+        ] {
+            let got = compare(
+                clause.op,
+                mac(addr),
+                clause.operand,
+                clause.anchor as u32,
+                clause.compared_bits(),
+            );
+            assert_eq!(got, Some(expected), "{what}: {addr:02X?}");
+        }
+    }
+
+    /// The anchor a live rule set actually carries: it selects the
+    /// subtype octet of a slow-protocol frame out of the sixteen bits
+    /// after the EtherType, which is the only reading under which the
+    /// rule discriminates anything.
+    #[test]
+    fn an_anchored_clause_selects_the_octet_it_was_written_for() {
+        let subtype = Clause {
+            // The two octets after the EtherType, whatever the hardware
+            // calls the code — this test is about the window, not the
+            // field.
+            field: Field::EtherType,
+            op: Op::Eq,
+            shift: 0x30,
+            anchor: 8,
+            operand: 0x0300,
+        };
+        assert_eq!(subtype.compared_bits(), 8, "one octet, not two");
+        let test = |v: u64| {
+            compare(subtype.op, v, subtype.operand, subtype.anchor as u32, subtype.compared_bits())
+        };
+        // OAM is subtype 0x03; the octet under it is the flags, and the
+        // rule must not care what it holds.
+        assert_eq!(test(0x0300), Some(true));
+        assert_eq!(test(0x0350), Some(true), "the flags octet is outside the window");
+        assert_eq!(test(0x03FF), Some(true));
+        // A different slow protocol must not match.
+        assert_eq!(test(0x0100), Some(false), "LACP is subtype 0x01");
+        assert_eq!(test(0x0200), Some(false));
+    }
+
+    /// An anchor of zero must leave every existing clause exactly as it
+    /// was: the window's low end simply sits at the bottom.
+    #[test]
+    fn a_zero_anchor_compares_the_same_bits_it_always_did() {
+        for shift in [0u8, 0x10, 0x30, 0x38, 0x3F] {
+            let c = Clause {
+                field: Field::EtherType,
+                op: Op::Eq,
+                shift,
+                anchor: 0,
+                operand: 0,
+            };
+            assert_eq!(c.compared_bits(), 64 - shift as u32);
+        }
+    }
+
+    /// Two ends that meet describe no comparison. Nothing observed is
+    /// shaped that way, and answering anyway would invent a result.
+    #[test]
+    fn an_empty_window_is_undecidable_and_counted() {
         let mut port = LuePort::new();
         program(&mut port, 3, 0x30, Entry::Clause {
             clause: Clause {
                 field: Field::EtherType,
                 op: Op::Eq,
                 shift: 0x30,
-                anchor: 8,
+                anchor: 0x30,
                 operand: 0x8809,
             },
             link: Link::Terminal(Action {
@@ -394,7 +510,8 @@ mod tests {
             &mut c,
         );
         assert!(matches!(v, Verdict::Undecidable { .. }));
-        assert_eq!(c.undecidable_anchor, 1);
+        assert_eq!(c.undecidable_window, 1);
+        assert!(c.verdicts_accounted_for(), "{c:?}");
     }
 
     /// An empty table decides nothing — it does not quietly match.

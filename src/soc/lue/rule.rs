@@ -126,20 +126,55 @@ impl Field {
 pub struct Clause {
     pub field: Field,
     pub op: Op,
-    /// Bits [21:16]. `64 - shift` bits of the operand are compared.
+    /// Bits [21:16]. The high end of the compare window: the bit above
+    /// it and everything over it are don't-care.
     pub shift: u8,
-    /// Bits [15:10]. Two values occur (`0` and `8`) and neither is
-    /// explained. ⛔ Decoding one is safe; **evaluating** a clause with a
-    /// non-zero anchor is not — the engine must refuse it rather than
-    /// guess.
+    /// Bits [15:10]. Where the compare window starts.
+    ///
+    /// -- OBSERVED that it is the window's **low end**: software emits
+    /// it paired with a comparand shifted up by the same amount, so a
+    /// clause with `anchor 23` against an address block leaves the low
+    /// 23 bits out of the comparison, and one with `anchor 8` against a
+    /// two-octet field compares only the upper octet. Every observed
+    /// clause decodes to something coherent under that reading and to
+    /// nothing under an anchor of zero.
+    ///
+    /// ⛔ **The window's high end is NOT established.** Two readings
+    /// survive every clause the firmware emits:
+    ///
+    /// * `[63 - shift : anchor]`, width `64 - shift - anchor` — what
+    ///   this model implements.
+    /// * `[anchor + 63 - shift : anchor]`, width `64 - shift` — a
+    ///   fixed-width window slid up by the anchor.
+    ///
+    /// They agree on every observed clause because each one either has
+    /// `shift == 0` (both windows then reach the top) or compares a
+    /// field too narrow to reach the bits where they differ. An earlier
+    /// reading of this file claimed the first was established by three
+    /// arguments; an adversarial re-check found all three
+    /// non-discriminating, and one of them read two mutually exclusive
+    /// branches as if both ran. Do not restore that claim.
+    ///
+    /// What separates them: a clause over a field that can carry bits
+    /// above `anchor + 64 - shift` — field `0x1B` is tested at
+    /// `shift 0x3A, anchor 5`, so a value with bit 6 set answers
+    /// differently under the two.
+    ///
+    /// ⛔ Also not established: whether the hardware masks the bits
+    /// below the anchor in place or right-aligns both sides. The two
+    /// agree on `==` and `!=`, and no observed clause pairs a non-zero
+    /// anchor with an ordered operator. This model right-aligns; see
+    /// [`super::engine`] for the experiment.
     pub anchor: u8,
     pub operand: u64,
 }
 
 impl Clause {
-    /// How many low bits of the operand take part in the comparison.
+    /// Width of the compare window, in bits.
     pub fn compared_bits(&self) -> u32 {
-        64u32.saturating_sub(self.shift as u32)
+        64u32
+            .saturating_sub(self.shift as u32)
+            .saturating_sub(self.anchor as u32)
     }
 
     pub fn header(&self) -> u32 {
@@ -175,15 +210,19 @@ pub enum Link {
 
 /// An action word.
 ///
-/// ⛔ The encoding is fully known; the **meaning** is known for none of
-/// the 92 action types. Nothing in the firmware ever reads a
-/// classification result back, so there is no channel through which a
-/// meaning could be checked. This type therefore carries the encoding
-/// and refuses to name it.
+/// The encoding is fully known. Of the meanings, exactly one is
+/// established and it is the one routing needs: see
+/// [`Action::destination_queue`]. The rest are carried, not named.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Action {
-    /// Bits [27:24]. Four bits, not eight — a live rule set shows two
-    /// distinct values, so this field is measured rather than assumed.
+    /// Bits [27:24].
+    ///
+    /// ⛔ Called a priority here because that is how the engine uses it,
+    /// but software sets it from a **per-batch tag** chosen by whoever
+    /// programmed the rule, not from anything frame-shaped. Whether the
+    /// hardware treats it as a precedence at all is **not established**.
+    /// What would settle it: two overlapping rules with different tags
+    /// and one frame that matches both.
     pub priority: u8,
     pub payload: ActionPayload,
 }
@@ -201,7 +240,55 @@ pub enum ActionPayload {
     Raw(u32),
 }
 
+/// Selector nibble of the group the queue result belongs to.
+const SELECTED_QUEUE_SEL: u8 = 2;
+/// Sub-index within that group. Software's result codes run from this
+/// one upwards through the group, so the neighbours are other results
+/// entirely — not other queues.
+const SELECTED_QUEUE_SUB: u8 = 0;
+
 impl Action {
+    /// The queue this action sends a frame to, if it names one.
+    ///
+    /// -- OBSERVED, and the only action meaning that is. Three things,
+    /// none of which is a specification read off and called hardware:
+    ///
+    /// * The encoding is re-derived from the image: the action encoder
+    ///   dispatches on the type through a table whose every entry was
+    ///   recomputed, and this one lands in the group and sub-index used
+    ///   here.
+    /// * At every call site that emits this type, the value handed to it
+    ///   is written `pin & 0x1F`, and those pin numbers are the ones the
+    ///   receive path polls its queues by. Queue numbers are gathered
+    ///   elsewhere into `1 << (pin & 0x1F)` bitmaps, which is where the
+    ///   five bits come from.
+    /// * Read back over a boot, the rules carrying this type are exactly
+    ///   the ones software builds for its user-facing port, and all of
+    ///   them name the same queue — the one the control path dequeues.
+    ///
+    /// ⚠ The published result-code table this type lines up with was
+    /// **not** used to establish it: an adversarial re-check found the
+    /// name column to be a read-off, and the "nothing left over" closure
+    /// argument to be an artifact of the window it was counted in. What
+    /// survived is the structure and the call sites, which is what the
+    /// three points above rest on.
+    ///
+    /// ⛔ Every **other** `Selected` action is a different result — a
+    /// scheduling index, a VLAN edit, a bitmask — and returning a queue
+    /// for one of those would route frames by a number that is not a
+    /// queue. A live rule set is full of them: of 84 selected actions
+    /// counted over a boot, **none** was this one.
+    pub fn destination_queue(&self) -> Option<u8> {
+        match self.payload {
+            ActionPayload::Selected { sel, sub, field, .. }
+                if sel == SELECTED_QUEUE_SEL && sub == SELECTED_QUEUE_SUB =>
+            {
+                Some((field & 0x1F) as u8)
+            }
+            _ => None,
+        }
+    }
+
     pub fn encode(&self) -> u32 {
         let prio = ((self.priority as u32) & 0xF) << 24;
         match self.payload {

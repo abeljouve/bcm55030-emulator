@@ -29,7 +29,7 @@ use epon_olt::fibre::FibreConfig;
 use epon_olt::link::Link;
 use epon_olt::peer::PeerConfig;
 
-use crate::soc::lue::{ActionPayload, ClassifierBinding, Lue, Verdict};
+use crate::soc::lue::{ClassifierBinding, Lue, Verdict};
 use mailbox::{Command, Slot, TxAssembler};
 
 // The protocol modules are re-exported so consumers keep addressing them
@@ -424,11 +424,11 @@ impl Olt {
 
     /// Which queue a frame goes to, and why.
     ///
-    /// ⛔ The step from a verdict to a queue is the link that is **not**
-    /// established: the action field is an index masked to five bits by
-    /// the same accessor the receive path uses to name a mailbox queue,
-    /// which leans towards "queue" — but leaning is not knowing. It lives
-    /// in its own function so that refuting it is a local change.
+    /// Only one action result names a queue, and
+    /// [`crate::soc::lue::Action::destination_queue`] is what says which.
+    /// A rule that matches on any other result has decided something —
+    /// just not where the frame goes — and that is counted separately
+    /// from a miss, because they are different facts.
     fn choose_slot(
         &mut self,
         classifier: Option<(&Lue, ClassifierBinding)>,
@@ -440,12 +440,12 @@ impl Olt {
         };
         self.classifier_counters.classified += 1;
         match lue.classify(binding, frame) {
-            Verdict::Match { action, .. } => match action.payload {
-                ActionPayload::Selected { field, .. } => {
+            Verdict::Match { action, .. } => match action.destination_queue() {
+                Some(queue) => {
                     self.classifier_counters.matched += 1;
-                    Slot((field & 0x1F) as u8)
+                    Slot(queue)
                 }
-                _ => {
+                None => {
                     // A match whose action names no queue decides
                     // nothing about routing.
                     self.classifier_counters.match_without_a_queue += 1;

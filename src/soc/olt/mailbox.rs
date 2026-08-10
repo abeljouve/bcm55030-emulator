@@ -21,22 +21,39 @@ pub const BLOCK_COUNT: u32 = 8;
 pub const STATUS_DATA_READY: u32 = 0x200;
 
 /// A mailbox queue, addressed by the low byte of a read command.
+///
+/// The byte is not opaque: software carries queues around as a single
+/// number whose top three bits are the channel block and whose low five
+/// are the queue inside it, and it splits that number the same way this
+/// type does — the block goes into the address, the low five bits into
+/// the command word. [`Slot::bitmap_position`] is that split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Slot(pub u8);
 
 impl Slot {
     /// Control-plane queue: MPCP and OAM share it.
     pub const CONTROL: Self = Self(0x10);
-    /// Queue used for frames that are neither control-plane nor EAPOL.
+    /// Queue used for everything that is not control-plane.
     pub const DATA: Self = Self(0x0F);
-    /// EAPOL queue.
-    pub const EAPOL: Self = Self(0x00);
 
     /// Queue a frame is delivered through, chosen by EtherType.
+    ///
+    /// -- OBSERVED that EAPOL has no queue of its own, and that it
+    /// shares the control queue. Software derives exactly three queue
+    /// numbers at start-up — `0x10`, `0x0F` and `0x0E` — by walking one
+    /// cursor down from the channel's depth; the third serves multicast
+    /// security associations. **None of them is zero**, and the receive
+    /// path only polls the numbers it derived, so a frame left at slot 0
+    /// would never be dequeued at all.
+    ///
+    /// Which one carries EAPOL is settled by the rules software actually
+    /// programs: read back over a boot, the table holding the rules that
+    /// name a queue has five, and every one of them ends in the same
+    /// queue result — `0x10`. One of the five is an EtherType match on
+    /// EAPOL, alongside the MPCP and slow-protocol ones.
     pub fn for_frame(frame: &[u8]) -> Self {
         match EtherType::of_frame(frame) {
-            Some(EtherType::Mpcp | EtherType::SlowProtocol) => Self::CONTROL,
-            Some(EtherType::Eapol) => Self::EAPOL,
+            Some(EtherType::Mpcp | EtherType::SlowProtocol | EtherType::Eapol) => Self::CONTROL,
             _ => Self::DATA,
         }
     }
@@ -254,7 +271,7 @@ mod tests {
     fn commands_round_trip_through_encode() {
         for cmd in [
             Command::Read { slot: Slot::CONTROL },
-            Command::Read { slot: Slot::EAPOL },
+            Command::Read { slot: Slot::DATA },
             Command::Write { channel: 0, len: 64, mpcp: true },
             Command::Write { channel: 3, len: 1518, mpcp: false },
         ] {
@@ -332,12 +349,30 @@ mod tests {
         mpcp[12..14].copy_from_slice(&EtherType::Mpcp.as_u16().to_be_bytes());
         assert_eq!(Slot::for_frame(&mpcp), Slot::CONTROL);
 
+        // EAPOL has no queue of its own: the rule software programs for
+        // it names the same queue as the MPCP and slow-protocol ones.
         let mut eapol = mpcp.clone();
         eapol[12..14].copy_from_slice(&EtherType::Eapol.as_u16().to_be_bytes());
-        assert_eq!(Slot::for_frame(&eapol), Slot::EAPOL);
+        assert_eq!(Slot::for_frame(&eapol), Slot::CONTROL);
 
         assert_eq!(Slot::for_frame(&[]), Slot::DATA);
         assert_eq!(Slot::CONTROL.bitmap_position(), (0, 16));
+    }
+
+    /// No queue is zero, and every queue software polls splits into a
+    /// block and an index the way the hardware is addressed. A slot of
+    /// zero would sit in a queue nothing ever reads.
+    #[test]
+    fn every_queue_the_receive_path_polls_is_one_software_derived() {
+        // The three numbers start-up derives, walking one cursor down.
+        for (slot, block, index) in [(0x10u8, 0usize, 16u32), (0x0F, 0, 15), (0x0E, 0, 14)] {
+            assert_eq!(Slot(slot).bitmap_position(), (block, index));
+            assert_ne!(slot, 0, "no derived queue is zero");
+        }
+        // And the two this model routes to are among them.
+        for slot in [Slot::CONTROL, Slot::DATA] {
+            assert!(matches!(slot.0, 0x0E..=0x10), "{slot:?} is not a derived queue");
+        }
     }
 
     #[test]

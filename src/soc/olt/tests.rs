@@ -244,13 +244,17 @@ fn the_bitmap_bit_tracks_its_queue() {
 #[test]
 fn reading_an_empty_slot_is_still_intercepted() {
     let mut olt = quiet_olt();
-    olt.inject_raw_frame(frame_with_ethertype(EtherType::Eapol));
+    // Control-plane, so it queues somewhere other than the queue read
+    // below — that separation is the whole point of the test.
+    olt.inject_raw_frame(frame_with_ethertype(EtherType::Mpcp));
     cross(&mut olt);
 
-    assert!(olt.write_cmd(CMD_STATUS_BASE, mailbox::Command::Read { slot: Slot::CONTROL }.encode()));
+    assert!(olt.write_cmd(CMD_STATUS_BASE, mailbox::Command::Read { slot: Slot::DATA }.encode()));
     assert!(olt.mailbox_fifo.is_empty());
     assert_eq!(olt.read_cmd_status(CMD_STATUS_BASE), Some(0));
-    assert_eq!(olt.mailbox_pending.get(&Slot::EAPOL.0).map(|q| q.len()), Some(1));
+    // The frame is still where it was queued — reading the wrong queue
+    // takes nothing out of the right one.
+    assert_eq!(olt.mailbox_pending.get(&Slot::CONTROL.0).map(|q| q.len()), Some(1));
 }
 
 #[test]
