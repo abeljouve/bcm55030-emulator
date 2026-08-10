@@ -160,6 +160,15 @@ pub struct ClassifierRouting {
     /// frame belongs; counting only the agreements would make the check
     /// unable to fail.
     pub matched_differs_from_fallback: u64,
+    /// Of the frames no rule matched, the ones the fallback calls
+    /// control-plane. A rule set written to route the control plane
+    /// should leave none of these behind, so this is the size of the gap
+    /// between what the rules cover and what the fallback thinks matters.
+    pub no_match_the_fallback_calls_control: u64,
+    /// And the ones it calls data — the half the rule set is not expected
+    /// to cover. Counted separately because the number above has no
+    /// meaning without its denominator.
+    pub no_match_the_fallback_calls_data: u64,
 }
 
 impl ClassifierRouting {
@@ -473,7 +482,13 @@ impl Olt {
             },
             Verdict::NoMatch => {
                 self.classifier_counters.no_match += 1;
-                Slot::for_frame(frame)
+                let slot = Slot::for_frame(frame);
+                if slot == Slot::CONTROL {
+                    self.classifier_counters.no_match_the_fallback_calls_control += 1;
+                } else {
+                    self.classifier_counters.no_match_the_fallback_calls_data += 1;
+                }
+                slot
             }
             Verdict::Undecidable { .. } => {
                 self.classifier_counters.undecidable += 1;
