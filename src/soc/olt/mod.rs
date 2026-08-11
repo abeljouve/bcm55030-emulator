@@ -143,6 +143,10 @@ pub struct ClassifierRouting {
     pub matched: u64,
     /// Matched, but the action does not name a queue: routing fell back.
     pub match_without_a_queue: u64,
+    /// Matched, and the action named a queue number wider than a slot. The
+    /// model reports the field whole; this is where the mailbox's own width
+    /// refuses it, so a wide queue cannot alias onto a narrow one.
+    pub matched_queue_outside_the_slot_space: u64,
     /// No rule matched; the specification calls this a drop, and the
     /// fallback routing it anyway is a known, counted divergence.
     pub no_match: u64,
@@ -175,7 +179,11 @@ impl ClassifierRouting {
     /// Every frame handed to the classifier left exactly one tally.
     pub fn decisions_accounted_for(&self) -> bool {
         self.classified
-            == self.matched + self.match_without_a_queue + self.no_match + self.undecidable
+            == self.matched
+                + self.match_without_a_queue
+                + self.matched_queue_outside_the_slot_space
+                + self.no_match
+                + self.undecidable
     }
 }
 
@@ -482,15 +490,26 @@ impl Olt {
         match verdict {
             Verdict::Match { actions, .. } => match actions.iter().find_map(|a| a.destination_queue())
             {
-                Some(queue) => {
-                    self.classifier_counters.matched += 1;
-                    if Slot(queue) == Slot::for_frame(frame) {
-                        self.classifier_counters.matched_agrees_with_fallback += 1;
-                    } else {
-                        self.classifier_counters.matched_differs_from_fallback += 1;
+                Some(queue) => match u8::try_from(queue) {
+                    Ok(q) => {
+                        self.classifier_counters.matched += 1;
+                        if Slot(q) == Slot::for_frame(frame) {
+                            self.classifier_counters.matched_agrees_with_fallback += 1;
+                        } else {
+                            self.classifier_counters.matched_differs_from_fallback += 1;
+                        }
+                        Slot(q)
                     }
-                    Slot(queue)
-                }
+                    Err(_) => {
+                        // The rule names a queue this mailbox cannot
+                        // address. The classifier reports the field at its
+                        // full twelve bits; the slot space here is one
+                        // byte, so the refusal belongs here and is counted
+                        // rather than folded down onto slot 0.
+                        self.classifier_counters.matched_queue_outside_the_slot_space += 1;
+                        Slot::for_frame(frame)
+                    }
+                },
                 None => {
                     // A match whose action names no queue decides
                     // nothing about routing.

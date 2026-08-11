@@ -638,9 +638,10 @@ pub struct OltRuleListMatchEntryParams {
     pub type_code: u8,
     /// Byte 6. Position established, meaning not. Default 0.
     pub byte6: Option<u8>,
-    /// Bytes 7 and 8, each subtracted from a base the type selects.
-    pub base_a: Option<u8>,
-    pub base_b: Option<u8>,
+    /// Bytes 7 and 8. Each is subtracted from a base the type code selects;
+    /// the base is the receiver's.
+    pub subtrahend_a: Option<u8>,
+    pub subtrahend_b: Option<u8>,
     /// Byte 9. Values 1 to 4 observed. Default 1.
     pub selector: Option<u8>,
     /// Byte 11 onward, as hex. Byte 10 is its length and is written for you.
@@ -3536,7 +3537,7 @@ impl EmulatorHandler {
                     MatchEntry::new(
                         m.type_code,
                         m.byte6.unwrap_or(0),
-                        (m.base_a.unwrap_or(0), m.base_b.unwrap_or(0)),
+                        (m.subtrahend_a.unwrap_or(0), m.subtrahend_b.unwrap_or(0)),
                         m.selector.unwrap_or(1),
                         m.bits_hex.as_deref().and_then(hex_decode).unwrap_or_default(),
                     )

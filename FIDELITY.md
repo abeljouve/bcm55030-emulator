@@ -41,20 +41,42 @@ behaviour of the SerDes / PCS. Known divergences from real silicon:
 - **The statistics counters behind the port block are plain storage.** The busy
   bit firmware spins on before taking a count — bit 31 of `0x01002D1C` — *is*
   modelled as the hardware's, so the wait itself behaves as it does on silicon.
-  The counter words behind it are not: they hold their reset values and never
+  The counter words behind it are not: they hold their seeded values and never
   advance with traffic, so a statistics read returns zero. It also reads zero on
   silicon, where those counters were measured flat while the port was carrying
   signal. **Agreement on that number therefore proves nothing**, and the
   statistics commands are not an oracle for conformance in either direction.
 - **One word of the port block has no rule.** `0x01002D0C` reads `0x00008807` on
-  silicon once the port is up, from a reset value of `0x00000003`, and no write
+  silicon once the port is up, from a pre-arm value of `0x00000003`, and no write
   produces it — so it is hardware-driven, but what drives it is not established.
   It is left as plain storage rather than given a guessed rule, and stays at the
-  reset value here.
+  seeded value here.
 
 In short: anything that depends on the **analog PHY, real clock domains, or
 lane-calibration timing** is approximated. The register-level and CPU-level
 behaviour is the faithful part.
+
+## Two register behaviours chosen to keep a firmware moving
+
+Everything above simplifies something measured. These two do not: each picks a
+behaviour because letting the model do the obvious thing sent a firmware down a
+stop path, and in each case what the silicon does is open. They are uniform
+rules — no address, image or symbol triggers them — but the reason they exist is
+an observation of software, so they are listed apart.
+
+- **`0x01002804` reads zero and swallows writes** (`src/soc/serdes.rs`). Letting
+  a write come back out of the same word made a hardware-state poller see bits
+  appear and take a shutdown path. Keeping the two directions apart is what
+  stops that; which direction the hardware implements is not established, and
+  the two names this word once carried have been retracted.
+- **`0x01003604` reads zero until something injects** (`src/soc/fatal_filter.rs`).
+  The power-on table holds a value for this word and the model deliberately does
+  **not** seed it: under either reading of the word that value is a status, and a
+  seeded status makes a firmware act on a condition nothing produced. This keeps
+  a polling loop moving; it is not a measurement of the reset value.
+
+Both are falsifiable the same way: a silicon reading of either word taken in a
+known state. Until then, neither is the silicon's behaviour.
 
 ## Not a divergence — two state-matching traps
 
@@ -66,6 +88,10 @@ the signal is an **input**, not something the model invents: with nothing inject
 the port reads unarmed with no partner, which is a faithful reading of that state
 and not a missing feature. Supply one with `--uni-rx none|basex|basex-an|10g`
 before comparing these words against a capture taken with a partner attached.
+
+The seeds for `0x01002D00..0x01002D40` are a post-boot, pre-arm silicon reading,
+not a power-on scan — that block is outside the two ranges that were
+brute-scanned.
 
 The contents of the classifier tables **depend on the state of the link**: one
 rule with the peer down, five once the link is established, six in between.

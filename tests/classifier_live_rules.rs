@@ -501,6 +501,86 @@ fn a_readable_rule_routes_a_frame_and_leaves_its_neighbour_alone() {
     assert!(after_miss.decisions_accounted_for(), "{after_miss:?}");
 }
 
+/// A rule naming a queue wider than a mailbox slot.
+///
+/// The classifier reports the queue field at its full twelve bits, so
+/// the number arrives here intact and the mailbox — whose slots are one
+/// byte — is what refuses it. The refusal is counted and the frame falls
+/// back; folding the number down instead would have delivered it to the
+/// control queue, which no rule asked for. That is the failure the
+/// classifier used to produce from the other end, by reporting "no
+/// queue" for a queue.
+#[test]
+fn a_queue_wider_than_a_slot_is_refused_by_the_mailbox_and_counted() {
+    use bcm55030_emulator::soc::lue::ClassifierBinding;
+    use bcm55030_emulator::soc::olt::mailbox::Slot;
+    use bcm55030_emulator::soc::olt::Olt;
+    use bcm55030_emulator::soc::peripheral::Peripheral;
+
+    const BROADCAST: MacAddr = MacAddr::new([0xFF; 6]);
+    let binding = ClassifierBinding { instance: 0, table: 2 };
+
+    // Twelve bits of queue field whose low byte is the control queue, so
+    // a model that truncated would route the frame there.
+    let wide = 0x110u16;
+    assert_eq!(Slot(wide as u8), Slot::CONTROL, "truncation would alias onto a real queue");
+    let action = Action {
+        priority: 1,
+        payload: ActionPayload::Selected { sel: 2, sub: 0, field: wide, wide: true },
+    };
+    assert_eq!(action.destination_queue(), Some(wide), "the model reports the field whole");
+
+    // The same destination-address rule as above, carrying that action.
+    let entry = Entry::Clause {
+        clause: Clause {
+            field: Field::from_code(0x00),
+            op: Op::Eq,
+            shift: 0x0F,
+            anchor: 0,
+            operand: 0x0000_FFFF_FFFF_FFFF,
+        },
+        link: Link::Terminal(action),
+    };
+    let mut lue = Lue::new();
+    for (i, w) in entry.encode().to_regs().iter().enumerate() {
+        lue.write_word(0x0100_2410 + i as u32 * 4, *w).unwrap();
+    }
+    lue.write_word(0x0100_240C, CMD_GO | CMD_WRITE | (2 << 12) | 0x7F).unwrap();
+
+    let mut olt = Olt::new();
+    olt.set_link_up(true);
+    let settle = |olt: &mut Olt, lue: &Lue| {
+        for _ in 0..256 {
+            olt.tick(0);
+            olt.load_frames_into_mailbox(Some((lue, binding)));
+        }
+    };
+    settle(&mut olt, &lue);
+    let before = olt.classifier_counters;
+
+    let mut frame = BROADCAST.octets().to_vec();
+    frame.extend_from_slice(&onu_mac().octets());
+    frame.extend_from_slice(&[0x08, 0x00]);
+    frame.resize(60, 0);
+    assert_eq!(Slot::for_frame(&frame), Slot::DATA, "the fallback is not the control queue");
+
+    olt.inject_raw_frame(frame);
+    settle(&mut olt, &lue);
+    let after = olt.classifier_counters;
+
+    assert_eq!(
+        after.matched_queue_outside_the_slot_space,
+        before.matched_queue_outside_the_slot_space + 1,
+        "the slot space is what must refuse it: {after:?}"
+    );
+    assert_eq!(after.matched, before.matched, "and it is not counted as routed");
+    assert_eq!(
+        after.match_without_a_queue, before.match_without_a_queue,
+        "the rule does name a queue; the mailbox is what cannot hold it"
+    );
+    assert!(after.decisions_accounted_for(), "{after:?}");
+}
+
 /// ⛔ **The trap this whole file exists to keep shut.** Most selected
 /// actions are not queue results at all, and reading their field as a
 /// queue would route frames by a number that is not one.
@@ -532,7 +612,7 @@ fn a_selected_action_that_is_not_the_queue_result_names_no_queue() {
     // Nothing outside the selected form names a queue either.
     for payload in [
         ActionPayload::Simple { type_code: 6 },
-        ActionPayload::Broadcast,
+        ActionPayload::SelectorE,
         ActionPayload::Raw(0x2100_0010),
     ] {
         assert_eq!(Action { priority: 1, payload }.destination_queue(), None, "{payload:?}");

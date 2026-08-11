@@ -24,9 +24,9 @@
 //!   * [`REG_BUSY`] bit 31 — see [`BUSY_BIT`].
 //!
 //! ⛔ One word of that list is still missing here: `0x01002D0C` reads
-//! `0x00008807` on silicon once the port is up, from a reset value of
+//! `0x00008807` on silicon once the port is up, from a pre-arm value of
 //! `0x00000003`, and no write produces it. It is a plain store in this
-//! model, so it stays at the reset value. What the value means is not
+//! model, so it stays at the seeded value. What the value means is not
 //! established — it looks like an EtherType and is not one that is
 //! known — so it is left as a stated gap rather than a guessed rule.
 //!
@@ -85,13 +85,19 @@ const RX_TEN_GIG_CODING: u32 = 0x9C00;
 /// armed or not.
 const PORT_ALWAYS: u32 = 1 << 8;
 
-/// Bit 3 of [`REG_PORT_STATUS`]. Clear in the power-on reading, set in
-/// all four readings taken after the port was armed — the only bit of
+/// Bit 3 of [`REG_PORT_STATUS`]. Clear in the one reading taken **before
+/// the port was armed**, set in all four taken after — the only bit of
 /// this word that tracks the port rather than the signal.
 ///
 /// It is the hardware's: over a boot that brought the port up, software
 /// read this word and never once wrote it, so no store it makes can be
 /// where the bit comes from.
+///
+/// ⚠ That reading is **post-boot**: this block sits outside the two
+/// ranges [`super::mmio_init`] brute-scanned, so its seeds are pre-arm
+/// observations, not power-on values. What is measured is *before
+/// arming*; nothing here separates that from a value software wrote
+/// earlier in the boot.
 const PORT_ARMED: u32 = 1 << 3;
 
 /// Bit 4 of [`REG_PORT_STATUS`]. Set with no signal on the receive pair
@@ -108,10 +114,9 @@ const PORT_AN_STATE: u32 = (1 << 2) | (1 << 5);
 
 /// Bit 31 of [`REG_BUSY`].
 ///
-/// Two readings exist and they disagree. The power-on value the reset
-/// table holds has it set, and it stays set across the first hundred
-/// reads of a boot. The reading taken after the port was armed has it
-/// clear.
+/// Two readings exist and they disagree. The value the reset table holds
+/// has it set, and it stays set across the first hundred reads of a
+/// boot. The reading taken after the port was armed has it clear.
 ///
 /// Software cannot be what sets it: over one boot it wrote this word
 /// sixty-three thousand times and not once with bit 31 among the bits it
@@ -197,10 +202,10 @@ impl UniRxSignal {
 ///
 /// Unarmed the word carries [`PORT_ALWAYS`] alone. That is not a guess
 /// about the other bits: the single reading of this word taken with the
-/// port unarmed is the power-on one, and it is exactly that value. The
-/// model reproduces the reading it has and derives the rest only once
-/// the port is armed, which is the state all four signal readings were
-/// taken in.
+/// port unarmed is the one the reset table holds, and that reading is
+/// post-boot and pre-arm — see [`super::mmio_init`]. The model
+/// reproduces the reading it has and derives the rest only once the port
+/// is armed, which is the state all four signal readings were taken in.
 fn port_status_word(rx: UniRxSignal, armed: bool) -> u32 {
     if !armed {
         return PORT_ALWAYS;
@@ -335,6 +340,11 @@ impl Uni {
         }
     }
 
+    /// Seed the block from the reset table.
+    ///
+    /// The method keeps the name its siblings in the other peripherals
+    /// carry, but for *this* block the table is not a power-on scan: the
+    /// rows are a post-boot, pre-arm reading (see [`super::mmio_init`]).
     fn apply_silicon_power_on(&mut self) {
         self.store.fill(0);
         for &(off, val) in super::mmio_init::SYSREG_INIT_VALUES {
@@ -343,9 +353,9 @@ impl Uni {
                 self.store[Self::idx(abs)] = val;
             }
         }
-        // The busy bit is the hardware's, so take its power-on state
-        // from the same table the rest of the block comes from and keep
-        // it out of the store.
+        // The busy bit is the hardware's, so take its seed from the same
+        // table the rest of the block comes from and keep it out of the
+        // store.
         let seed = self.store[Self::idx(REG_BUSY)];
         self.port_busy = (seed & BUSY_BIT) != 0;
         self.store[Self::idx(REG_BUSY)] = seed & !BUSY_BIT;
@@ -409,8 +419,8 @@ impl Peripheral for Uni {
     }
 
     fn reset_warm(&mut self) {
-        // The reset table is the power-on snapshot; there is no second
-        // set of values for a warm start.
+        // The reset table holds one reading for this block; there is no
+        // second set of values for a warm start.
         self.reset_cold();
     }
 
@@ -507,7 +517,7 @@ mod tests {
     /// The bit that says the port is armed is absent from the one
     /// reading taken before it was.
     #[test]
-    fn the_armed_bit_is_absent_from_the_power_on_reading() {
+    fn the_armed_bit_is_absent_from_the_reading_taken_before_arming() {
         let mut u = Uni::new();
         u.reset_warm();
         assert_eq!(u.read_word(REG_PORT_STATUS).unwrap(), PORT_ALWAYS);
@@ -555,30 +565,126 @@ mod tests {
         assert_eq!(u.counters.port_reads_while_busy, 0);
     }
 
-    /// The seeded words are the ones the reset table holds — the seven
-    /// that a read-back on silicon matched word for word, and this is
-    /// what keeps the model on that side of the comparison.
+    /// Every word of this block the reset table names, in address order.
+    fn seeded_words() -> Vec<(u32, u32)> {
+        crate::soc::mmio_init::SYSREG_INIT_VALUES
+            .iter()
+            .map(|&(off, val)| (0x0100_0000 + off, val))
+            .filter(|(abs, _)| (UNI_BASE..UNI_END).contains(abs))
+            .collect()
+    }
+
+    /// The reading the table holds for one word of this block.
+    fn seed(addr: u32) -> u32 {
+        seeded_words()
+            .into_iter()
+            .find(|&(abs, _)| abs == addr)
+            .map(|(_, val)| val)
+            .unwrap_or_else(|| panic!("the reset table names no {addr:#010X}"))
+    }
+
+    /// The three derived words reproduce their seed **without storing
+    /// it** — which is the claim, and the only part of the eleven that is
+    /// not the table read back against itself.
     #[test]
-    fn the_power_on_values_match_the_ones_the_reset_table_holds() {
+    fn the_derived_words_reproduce_their_seed_without_storing_it() {
         let mut u = Uni::new();
         u.reset_warm();
-        let mut seeded = 0usize;
-        for &(off, val) in crate::soc::mmio_init::SYSREG_INIT_VALUES {
-            let abs = 0x0100_0000 + off;
-            if !(UNI_BASE..UNI_END).contains(&abs) {
-                continue;
-            }
-            seeded += 1;
+        // Two of the three are produced whole, so a marker cannot
+        // displace them: what comes back is still the measured reading.
+        for addr in [REG_RX_STATUS, REG_PORT_STATUS] {
             assert_eq!(
-                u.read_word(abs).unwrap(),
-                val,
-                "power-on value at {abs:#010X}"
+                u.read_word(addr).unwrap(),
+                seed(addr),
+                "seed at {addr:#010X}"
+            );
+            u.write_word(addr, 0xFFFF_FFFF).unwrap();
+            assert_eq!(
+                u.read_word(addr).unwrap(),
+                seed(addr),
+                "a write cannot become the reading at {addr:#010X}"
             );
         }
-        assert_eq!(seeded, 11, "the reset table seeds eleven words of this block");
-        // And the words the table does not name read zero.
-        for addr in [UNI_BASE, 0x0100_2D20, 0x0100_2D34, 0x0100_2D38, 0x0100_2D3C] {
-            assert_eq!(u.read_word(addr).unwrap(), 0, "unseeded word {addr:#010X}");
+        // The third is produced one bit at a time: bit 31 survives a
+        // write that clears it, and the bits around it — which are
+        // software's — do not.
+        assert_eq!(u.read_word(REG_BUSY).unwrap(), seed(REG_BUSY));
+        u.write_word(REG_BUSY, 0x0000_0000).unwrap();
+        assert_eq!(
+            u.read_word(REG_BUSY).unwrap(),
+            BUSY_BIT,
+            "bit 31 is produced, the rest of the word is stored"
+        );
+    }
+
+    /// Which words are derived and which are stored, swept rather than
+    /// asserted: a marker written to each of the sixteen comes back out
+    /// of every word except the two that are produced, and out of every
+    /// bit of the busy word except bit 31.
+    #[test]
+    fn exactly_the_documented_words_are_derived_and_the_rest_are_stored() {
+        const MARKER: u32 = 0x5A5A_A5A5; // bit 31 clear, so the busy word
+                                         // can show which bit it keeps
+        for word in (UNI_BASE..UNI_END).step_by(4) {
+            let mut u = Uni::new();
+            u.reset_warm();
+            u.write_word(word, MARKER).unwrap();
+            let back = u.read_word(word).unwrap();
+            match word {
+                REG_RX_STATUS | REG_PORT_STATUS => assert_eq!(
+                    back,
+                    seed(word),
+                    "{word:#010X} is derived: a write must not reach the reading"
+                ),
+                REG_BUSY => assert_eq!(
+                    back,
+                    MARKER | BUSY_BIT,
+                    "{word:#010X} stores every bit but the one the hardware owns"
+                ),
+                _ => assert_eq!(back, MARKER, "{word:#010X} is a plain store"),
+            }
+        }
+    }
+
+    /// Coverage, not values: every row the reset table holds for this
+    /// block reaches the block, and no word outside those rows is
+    /// touched.
+    ///
+    /// ⚠ Read this for what it is. Comparing a seeded word against the
+    /// table it was seeded from says **nothing** about whether the value
+    /// is the silicon's — that claim rests on the hardware reading
+    /// [`super::mmio_init`] records, not on this test. What it does catch
+    /// is a seeding path that silently drops or misplaces rows: skip one
+    /// row of the eight plain-storage words and every other test in this
+    /// file still passes, because the three derived words produce their
+    /// readings without consulting the store.
+    #[test]
+    fn the_reset_table_seeds_eleven_words_of_this_block_and_no_others() {
+        let mut u = Uni::new();
+        u.reset_warm();
+        let seeded = seeded_words();
+        assert_eq!(
+            seeded.len(),
+            11,
+            "the reset table seeds eleven words of this block"
+        );
+        for word in (UNI_BASE..UNI_END).step_by(4) {
+            match seeded.iter().find(|&&(abs, _)| abs == word) {
+                // The derived three answer from a rule, not from the
+                // store, so they cannot witness the seeding loop; their
+                // own test does that.
+                Some(_) if matches!(word, REG_RX_STATUS | REG_PORT_STATUS | REG_BUSY) => {}
+                Some(&(_, val)) => assert_eq!(
+                    u.read_word(word).unwrap(),
+                    val,
+                    "the seeding loop skipped the row for {word:#010X}"
+                ),
+                None => assert_eq!(
+                    u.read_word(word).unwrap(),
+                    0,
+                    "word the table does not name: {word:#010X}"
+                ),
+            }
         }
     }
 

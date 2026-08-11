@@ -75,7 +75,9 @@ const WORDS_PER_INSTANCE: u32 = 5;
 /// model. An inventory of these tables that does not say which state it
 /// was taken in is a confounded measurement, and comparing two taken in
 /// different states invents a discrepancy. `LuePort::cleared_slots` is
-/// what makes the disappearance visible rather than merely absent.
+/// what makes the disappearance visible rather than merely absent, and a
+/// headless run prints it: see the end-of-run report in
+/// `src/bin/arc700.rs`.
 ///
 /// Three measurements since then say the default is not merely the least
 /// bad choice, without saying it is what the hardware consults:

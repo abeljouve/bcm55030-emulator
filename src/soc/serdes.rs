@@ -75,6 +75,9 @@ pub const SERDES_LANE_END: u32 = 0x0100_2A00;
 /// state poller see bits appear and take a shutdown path. Keeping the
 /// two directions apart is what stops that; which of them the hardware
 /// actually implements is open.
+///
+/// Listed in `FIDELITY.md`, "Two register behaviours chosen to keep a
+/// firmware moving" — keep the two in step.
 const REG_ZERO_READ_WORKAROUND: u32 = 0x0100_2804;
 
 /// SerDes Lane Status File window — a 256-entry × 8-byte per-lane

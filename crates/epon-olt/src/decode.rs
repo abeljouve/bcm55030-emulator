@@ -355,8 +355,8 @@ fn dissect_match_entry(fields: &mut Vec<Field>, m: &MatchEntry, at: usize) {
     fields.push(Field::at(3, "Byte 6", format!("0x{:02X}", m.byte6), at + 2, 1));
     fields.push(Field::at(
         3,
-        "Bases",
-        format!("0x{:02X}, 0x{:02X}", m.bases.0, m.bases.1),
+        "Subtrahends",
+        format!("0x{:02X}, 0x{:02X}", m.subtrahends.0, m.subtrahends.1),
         at + 3,
         2,
     ));

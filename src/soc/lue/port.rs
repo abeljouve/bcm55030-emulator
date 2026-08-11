@@ -134,6 +134,11 @@ impl PortCounters {
 
 /// What happened to one slot of one table, over the run.
 ///
+/// Where it comes out: [`LuePort::cleared_slots`] collects the slots this
+/// journal says were written and then emptied, and a headless run prints
+/// them after its final-state block — see `src/bin/arc700.rs`. Without a
+/// reader the journal would record a difference nobody could look at.
+///
 /// The port's aggregate counters answer "how many entries were cleared";
 /// they cannot answer "which one, and when". That difference is not
 /// academic: a table read at the end of a boot held five rules where a

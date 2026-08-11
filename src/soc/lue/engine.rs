@@ -12,8 +12,8 @@
 //!   them. The other codes a live rule set uses are real but unexplained,
 //!   and a clause over one of them returns [`Verdict::Undecidable`] —
 //!   never a match, never a silent miss.
-//! * **Guess an operator.** Four of the sixteen operator codes are
-//!   established by their operands; software emits four more whose
+//! * **Guess an operator.** Three of the sixteen operator codes are
+//!   established by their operands; software emits five more whose
 //!   meaning is not. Acting on one of those is worst where it looks most
 //!   harmless — a rule whose clauses all carry an unexplained code would
 //!   match *every* frame and route it, which is not a missing answer but
@@ -77,8 +77,10 @@ fn extract_field(field: Field, frame: &[u8]) -> Option<u64> {
         Field::Observed(FRAME_LENGTH) | Field::Unknown(FRAME_LENGTH) => Some(frame.len() as u64),
         Field::Observed(DEFAULT_EXTRACTOR) | Field::Unknown(DEFAULT_EXTRACTOR) => {
             // A tagged frame moves everything after the type field, and
-            // the model has no established offset to move it by.
-            if field_presence(Field::from_code(TAG_FIELD_CODES[0]), frame) != Presence::Absent {
+            // the model has no established offset to move it by. Asked of
+            // the frame rather than of one of [`TAG_FIELD_CODES`], whose
+            // order says nothing.
+            if tag_presence(frame) != Presence::Absent {
                 return None;
             }
             frame.get(ETHERNET_HEADER_LEN..ETHERNET_HEADER_LEN + 2).map(be)
@@ -247,10 +249,16 @@ const TAG_FIELD_CODES: [u8; 2] = [0x03, 0x04];
 /// carrying this code should still match. Under the reading here that
 /// rule cannot match it; under the other one it must.
 ///
-/// ⛔ All fifteen sites that emit this code carry one of
-/// [`TAG_FIELD_CODES`]. Over any other field code the engine refuses,
-/// rather than letting an unexplained operator become an unconditional
-/// match on a field whose presence it cannot even ask about.
+/// ⛔ The scope of that inference is **imported from one image**: in the
+/// firmware traced, all fifteen sites emitting this code carry one of
+/// [`TAG_FIELD_CODES`], and outside that pair nothing says what the code
+/// asks. So the engine acts on it only there. This bounds what the
+/// *model claims*, not what the hardware accepts — silicon may take this
+/// code over any field code, and if a rule does, the engine answers
+/// [`Verdict::Undecidable`] and counts it. A refusal that propagates as a
+/// refusal is the one direction a census may be used in; the queue field
+/// in [`super::rule`] is the case where it is not, and the difference is
+/// whether the caller can tell the refusal from a different answer.
 const OP_TAG_ABSENCE: u8 = 6;
 
 /// Whether a frame carries the field a clause names.
@@ -285,13 +293,26 @@ fn field_presence(field: Field, frame: &[u8]) -> Presence {
         return Presence::Unknown;
     }
     let code = field.code();
-    if !TAG_FIELD_CODES.contains(&code) {
-        // A frame always carries its addresses and its type field; for
-        // anything else the model has no notion of presence to offer.
-        return match code {
-            0x00 | 0x01 | 0x02 => Presence::Present,
-            _ => Presence::Unknown,
-        };
+    if TAG_FIELD_CODES.contains(&code) {
+        return tag_presence(frame);
+    }
+    // A frame always carries its addresses and its type field; for
+    // anything else the model has no notion of presence to offer.
+    match code {
+        0x00 | 0x01 | 0x02 => Presence::Present,
+        _ => Presence::Unknown,
+    }
+}
+
+/// Does this frame carry a tag at all?
+///
+/// Asked without deciding which of [`TAG_FIELD_CODES`] names which tag:
+/// both codes answer this identically, which is the whole reason the
+/// question is askable while the attribution is not. Nothing here may
+/// index that array — its order is explicitly not established.
+fn tag_presence(frame: &[u8]) -> Presence {
+    if frame.len() < ETHERNET_HEADER_LEN {
+        return Presence::Unknown;
     }
     let ethertype = ((frame[12] as u16) << 8) | frame[13] as u16;
     if TAG_ETHERTYPES.contains(&ethertype) {
@@ -333,7 +354,6 @@ fn compare(op: Op, value: u64, operand: u64, anchor: u32, bits: u32) -> Option<b
     let (v, o) = (window_shift(value, anchor, bits), window_shift(operand, anchor, bits));
     match op {
         Op::Eq => Some(v == o),
-        Op::Ne => Some(v != o),
         Op::Le => Some(v <= o),
         Op::Ge => Some(v >= o),
         // Emitted by software, meaning not established. The one exception
@@ -1038,14 +1058,17 @@ mod tests {
     /// The operators software emits but nothing explains are refused, and
     /// the refusal is counted rather than silently turned into a verdict.
     ///
-    /// This is the behaviour that matters most. Two of these codes used
-    /// to answer unconditionally — one always false, one always true —
-    /// and the second is the dangerous one: a rule whose every clause
-    /// carried it matched every frame and routed it.
+    /// Two of these codes used to answer unconditionally — one always
+    /// false, one always true — and the second is the dangerous one: a
+    /// rule whose every clause carried it matched every frame and routed
+    /// it. Code 2 is here for the same reason with a different history:
+    /// it was acted on as `!=`, a predicate that matches nearly every
+    /// frame, on an argument that establishes the operand kind and not
+    /// the polarity.
     #[test]
     fn the_operators_the_model_will_not_act_on_are_refused_and_counted() {
         let frame = frame_with_ethertype(0x8809);
-        for code in [0u8, 5, 7] {
+        for code in [0u8, 2, 5, 7] {
             let mut port = LuePort::new();
             program(&mut port, 3, 0x80, Entry::Clause {
                 clause: Clause {
@@ -1077,6 +1100,18 @@ mod tests {
         let v = Engine::classify(&port, &[RuleStart { table: 3, index: 0x80 }], &frame, &mut c);
         assert!(matches!(v, Verdict::Match { .. }), "{v:?}");
         assert_eq!(c.undecidable_operator, 0);
+    }
+
+    /// The partition [`compare`] acts on and the one
+    /// [`Op::is_established`] announces must be the same partition. Two
+    /// places saying which operators are grounded is one place too many;
+    /// this is what pins them.
+    #[test]
+    fn the_engine_acts_on_exactly_the_operators_the_type_calls_established() {
+        for code in 0..16u8 {
+            let op = Op::from_code(code);
+            assert_eq!(compare(op, 1, 1, 0, 64).is_some(), op.is_established(), "code {code}");
+        }
     }
 
     /// The one unexplained operator the engine does act on is confined to
@@ -1170,14 +1205,13 @@ mod tests {
                 assert!(a + bits <= 64, "the window must fit in 64 bits");
                 for &value in &values {
                     for &operand in &values {
-                        for op in [Op::Eq, Op::Ne, Op::Le, Op::Ge] {
+                        for op in [Op::Eq, Op::Le, Op::Ge] {
                             let right = compare(op, value, operand, a, bits)
                                 .expect("an established operator always decides");
                             let (v, o) =
                                 (window_place(value, a, bits), window_place(operand, a, bits));
                             let placed = match op {
                                 Op::Eq => v == o,
-                                Op::Ne => v != o,
                                 Op::Le => v <= o,
                                 Op::Ge => v >= o,
                                 other => panic!("not an established operator: {other:?}"),

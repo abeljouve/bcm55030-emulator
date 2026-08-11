@@ -20,13 +20,31 @@ use crate::extended::{leaf, Container, Descriptor, Length, Variable};
 /// why they are separate fields here: a receiver that refuses an unknown
 /// sub-operation was observed to stop reading the rest of the message, not
 /// just the entry, so the inversion costs everything and is silent.
+///
+/// ⚠ **The four names are not earned the same way.** `MatchEntries` and
+/// `ActionEntries` are named for the two shapes this module parses — a
+/// difference in the bytes, which this crate owns. `Mark` and `Reset` have no
+/// distinct shape (a bare octet, and a bare octet plus a zero): their names
+/// come from an **effect a receiver was observed to have**, which this crate
+/// neither models nor can check. They are kept because
+/// [`RuleListUpdate::variables`] depends on that effect for its ordering, so a
+/// bare number would hide the reason the order exists. Read them as labels for
+/// codes 0 and 1, not as claims.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubOp {
+    /// Code 0. A receiver was observed to set a flag on this and nothing
+    /// else; it carries no body.
     Mark,
+    /// Code 1. A receiver was observed to clear, on this and only this, the
+    /// state that makes a second update accumulate onto the first — which is
+    /// why [`RuleListUpdate::variables`] emits it before everything else.
+    /// Carries one octet, always [`RESET_TRAILER`].
     Reset,
-    /// Entries of the list a rule matches on.
+    /// Code 2. Entries of the list a rule matches on: the shape
+    /// [`MatchEntry`] parses.
     MatchEntries,
-    /// Entries of the list a rule acts through.
+    /// Code 3. Entries of the list a rule acts through: the shape
+    /// [`ActionEntry`] parses.
     ActionEntries,
 }
 
@@ -55,7 +73,7 @@ impl SubOp {
 ///
 /// Position established by the frame that was exercised; nothing observed
 /// gives it a second value, so it is written out rather than parameterised.
-const RESET_TRAILER: u8 = 0x00;
+pub const RESET_TRAILER: u8 = 0x00;
 
 /// The single octet the apply action carries.
 const APPLY_BODY: u8 = 0x00;
@@ -71,8 +89,11 @@ pub struct MatchEntry {
     pub type_code: u8,
     /// Byte 6. Position established, meaning not.
     pub byte6: u8,
-    /// Bytes 7 and 8, each subtracted from a base the type selects.
-    pub bases: (u8, u8),
+    /// Bytes 7 and 8. Each is **subtracted from** a base the type code
+    /// selects, so each is a subtrahend; the base itself belongs to the
+    /// receiver and is not carried here. An earlier name called these the
+    /// bases, which inverts the relation this very comment states.
+    pub subtrahends: (u8, u8),
     /// Byte 9. Values 1 to 4 observed.
     pub selector: u8,
     /// Byte 11 onward. Byte 10 carries its length, so it is not stored
@@ -86,19 +107,25 @@ pub struct MatchEntry {
 
 impl MatchEntry {
     /// Octets of an entry before its bit field: sub-operation, type, byte 6,
-    /// two bases, selector, and the bit-field length.
+    /// two subtrahends, selector, and the bit-field length.
     const FIXED_LEN: usize = 7;
 
-    pub fn new(type_code: u8, byte6: u8, bases: (u8, u8), selector: u8, bits: Vec<u8>) -> Self {
-        Self { type_code, byte6, bases, selector, bits, trailing: Vec::new() }
+    pub fn new(
+        type_code: u8,
+        byte6: u8,
+        subtrahends: (u8, u8),
+        selector: u8,
+        bits: Vec<u8>,
+    ) -> Self {
+        Self { type_code, byte6, subtrahends, selector, bits, trailing: Vec::new() }
     }
 
     fn encode_into(&self, out: &mut Vec<u8>) {
         out.push(SubOp::MatchEntries.as_u8());
         out.push(self.type_code);
         out.push(self.byte6);
-        out.push(self.bases.0);
-        out.push(self.bases.1);
+        out.push(self.subtrahends.0);
+        out.push(self.subtrahends.1);
         out.push(self.selector);
         out.push(self.bits.len().min(u8::MAX as usize) as u8);
         out.extend_from_slice(&self.bits);
@@ -119,7 +146,7 @@ impl MatchEntry {
         Some(Self {
             type_code: value[1],
             byte6: value[2],
-            bases: (value[3], value[4]),
+            subtrahends: (value[3], value[4]),
             selector: value[5],
             bits: value[Self::FIXED_LEN..Self::FIXED_LEN + take].to_vec(),
             trailing: value[Self::FIXED_LEN + take..].to_vec(),
@@ -425,7 +452,7 @@ mod tests {
         assert_eq!(bytes[4], SubOp::MatchEntries.as_u8());
         assert_eq!(bytes[5], 0x06, "type code");
         assert_eq!(bytes[6], 0x01, "byte 6");
-        assert_eq!(&bytes[7..9], &[0x0C, 0x02], "the two bases");
+        assert_eq!(&bytes[7..9], &[0x0C, 0x02], "the two subtrahends");
         assert_eq!(bytes[9], 3, "selector");
         assert_eq!(bytes[10], 2, "length of the bit field");
         assert_eq!(&bytes[11..], &[0xFF, 0x0F]);

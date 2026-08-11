@@ -48,26 +48,33 @@ pub const LINK_AND_NEXT: u32 = 0x1000_0000;
 
 /// Comparison operator, four bits.
 ///
-/// Four codes are established by their operands — the values a rule
+/// Three codes are established by their operands — the values a rule
 /// compares against say what the comparison is, without any table being
-/// read off. The other four codes software emits are **not** explained,
+/// read off. The other five codes software emits are **not** explained,
 /// and are kept apart from the ones it never emits at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
     /// Code 1. Established by its operands: a reserved control multicast
     /// address, and the EtherType values rules compare against.
+    ///
+    /// Its **polarity** is established as well, and without reading it
+    /// off a specification: every rule carrying this code is one of the
+    /// rules that capture the control plane, and under the opposite
+    /// reading every one of them is dead — a rule asking for an
+    /// EtherType the control plane never carries would match all the
+    /// other traffic and none of the traffic it was written for. Same
+    /// shape of argument as the tag-absence operator in
+    /// [`super::engine`]. It has no twin for code 2, which is why that
+    /// one is in [`OBSERVED_OP_CODES`].
     Eq,
-    /// Code 2. Established: the same constants appear under [`Op::Eq`]
-    /// elsewhere, so the two codes ask the same question either way up.
-    Ne,
     /// Code 3, an upper bound. The direction comes from the operand pairs
     /// themselves — each site carrying this code pairs with a code-4 site
     /// whose value is lower, and the two bracket a range.
     Le,
     /// Code 4, the lower bound and the other half of those pairs.
     Ge,
-    /// Codes 0, 5, 6 and 7. Software **emits all four**, in one boot, and
-    /// what they mean is not established. Kept distinct from
+    /// Codes 0, 2, 5, 6 and 7. Software **emits all five**, in one boot,
+    /// and what they mean is not established. Kept distinct from
     /// [`Op::Unknown`] so that "seen but unexplained" does not read as
     /// "never seen" — the same idiom as [`Field::Observed`].
     Observed(u8),
@@ -75,22 +82,37 @@ pub enum Op {
     Unknown(u8),
 }
 
-/// The four operator codes software emits whose meaning is not
+/// The five operator codes software emits whose meaning is not
 /// established.
 ///
-/// All four appear in one boot, which is why they are a list here rather
+/// ⛔ Code 2 used to be named `Ne` and acted on. What established it was
+/// that the same constants appear under [`Op::Eq`] elsewhere — which says
+/// the two codes take the same kind of operand, not that one is the
+/// negation of the other. The reading that made it a negation runs
+/// through calling the rules that carry it reject rules, and discard is
+/// not distinguishable from forward anywhere in the image. So it is a
+/// comparison of unknown polarity, and the model does not act on it.
+/// Acting on it is the dangerous direction: `!=` matches almost every
+/// frame, so a rule whose clauses all carried it would match everything
+/// and route it — a confident wrong answer, not a missing one.
+///
+/// ⚠ What would settle it, and it is one experiment on a device: the rule
+/// builder takes the operator verbatim, so a one-clause rule at code 2
+/// over a field of known value, plus a match count, separates the two
+/// polarities directly.
+///
+/// All five appear in one boot, which is why they are a list here rather
 /// than a gap: "not explained" and "not emitted" are different states,
 /// and the second one is the only one that would justify a guess.
-pub const OBSERVED_OP_CODES: [u8; 4] = [0, 5, 6, 7];
+pub const OBSERVED_OP_CODES: [u8; 5] = [0, 2, 5, 6, 7];
 
 impl Op {
     pub const fn from_code(code: u8) -> Self {
         match code & 0xF {
             1 => Op::Eq,
-            2 => Op::Ne,
             3 => Op::Le,
             4 => Op::Ge,
-            0 | 5 | 6 | 7 => Op::Observed(code & 0xF),
+            0 | 2 | 5 | 6 | 7 => Op::Observed(code & 0xF),
             other => Op::Unknown(other),
         }
     }
@@ -98,7 +120,6 @@ impl Op {
     pub const fn code(self) -> u8 {
         match self {
             Op::Eq => 1,
-            Op::Ne => 2,
             Op::Le => 3,
             Op::Ge => 4,
             Op::Observed(n) | Op::Unknown(n) => n & 0xF,
@@ -106,8 +127,13 @@ impl Op {
     }
 
     /// Whether the operand ordering of this operator is established.
+    ///
+    /// This partition and the one [`super::engine`]'s comparison acts on
+    /// must be the same partition; a test over there pins them together
+    /// rather than leaving two places to say which operators are
+    /// grounded.
     pub const fn is_established(self) -> bool {
-        matches!(self, Op::Eq | Op::Ne | Op::Le | Op::Ge)
+        matches!(self, Op::Eq | Op::Le | Op::Ge)
     }
 }
 
@@ -343,13 +369,17 @@ pub struct Action {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionPayload {
-    /// Top nibble `0xE`, no other field.
+    /// Selector nibble `0xE`, with every bit below the tag field clear.
     ///
-    /// ⛔ The name is older than the evidence and does not survive it:
-    /// nothing establishes what this word does, and the type code it was
-    /// once attributed to (0) has **no measured word at all** — see
-    /// [`ActionPayload::simple`]. Carried and round-tripped, not named.
-    Broadcast,
+    /// Named by its encoding because nothing establishes what it does. It
+    /// is kept apart from [`ActionPayload::Selected`] — whose selectors
+    /// run `2..=0xD` and carry a sub-index and a field — because no word
+    /// of this shape has ever carried either. The name it used to wear
+    /// attributed it to a result type; that attribution is dead, since
+    /// the type it named encodes to `0x0010_0000` and not to this word
+    /// (see [`ActionPayload::simple`]). Carried and round-tripped, not
+    /// named.
+    SelectorE,
     /// Carried as `type_code ^ 1` in bits [22:20].
     ///
     /// Only `2..=7` have a measured word behind them; build those through
@@ -374,14 +404,10 @@ const SELECTED_QUEUE_SEL: u8 = 2;
 /// entirely — not other queues.
 const SELECTED_QUEUE_SUB: u8 = 0;
 
-/// Widest queue number any emission site can produce.
-///
-/// ⛔ This is an observation about the **emitter**, not a field width:
-/// every call site writes `idx & 0x1F`, so five bits is what software can
-/// express. The field itself is twelve bits wide, and what the hardware
-/// does with a wider value is not established — which is why a wider one
-/// is refused rather than folded down into this range.
-const QUEUE_FIELD_MAX: u16 = 0x1F;
+// ⛔ There is deliberately **no** queue-field bound here, and adding one
+// back is the mistake this note exists to stop. Why narrowing the field
+// to the range software was seen to emit reports a different answer
+// rather than withholding one: see [`Action::destination_queue`].
 
 impl ActionPayload {
     /// A [`ActionPayload::Simple`] payload for a type code that has a
@@ -391,9 +417,10 @@ impl ActionPayload {
     /// have **no measured word**, and the encoding is not merely unknown
     /// for them, it is contradictory: type 1 would encode to all zeros —
     /// which the spill scan of [`Rule::decode`] reads as padding — and
-    /// type 0 to `0x0010_0000`, while the word the name
-    /// [`ActionPayload::Broadcast`] was attached to is `0xE000_0000`.
-    /// Inventing one would put a word in a table that nothing ever wrote.
+    /// type 0 to `0x0010_0000`, while the word type 0 was once attributed
+    /// to — the one [`ActionPayload::SelectorE`] carries — is
+    /// `0xE000_0000`. Inventing one would put a word in a table that
+    /// nothing ever wrote.
     pub const fn simple(type_code: u8) -> Option<Self> {
         if matches!(type_code, 2..=7) {
             Some(ActionPayload::Simple { type_code })
@@ -439,17 +466,24 @@ impl Action {
     /// not a property of every rule set, and two words of this very type
     /// have since been seen elsewhere.
     ///
-    /// ⛔ A field wider than [`QUEUE_FIELD_MAX`] is **refused, not
-    /// truncated**: masking it would alias queue 32 onto queue 0 and route
-    /// frames somewhere no rule asked for.
-    pub fn destination_queue(&self) -> Option<u8> {
+    /// ⛔ **Do not narrow the queue field to the range software was seen
+    /// to emit.** Every call site of the one image traced writes
+    /// `idx & 0x1F`; that is a census of an emitter, not a width. The
+    /// field is twelve bits, and refusing the rest here does not withhold
+    /// an answer — it reports "this action names no queue" about an
+    /// action that names one, which [`Rule::destination_queue`]'s
+    /// `find_map` then skips in favour of a later action, and which the
+    /// datapath tallies as a match with no queue before routing the frame
+    /// by EtherType instead. A refusal that reads as a different answer
+    /// is not the safe direction. What the hardware does with a value
+    /// above `0x1F` stays unestablished; the model reports it and lets
+    /// the consumer with a finite slot space refuse it.
+    pub fn destination_queue(&self) -> Option<u16> {
         match self.payload {
             ActionPayload::Selected { sel, sub, field, .. }
-                if sel == SELECTED_QUEUE_SEL
-                    && sub == SELECTED_QUEUE_SUB
-                    && field <= QUEUE_FIELD_MAX =>
+                if sel == SELECTED_QUEUE_SEL && sub == SELECTED_QUEUE_SUB =>
             {
-                Some(field as u8)
+                Some(field)
             }
             _ => None,
         }
@@ -458,7 +492,7 @@ impl Action {
     pub fn encode(&self) -> u32 {
         let prio = ((self.priority as u32) & 0xF) << 24;
         match self.payload {
-            ActionPayload::Broadcast => 0xE000_0000 | prio,
+            ActionPayload::SelectorE => 0xE000_0000 | prio,
             ActionPayload::Simple { type_code } => {
                 (((type_code ^ 1) as u32 & 0x7) << 20) | prio
             }
@@ -479,7 +513,7 @@ impl Action {
         // Bits [23:20] outside the priority field, for the simple form.
         let simple = ((word >> 20) & 0x7) as u8;
         let payload = if sel == 0xE && word & 0x00FF_FFFF == 0 && (word >> 20) & 0xF == 0 {
-            ActionPayload::Broadcast
+            ActionPayload::SelectorE
         } else if sel == 0 && word & 0x000F_FFFF == 0 && simple != 0 {
             ActionPayload::Simple { type_code: simple ^ 1 }
         } else if (2..=0xD).contains(&sel) {
@@ -690,7 +724,12 @@ impl Rule {
     /// of by type code here rather than named. Looking only at the first
     /// would miss the queue — it is the **last** of the three in every
     /// rule software builds for its user-facing port.
-    pub fn destination_queue(&self) -> Option<u8> {
+    ///
+    /// ⛔ This is a `find_map`, so an action that answers `None` is
+    /// **skipped, not propagated**: the next action gets to answer for
+    /// the rule. That is why [`Action::destination_queue`] must not turn
+    /// a queue number it finds surprising into a `None`.
+    pub fn destination_queue(&self) -> Option<u16> {
         self.actions.iter().find_map(Action::destination_queue)
     }
 }
@@ -748,7 +787,7 @@ mod tests {
         for code in 0..16u8 {
             assert_eq!(Op::from_code(code).code(), code, "code {code}");
         }
-        for code in [1u8, 2, 3, 4] {
+        for code in [1u8, 3, 4] {
             assert!(Op::from_code(code).is_established(), "code {code}");
         }
         for code in OBSERVED_OP_CODES {
@@ -945,26 +984,50 @@ mod tests {
         assert_eq!(assembled.destination_queue(), Some(0x0F));
     }
 
-    /// A queue field wider than anything an emitter can produce is
-    /// refused. Masking it would alias queue 32 onto queue 0 and route a
-    /// frame to a queue no rule named.
+    /// The queue field is reported at its full width. Narrowing it here
+    /// to what one emitter was seen to produce would report "no queue"
+    /// for a queue, which is a different answer and not a withheld one.
+    ///
+    /// Whoever cannot address a queue that wide refuses it where the
+    /// narrowness is real — the mailbox slot is one byte, and
+    /// `soc::olt` counts that refusal rather than folding it down.
     #[test]
-    fn a_queue_field_wider_than_five_bits_is_refused_not_aliased() {
+    fn a_queue_field_wider_than_any_observed_emitter_is_still_reported() {
         for field in [0x20u16, 0x21, 0x3F, 0x100, 0xFFF] {
             let action = Action {
                 priority: 1,
                 payload: ActionPayload::Selected { sel: 2, sub: 0, field, wide: true },
             };
-            assert_eq!(action.destination_queue(), None, "field {field:#05x}");
-            // It still round-trips: refusing to read it is not dropping it.
+            assert_eq!(action.destination_queue(), Some(field), "field {field:#05x}");
             assert_eq!(Action::decode(action.encode()), action, "field {field:#05x}");
         }
-        // The boundary, from both sides.
+        // The widest number an emitter was seen to write, and the one
+        // above it: both answered, and answered differently.
         let inside = Action {
             priority: 1,
             payload: ActionPayload::Selected { sel: 2, sub: 0, field: 0x1F, wide: true },
         };
         assert_eq!(inside.destination_queue(), Some(0x1F));
+        let outside = Action {
+            payload: ActionPayload::Selected { sel: 2, sub: 0, field: 0x20, wide: true },
+            ..inside
+        };
+        assert_eq!(outside.destination_queue(), Some(0x20), "not aliased onto 0");
+
+        // A rule whose first action names a wide queue must report that
+        // queue, not skip to the next action's. This is the failure the
+        // refusal used to produce.
+        let rule = Rule {
+            clauses: vec![observed_clauses()[0]],
+            actions: vec![
+                outside,
+                Action {
+                    priority: 1,
+                    payload: ActionPayload::Selected { sel: 2, sub: 0, field: 0x10, wide: true },
+                },
+            ],
+        };
+        assert_eq!(rule.destination_queue(), Some(0x20));
     }
 
     /// The two type codes with no measured word have no encoding here.

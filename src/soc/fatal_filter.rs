@@ -47,6 +47,9 @@ const REG_FILTER_STATUS: u32 = 0x0100_3600;
 /// the first is traceable to a name the register DB has since
 /// retracted. Reading it as zero until something injects is a
 /// workaround for a polling loop, not a measurement.
+///
+/// Listed in `FIDELITY.md`, "Two register behaviours chosen to keep a
+/// firmware moving" — keep the two in step.
 const REG_3604: u32 = 0x0100_3604;
 const REG_FILTER_ENABLE: u32 = 0x0100_3608;
 const REG_FILTER_IRQ: u32 = 0x0100_3610;

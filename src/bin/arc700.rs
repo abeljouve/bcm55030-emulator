@@ -10,6 +10,7 @@ use parking_lot::{Mutex, RwLock};
 
 use bcm55030_emulator::cpu::Cpu;
 use bcm55030_emulator::soc::bank::BootMode;
+use bcm55030_emulator::soc::lue::Lue;
 
 fn usage(prog: &str) {
     eprintln!("BCM55030 ARC 700 Emulator");
@@ -606,6 +607,45 @@ fn run_with_mcp(cpu: Cpu, cfg: &Config, port: u16) {
     }
 }
 
+/// The classifier slots this run wrote and then emptied, one line each.
+///
+/// A cleared slot reads back exactly like one nothing ever wrote, so a
+/// table dumped at the end of a boot cannot show a rule that was
+/// installed and then erased. The journal is the only place that
+/// difference survives — see `soc::lue::LuePort::cleared_slots`. The
+/// ordinals are command counts, not cycles: the port has no clock.
+///
+/// Returns nothing at all when nothing was cleared, rather than a heading
+/// with no rows under it: most runs clear nothing, and a heading printed
+/// anyway would turn "no rule was erased" into "here is the list, it is
+/// empty" — the same reading the aggregate counter already gives wrongly.
+fn cleared_classifier_slots(lue: &Lue) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (inst, port) in lue.inst.iter().enumerate() {
+        let cleared = port.cleared_slots();
+        if cleared.is_empty() {
+            continue;
+        }
+        lines.push(String::new());
+        lines.push(format!("=== Classifier instance {inst}: slots written then cleared ==="));
+        for s in cleared {
+            let q = s.log.cleared_content.expect("cleared_slots filters on this");
+            lines.push(format!(
+                "table {:2}  index 0x{:03X}  writes {}  cleared at command {}  held {:08X} {:08X} {:08X} {:08X}",
+                s.table,
+                s.index,
+                s.log.writes,
+                s.log.last_clear_at.unwrap_or(0),
+                q.words[0],
+                q.words[1],
+                q.words[2],
+                q.words[3],
+            ));
+        }
+    }
+    lines
+}
+
 fn main() {
     let cfg = parse_args();
     bcm55030_emulator::set_verbose(cfg.verbose);
@@ -872,6 +912,13 @@ fn main() {
     }
     eprintln!("Reboots: {}", reboot_count);
 
+    if let Some(bank) = cpu.bank() {
+        let lines = cleared_classifier_slots(&bank.read().lue);
+        for line in lines {
+            eprintln!("{line}");
+        }
+    }
+
     if let Some(ref path) = cfg.dccm_dump {
         bcm55030_emulator::vlog!("[BCM55030] Dumping DCCM to {}", path);
         let size = cpu.mem.sram_size();
@@ -944,6 +991,78 @@ fn main() {
         } else {
             bcm55030_emulator::vlog!("[BCM55030] Flash not modified, nothing to persist");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcm55030_emulator::soc::lue::{Quad, CMD_GO, CMD_WRITE};
+
+    /// Drive the port the way software does: the four data words, then a
+    /// write command naming table and index. Zeros clear the slot.
+    fn write_entry(lue: &mut Lue, inst: u32, table: u16, index: u16, words: [u32; 4]) {
+        let base = if inst == 0 { 0x0100_240Cu32 } else { 0x0100_280C };
+        for (i, w) in Quad::new(words).to_regs().iter().enumerate() {
+            lue.write_word(base + 4 + i as u32 * 4, *w).unwrap();
+        }
+        lue.write_word(base, CMD_GO | CMD_WRITE | ((table as u32) << 12) | index as u32)
+            .unwrap();
+    }
+
+    /// The measurement this report exists to replay: a rule installed and
+    /// then padded over leaves nothing in the table and everything in the
+    /// journal. A slot that only ever saw zeros is the start-up path's
+    /// padding — several hundred of them a boot — and reporting it would
+    /// bury the one line that matters.
+    #[test]
+    fn the_report_names_the_rule_a_run_erased_and_not_the_padding() {
+        let mut lue = Lue::new();
+        let rule = [0xF038_00F1, 0x0000_0001, 0x0000_0010, 0x0F60_0000];
+
+        write_entry(&mut lue, 1, 8, 0x2E, rule);
+        write_entry(&mut lue, 1, 8, 0x2E, [0; 4]);
+        // Never held anything: padding, not a lost rule.
+        write_entry(&mut lue, 1, 8, 0x2F, [0; 4]);
+        // Written and left alone: not a disappearance either.
+        write_entry(&mut lue, 1, 8, 0x34, rule);
+
+        let lines = cleared_classifier_slots(&lue);
+        assert_eq!(lines.len(), 3, "blank line, heading, one slot: {lines:?}");
+        assert_eq!(lines[0], "");
+        assert!(lines[1].contains("instance 1"), "{}", lines[1]);
+        assert!(lines[2].contains("table  8"), "{}", lines[2]);
+        assert!(lines[2].contains("index 0x02E"), "{}", lines[2]);
+        assert!(lines[2].contains("writes 2"), "{}", lines[2]);
+        assert!(lines[2].contains("F03800F1 00000001 00000010 0F600000"), "{}", lines[2]);
+        assert!(
+            !lines.iter().any(|l| l.contains("0x02F") || l.contains("0x034")),
+            "only the slot that lost a rule is a disappearance: {lines:?}"
+        );
+    }
+
+    /// Both instances are walked, and each heading names its own.
+    #[test]
+    fn each_instance_reports_under_its_own_heading() {
+        let mut lue = Lue::new();
+        for inst in 0..2u32 {
+            write_entry(&mut lue, inst, 3, 0x40, [1, 2, 3, 4]);
+            write_entry(&mut lue, inst, 3, 0x40, [0; 4]);
+        }
+        let lines = cleared_classifier_slots(&lue);
+        assert_eq!(lines.len(), 6, "two blocks of three: {lines:?}");
+        assert!(lines[1].contains("instance 0"), "{}", lines[1]);
+        assert!(lines[4].contains("instance 1"), "{}", lines[4]);
+    }
+
+    /// A run that cleared nothing prints nothing. "No rule was erased" and
+    /// "here is the list of erased rules, it is empty" read differently,
+    /// and only the first one is what a quiet boot means.
+    #[test]
+    fn a_run_that_cleared_nothing_prints_no_heading() {
+        let mut lue = Lue::new();
+        write_entry(&mut lue, 1, 8, 0x2E, [0xF038_00F1, 0, 0x10, 0]);
+        assert!(cleared_classifier_slots(&lue).is_empty());
     }
 }
 

@@ -218,7 +218,7 @@ pub const SYSREG_INIT_VALUES: &[(u32, u32)] = &[
     (0x1C20, 0x0001FFFF),
     (0x1C24, 0x0001FFFF),
     (0x1C3C, 0x000001B0),
-    // -------- 0x2400..0x2D30 — DMA / MACsec --------
+    // -------- 0x2400..0x29C4 — DMA / MACsec --------
     (0x2400, 0x00000013),
     (0x2404, 0x00000001),
     (0x240C, 0x40013040),
@@ -249,6 +249,14 @@ pub const SYSREG_INIT_VALUES: &[(u32, u32)] = &[
     (0x2990, 0x000FE000),
     (0x29C0, 0x00010000),
     (0x29C4, 0x00EDB04D),
+    // -------- 0x2D00..0x2D30 — UNI-side Ethernet port --------
+    //   Outside both brute-scanned ranges. These eleven words are a silicon
+    //   reading taken after boot with the port not yet armed, not a
+    //   power-on scan. Seven words of the block were re-read on hardware
+    //   in that state: the six of them this table names matched word for
+    //   word, and the seventh (0x2D00) read zero, which is what a word
+    //   the table does not name reads here anyway. Callers that say
+    //   "power-on" about this block are overstating what was measured.
     (0x2D04, 0x00000600),
     (0x2D08, 0x00005555),
     (0x2D0C, 0x00000003),
