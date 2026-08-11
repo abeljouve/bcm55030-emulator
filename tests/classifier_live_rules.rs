@@ -24,6 +24,11 @@ const DATA: u32 = 0x0100_2810;
 /// The table the readback path addresses.
 const TABLE: u8 = 3;
 
+/// The operator code the tag clauses carry. Software emits it, and what
+/// it means is not established — so it travels as a number here rather
+/// than under a name that would present a supposition as a measurement.
+const TAG_ABSENCE: Op = Op::from_code(6);
+
 /// A clause with no anchor, which is all but one of them.
 fn clause(field: u8, op: Op, shift: u8, operand: u64) -> Clause {
     Clause { field: Field::from_code(field), op, shift, anchor: 0, operand }
@@ -57,8 +62,8 @@ fn live_rules() -> Vec<Rule> {
         Rule {
             index: 0x2F,
             clauses: vec![
-                clause(0x03, Op::NotExists, 0x3F, 0),
-                clause(0x04, Op::NotExists, 0x3F, 0),
+                clause(0x03, TAG_ABSENCE, 0x3F, 0),
+                clause(0x04, TAG_ABSENCE, 0x3F, 0),
                 clause(0x02, Op::Eq, 0x00, 0x8180),
             ],
             action: terminal(2),
@@ -66,8 +71,8 @@ fn live_rules() -> Vec<Rule> {
         Rule {
             index: 0x32,
             clauses: vec![
-                clause(0x03, Op::NotExists, 0x3F, 0),
-                clause(0x04, Op::NotExists, 0x3F, 0),
+                clause(0x03, TAG_ABSENCE, 0x3F, 0),
+                clause(0x04, TAG_ABSENCE, 0x3F, 0),
                 clause(0x02, Op::Eq, 0x00, 0x888E),
             ],
             action: terminal(2),
@@ -81,8 +86,8 @@ fn live_rules() -> Vec<Rule> {
             index: 0x36,
             clauses: vec![
                 clause(0x02, Op::Eq, 0x30, 0x8808),
-                clause(0x03, Op::NotExists, 0x3F, 0),
-                clause(0x04, Op::NotExists, 0x3F, 0),
+                clause(0x03, TAG_ABSENCE, 0x3F, 0),
+                clause(0x04, TAG_ABSENCE, 0x3F, 0),
                 clause(0x10, Op::Ge, 0x30, 2),
                 clause(0x10, Op::Le, 0x30, 6),
             ],
@@ -92,8 +97,8 @@ fn live_rules() -> Vec<Rule> {
             index: 0x3B,
             clauses: vec![
                 clause(0x02, Op::Eq, 0x30, 0x8809),
-                clause(0x03, Op::NotExists, 0x3F, 0),
-                clause(0x04, Op::NotExists, 0x3F, 0),
+                clause(0x03, TAG_ABSENCE, 0x3F, 0),
+                clause(0x04, TAG_ABSENCE, 0x3F, 0),
                 // The one clause with an anchor, and the only value of it
                 // that occurs on a rule this table holds.
                 Clause {
@@ -427,8 +432,13 @@ fn a_readable_rule_routes_a_frame_and_leaves_its_neighbour_alone() {
         clause: Clause {
             field: Field::from_code(0x00),
             op: Op::Eq,
-            // 49 bits, which is how the rule is programmed: a 48-bit
-            // address with the bit above it required to be clear.
+            // ⚠ This number comes from a readback and is **not** anchored
+            // the way `MPCP_RULE_ENTRIES` is: no header word is checked
+            // against it anywhere in this file. A shift of 0x10 would
+            // give a 48-bit window instead of a 49-bit one, and the two
+            // agree on every frame — the bit above a 48-bit address is
+            // always clear — so nothing here can tell them apart. Left as
+            // measured rather than adjusted to fit a relation.
             shift: 0x0F,
             anchor: 0,
             operand: 0x0000_FFFF_FFFF_FFFF,
@@ -583,8 +593,8 @@ fn mpcp_routing_rule() -> bcm55030_emulator::soc::lue::Rule {
         clauses: vec![
             clause(0x00, Op::Eq, 0x10, 0x0180_C200_0001),
             clause(0x02, Op::Eq, 0x30, 0x8808),
-            clause(0x03, Op::NotExists, 0x3F, 0),
-            clause(0x04, Op::NotExists, 0x3F, 0),
+            clause(0x03, TAG_ABSENCE, 0x3F, 0),
+            clause(0x04, TAG_ABSENCE, 0x3F, 0),
             clause(0x10, Op::Ge, 0x30, 2),
             clause(0x10, Op::Le, 0x30, 6),
         ],

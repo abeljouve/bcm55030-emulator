@@ -1,9 +1,17 @@
 //! Extended OAM: organization-specific OAMPDUs and their variable encoding.
 //!
 //! An extended OAMPDU is an Information-class frame with code
-//! [`Code::OrganizationSpecific`], an OUI, a vendor opcode, and a list of
-//! variables. Variables are addressed by a branch and a leaf; a request
-//! carries the address alone, a response carries a length and a value.
+//! [`Code::OrganizationSpecific`], an OUI, one octet under that OUI, and a
+//! body. Variables are addressed by a branch and a leaf; a request carries
+//! the address alone, a response carries a length and a value.
+//!
+//! **The octet after the OUI only means anything under its OUI.** A receiver
+//! switches on the 24-bit identifier first and reaches a different table for
+//! each one, so the pair travels together as a [`Channel`] and the octet is
+//! never read on its own. Reading it without the OUI is what makes one
+//! container's message announce itself as another's, and makes a body that
+//! carries no variable list get walked as one — which fabricates containers
+//! out of whatever bytes followed.
 
 use std::fmt;
 
@@ -11,15 +19,15 @@ use crate::oam::{self, Code, Flags, Oui, SUBTYPE_OAM};
 use crate::types::{EtherType, FrameWriter, MacAddr, MIN_FRAME_LEN};
 
 /// Offset of the OUI, right after the OAMPDU code.
-const OUI_OFFSET: usize = 18;
-/// Offset of the vendor opcode.
-const OPCODE_OFFSET: usize = 21;
-/// Offset of the first variable.
-const VARIABLES_OFFSET: usize = 22;
+pub const OUI_OFFSET: usize = 18;
+/// Offset of the octet that follows the OUI.
+pub const CODE_OFFSET: usize = 21;
+/// Offset of the body.
+pub const BODY_OFFSET: usize = 22;
 
-/// Vendor opcodes carried under the OUI.
+/// Messages of the DPoE variable channel, under [`Oui::DPOE`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Opcode {
+pub enum DpoeOpcode {
     GetRequest,
     GetResponse,
     SetRequest,
@@ -31,21 +39,7 @@ pub enum Opcode {
     Other(u8),
 }
 
-impl Opcode {
-    /// How the variable list that follows is laid out.
-    ///
-    /// A request names what it wants; a response carries what was found. The
-    /// two are not distinguishable from the bytes alone, so reading a list
-    /// without knowing the opcode means reading a request's next address as
-    /// the previous one's length — which yields a plausible container made of
-    /// the addresses that came after it.
-    pub const fn list_shape(self) -> ListShape {
-        match self {
-            Self::GetRequest => ListShape::Addresses,
-            _ => ListShape::Containers,
-        }
-    }
-
+impl DpoeOpcode {
     pub const fn as_u8(self) -> u8 {
         match self {
             Self::GetRequest => 0x01,
@@ -57,10 +51,8 @@ impl Opcode {
             Self::Other(v) => v,
         }
     }
-}
 
-impl From<u8> for Opcode {
-    fn from(v: u8) -> Self {
+    pub const fn from_u8(v: u8) -> Self {
         match v {
             0x01 => Self::GetRequest,
             0x02 => Self::GetResponse,
@@ -73,7 +65,7 @@ impl From<u8> for Opcode {
     }
 }
 
-impl fmt::Display for Opcode {
+impl fmt::Display for DpoeOpcode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::GetRequest => write!(f, "get-request"),
@@ -82,18 +74,154 @@ impl fmt::Display for Opcode {
             Self::SetResponse => write!(f, "set-response"),
             Self::LinkEvents => write!(f, "link-events"),
             Self::Multipart => write!(f, "multipart"),
-            Self::Other(v) => write!(f, "opcode 0x{v:02X}"),
+            Self::Other(v) => write!(f, "code 0x{v:02X}"),
         }
     }
 }
 
-/// What the entries of a variable list are.
+/// Messages of the second container, under [`Oui::VENDOR_EXTENSION`].
+///
+/// Only one of its codes has been observed to carry a variable list. The rest
+/// are real messages this link exchanges, but their bodies are something else,
+/// so they get a code and no shape rather than a name and a wrong one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ListShape {
-    /// Addresses alone, plus whatever parameters an address takes.
+pub enum ExtensionMessage {
+    /// The one code whose body is a variable list.
+    Variables,
+    Other(u8),
+}
+
+impl ExtensionMessage {
+    /// The code the variable-list message travels under.
+    pub const VARIABLES_CODE: u8 = 0x03;
+
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::Variables => Self::VARIABLES_CODE,
+            Self::Other(v) => v,
+        }
+    }
+
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            Self::VARIABLES_CODE => Self::Variables,
+            other => Self::Other(other),
+        }
+    }
+}
+
+impl fmt::Display for ExtensionMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Variables => write!(f, "variables"),
+            Self::Other(v) => write!(f, "code 0x{v:02X}"),
+        }
+    }
+}
+
+/// The OUI and the octet under it, as one value.
+///
+/// The octet is only meaningful under its OUI, which is why the two are never
+/// apart here: sending a code from one container under the other's OUI is not
+/// something this type can express.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Channel {
+    Dpoe(DpoeOpcode),
+    Extension(ExtensionMessage),
+    Other { oui: Oui, code: u8 },
+}
+
+impl Channel {
+    pub const fn oui(self) -> Oui {
+        match self {
+            Self::Dpoe(_) => Oui::DPOE,
+            Self::Extension(_) => Oui::VENDOR_EXTENSION,
+            Self::Other { oui, .. } => oui,
+        }
+    }
+
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Dpoe(op) => op.as_u8(),
+            Self::Extension(m) => m.as_u8(),
+            Self::Other { code, .. } => code,
+        }
+    }
+
+    /// Read a channel from the two fields as they arrive: identifier first,
+    /// octet second.
+    pub fn decode(oui: Oui, code: u8) -> Self {
+        match oui {
+            Oui::DPOE => Self::Dpoe(DpoeOpcode::from_u8(code)),
+            Oui::VENDOR_EXTENSION => Self::Extension(ExtensionMessage::from_u8(code)),
+            other => Self::Other { oui: other, code },
+        }
+    }
+
+    /// How the body that follows is laid out.
+    ///
+    /// A request names what it wants; a response carries what was found. The
+    /// two are not distinguishable from the bytes alone, so reading a list
+    /// without knowing the message means reading a request's next address as
+    /// the previous one's length — which yields a plausible container made of
+    /// the addresses that came after it.
+    pub const fn body_shape(self) -> BodyShape {
+        match self {
+            Self::Dpoe(DpoeOpcode::GetRequest) => BodyShape::Addresses,
+            Self::Dpoe(_) => BodyShape::Containers,
+            Self::Extension(ExtensionMessage::Variables) => BodyShape::Containers,
+            // Every other code of the second container, and every unknown
+            // container: nothing says these bodies are variable lists.
+            Self::Extension(ExtensionMessage::Other(_)) | Self::Other { .. } => BodyShape::Opaque,
+        }
+    }
+}
+
+impl fmt::Display for Channel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Dpoe(op) => write!(f, "{op}"),
+            Self::Extension(m) => write!(f, "{m}"),
+            Self::Other { code, .. } => write!(f, "code 0x{code:02X}"),
+        }
+    }
+}
+
+/// What the body of an extended OAMPDU is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyShape {
+    /// Addresses alone, plus whatever parameters they take.
     Addresses,
     /// Addresses with a length and a value.
     Containers,
+    /// Not a variable list. Left undecoded rather than walked as one: only
+    /// one code of the extension container has been observed to carry a
+    /// list, and walking the rest fabricates containers.
+    Opaque,
+}
+
+/// A byte range of the frame a parsed thing came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub start: usize,
+    pub len: usize,
+}
+
+impl Span {
+    pub const fn new(start: usize, len: usize) -> Self {
+        Self { start, len }
+    }
+
+    pub const fn end(self) -> usize {
+        self.start + self.len
+    }
+}
+
+/// A variable together with the bytes it was read from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Located {
+    pub variable: Variable,
+    pub span: Span,
 }
 
 /// The first octet of a variable address.
@@ -151,12 +279,19 @@ impl fmt::Display for Branch {
     }
 }
 
-/// Attribute leaves seen on this link.
+/// Leaves seen on this link.
 pub mod leaf {
     pub const DEVICE_ID: u16 = 0x0002;
     pub const FIRMWARE_INFO: u16 = 0x0003;
     pub const MANUFACTURER_INFO: u16 = 0x0006;
     pub const MANUFACTURER_ORG_NAME: u16 = 0x000E;
+    /// Carries one entry of a classifier rule list. Under the attribute
+    /// branch; see [`crate::rule_list`].
+    pub const RULE_LIST: u16 = 0x0501;
+    /// Under the action branch: put the accumulated entries into effect.
+    pub const RULE_LIST_APPLY: u16 = 0x0502;
+    /// Queue configuration, as one container.
+    pub const QUEUE_CONFIG: u16 = 0x7FF1;
 }
 
 /// The length octet of a variable, which is not a plain count.
@@ -227,6 +362,14 @@ impl Descriptor {
         Self { branch: Branch::Attribute, leaf }
     }
 
+    pub const fn action(leaf: u16) -> Self {
+        Self { branch: Branch::Action, leaf }
+    }
+
+    pub const fn object_context(leaf: u16) -> Self {
+        Self { branch: Branch::ObjectContext, leaf }
+    }
+
     fn write(&self, w: &mut FrameWriter) {
         w.u8(self.branch.as_u8()).u16(self.leaf);
     }
@@ -257,8 +400,14 @@ impl Container {
 #[derive(Clone, Debug)]
 pub struct Pdu {
     pub oui: Oui,
-    pub opcode: Opcode,
-    pub variables: Vec<Variable>,
+    pub channel: Channel,
+    /// Entries of the variable list, each with the bytes it came from. Empty
+    /// when the body is opaque — a body nothing says is a list is kept, not
+    /// walked.
+    pub variables: Vec<Located>,
+    /// Set when [`Channel::body_shape`] is [`BodyShape::Opaque`]: the body is
+    /// recorded so it can be shown and re-sent, and deliberately not decoded.
+    pub opaque_body: Option<Span>,
 }
 
 impl Pdu {
@@ -274,20 +423,32 @@ impl Pdu {
             *frame.get(OUI_OFFSET + 1)?,
             *frame.get(OUI_OFFSET + 2)?,
         ]);
-        let opcode = Opcode::from(*frame.get(OPCODE_OFFSET)?);
-        Some(Self {
-            oui,
-            opcode,
-            variables: parse_variables(
-                frame.get(VARIABLES_OFFSET..).unwrap_or(&[]),
-                opcode.list_shape(),
-            ),
-        })
+        // The identifier decides what the next octet means, so it is read
+        // first and the octet is never interpreted without it.
+        let channel = Channel::decode(oui, *frame.get(CODE_OFFSET)?);
+        let body = frame.get(BODY_OFFSET..).unwrap_or(&[]);
+        let shape = channel.body_shape();
+        let (variables, opaque_body) = match shape {
+            BodyShape::Opaque => (Vec::new(), Some(Span::new(BODY_OFFSET, body.len()))),
+            shape => (parse_variables(body, shape, BODY_OFFSET), None),
+        };
+        Some(Self { oui, channel, variables, opaque_body })
     }
 
-    /// The entries that carry a value. A request has none.
+    /// The shape the body was read with.
+    pub fn body_shape(&self) -> BodyShape {
+        self.channel.body_shape()
+    }
+
+    /// The variables, without their spans.
+    pub fn variables(&self) -> impl Iterator<Item = &Variable> {
+        self.variables.iter().map(|l| &l.variable)
+    }
+
+    /// The entries that carry a value. A request has none, and so does a
+    /// body that was never parsed as a list.
     pub fn containers(&self) -> impl Iterator<Item = &Container> {
-        self.variables.iter().filter_map(Variable::as_container)
+        self.variables.iter().filter_map(|l| l.variable.as_container())
     }
 }
 
@@ -334,72 +495,125 @@ fn request_parameter_len(descriptor: Descriptor) -> Option<usize> {
 
 /// Walk a variable list until its terminator or its end.
 ///
-/// `shape` comes from the opcode: see [`Opcode::list_shape`].
-pub fn parse_variables(mut bytes: &[u8], shape: ListShape) -> Vec<Variable> {
+/// `shape` comes from the channel: see [`Channel::body_shape`]. `base` is the
+/// offset of `bytes` inside the frame, so every entry can carry the range it
+/// was read from — a dissection whose fields have no range cannot highlight
+/// the bytes behind a selection, which is the whole contract of the tree.
+///
+/// [`BodyShape::Opaque`] never reaches here: a caller that cannot say the body
+/// is a list must not have it walked as one.
+pub fn parse_variables(bytes: &[u8], shape: BodyShape, base: usize) -> Vec<Located> {
     let mut out = Vec::new();
-    while bytes.len() >= 3 {
-        let branch = Branch::from(bytes[0]);
-        let leaf = u16::from_be_bytes([bytes[1], bytes[2]]);
+    if shape == BodyShape::Opaque {
+        return out;
+    }
+    let mut at = 0usize;
+    while bytes.len() - at >= 3 {
+        let rest = &bytes[at..];
+        let branch = Branch::from(rest[0]);
+        let leaf = u16::from_be_bytes([rest[1], rest[2]]);
         if branch == Branch::Terminator && leaf == 0 {
             break;
         }
         let descriptor = Descriptor { branch, leaf };
-        if shape == ListShape::Addresses {
+        if shape == BodyShape::Addresses {
             if let Some(n) = request_parameter_len(descriptor) {
-                let take = n.min(bytes.len() - 3);
-                out.push(Variable::Address {
-                    descriptor,
-                    parameters: bytes[3..3 + take].to_vec(),
+                let take = n.min(rest.len() - 3);
+                out.push(Located {
+                    variable: Variable::Address {
+                        descriptor,
+                        parameters: rest[3..3 + take].to_vec(),
+                    },
+                    span: Span::new(base + at, 3 + take),
                 });
-                bytes = &bytes[3 + take..];
+                at += 3 + take;
                 continue;
             }
         }
         // A descriptor with no length octet ends the list too.
-        let Some(&raw_len) = bytes.get(3) else { break };
+        let Some(&raw_len) = rest.get(3) else { break };
         let length = Length::from_u8(raw_len);
-        let take = length.data_len().min(bytes.len().saturating_sub(4));
-        out.push(Variable::Container(Container {
-            descriptor,
-            length,
-            value: bytes[4..4 + take].to_vec(),
-        }));
-        bytes = &bytes[4 + take..];
+        let take = length.data_len().min(rest.len().saturating_sub(4));
+        out.push(Located {
+            variable: Variable::Container(Container {
+                descriptor,
+                length,
+                value: rest[4..4 + take].to_vec(),
+            }),
+            span: Span::new(base + at, 4 + take),
+        });
+        at += 4 + take;
     }
     out
 }
 
 /// Frame header shared by every extended OAMPDU we build.
+///
+/// The identifier and the octet under it are one field here, so a code from
+/// one container cannot be written out under the other's identifier.
 #[derive(Clone, Copy, Debug)]
 pub struct Header {
     pub dst: MacAddr,
     pub src: MacAddr,
     pub flags: Flags,
-    pub oui: Oui,
-    pub opcode: Opcode,
+    pub channel: Channel,
 }
 
 impl Header {
-    fn writer(&self) -> FrameWriter {
+    /// The identifier this header will write.
+    pub const fn oui(&self) -> Oui {
+        self.channel.oui()
+    }
+
+    pub fn writer(&self) -> FrameWriter {
         let mut w = FrameWriter::ethernet(self.dst, self.src, EtherType::SlowProtocol);
         w.u8(SUBTYPE_OAM)
             .u16(self.flags.as_u16())
             .u8(Code::OrganizationSpecific.as_u8())
-            .bytes(&self.oui.0)
-            .u8(self.opcode.as_u8());
+            .bytes(&self.channel.oui().0)
+            .u8(self.channel.code());
         w
     }
 }
 
-/// Build a request reading `descriptors`, terminated so a reader stops
+/// Write one variable, whichever kind it is.
+fn write_variable(w: &mut FrameWriter, v: &Variable) {
+    match v {
+        Variable::Address { descriptor, parameters } => {
+            descriptor.write(w);
+            w.bytes(parameters);
+        }
+        Variable::Container(c) => {
+            c.descriptor.write(w);
+            w.u8(c.length.as_u8());
+            w.bytes(&c.value);
+        }
+    }
+}
+
+/// The three zero octets that end a variable list: branch, leaf and length.
+fn write_terminator(w: &mut FrameWriter) {
+    w.u8(Branch::Terminator.as_u8()).u16(0).u8(0);
+}
+
+/// Build a message whose body is `variables`, terminated so a reader stops
 /// where we intend it to.
+pub fn variables_message(header: Header, variables: &[Variable]) -> Vec<u8> {
+    let mut w = header.writer();
+    for v in variables {
+        write_variable(&mut w, v);
+    }
+    write_terminator(&mut w);
+    w.pad_to(MIN_FRAME_LEN)
+}
+
+/// Build a request reading `descriptors`.
 pub fn get_request(header: Header, descriptors: &[Descriptor]) -> Vec<u8> {
     let mut w = header.writer();
     for d in descriptors {
         d.write(&mut w);
     }
-    // Terminator: branch, leaf and length all zero.
-    w.u8(Branch::Terminator.as_u8()).u16(0).u8(0);
+    write_terminator(&mut w);
     w.pad_to(MIN_FRAME_LEN)
 }
 
@@ -411,7 +625,18 @@ pub fn get_response(header: Header, containers: &[Container]) -> Vec<u8> {
         w.u8(c.length.as_u8());
         w.bytes(&c.value);
     }
-    w.u8(Branch::Terminator.as_u8()).u16(0).u8(0);
+    write_terminator(&mut w);
+    w.pad_to(MIN_FRAME_LEN)
+}
+
+/// Build a message whose body is handed over verbatim.
+///
+/// The escape hatch that keeps a refusal measurable: a receiver's answer to a
+/// malformed message is an observation, and normalising the bytes on the way
+/// out destroys it.
+pub fn raw_message(header: Header, body: &[u8]) -> Vec<u8> {
+    let mut w = header.writer();
+    w.bytes(body);
     w.pad_to(MIN_FRAME_LEN)
 }
 
@@ -422,28 +647,42 @@ mod tests {
     const PEER: MacAddr = MacAddr::new([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
     const ONU: MacAddr = MacAddr::new([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
 
-    fn header(opcode: Opcode) -> Header {
-        Header {
-            dst: ONU,
-            src: PEER,
-            flags: Flags::converged(),
-            oui: Oui::DPOE,
-            opcode,
-        }
+    fn header(channel: Channel) -> Header {
+        Header { dst: ONU, src: PEER, flags: Flags::converged(), channel }
     }
 
+    /// Codes of the second container seen carrying traffic on this link.
+    /// A fixture, not a table the model consults: what the model needs to
+    /// know about them is that their bodies are not variable lists.
+    const EXTENSION_CODES_SEEN: [u8; 12] =
+        [0x00, 0x01, 0x03, 0x06, 0x09, 0x0A, 0x0B, 0x0C, 0x11, 0x13, 0x15, 0x17];
+
     #[test]
-    fn opcodes_and_branches_round_trip() {
+    fn codes_and_branches_round_trip_under_their_own_identifier() {
         for op in [
-            Opcode::GetRequest,
-            Opcode::GetResponse,
-            Opcode::SetRequest,
-            Opcode::SetResponse,
-            Opcode::LinkEvents,
-            Opcode::Multipart,
+            DpoeOpcode::GetRequest,
+            DpoeOpcode::GetResponse,
+            DpoeOpcode::SetRequest,
+            DpoeOpcode::SetResponse,
+            DpoeOpcode::LinkEvents,
+            DpoeOpcode::Multipart,
+            DpoeOpcode::Other(0x7F),
         ] {
-            assert_eq!(Opcode::from(op.as_u8()), op);
+            assert_eq!(DpoeOpcode::from_u8(op.as_u8()), op);
+            let c = Channel::Dpoe(op);
+            assert_eq!(Channel::decode(c.oui(), c.code()), c);
         }
+        for code in EXTENSION_CODES_SEEN {
+            let m = ExtensionMessage::from_u8(code);
+            assert_eq!(m.as_u8(), code);
+            let c = Channel::Extension(m);
+            assert_eq!(Channel::decode(Oui::VENDOR_EXTENSION, code), c);
+        }
+        let unknown = Oui([0xAA, 0xBB, 0xCC]);
+        assert_eq!(
+            Channel::decode(unknown, 3),
+            Channel::Other { oui: unknown, code: 3 }
+        );
         for b in [
             Branch::Terminator,
             Branch::ObjectContext,
@@ -453,6 +692,43 @@ mod tests {
         ] {
             assert_eq!(Branch::from(b.as_u8()), b);
         }
+    }
+
+    /// The same octet under two identifiers is two different messages, and
+    /// the bodies behind them are laid out differently. Reading the octet
+    /// without its identifier is what made one container's message announce
+    /// itself as the other's.
+    #[test]
+    fn the_same_octet_is_a_different_code_under_each_oui() {
+        let code = ExtensionMessage::VARIABLES_CODE;
+        let dpoe = Channel::decode(Oui::DPOE, code);
+        let ext = Channel::decode(Oui::VENDOR_EXTENSION, code);
+        assert_ne!(dpoe, ext);
+        assert_eq!(dpoe, Channel::Dpoe(DpoeOpcode::SetRequest));
+        assert_eq!(ext, Channel::Extension(ExtensionMessage::Variables));
+        // Same octet on the wire, same shape here — but the code 1 that
+        // reads as a read request under one identifier carries no list at
+        // all under the other.
+        assert_eq!(dpoe.code(), ext.code());
+        assert_eq!(
+            Channel::decode(Oui::DPOE, 1).body_shape(),
+            BodyShape::Addresses
+        );
+        assert_eq!(
+            Channel::decode(Oui::VENDOR_EXTENSION, 1).body_shape(),
+            BodyShape::Opaque
+        );
+    }
+
+    #[test]
+    fn only_one_code_of_the_extension_container_carries_a_list() {
+        let carrying: Vec<u8> = EXTENSION_CODES_SEEN
+            .into_iter()
+            .filter(|&c| {
+                Channel::decode(Oui::VENDOR_EXTENSION, c).body_shape() != BodyShape::Opaque
+            })
+            .collect();
+        assert_eq!(carrying, vec![ExtensionMessage::VARIABLES_CODE]);
     }
 
     #[test]
@@ -483,16 +759,16 @@ mod tests {
             Descriptor::attribute(leaf::FIRMWARE_INFO),
             Descriptor::attribute(leaf::MANUFACTURER_INFO),
         ];
-        let frame = get_request(header(Opcode::GetRequest), &wanted);
+        let frame = get_request(header(Channel::Dpoe(DpoeOpcode::GetRequest)), &wanted);
         let pdu = Pdu::parse(&frame).expect("parses");
-        assert_eq!(pdu.opcode, Opcode::GetRequest);
+        assert_eq!(pdu.channel, Channel::Dpoe(DpoeOpcode::GetRequest));
         assert_eq!(pdu.oui, Oui::DPOE);
         // A request names addresses and carries no values. Reading it as a
         // list of containers used to yield one fabricated container whose
         // length and value were the addresses that followed it.
         assert_eq!(pdu.containers().count(), 0);
         assert_eq!(
-            pdu.variables,
+            pdu.variables().cloned().collect::<Vec<_>>(),
             wanted
                 .iter()
                 .map(|d| Variable::Address { descriptor: *d, parameters: Vec::new() })
@@ -509,9 +785,9 @@ mod tests {
             Branch::Attribute.as_u8(), 0x00, 0x03,
             Branch::Terminator.as_u8(), 0x00, 0x00,
         ];
-        let vars = parse_variables(&bytes, ListShape::Addresses);
+        let vars = parse_variables(&bytes, BodyShape::Addresses, 0);
         assert_eq!(
-            vars,
+            vars.iter().map(|l| l.variable.clone()).collect::<Vec<_>>(),
             vec![
                 Variable::Address {
                     descriptor: Descriptor::attribute(0x0301),
@@ -523,6 +799,9 @@ mod tests {
                 },
             ]
         );
+        // And each one says which bytes it came from.
+        assert_eq!(vars[0].span, Span::new(0, 6));
+        assert_eq!(vars[1].span, Span::new(6, 3));
     }
 
     /// A context selector is written out in full wherever it appears, so it
@@ -534,17 +813,17 @@ mod tests {
             Branch::Attribute.as_u8(), 0x00, 0x03,
             Branch::Terminator.as_u8(), 0x00, 0x00,
         ];
-        let vars = parse_variables(&bytes, ListShape::Addresses);
+        let vars = parse_variables(&bytes, BodyShape::Addresses, 0);
         assert_eq!(vars.len(), 2);
         assert_eq!(
-            vars[0],
+            vars[0].variable,
             Variable::Container(Container {
-                descriptor: Descriptor { branch: Branch::ObjectContext, leaf: 0x0002 },
+                descriptor: Descriptor::object_context(0x0002),
                 length: Length::Bytes(2),
                 value: vec![0x00, 0x00],
             })
         );
-        assert_eq!(vars[1].descriptor(), Descriptor::attribute(leaf::FIRMWARE_INFO));
+        assert_eq!(vars[1].variable.descriptor(), Descriptor::attribute(leaf::FIRMWARE_INFO));
     }
 
     #[test]
@@ -561,9 +840,9 @@ mod tests {
                 value: vec![0xCD; 16],
             },
         ];
-        let frame = get_response(header(Opcode::GetResponse), &containers);
+        let frame = get_response(header(Channel::Dpoe(DpoeOpcode::GetResponse)), &containers);
         let pdu = Pdu::parse(&frame).expect("parses");
-        assert_eq!(pdu.opcode, Opcode::GetResponse);
+        assert_eq!(pdu.channel, Channel::Dpoe(DpoeOpcode::GetResponse));
         assert_eq!(pdu.containers().cloned().collect::<Vec<_>>(), containers);
     }
 
@@ -574,7 +853,7 @@ mod tests {
             length: Length::Status(0xA1),
             value: Vec::new(),
         }];
-        let frame = get_response(header(Opcode::GetResponse), &containers);
+        let frame = get_response(header(Channel::Dpoe(DpoeOpcode::GetResponse)), &containers);
         let pdu = Pdu::parse(&frame).expect("parses");
         let parsed: Vec<_> = pdu.containers().collect();
         assert_eq!(parsed.len(), 1);
@@ -590,10 +869,10 @@ mod tests {
             Branch::Terminator.as_u8(), 0x00, 0x00, 0x00,
         ];
         bytes.extend_from_slice(&[Branch::Attribute.as_u8(), 0x00, 0x06, 0x04, 1, 2, 3, 4]);
-        let vars = parse_variables(&bytes, ListShape::Containers);
+        let vars = parse_variables(&bytes, BodyShape::Containers, 0);
         assert_eq!(vars.len(), 1);
         assert_eq!(
-            vars[0].as_container().expect("a container").value,
+            vars[0].variable.as_container().expect("a container").value,
             vec![0x11, 0x22]
         );
     }
@@ -602,11 +881,74 @@ mod tests {
     fn a_truncated_value_does_not_run_past_the_buffer() {
         // Announces 128 bytes but carries four.
         let bytes = [Branch::Attribute.as_u8(), 0x00, 0x03, 0x00, 1, 2, 3, 4];
-        let vars = parse_variables(&bytes, ListShape::Containers);
+        let vars = parse_variables(&bytes, BodyShape::Containers, 0);
         assert_eq!(vars.len(), 1);
-        let c = vars[0].as_container().expect("a container");
+        let c = vars[0].variable.as_container().expect("a container");
         assert_eq!(c.length, Length::Full);
         assert_eq!(c.value, vec![1, 2, 3, 4]);
+        // The span stops at the buffer too, or a view would highlight
+        // bytes the frame does not have.
+        assert_eq!(vars[0].span, Span::new(0, bytes.len()));
+    }
+
+    /// A body nothing says is a variable list is kept and not walked. Walking
+    /// it produced containers made of whatever bytes followed, and each one
+    /// was counted as a reply.
+    #[test]
+    fn an_opaque_body_is_not_walked_as_a_variable_list() {
+        let body = [0xD7, 0x05, 0x01, 0x04, 0xDE, 0xAD, 0xBE, 0xEF];
+        let frame = raw_message(
+            header(Channel::Extension(ExtensionMessage::Other(0x0A))),
+            &body,
+        );
+        let pdu = Pdu::parse(&frame).expect("parses");
+        assert_eq!(pdu.body_shape(), BodyShape::Opaque);
+        assert!(pdu.variables.is_empty());
+        assert_eq!(pdu.containers().count(), 0);
+        let span = pdu.opaque_body.expect("the body is kept");
+        assert_eq!(span.start, BODY_OFFSET);
+        assert_eq!(&frame[span.start..span.start + body.len()], &body);
+        assert!(span.end() <= frame.len());
+    }
+
+    #[test]
+    fn a_raw_body_survives_untouched() {
+        // Deliberately malformed: a length octet promising more than is
+        // there, under a channel whose body is a list. Its bytes must reach
+        // the wire as given, because the receiver's refusal is the
+        // measurement.
+        let body = [0xD7, 0x05, 0x01, 0x7F, 0x01, 0x02];
+        let frame = raw_message(
+            header(Channel::Extension(ExtensionMessage::Variables)),
+            &body,
+        );
+        assert_eq!(&frame[BODY_OFFSET..BODY_OFFSET + body.len()], &body);
+    }
+
+    #[test]
+    fn every_variable_carries_the_span_it_was_read_from() {
+        let containers = vec![
+            Container {
+                descriptor: Descriptor::attribute(leaf::FIRMWARE_INFO),
+                length: Length::Bytes(4),
+                value: vec![1, 2, 3, 4],
+            },
+            Container {
+                descriptor: Descriptor::attribute(leaf::DEVICE_ID),
+                length: Length::Bytes(2),
+                value: vec![9, 9],
+            },
+        ];
+        let frame = get_response(header(Channel::Dpoe(DpoeOpcode::GetResponse)), &containers);
+        let pdu = Pdu::parse(&frame).expect("parses");
+        assert_eq!(pdu.variables.len(), 2);
+        let mut expected = BODY_OFFSET;
+        for (located, c) in pdu.variables.iter().zip(&containers) {
+            assert_eq!(located.span.start, expected);
+            assert_eq!(located.span.len, 4 + c.value.len());
+            assert!(located.span.end() <= frame.len());
+            expected += located.span.len;
+        }
     }
 
     #[test]

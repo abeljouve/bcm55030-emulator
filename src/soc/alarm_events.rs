@@ -1,29 +1,23 @@
-//! BCM55030 alarm / event dispatch — UI test harness.
+//! Alarm / event dispatch — a UI test harness, not a hardware model.
 //!
-//! This peripheral **does not model hardware**. The real BCM55030
-//! alarm pipeline is driven by upstream event sources:
+//! This peripheral **does not model hardware**. It claims no MMIO
+//! range, has no decoder of its own, does nothing on `tick()`, and
+//! never writes into memory. All it holds is a set of opcodes forced
+//! from the UI through [`AlarmEvent::ForcePending`] /
+//! [`AlarmEvent::ClearPending`], which the snapshot exposes.
 //!
-//!   * **LLID teardown events (opcodes 193, 199, 201)** — raised
-//!     by the EPON MAC when a deregister or link-down happens.
-//!   * **Stats counter overflow events (opcodes 23, 64)** — raised
-//!     when a per-LLID counter crosses its high-water threshold
-//!     (block 75).
-//!   * **GPIO / PMD pin-change events (opcodes 28, 131)** — raised
-//!     by physical I/O events not yet modelled.
+//! ⛔ This doc used to attribute specific opcode numbers to specific
+//! upstream sources — a teardown group, a counter-overflow group, a
+//! pin-change group. Those attributions were INFERRED, and a file
+//! whose first line says it models no hardware is the last place a
+//! reader should meet a numbered source map. They are removed rather
+//! than annotated: keeping them would mean carrying a map of a
+//! pipeline this module deliberately does not have.
 //!
-//! This peripheral does not write into firmware SRAM. It:
-//!
-//!   1.  Claims no MMIO range — it has no HW decoder of its own.
-//!   2.  Stores a **UI-forced** pending-opcode set that can be poked
-//!       via [`AlarmEvent::ForcePending`] / [`AlarmEvent::ClearPending`];
-//!       the UI snapshot exposes it.
-//!   3.  Does nothing on `tick()`.
-//!
-//! **Limitation:** with no synthetic seeder, the `alm/info` and
-//! `alm/gpio` CLI commands on a quiescent emulator show fewer
-//! persistent opcodes than real hardware would. Opcodes 28 and 131 in
-//! particular have no upstream source in the model yet and must be
-//! driven explicitly from the UI through [`AlarmEvent::ForcePending`].
+//! What remains true, and is the reason the harness exists: on a
+//! quiescent emulator the alarm CLI commands show fewer persistent
+//! opcodes than hardware would, because nothing in the model raises
+//! any. Every opcode you see here was put there from the UI.
 
 use crate::cpu::exception::Exception;
 use crate::soc::peripheral::{
@@ -31,9 +25,12 @@ use crate::soc::peripheral::{
     PeripheralSnapshot,
 };
 
-/// Maximum number of distinct opcodes the test harness tracks. The
-/// firmware dispatch table has 147 handler slots; 64 covers the
-/// working set without wasting snapshot bandwidth.
+/// Maximum number of distinct opcodes the test harness tracks.
+///
+/// A bound on a UI list, chosen so a snapshot stays small. ⛔ It is not
+/// derived from anything on the chip; the handler-table size this
+/// comment used to cite is a property of a piece of software, and this
+/// module models no hardware to compare it against.
 pub const FORCED_OPCODE_CAPACITY: usize = 64;
 
 #[derive(Clone)]

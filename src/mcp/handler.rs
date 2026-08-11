@@ -620,13 +620,77 @@ pub struct OltSendExtendedParams {
     /// Attribute leaf to read, e.g. `3` for firmware info. Takes precedence
     /// over `payload_hex` when both are given.
     pub attribute_leaf: Option<u16>,
-    /// Raw bytes placed after the vendor opcode, when building the request
-    /// by hand.
+    /// Raw bytes placed after the code octet, when building the message by
+    /// hand. They reach the wire untouched, which is what keeps a receiver's
+    /// refusal of a malformed message measurable.
     pub payload_hex: Option<String>,
-    /// Vendor opcode. Default 1 (get-request).
+    /// The octet after the OUI. It only means anything under its OUI, so the
+    /// default depends on which one you asked for.
     pub opcode: Option<u8>,
     /// OUI as `00-10-00` or `001000`. Default `00-10-00`.
     pub oui: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OltRuleListMatchEntryParams {
+    /// Byte 5 of the entry. A code; what it selects is decided by the
+    /// receiver, so it travels as a number.
+    pub type_code: u8,
+    /// Byte 6. Position established, meaning not. Default 0.
+    pub byte6: Option<u8>,
+    /// Bytes 7 and 8, each subtracted from a base the type selects.
+    pub base_a: Option<u8>,
+    pub base_b: Option<u8>,
+    /// Byte 9. Values 1 to 4 observed. Default 1.
+    pub selector: Option<u8>,
+    /// Byte 11 onward, as hex. Byte 10 is its length and is written for you.
+    pub bits_hex: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OltRuleListActionEntryParams {
+    /// Byte 5 of the entry.
+    pub type_code: u8,
+    /// Bytes 8 and 9. Omit both to send an entry with no parameter; the tag
+    /// at bytes 6..7 is written for you.
+    pub param_a: Option<u8>,
+    pub param_b: Option<u8>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OltSendRuleListParams {
+    /// Emit the reset entry first.
+    pub reset: Option<bool>,
+    /// Emit the mark entry.
+    pub mark: Option<bool>,
+    /// Entries of the list a rule matches on.
+    pub match_entries: Option<Vec<OltRuleListMatchEntryParams>>,
+    /// Entries of the list a rule acts through.
+    pub action_entries: Option<Vec<OltRuleListActionEntryParams>>,
+    /// Emit the action that puts the entries into effect.
+    pub apply: Option<bool>,
+    /// OUI the message travels under. Default `00-0D-B6`, the container the
+    /// rule list was observed on.
+    pub oui: Option<String>,
+    /// The octet after the OUI. Defaults to the one code of that container
+    /// whose body is a variable list.
+    pub opcode: Option<u8>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OltSendRuleListResult {
+    pub ok: bool,
+    pub frame_hex: String,
+    pub length: usize,
+    /// The channel the message went out on, identifier and code together.
+    pub channel: String,
+    /// Variables the update produced, in the order they were written.
+    pub variables: usize,
+    /// False when discovery has not converged: a conforming receiver
+    /// discards extended OAMPDUs until both ends report stable.
+    pub gate_open: bool,
+    pub discovery_state: String,
+    pub tx_index_before: usize,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -3403,21 +3467,15 @@ impl EmulatorHandler {
 
     #[tool(
         name = "olt_send_extended",
-        description = "Send an extended (organization-specific) OAMPDU to the ONU — typically an attribute read. Read the answer with olt_get_frames after letting the CPU run."
+        description = "Send an extended (organization-specific) OAMPDU to the ONU — typically an attribute read, or a hand-built body that reaches the wire untouched. Read the answer with olt_get_frames after letting the CPU run."
     )]
     async fn olt_send_extended(
         &self,
         Parameters(params): Parameters<OltSendExtendedParams>,
     ) -> Json<OltSendExtendedResult> {
-        use crate::soc::olt::{extended, oam};
         let mut bank = self.handle.bank.write();
         let tx_index_before = bank.olt.tx_log().len();
-        let oui = params
-            .oui
-            .as_deref()
-            .and_then(parse_oui)
-            .map(oam::Oui)
-            .unwrap_or(oam::Oui::DPOE);
+        let oui = params.oui.as_deref().and_then(parse_oui).unwrap_or(DEFAULT_OUI);
 
         let frame = if let Some(leaf) = params.attribute_leaf {
             bank.olt.request_attribute(leaf)
@@ -3427,8 +3485,10 @@ impl EmulatorHandler {
                 .as_deref()
                 .and_then(hex_decode)
                 .unwrap_or_default();
-            let opcode = extended::Opcode::from(params.opcode.unwrap_or(1));
-            bank.olt.send_extended(oui, opcode, &payload)
+            // The octet only means anything under its identifier, so the
+            // value used when the caller names none depends on the OUI.
+            let code = params.opcode.unwrap_or_else(|| default_code_for(oui));
+            bank.olt.send_extended(oui, code, &payload)
         };
 
         let d = bank.olt.discovery();
@@ -3436,6 +3496,79 @@ impl EmulatorHandler {
             ok: true,
             frame_hex: bytes_to_hex(&frame),
             length: frame.len(),
+            gate_open: d.converged(),
+            discovery_state: format!("{:?}", d.state()),
+            tx_index_before,
+        })
+    }
+
+    #[tool(
+        name = "olt_send_rule_list",
+        description = "Send a classifier rule-list update as one extended OAMPDU: an optional reset and mark, entries of the match list and of the action list, and an optional apply. Each entry's sub-operation and type code are separate named fields, which is what keeps them from being written the wrong way round."
+    )]
+    async fn olt_send_rule_list(
+        &self,
+        Parameters(params): Parameters<OltSendRuleListParams>,
+    ) -> Json<OltSendRuleListResult> {
+        use crate::soc::olt::extended::Channel;
+        use crate::soc::olt::rule_list::{
+            ActionEntry, ActionParameter, MatchEntry, RuleListUpdate,
+        };
+
+        let mut bank = self.handle.bank.write();
+        let tx_index_before = bank.olt.tx_log().len();
+        let oui = params
+            .oui
+            .as_deref()
+            .and_then(parse_oui)
+            .unwrap_or(RULE_LIST_OUI);
+        let channel =
+            Channel::decode(oui, params.opcode.unwrap_or_else(|| default_code_for(oui)));
+
+        let update = RuleListUpdate {
+            reset: params.reset.unwrap_or(false),
+            mark: params.mark.unwrap_or(false),
+            match_entries: params
+                .match_entries
+                .unwrap_or_default()
+                .into_iter()
+                .map(|m| {
+                    MatchEntry::new(
+                        m.type_code,
+                        m.byte6.unwrap_or(0),
+                        (m.base_a.unwrap_or(0), m.base_b.unwrap_or(0)),
+                        m.selector.unwrap_or(1),
+                        m.bits_hex.as_deref().and_then(hex_decode).unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            action_entries: params
+                .action_entries
+                .unwrap_or_default()
+                .into_iter()
+                .map(|a| {
+                    let parameter = match (a.param_a, a.param_b) {
+                        (None, None) => None,
+                        (x, y) => Some(ActionParameter::new(
+                            x.unwrap_or(0),
+                            y.unwrap_or(0),
+                        )),
+                    };
+                    ActionEntry::new(a.type_code, parameter)
+                })
+                .collect(),
+            apply: params.apply.unwrap_or(false),
+        };
+
+        let variables = update.variables().len();
+        let frame = bank.olt.send_rule_list(channel, &update);
+        let d = bank.olt.discovery();
+        Json(OltSendRuleListResult {
+            ok: true,
+            frame_hex: bytes_to_hex(&frame),
+            length: frame.len(),
+            channel: format!("{} {}", channel.oui(), channel),
+            variables,
             gate_open: d.converged(),
             discovery_state: format!("{:?}", d.state()),
             tx_index_before,
@@ -3691,17 +3824,29 @@ impl EmulatorHandler {
 }
 
 
+/// The container an extended OAMPDU goes out on when the caller names none.
+const DEFAULT_OUI: crate::soc::olt::oam::Oui = crate::soc::olt::oam::Oui::DPOE;
+/// The container the rule list was observed on.
+const RULE_LIST_OUI: crate::soc::olt::oam::Oui =
+    crate::soc::olt::oam::Oui::VENDOR_EXTENSION;
+
 /// Parse an OUI written `00-10-00`, `00:10:00` or `001000`.
-fn parse_oui(s: &str) -> Option<[u8; 3]> {
-    let clean: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-    if clean.len() != 6 {
-        return None;
+fn parse_oui(s: &str) -> Option<crate::soc::olt::oam::Oui> {
+    crate::soc::olt::oam::Oui::parse(s)
+}
+
+/// The octet to write after an OUI the caller named without a code.
+///
+/// There is no OUI-independent default: the octet is read under its
+/// identifier, so `1` means a read request in one container and something
+/// with no variable list at all in the other. Taking `1` for every OUI is how
+/// a message announced itself as one it was not.
+fn default_code_for(oui: crate::soc::olt::oam::Oui) -> u8 {
+    use crate::soc::olt::extended::{DpoeOpcode, ExtensionMessage};
+    match oui {
+        RULE_LIST_OUI => ExtensionMessage::Variables.as_u8(),
+        _ => DpoeOpcode::GetRequest.as_u8(),
     }
-    let mut out = [0u8; 3];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(out)
 }
 
 fn oam_flags_view(f: crate::soc::olt::oam::Flags) -> OamFlagsView {
@@ -3898,6 +4043,7 @@ fn is_mutation_tool(name: &str) -> bool {
             | "olt_set_trace"
             | "olt_reset_session"
             | "olt_send_extended"
+            | "olt_send_rule_list"
             | "olt_inject_frame"
     )
 }
@@ -4037,5 +4183,48 @@ fn build_peripheral_event(p: &InjectPeripheralEventParams) -> Option<PeripheralE
             Some(PeripheralEvent::FatalFilter(FatalFilterEvent::ClearFatal))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::soc::olt::extended::{Channel, DpoeOpcode, ExtensionMessage};
+    use crate::soc::olt::oam::Oui;
+
+    /// The tool used to write `1` after whichever OUI the caller named. That
+    /// octet is read under its identifier, so the same `1` announced a read
+    /// request under one container and a message with no variable list at
+    /// all under the other.
+    #[test]
+    fn the_default_code_depends_on_the_container_it_goes_under() {
+        assert_eq!(default_code_for(DEFAULT_OUI), DpoeOpcode::GetRequest.as_u8());
+        assert_eq!(
+            default_code_for(RULE_LIST_OUI),
+            ExtensionMessage::Variables.as_u8()
+        );
+        assert_ne!(default_code_for(DEFAULT_OUI), default_code_for(RULE_LIST_OUI));
+        // And each default decodes back to a message of its own container.
+        assert_eq!(
+            Channel::decode(DEFAULT_OUI, default_code_for(DEFAULT_OUI)),
+            Channel::Dpoe(DpoeOpcode::GetRequest)
+        );
+        assert_eq!(
+            Channel::decode(RULE_LIST_OUI, default_code_for(RULE_LIST_OUI)),
+            Channel::Extension(ExtensionMessage::Variables)
+        );
+    }
+
+    #[test]
+    fn an_oui_parameter_accepts_the_spellings_a_caller_writes() {
+        for (text, want) in [
+            ("00-10-00", Oui::DPOE),
+            ("001000", Oui::DPOE),
+            ("00:0d:b6", Oui::VENDOR_EXTENSION),
+            ("000DB6", Oui::VENDOR_EXTENSION),
+        ] {
+            assert_eq!(parse_oui(text), Some(want), "{text}");
+        }
+        assert_eq!(parse_oui("00-10"), None);
     }
 }

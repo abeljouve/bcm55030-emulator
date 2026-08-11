@@ -2,13 +2,14 @@
 //!
 //! Owns the DMA channel file at `0x01002000..0x01004000`. The file
 //! is organised as a set of stride-`0x200` channel slots (one per
-//! DMA channel) sharing a common sub-offset layout. The MACsec SA
-//! programming windows at `0x01002400..0x01002D40` and
-//! `0x01003500..0x01003540` sit inside this range but are claimed
-//! first by [`Macsec`](super::macsec::Macsec) — DMA excludes those
-//! addresses via its own [`claims`](DmaChannelController::claims)
-//! predicate so the two peripherals do not fight over the same
-//! routes.
+//! DMA channel) sharing a common sub-offset layout.
+//!
+//! Four sub-ranges inside that span are served by other peripherals
+//! and are excluded from this one's
+//! [`claims`](DmaChannelController::claims) predicate, so no two
+//! peripherals fight over a route — see `FOREIGN_RANGES` below.
+//! ⛔ Only one of the four is MACsec; this doc used to call all of them
+//! MACsec windows, and the constant used to be named after that.
 //!
 //! Each channel slot exposes, at minimum:
 //!
@@ -39,16 +40,24 @@ use crate::soc::peripheral::{
 pub const DMA_BASE: u32 = 0x0100_2000;
 pub const DMA_END: u32 = 0x0100_4000;
 
-/// Sub-ranges inside `DMA_BASE..DMA_END` that belong to other
-/// peripherals (MACsec, filter/fatal) and must NOT be claimed by
-/// this one. The bank router checks MACsec first, but the
-/// exclusion keeps the predicate self-consistent if routing order
-/// ever changes.
+/// Sub-ranges inside `DMA_BASE..DMA_END` that another peripheral
+/// serves, and that this one must therefore not claim.
 ///
-/// `0x01003604` is the filter / fatal error aggregator carved out
-/// from the DMA window until `fatal_filter.rs` lands; it stays in
-/// `sysreg_shim` with a hardcoded `=> 0` arm.
-const MACSEC_CARVEOUTS: &[(u32, u32)] = &[
+/// ⛔ Renamed from `MACSEC_CARVEOUTS`: only the first of the four is a
+/// MACsec range. The second is the 96-bit indirect table of
+/// `soc/mac_filter`, the third a further window in that family, and the
+/// fourth the block `soc/fatal_filter` serves — none of them MACsec.
+/// The bank router checks the other peripherals first, so this list is
+/// belt-and-braces; it keeps the predicate self-consistent if the
+/// routing order ever changes.
+///
+/// ⛔ These bounds are load-bearing and independent of whatever any
+/// other peripheral's own claim predicate says. Narrowing one here does
+/// not follow from narrowing a claim elsewhere: it would hand this
+/// peripheral an address range it has never served, and the change
+/// would only show up as a routing difference in a boot trace. Change
+/// the name, never the numbers.
+const FOREIGN_RANGES: &[(u32, u32)] = &[
     (0x0100_2400, 0x0100_2D40),
     (0x0100_3000, 0x0100_3080),
     (0x0100_3500, 0x0100_3540),
@@ -94,7 +103,7 @@ impl DmaChannelController {
         if !(DMA_BASE..DMA_END).contains(&addr) {
             return false;
         }
-        !MACSEC_CARVEOUTS
+        !FOREIGN_RANGES
             .iter()
             .any(|(start, end)| addr >= *start && addr < *end)
     }
@@ -245,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn macsec_carveouts_excluded_from_claim() {
+    fn foreign_ranges_are_excluded_from_the_claim() {
         let d = DmaChannelController::new();
         assert!(d.claims(0x0100_2000));
         assert!(d.claims(0x0100_23FC));

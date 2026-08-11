@@ -46,6 +46,12 @@ use crate::soc::peripheral::{
     PeripheralSnapshot,
 };
 
+/// The word the first register of the file reads back.
+///
+/// ⛔ Not a part number. The register DB reads the top half of this value as
+/// one, which would name a different SoC than the one this emulator models —
+/// naming a chip from a magic constant is an inference wearing an
+/// identifier's clothes. Kept as the value that was read, nothing more.
 pub const CHIP_ID_VALUE: u32 = 0x47010203;
 pub const CHIP_REV_VALUE: u32 = 0xB2110816;
 /// Silicon power-on default for LLID_CAPTURE_MASK / PON_MODE — zero,
@@ -62,9 +68,13 @@ pub const LLID_COUNTER_MASK_RESET: u32 = 0x0007_7FF7;
 pub const MPCP_CMD_LATCH_RESET: u32 = 0x0001_5000;
 pub const EPON_SIG_VALUE: u32 = 0x4550_4F4E; // "EPON"
 
-/// Number of active LLID slots the firmware scans in the stride-0x200
-/// counter / IRQ / drain blocks. The HW exposes up to 16 slots but
-/// the firmware only enables six on the BCM55030 reference design.
+/// Number of LLID slots this model serves in the stride-0x200 counter /
+/// IRQ / drain blocks.
+///
+/// ⛔ Six is the number **this model** serves, not a measured slot count.
+/// The window it spans (`0x01001400..0x01002000`) is what fixes it; no
+/// reading of the hardware says how many slots exist, and the "reference
+/// design" this comment used to invoke is not in evidence anywhere.
 pub const LLID_SLOT_COUNT: usize = 6;
 
 const EPON_LLID_BASE: u32 = 0x0100_1400;
@@ -79,6 +89,17 @@ const REG_REPORT_FRAME_LEN: u32 = 0x0100_052C;
 const EPON_TABLE_BASE: u32 = 0x0100_0400;
 const EPON_TABLE_END: u32 = 0x0100_0E80;
 
+// ⛔ The names below are INFERRED. The register DB holds a competing map of
+// the same page shifted by +0xFFC, and a third at block 68 rooted at
+// 0x01000000; for 0x01000020 alone three names exist (LLID_MASK_CONTROL
+// here, MPCP_SLOT_CONFIG in block 39, LINK_ENABLE_BITMAP_LOW in block 68).
+// No measurement separates them, so a name here is a label on a word, not a
+// claim about a subsystem.
+//
+// What IS established in this file is behavioural, not nominal: which words
+// the firmware polls, which are write-1-to-clear, which read as constants,
+// and which anchor addresses drop bit 0 on write. Those are the facts the
+// tests below pin; the names are how we talk about them.
 const REG_CHIP_ID: u32 = 0x0100_0000;
 const REG_CHIP_REV: u32 = 0x0100_0004;
 const REG_LLID_CAPTURE_MASK: u32 = 0x0100_000C;

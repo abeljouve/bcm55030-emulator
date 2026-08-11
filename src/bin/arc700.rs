@@ -41,6 +41,8 @@ fn usage(prog: &str) {
     eprintln!("  --mcp-port <PORT>           Start MCP server on PORT (enables worker mode)");
     eprintln!("  --olt-mac <MAC>             OLT MAC address (AA:BB:CC:DD:EE:FF)");
     eprintln!("  --olt-attributes <L,L,..>   Attribute leaves the peer reads, hex (e.g. 3,6,e)");
+    eprintln!("  --uni-rx <SIGNAL>           What arrives on the UNI receive pair, and arm the");
+    eprintln!("                              port: none | basex | basex-an | 10g (default: unarmed)");
     eprintln!();
     eprintln!("For the egui GUI, build with --features ui:");
     eprintln!("  cargo run --release --features ui --bin arc700-gui");
@@ -81,6 +83,11 @@ struct Config {
     /// `--olt-attributes`: leaves the peer reads in rotation. Widen it to
     /// survey which attributes the firmware answers, and with what width.
     olt_attributes: Option<Vec<u16>>,
+    /// `--uni-rx`: the signal a link partner puts on the UNI receive
+    /// pair. Passing it also arms the port — every reading of the two
+    /// derived words was taken with the port armed, so an unarmed one
+    /// would be a state the model has never been shown.
+    uni_rx: Option<bcm55030_emulator::soc::uni::UniRxSignal>,
     /// `--timing`: enable the cycle-accurate cache + bus-contention overlay
     /// (the `timing` feature). Off by default; the ISS is unchanged without it.
     #[cfg(feature = "timing")]
@@ -132,6 +139,7 @@ fn parse_args() -> Config {
         mcp_port: None,
         olt_mac: None,
         olt_attributes: None,
+        uni_rx: None,
         #[cfg(feature = "timing")]
         timing: false,
     };
@@ -312,6 +320,24 @@ fn parse_args() -> Config {
                         })
                         .collect(),
                 );
+            }
+            "--uni-rx" => {
+                use bcm55030_emulator::soc::uni::UniRxSignal;
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --uni-rx requires none|basex|basex-an|10g");
+                    process::exit(1);
+                }
+                cfg.uni_rx = Some(match args[i].as_str() {
+                    "none" => UniRxSignal::None,
+                    "basex" => UniRxSignal::BaseX { autoneg: false },
+                    "basex-an" => UniRxSignal::BaseX { autoneg: true },
+                    "10g" => UniRxSignal::TenGigCoding,
+                    other => {
+                        eprintln!("Error: --uni-rx: unknown signal {other:?}");
+                        process::exit(1);
+                    }
+                });
             }
             "--olt-mac" => {
                 i += 1;
@@ -743,6 +769,17 @@ fn main() {
         if let Some(mac) = cfg.olt_mac {
             bank.olt.config.mac = mac.into();
         }
+    }
+
+    // A link partner on the UNI port. Nothing arms the port on its own:
+    // the emulator has no partner unless one is declared here.
+    if let Some(rx) = cfg.uni_rx {
+        use bcm55030_emulator::soc::peripheral::PeripheralEvent;
+        use bcm55030_emulator::soc::uni::UniEvent;
+        let mut bank = cpu.bank().unwrap().write();
+        bank.inject_event(&PeripheralEvent::Uni(UniEvent::SetArmed(true)));
+        bank.inject_event(&PeripheralEvent::Uni(UniEvent::SetRxSignal(rx)));
+        eprintln!("[uni] receive pair: {rx:?}, port armed");
     }
 
     if let Some(port) = cfg.mcp_port {

@@ -1,21 +1,38 @@
-//! BCM55030 Numerically Controlled Oscillator (NCO).
+//! The 16-slot low-memory table that doubles as the ARC interrupt
+//! vector table, plus one word at `0x01000F80`.
 //!
-//! Owns the single `NCO_TX_MODE_SECONDARY` register at `0x01000F80`
-//! (hwregs block 23). The firmware uses this register to toggle
-//! dual-TX mode on the SerDes TX path:
+//! ⛔ The module keeps its `nco` name for its consumers, but the name is
+//! the weakest thing in it. The table this module's slots model holds
+//! `j @<limm>` instruction pairs — that reading is anchored on live
+//! silicon, where slot 0 reads `2020 0f80 0000 0150`, an ARCompact jump
+//! to `0x150`. An oscillator's frequency word and a jump target cannot
+//! be the same four bytes, so the per-field oscillator names this file
+//! used to carry (`CONFIG` / `PRESCALE` / `FREQ_HI` / `FREQ_LO`) are
+//! not describing what is stored. They are recorded here only as the
+//! names the register DB uses for the same slot, which calls it an NCO
+//! channel array — and separately notes that reading as mislabelled.
 //!
-//! | Bit | Name                     | Semantics                   |
-//! |:----|:-------------------------|:----------------------------|
-//! | `9` | `NCO_TX_MODE_SECONDARY`  | Set in mode 2               |
-//! | `14`| `NCO_DUAL_TX_ENABLE`     | Enable dual-TX mode         |
+//! ⛔ `0x01000F80` has **three** claimants in the register DB and no
+//! measurement separates them: a MACsec channel-enable word (block 15),
+//! a secondary TX-mode word with a bit 9 (block 23), and a lane-busy
+//! status bit 3 (block 25). This module serves it as a plain backing
+//! store, which is the only behaviour all three readings agree on. The
+//! bit table this doc used to print asserted the second reading as
+//! fact; the constant is `REG_NCO_TX_MODE` for its call sites, not
+//! because the name is established.
 //!
-//! v1 is a plain backing store. `CLK_READY_FLAG` at `0x00FC1017` is
-//! not claimed here because the warm boot path never touches it; it
-//! can migrate in when a firmware path that reads it is identified.
+//! `CLK_READY_FLAG` at `0x00FC1017` is not claimed here because the warm
+//! boot path never touches it; it can migrate in when a firmware path
+//! that reads it is identified.
 
 use crate::cpu::exception::Exception;
 use crate::soc::peripheral::{AddressRange, Peripheral, PeripheralSnapshot};
 
+/// The one MMIO word this peripheral claims. ⛔ Three blocks of the
+/// register DB name it differently and nothing measured separates them
+/// — see the module doc. The constant keeps its name for its call
+/// sites; served as a plain backing store, which is what all three
+/// readings have in common.
 pub const REG_NCO_TX_MODE: u32 = 0x0100_0F80;
 
 const NCO_RANGES: &[AddressRange] =
@@ -34,23 +51,29 @@ pub const NCO_SLOT_BYTES: u32 = 8;
 pub const NCO_IVT_LIMIT: u32 = (NCO_CHANNELS as u32) * NCO_SLOT_BYTES;
 
 /// The ARCompact `j @<limm>` opcode word that prefixes every
-/// programmed NCO/IVT slot (`CONFIG=0x2020`, `PRESCALE=0x0F80`,
-/// big-endian on-chip = bytes `20 20 0f 80`). When a slot's first
-/// four bytes equal this, the channel is an installed interrupt
-/// vector and the trailing 32-bit word is the absolute jump target.
-/// Live-silicon anchor: slot0 = `2020 0f80 0000 0150` = `j @0x150`.
+/// programmed slot (big-endian on-chip = bytes `20 20 0f 80`). When a
+/// slot's first four bytes equal this, the channel is an installed
+/// interrupt vector and the trailing 32-bit word is the absolute jump
+/// target. Live-silicon anchor: slot 0 = `2020 0f80 0000 0150`,
+/// i.e. `j @0x150`. This is the measured half of the module; the
+/// oscillator reading of the same bytes is the unmeasured half.
 pub const NCO_J_LIMM_OPCODE: u32 = 0x2020_0F80;
 
-/// One NCO channel / ARC interrupt-vector slot. The hardware aliases
-/// the 16-channel NCO table over the low-memory ARC interrupt-vector
-/// range on a separate physical bus: `.di` (uncached) stores land
-/// here, while plain CPU reads / instruction fetch see SRAM. The ARC
-/// interrupt unit fetches its vector from this table, not from SRAM.
-/// (The NCO table IS the ARC IVT; live-silicon slot0 = `j @0x150`.)
+/// One slot of the 16-entry table. The hardware aliases it over the
+/// low-memory ARC interrupt-vector range on a separate physical bus:
+/// `.di` (uncached) stores land here, while plain CPU reads and
+/// instruction fetch see SRAM. The ARC interrupt unit fetches its
+/// vector from this table, not from SRAM — live-silicon slot 0 reads
+/// `j @0x150`.
 #[derive(Clone, Copy)]
 pub struct NcoSlot {
-    /// Raw 8 bytes exactly as written by the `stw.di` field stores
-    /// (`+0 CONFIG`, `+2 PRESCALE`, `+4 FREQ_HI`, `+6 FREQ_LO`).
+    /// Raw 8 bytes exactly as written by the four `stw.di` halfword
+    /// stores: `+0 opcode_hi`, `+2 opcode_lo`, `+4 target_hi`,
+    /// `+6 target_lo`. ⛔ The register DB names the same four fields
+    /// `CONFIG` / `PRESCALE` / `FREQ_HI` / `FREQ_LO`, i.e. an
+    /// oscillator's configuration and frequency. Those names cannot be
+    /// right for a slot that decodes as a jump, and nothing in this
+    /// module treats the bytes as a frequency.
     pub raw: [u8; 8],
     /// Any `.di` field has been written to this slot since reset.
     pub written: bool,
@@ -61,14 +84,17 @@ impl NcoSlot {
         Self { raw: [0; 8], written: false }
     }
 
-    /// `CONFIG` halfword (`raw[0..2]`, big-endian).
+    /// High halfword of the opcode pair (`raw[0..2]`, big-endian) — the
+    /// register DB calls this field `CONFIG`.
     #[inline]
     pub fn config(&self) -> u16 {
         ((self.raw[0] as u16) << 8) | self.raw[1] as u16
     }
 
-    /// The absolute 32-bit jump target (`FREQ_HI:FREQ_LO`,
-    /// `raw[4..8]`, big-endian) — the operand of the `j @<limm>`.
+    /// The absolute 32-bit jump target (`raw[4..8]`, big-endian) — the
+    /// long-immediate operand of the `j @<limm>` in the first four
+    /// bytes. ⛔ The register DB reads the same two halfwords as a
+    /// frequency word split high/low.
     #[inline]
     pub fn target(&self) -> u32 {
         ((self.raw[4] as u32) << 24)

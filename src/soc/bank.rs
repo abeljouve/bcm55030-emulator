@@ -39,6 +39,7 @@ use crate::soc::serdes::SerDes;
 use crate::soc::sysreg_shim::SysregShim;
 use crate::soc::timer::EponTimer;
 use crate::soc::uart::Uart;
+use crate::soc::uni::Uni;
 use crate::soc::mac_filter::MacFilter;
 
 /// CPU instructions between bank tick invocations. Higher = less
@@ -154,11 +155,17 @@ impl SeqTrace {
     }
 
     /// Write one JSON Lines entry. Never panics — silently ignores write errors.
+    ///
+    /// `blink` is here because the indirect ports are all driven from a
+    /// single helper: every access to one carries the same `pc`, so the
+    /// program counter attributes nothing and the return address is the
+    /// only column that names a caller.
     #[inline]
-    pub fn emit(&mut self, cycle: u64, pc: u32, addr: u32, value: u32, rw: &str, width: &str, periph: &str, di: bool) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit(&mut self, cycle: u64, pc: u32, blink: u32, addr: u32, value: u32, rw: &str, width: &str, periph: &str, di: bool) {
         let _ = writeln!(
             self.writer,
-            r#"{{"cycle":{cycle},"pc":{pc},"addr":{addr},"value":{value},"rw":"{rw}","width":"{width}","periph":"{periph}","di":{di}}}"#,
+            r#"{{"cycle":{cycle},"pc":{pc},"blink":{blink},"addr":{addr},"value":{value},"rw":"{rw}","width":"{width}","periph":"{periph}","di":{di}}}"#,
         );
     }
 
@@ -194,6 +201,10 @@ pub struct PeripheralBank {
     pub use_classifier: bool,
     pub classifier_binding: crate::soc::lue::ClassifierBinding,
     pub serdes: SerDes,
+    /// The UNI-side Ethernet port. Its block sits inside what the SerDes
+    /// and the MACsec engine both used to claim, so it is tested before
+    /// either of them on every dispatch chain.
+    pub uni: Uni,
     pub epon_mac: EponMac,
     pub macsec: Macsec,
     pub dma: DmaChannelController,
@@ -318,6 +329,7 @@ impl PeripheralBank {
                 bus
             },
             serdes: SerDes::new(),
+            uni: Uni::new(),
             epon_mac: EponMac::new(),
             macsec: Macsec::new(),
             dma: DmaChannelController::new(),
@@ -393,6 +405,7 @@ impl PeripheralBank {
         self.bsc_i2c.tick(cpu_instructions);
         self.mpcp_bus.tick();
         self.serdes.tick(cpu_instructions);
+        self.uni.tick(cpu_instructions);
         self.epon_mac.tick(cpu_instructions);
         self.macsec.tick(cpu_instructions);
         self.dma.tick(cpu_instructions);
@@ -619,6 +632,7 @@ impl PeripheralBank {
         // G4: cal-done bit7 (0x1BB/0x1DB) NOT force-seeded on reset —
         // default not-converged. Scenario opt-in applies it in tick().
         self.serdes.reset_cold();
+        self.uni.reset_cold();
         self.epon_mac.reset_cold();
         self.macsec.reset_cold();
         self.dma.reset_cold();
@@ -653,6 +667,7 @@ impl PeripheralBank {
         // G4: cal-done bit7 (0x1BB/0x1DB) NOT force-seeded on reset —
         // default not-converged. Scenario opt-in applies it in tick().
         self.serdes.reset_warm();
+        self.uni.reset_warm();
         self.epon_mac.reset_warm();
         self.macsec.reset_warm();
         self.dma.reset_warm();
@@ -783,7 +798,7 @@ impl PeripheralBank {
     fn seq_emit(&mut self, addr: u32, value: u32, rw: &str, width: &str, periph: &str) {
         if let Some(ref mut st) = self.seq_trace {
             if st.addr_matches(addr) {
-                st.emit(self.current_insn, self.current_pc, addr, value, rw, width, periph, self.current_di);
+                st.emit(self.current_insn, self.current_pc, self.current_blink, addr, value, rw, width, periph, self.current_di);
             }
         }
     }
@@ -797,6 +812,7 @@ impl PeripheralBank {
             self.bsc_i2c.snapshot(),
             self.bsc_i2c.sfp_snapshot(),
             self.serdes.snapshot(),
+            self.uni.snapshot(),
             self.epon_mac.snapshot(),
             self.macsec.snapshot(),
             self.dma.snapshot(),
@@ -810,11 +826,12 @@ impl PeripheralBank {
 
     /// Dispatch a UI event to the peripheral that understands it.
     pub fn inject_event(&mut self, event: &PeripheralEvent) -> bool {
-        let targets: [&mut dyn Peripheral; 14] = [
+        let targets: [&mut dyn Peripheral; 15] = [
             &mut self.uart,
             &mut self.pbc,
             &mut self.bsc_i2c,
             &mut self.serdes,
+            &mut self.uni,
             &mut self.epon_mac,
             &mut self.macsec,
             &mut self.dma,
@@ -864,6 +881,7 @@ impl PeripheralBank {
         if self.pbc.claims(addr) { return Some("pbc"); }
         if self.bsc_i2c.claims(addr) { return Some("bsc_i2c"); }
         if self.lue.claims(addr) { return Some("lue"); }
+        if self.uni.claims(addr) { return Some("uni"); }
         if self.serdes.claims(addr) { return Some("serdes"); }
         // mpcp_tssync claims 8 exact addresses, two of which (0x0D88/
         // 0x0D8C) fall inside epon_mac's table window — check it FIRST.
@@ -891,6 +909,7 @@ impl PeripheralBank {
             use_classifier: self.use_classifier,
             classifier_binding: self.classifier_binding,
             serdes: self.serdes.clone(),
+            uni: self.uni.clone(),
             epon_mac: self.epon_mac.clone(),
             macsec: self.macsec.clone(),
             dma: self.dma.clone(),
@@ -922,6 +941,7 @@ impl PeripheralBank {
         self.use_classifier = state.use_classifier;
         self.classifier_binding = state.classifier_binding;
         self.serdes = state.serdes;
+        self.uni = state.uni;
         self.epon_mac = state.epon_mac;
         self.macsec = state.macsec;
         self.dma = state.dma;
@@ -982,6 +1002,9 @@ impl PeripheralBank {
         }
         if self.lue.claims(addr) {
             return Ok(self.lue.peek_word(addr).unwrap_or(0));
+        }
+        if self.uni.claims(addr) {
+            return self.uni.peek_word(addr);
         }
         if self.serdes.claims(addr) {
             return self.serdes.peek_word(addr);
@@ -1082,6 +1105,7 @@ impl PeripheralBank {
             return Ok(v);
         }
         if self.lue.claims(addr) { dispatch_rw!(self.lue, "lue"); }
+        if self.uni.claims(addr) { dispatch_rw!(self.uni, "uni"); }
         if self.serdes.claims(addr) {
             let v = self.serdes.read_word(addr)?;
             let tag = SerDes::mdio_peripheral_tag(addr);
@@ -1234,6 +1258,7 @@ impl PeripheralBank {
             return Ok(());
         }
         if self.lue.claims(addr) { dispatch_ww!(self.lue, "lue"); }
+        if self.uni.claims(addr) { dispatch_ww!(self.uni, "uni"); }
         if self.serdes.claims(addr) {
             if addr == 0x0100_01B0 {
                 let old = self.serdes.peek_word(addr).unwrap_or(0);
@@ -1357,6 +1382,7 @@ impl PeripheralBank {
         if self.pbc.claims(addr) { dispatch_rh!(self.pbc, "pbc"); }
         if self.bsc_i2c.claims(addr) { dispatch_rh!(self.bsc_i2c, "bsc_i2c"); }
         if self.lue.claims(addr) { dispatch_rh!(self.lue, "lue"); }
+        if self.uni.claims(addr) { dispatch_rh!(self.uni, "uni"); }
         if self.serdes.claims(addr) { dispatch_rh!(self.serdes, "serdes"); }
         if self.mpcp_tssync.claims(addr) { dispatch_rh!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.epon_mac.claims(addr) { dispatch_rh!(self.epon_mac, "epon_mac"); }
@@ -1392,6 +1418,7 @@ impl PeripheralBank {
         if self.pbc.claims(addr) { dispatch_wh!(self.pbc, "pbc"); }
         if self.bsc_i2c.claims(addr) { dispatch_wh!(self.bsc_i2c, "bsc_i2c"); }
         if self.lue.claims(addr) { dispatch_wh!(self.lue, "lue"); }
+        if self.uni.claims(addr) { dispatch_wh!(self.uni, "uni"); }
         if self.serdes.claims(addr) { dispatch_wh!(self.serdes, "serdes"); }
         if self.mpcp_tssync.claims(addr) { dispatch_wh!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.epon_mac.claims(addr) { dispatch_wh!(self.epon_mac, "epon_mac"); }
@@ -1437,6 +1464,7 @@ impl PeripheralBank {
         if self.pbc.claims(addr) { dispatch_rb!(self.pbc, "pbc"); }
         if self.bsc_i2c.claims(addr) { dispatch_rb!(self.bsc_i2c, "bsc_i2c"); }
         if self.lue.claims(addr) { dispatch_rb!(self.lue, "lue"); }
+        if self.uni.claims(addr) { dispatch_rb!(self.uni, "uni"); }
         if self.serdes.claims(addr) { dispatch_rb!(self.serdes, "serdes"); }
         if self.mpcp_tssync.claims(addr) { dispatch_rb!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.epon_mac.claims(addr) { dispatch_rb!(self.epon_mac, "epon_mac"); }
@@ -1472,6 +1500,7 @@ impl PeripheralBank {
         if self.pbc.claims(addr) { dispatch_wb!(self.pbc, "pbc"); }
         if self.bsc_i2c.claims(addr) { dispatch_wb!(self.bsc_i2c, "bsc_i2c"); }
         if self.lue.claims(addr) { dispatch_wb!(self.lue, "lue"); }
+        if self.uni.claims(addr) { dispatch_wb!(self.uni, "uni"); }
         if self.serdes.claims(addr) { dispatch_wb!(self.serdes, "serdes"); }
         if self.mpcp_tssync.claims(addr) { dispatch_wb!(self.mpcp_tssync, "mpcp_tssync"); }
         if self.epon_mac.claims(addr) { dispatch_wb!(self.epon_mac, "epon_mac"); }

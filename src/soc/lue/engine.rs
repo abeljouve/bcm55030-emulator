@@ -6,20 +6,27 @@
 //! fourth word is something else ends the rule, and that word is its
 //! first action word.
 //!
-//! Two things this engine deliberately refuses to do:
+//! Three things this engine deliberately refuses to do:
 //!
 //! * **Guess a field.** Only three field codes have a frame field behind
 //!   them. The other codes a live rule set uses are real but unexplained,
 //!   and a clause over one of them returns [`Verdict::Undecidable`] —
 //!   never a match, never a silent miss.
+//! * **Guess an operator.** Four of the sixteen operator codes are
+//!   established by their operands; software emits four more whose
+//!   meaning is not. Acting on one of those is worst where it looks most
+//!   harmless — a rule whose clauses all carry an unexplained code would
+//!   match *every* frame and route it, which is not a missing answer but
+//!   a confident wrong one. Exactly one unexplained code is acted on, in
+//!   exactly one place: see [`OP_TAG_ABSENCE`].
 //! * **Fall through.** A frame that matches nothing is a miss with a
 //!   counter, not an implicit default.
 //!
-//! Not every clause is a comparison. Two operators ask whether the frame
-//! carries the field at all, and those are answered from the frame's
-//! shape rather than from a value — see [`field_presence`], which decides
-//! the case where an open question does not matter and refuses the case
-//! where it does.
+//! Not every clause is a comparison. One operator is read as asking
+//! whether the frame carries a tag at all, and that is answered from the
+//! frame's shape rather than from a value — see [`field_presence`], which
+//! decides the case where an open question does not matter and refuses
+//! the case where it does.
 //!
 //! A clause compares over a window, not over the whole field: `shift`
 //! and `anchor` are its two ends, and both are honoured here. See
@@ -104,13 +111,20 @@ fn extract_field(field: Field, frame: &[u8]) -> Option<u64> {
 /// is what the model needs: **on the boot path this descriptor is written
 /// once and never rewritten.**
 ///
-/// ⛔ **What the descriptor selects is NOT established.** Of its four
-/// fields only the width is pinned — by the table software uses to turn a
-/// protocol field code into a hardware one, whose width column agrees
-/// with twenty-odd known field widths — and slot 0's says **16 bits**.
-/// The remaining fields are a selector into some field namespace and two
-/// numbers whose unit (bits? bytes? from where?) nothing in the image
-/// fixes.
+/// ⛔ **What the descriptor selects is NOT established**, and the one
+/// thing that used to be called pinned has since been contradicted. The
+/// claim was that the descriptor's width is 16 bits, read off the width
+/// column of the software-side table that turns a wire field code into a
+/// header field code. That table has since been read out of a live
+/// device in full, and **not one of its extractor rows is 16 bits wide**
+/// — the rows that name an extractor rather than a hardware field carry
+/// widths of 0x14 and 0x20, never 0x10. So either the row was misread or
+/// the width does not come from that table at all.
+///
+/// ⛔ The remaining columns of that table are **not** imported here, and
+/// must not be: it is a software translation table, indexed before
+/// anything is written, and the hardware never reads it. Its column names
+/// are inferred, not measured.
 ///
 /// -- INFERRED: this model reads those sixteen bits as the two octets
 /// **after** the type field. What the image gives is only this — the
@@ -126,6 +140,12 @@ fn extract_field(field: Field, frame: &[u8]) -> Option<u64> {
 /// 203 of 596 frames, every one to the queue the EtherType fallback
 /// picks independently and none to a different one. That is an outcome
 /// this reading could have failed and did not.
+///
+/// -- A corroboration that costs nothing and was not sought: the same
+/// full read of the translation table shows **six** rows naming an
+/// extractor rather than a hardware field. Six plus the reserved slot 0
+/// is seven, which is exactly the width of the `0x10..=0x16` slot range
+/// this constant sits at the bottom of. The range closes.
 const DEFAULT_EXTRACTOR: u8 = 0x10;
 
 /// The code the size-bucket rules compare against frame-length boundaries.
@@ -168,6 +188,21 @@ const FRAME_LENGTH: u8 = 0x24;
 /// boot plus four injected frames, binding the classifier to instance 0
 /// tables 4 through 8 yields **592 field refusals out of 600 frames** and
 /// not one verdict. Every one of those refusals is this code.
+///
+/// ⛔ **The identification is back to being a hypothesis.** The argument
+/// above turns on the commit helper emitting *this code*, and it reads
+/// the `0x0F` at that site as a header field code. There are **two code
+/// spaces** — see [`super::rule::Field`] — and nothing at that site says
+/// which one the byte belongs to. Read as a wire code instead, it
+/// translates to header code `0x0A`, and then the clause the helper
+/// appends is not this code at all and the corroboration below is about
+/// some other field.
+///
+/// ⚠ Two things inherit the doubt and must move with it if it resolves:
+/// the per-link table story in [`super::ClassifierBinding`], and the
+/// table index `header[2] + 4` that goes with it. Nothing is renamed or
+/// removed on the strength of a hypothesis — this is a flag, not a
+/// retraction.
 const LINK_INDEX: u8 = 0x0F;
 
 /// The EtherTypes that mark a tagged frame.
@@ -190,10 +225,33 @@ const TAG_ETHERTYPES: [u16; 2] = [0x8100, 0x88A8];
 /// encodes neither.
 ///
 /// -- OBSERVED that absence is a state of its own and not a value: on one
-/// path software emits `NotExists` for a tag whose configured value is
-/// zero and `Eq` for any other value, so "not there" and "there, and
-/// zero" are two different questions to this hardware.
+/// path software emits [`OP_TAG_ABSENCE`] for a tag whose configured
+/// value is zero and equality for any other value, so "not there" and
+/// "there, and zero" are two different questions to this hardware.
 const TAG_FIELD_CODES: [u8; 2] = [0x03, 0x04];
+
+/// The one unexplained operator code this engine acts on — and only over
+/// the two tag field codes.
+///
+/// -- INFERRED that it means "the frame does not carry this field". The
+/// argument is **not** the one this file used to make; that one said the
+/// configured value was zero, which reads just as well as a wildcard and
+/// therefore separated nothing. What does separate the two polarities:
+/// every rule carrying this code is one of the rules that capture the
+/// control plane, and control-plane frames on this link are untagged. So
+/// under "absent" those rules capture what they were written for, and
+/// under the opposite polarity **every one of them is dead** and the
+/// control plane is captured by nothing.
+///
+/// ⚠ Falsifier, and it is a single frame: a tagged frame that a rule
+/// carrying this code should still match. Under the reading here that
+/// rule cannot match it; under the other one it must.
+///
+/// ⛔ All fifteen sites that emit this code carry one of
+/// [`TAG_FIELD_CODES`]. Over any other field code the engine refuses,
+/// rather than letting an unexplained operator become an unconditional
+/// match on a field whose presence it cannot even ask about.
+const OP_TAG_ABSENCE: u8 = 6;
 
 /// Whether a frame carries the field a clause names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,6 +274,12 @@ enum Presence {
 ///
 /// That is the whole shape of it: decide where the open question does not
 /// matter, refuse where it does.
+///
+/// Only [`TAG_FIELD_CODES`] reach here from a clause — the caller refuses
+/// [`OP_TAG_ABSENCE`] over anything else before asking. The other arms
+/// serve the tag lookup [`extract_field`] does, and answer `Unknown`
+/// rather than a guess for everything the model has no notion of presence
+/// for.
 fn field_presence(field: Field, frame: &[u8]) -> Presence {
     if frame.len() < ETHERNET_HEADER_LEN {
         return Presence::Unknown;
@@ -237,33 +301,46 @@ fn field_presence(field: Field, frame: &[u8]) -> Presence {
     }
 }
 
-/// Compare, over the clause's window: `bits` bits starting at `anchor`.
-///
-/// Both sides are brought down to the window before comparing. ⛔ Whether
-/// the hardware does that or masks the bits below the anchor in place is
-/// **not established** — the two agree on `==` and `!=`, which is the
-/// only pairing any observed clause makes with a non-zero anchor. What
-/// would separate them: a rule over the EtherType with an ordered
-/// operator and an anchor of 8, against two frames whose EtherTypes
-/// differ only in their low octet.
-///
-/// Returns `None` for an operator the model will not act on.
-fn compare(op: Op, value: u64, operand: u64, anchor: u32, bits: u32) -> Option<bool> {
+/// Bring a value down to a clause's compare window: `bits` bits starting
+/// at `anchor`.
+fn window_shift(x: u64, anchor: u32, bits: u32) -> u64 {
     let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
-    let window = |x: u64| (x >> anchor.min(63)) & mask;
-    let (v, o) = (window(value), window(operand));
+    (x >> anchor.min(63)) & mask
+}
+
+/// The rival convention: mask the window's bits and leave them where they
+/// are, rather than right-aligning both sides.
+///
+/// Kept because it makes the equivalence testable rather than merely
+/// argued — see `the_masking_convention_does_not_change_any_ordered_verdict`.
+/// It is `window_shift` followed by a left shift, and since
+/// `anchor + bits == 64 - shift <= 64` that shift never overflows, so it
+/// is strictly monotone and preserves every ordered verdict as well as
+/// the equalities.
+#[cfg(test)]
+fn window_place(x: u64, anchor: u32, bits: u32) -> u64 {
+    window_shift(x, anchor, bits) << anchor.min(63)
+}
+
+/// Compare, over the clause's window.
+///
+/// Returns `None` for an operator the model will not act on — which is
+/// every code whose ordering is not established by its operands. A rule
+/// whose clauses all carry such a code would otherwise match every frame
+/// and route it, and that is the failure mode this refusal exists for:
+/// not a missing answer, a confident wrong one.
+fn compare(op: Op, value: u64, operand: u64, anchor: u32, bits: u32) -> Option<bool> {
+    let (v, o) = (window_shift(value, anchor, bits), window_shift(operand, anchor, bits));
     match op {
-        Op::Never => Some(false),
-        Op::Always => Some(true),
         Op::Eq => Some(v == o),
         Op::Ne => Some(v != o),
         Op::Le => Some(v <= o),
         Op::Ge => Some(v >= o),
-        // Not a comparison at all — a statement about whether the frame
-        // carries the field. Handled before this point, from
-        // [`field_presence`], never from a value.
-        Op::Exists | Op::NotExists => None,
-        Op::Unknown(_) => None,
+        // Emitted by software, meaning not established. The one exception
+        // is [`OP_TAG_ABSENCE`], which never reaches this function: it is
+        // answered from the frame's shape in [`Engine::test_clause`],
+        // never from a value.
+        Op::Observed(_) | Op::Unknown(_) => None,
     }
 }
 
@@ -413,10 +490,15 @@ impl Engine {
     /// decided — the caller turns that into a counter.
     pub(super) fn test_clause(clause: &Clause, frame: &[u8]) -> Result<bool, &'static str> {
         // Presence is not a comparison: no window, no operand, no value.
-        if matches!(clause.op, Op::Exists | Op::NotExists) {
+        // The one unexplained operator this engine acts on, and only over
+        // the two field codes every one of its emission sites carries.
+        if clause.op.code() == OP_TAG_ABSENCE {
+            if !TAG_FIELD_CODES.contains(&clause.field.code()) {
+                return Err("operator is not one the model acts on");
+            }
             return match field_presence(clause.field, frame) {
-                Presence::Present => Ok(clause.op == Op::Exists),
-                Presence::Absent => Ok(clause.op == Op::NotExists),
+                Presence::Present => Ok(false),
+                Presence::Absent => Ok(true),
                 Presence::Unknown => Err("field presence is not established"),
             };
         }
@@ -951,6 +1033,167 @@ mod tests {
         }
         // Below an Ethernet header there is no frame to measure.
         assert_eq!(extract_field(Field::from_code(FRAME_LENGTH), &[0u8; 8]), None);
+    }
+
+    /// The operators software emits but nothing explains are refused, and
+    /// the refusal is counted rather than silently turned into a verdict.
+    ///
+    /// This is the behaviour that matters most. Two of these codes used
+    /// to answer unconditionally — one always false, one always true —
+    /// and the second is the dangerous one: a rule whose every clause
+    /// carried it matched every frame and routed it.
+    #[test]
+    fn the_operators_the_model_will_not_act_on_are_refused_and_counted() {
+        let frame = frame_with_ethertype(0x8809);
+        for code in [0u8, 5, 7] {
+            let mut port = LuePort::new();
+            program(&mut port, 3, 0x80, Entry::Clause {
+                clause: Clause {
+                    field: Field::EtherType,
+                    op: Op::from_code(code),
+                    shift: 0x30,
+                    anchor: 0,
+                    operand: 0x8809,
+                },
+                link: Link::Terminal(Action {
+                    priority: 0,
+                    payload: ActionPayload::simple(6).unwrap(),
+                }),
+            });
+            let mut c = EngineCounters::default();
+            let v = Engine::classify(&port, &[RuleStart { table: 3, index: 0x80 }], &frame, &mut c);
+            assert!(matches!(v, Verdict::Undecidable { .. }), "operator {code}: {v:?}");
+            assert_eq!(c.undecidable_operator, 1, "operator {code}");
+            assert_eq!(c.matched, 0, "operator {code} must never match");
+            assert!(c.verdicts_accounted_for(), "operator {code}: {c:?}");
+        }
+
+        // The negative control: the same clause under an established
+        // operator does decide, and decides yes. Without it, "refused" is
+        // indistinguishable from "the fixture never matched anything".
+        let mut port = LuePort::new();
+        program(&mut port, 3, 0x80, ethertype_rule(0x8809, 2));
+        let mut c = EngineCounters::default();
+        let v = Engine::classify(&port, &[RuleStart { table: 3, index: 0x80 }], &frame, &mut c);
+        assert!(matches!(v, Verdict::Match { .. }), "{v:?}");
+        assert_eq!(c.undecidable_operator, 0);
+    }
+
+    /// The one unexplained operator the engine does act on is confined to
+    /// the two field codes every one of its emission sites carries.
+    #[test]
+    fn the_tag_absence_operator_applies_only_to_the_tag_field_codes() {
+        let untagged = frame_with_ethertype(0x8809);
+        for code in TAG_FIELD_CODES {
+            let clause = Clause {
+                field: Field::from_code(code),
+                op: Op::from_code(OP_TAG_ABSENCE),
+                shift: 0x3F,
+                anchor: 0,
+                operand: 0,
+            };
+            assert_eq!(Engine::test_clause(&clause, &untagged), Ok(true), "code {code:#04x}");
+        }
+
+        // Any other field code, same operator: refused. Before this, the
+        // presence path answered `Present` for the address and type
+        // codes, which turned the clause into an unconditional false and
+        // an unexplained operator into a decided verdict.
+        for code in [0x00u8, 0x01, 0x02, 0x10, 0x24, 0x0F] {
+            let clause = Clause {
+                field: Field::from_code(code),
+                op: Op::from_code(OP_TAG_ABSENCE),
+                shift: 0x3F,
+                anchor: 0,
+                operand: 0,
+            };
+            assert_eq!(
+                Engine::test_clause(&clause, &untagged),
+                Err("operator is not one the model acts on"),
+                "code {code:#04x}"
+            );
+        }
+
+        // And on a tagged frame the tag codes go back to being refused,
+        // because which of the two names which tag is not established.
+        for tpid in TAG_ETHERTYPES {
+            let tagged = frame_with_ethertype(tpid);
+            let clause = Clause {
+                field: Field::from_code(TAG_FIELD_CODES[0]),
+                op: Op::from_code(OP_TAG_ABSENCE),
+                shift: 0x3F,
+                anchor: 0,
+                operand: 0,
+            };
+            assert_eq!(
+                Engine::test_clause(&clause, &tagged),
+                Err("field presence is not established"),
+                "{tpid:#06x}"
+            );
+        }
+    }
+
+    /// The two masking conventions cannot disagree — proved by exhausting
+    /// them rather than by arguing it in a comment.
+    ///
+    /// Right-aligning both sides and masking them in place differ by a
+    /// left shift that never overflows, which is monotone, so it
+    /// preserves the ordered operators as well as the equalities. This
+    /// was carried as an open question for a long time; it is not one.
+    #[test]
+    fn the_masking_convention_does_not_change_any_ordered_verdict() {
+        let values: [u64; 8] = [
+            0,
+            1,
+            0x8809,
+            0x0180_C200_0001,
+            0x0000_FFFF_FFFF_FFFF,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0x1234_5678_9ABC_DEF0,
+            0x8000_0000_0000_0000,
+        ];
+        let mut pairs = 0u32;
+        for shift in [0u8, 8, 0x10, 0x23, 0x30, 0x38, 0x3E] {
+            for anchor in [0u8, 1, 5, 8, 0x17, 0x20, 0x28] {
+                let clause = Clause {
+                    field: Field::EtherType,
+                    op: Op::Eq,
+                    shift,
+                    anchor,
+                    operand: 0,
+                };
+                let bits = clause.compared_bits();
+                if bits == 0 {
+                    continue;
+                }
+                let a = clause.anchor as u32;
+                assert!(a + bits <= 64, "the window must fit in 64 bits");
+                for &value in &values {
+                    for &operand in &values {
+                        for op in [Op::Eq, Op::Ne, Op::Le, Op::Ge] {
+                            let right = compare(op, value, operand, a, bits)
+                                .expect("an established operator always decides");
+                            let (v, o) =
+                                (window_place(value, a, bits), window_place(operand, a, bits));
+                            let placed = match op {
+                                Op::Eq => v == o,
+                                Op::Ne => v != o,
+                                Op::Le => v <= o,
+                                Op::Ge => v >= o,
+                                other => panic!("not an established operator: {other:?}"),
+                            };
+                            assert_eq!(
+                                right, placed,
+                                "shift {shift:#04x} anchor {anchor:#04x} {op:?} \
+                                 {value:#018x} vs {operand:#018x}"
+                            );
+                            pairs += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(pairs > 1000, "the sweep must actually sweep: {pairs}");
     }
 
     /// The port must round-trip whatever it is given, so an entry the

@@ -1,14 +1,16 @@
 //! BCM55030 MACsec cryptographic engine.
 //!
-//! Claims the MACsec 1G and 10G Security Association programming
-//! windows plus the key table tail:
+//! Claims:
 //!
-//!   * `0x01002400..0x01002D40` — MACsec 1G + 10G SA programming,
-//!     key engine, PN threshold engine, channel enable/reset, LLID
-//!     IRQ bitmap. Register layout is twin-mirrored: the 1G bank
-//!     starts at `0x2400`, the 10G bank at `0x2800`. Every offset
-//!     inside a bank follows the same structure (SA config,
-//!     nonce, key words, trigger).
+//!   * `0x01002A00..0x01002D00` — the tail of the twin-mirrored SA
+//!     programming window. The claim used to start at `0x01002400` and
+//!     run to `0x01002D40`, which was three quarters fiction: the SerDes
+//!     lane window is tested first on every dispatch chain and takes
+//!     everything below `0x01002A00`, and the block at `0x01002D00` is
+//!     the UNI-side Ethernet port (`soc::uni`). Only this slice was ever
+//!     reached, so only this slice is claimed — and the tests that
+//!     asserted on the unreachable part were passing for the wrong
+//!     reason, and stamping a MACsec name on a UNI register besides.
 //!   * `0x01003500..0x01003540` — MACsec key table tail (block
 //!     3501 per `hwregs`).
 //!
@@ -30,8 +32,8 @@ use crate::soc::peripheral::{
     PeripheralSnapshot,
 };
 
-pub const MACSEC_SA_BASE: u32 = 0x0100_2400;
-pub const MACSEC_SA_END: u32 = 0x0100_2D40;
+pub const MACSEC_SA_BASE: u32 = 0x0100_2A00;
+pub const MACSEC_SA_END: u32 = 0x0100_2D00;
 
 pub const MACSEC_KEY_TAIL_BASE: u32 = 0x0100_3500;
 pub const MACSEC_KEY_TAIL_END: u32 = 0x0100_3540;
@@ -50,12 +52,10 @@ const CMD_BIT: u32 = 0x8000_0000;
 ///   * `0x01002A44` — MPCP HW command engine, second bank (`+ 0x400`).
 ///     Its busy-wait has no timeout, so the bit must always clear.
 ///
-/// This claim range overlaps the SerDes lane window
-/// (`0x01002400..0x01002A00`), which every dispatch chain tests
-/// **first**. Only offsets at or above `0x01002A00` ever reach this
-/// peripheral, so the three command registers below that boundary
-/// (`0x0100240C`, `0x0100280C`, `0x01002644`) are served by
-/// `serdes::is_cmd_bit_register` and were dead weight here.
+/// The three command registers below `0x01002A00` (`0x0100240C`,
+/// `0x0100280C`, `0x01002644`) are served by
+/// `serdes::is_cmd_bit_register`; the claim no longer reaches down
+/// there at all.
 ///
 /// Identified by tracing each busy-wait loop after a naive "clear bits
 /// [31:27] on every write" broke UART interactivity via false-positive
@@ -78,12 +78,6 @@ pub struct Macsec {
     /// Bit `n` is set when SA slot `n` has a forced PN overflow.
     pn_overflow_mask: u32,
 
-    /// Software-written fatal error mask (`FATAL_ERROR_MASK` at
-    /// `0x01002804`). Kept separately so the backing store does
-    /// not alias the read-only `FATAL_ERROR_STATUS` at the same
-    /// address.
-    fatal_error_mask: u32,
-
     pub trace: bool,
 }
 
@@ -97,7 +91,6 @@ impl Macsec {
             key_tail_store: vec![0u32; tail_words],
             key_tail_pending_clear: vec![0u32; tail_words],
             pn_overflow_mask: 0,
-            fatal_error_mask: 0,
             trace: false,
         }
     }
@@ -166,18 +159,11 @@ impl Peripheral for Macsec {
         MACSEC_SA_RANGES
     }
 
+    // The split word at `0x01002804` is not handled here any more: it
+    // sits below `0x01002A00`, so this peripheral was never reached at
+    // it. The one servant is `serdes::REG_ZERO_READ_WORKAROUND`, where
+    // the two names it used to carry are retracted along with it.
     fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
-        // Write-one-read-another aliases at 0x01002804:
-        //   * Write path → block 5602 FATAL_ERROR_MASK (software sets
-        //     the fatal-error bit mask, typically 0x105C)
-        //   * Read path  → block 5601 FATAL_ERROR_STATUS, which on
-        //     silicon returns 0 when no fatal condition is latched
-        // A shared backing store would let the MASK write poison the
-        // STATUS read: the firmware's hardware-state poller would see
-        // bits 0x105C flipping and trigger a shutdown loop.
-        if addr == 0x0100_2804 {
-            return Ok(0);
-        }
         if (MACSEC_SA_BASE..MACSEC_SA_END).contains(&addr) {
             let idx = Self::sa_idx(addr);
             let val = Self::read_slot(
@@ -201,16 +187,6 @@ impl Peripheral for Macsec {
     fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
         if (MACSEC_SA_BASE..MACSEC_SA_END).contains(&addr) {
             let idx = Self::sa_idx(addr);
-            // FATAL_ERROR_MASK write (see the matching read arm
-            // above). Stash the value so the UI snapshot can
-            // surface it, but do not let it alias the STATUS
-            // read. A shared backing-store array would cause the
-            // firmware's hardware-state poller to see bits flipping
-            // and fire an unexpected shutdown.
-            if addr == 0x0100_2804 {
-                self.fatal_error_mask = val;
-                return Ok(());
-            }
             Self::write_slot_sparse(
                 &mut self.sa_store,
                 &mut self.sa_pending_clear,
@@ -242,7 +218,6 @@ impl Peripheral for Macsec {
         self.key_tail_store.fill(0);
         self.key_tail_pending_clear.fill(0);
         self.pn_overflow_mask = 0;
-        self.fatal_error_mask = 0;
         self.apply_silicon_power_on();
     }
 
@@ -261,12 +236,17 @@ impl Peripheral for Macsec {
             .filter(|chunk| chunk.iter().any(|&w| w != 0))
             .count() as u8;
         PeripheralSnapshot::Macsec(MacsecSnapshot {
-            control: self.sa_store.get(Self::sa_idx(0x0100_2468).min(self.sa_store.len() - 1))
+            // The mirrored offsets of the second bank: the first bank
+            // is served by the SerDes lane window, so `+0x400` is the
+            // only copy this peripheral can show.
+            control: self
+                .sa_store
+                .get(Self::sa_idx(0x0100_2A68))
                 .copied()
                 .unwrap_or(0),
             enable_mode: self
                 .sa_store
-                .get(Self::sa_idx(0x0100_2420).min(self.sa_store.len() - 1))
+                .get(Self::sa_idx(0x0100_2A20))
                 .copied()
                 .unwrap_or(0),
             key_engine_busy: false,
@@ -299,14 +279,17 @@ impl Peripheral for Macsec {
 mod tests {
     use super::*;
 
+    /// Rebuilt on `0x01002A80`. The old form used `0x01002480`, an
+    /// address the bank never routes here — it passed while proving
+    /// nothing about the peripheral under test.
     #[test]
     fn sa_config_register_is_plain_backing_store() {
         let mut m = Macsec::new();
-        m.write_word(0x0100_2480, 0x8000_00AA).unwrap();
+        m.write_word(0x0100_2A80, 0x8000_00AA).unwrap();
         // SA config registers do NOT use the command-bit protocol.
         // Subsequent reads return the stored value unchanged.
-        assert_eq!(m.read_word(0x0100_2480).unwrap(), 0x8000_00AA);
-        assert_eq!(m.read_word(0x0100_2480).unwrap(), 0x8000_00AA);
+        assert_eq!(m.read_word(0x0100_2A80).unwrap(), 0x8000_00AA);
+        assert_eq!(m.read_word(0x0100_2A80).unwrap(), 0x8000_00AA);
     }
 
     /// `0x01002A44` is the only command register this peripheral is ever
@@ -328,25 +311,45 @@ mod tests {
         assert_eq!(m.read_word(0x0100_3520).unwrap(), 0xDEAD_BEEF);
     }
 
+    /// The reset table names no address inside the slice this
+    /// peripheral serves, so a warm start leaves it zero. The old form
+    /// of this test asserted on `0x2400`, `0x2800` and `0x2D18` — three
+    /// addresses the bank routes to the SerDes and to the UNI port —
+    /// and so put a MACsec name on a UNI register while passing.
     #[test]
-    fn warm_seed_loads_macsec_init_values() {
+    fn the_warm_seed_names_nothing_inside_the_slice_this_peripheral_serves() {
         let mut m = Macsec::new();
         m.reset_warm();
-        // mmio_init: 0x2400 = 0x13, 0x2800 = 0x13, 0x2D18 = 0x08130E04
-        assert_eq!(m.read_word(0x0100_2400).unwrap() & 0xFF, 0x13);
-        assert_eq!(m.read_word(0x0100_2800).unwrap() & 0xFF, 0x13);
-        assert_eq!(m.read_word(0x0100_2D18).unwrap(), 0x0813_0E04);
+        for &(off, _) in crate::soc::mmio_init::SYSREG_INIT_VALUES {
+            let abs = 0x0100_0000 + off;
+            assert!(
+                !(MACSEC_SA_BASE..MACSEC_SA_END).contains(&abs),
+                "{abs:#010X} would seed this peripheral; update the test, not the claim"
+            );
+        }
+        assert_eq!(m.read_word(0x0100_2A44).unwrap(), 0);
+        // The key tail is seeded, and that part is unchanged.
+        assert_eq!(m.read_word(0x0100_3500).unwrap(), 0x0001_0000);
     }
 
+    /// The window this peripheral never served is no longer claimed:
+    /// everything below `0x01002A00` goes to the SerDes lane window and
+    /// the classifier ports, and `0x01002D00` upward is the UNI port.
     #[test]
-    fn claims_respects_bounds() {
+    fn macsec_no_longer_claims_the_window_it_never_served() {
         let m = Macsec::new();
-        assert!(m.claims(0x0100_2400));
-        assert!(m.claims(0x0100_2D3C));
-        assert!(!m.claims(0x0100_2D40));
+        assert!(!m.claims(0x0100_2400));
+        assert!(!m.claims(0x0100_2480));
+        assert!(!m.claims(0x0100_2800));
+        assert!(!m.claims(0x0100_2D18));
+        assert!(!m.claims(0x0100_2D3C));
+        // What it does serve.
+        assert!(m.claims(0x0100_2A00));
+        assert!(m.claims(0x0100_2A44));
+        assert!(m.claims(0x0100_2CFC));
+        assert!(!m.claims(0x0100_2D00));
         assert!(m.claims(0x0100_3500));
         assert!(!m.claims(0x0100_3540));
-        assert!(!m.claims(0x0100_23FC));
     }
 
     #[test]

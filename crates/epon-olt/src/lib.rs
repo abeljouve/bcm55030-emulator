@@ -30,6 +30,7 @@
 //! - [`mpcp`] MPCPDU encode/decode (clause 64)
 //! - [`oam`] OAMPDU encode/decode (clause 57)
 //! - [`extended`] organization-specific OAMPDUs and their variables
+//! - [`rule_list`] classifier rule lists carried as extended-OAM variables
 //! - [`decode`] frame dissection, for a packet view or a log
 //! - [`fcs`] the frame check sequence a frame carries on the wire
 //! - [`state`] MPCP registration state
@@ -44,13 +45,17 @@ pub mod mpcp;
 pub mod oam;
 pub mod onu;
 pub mod peer;
+pub mod rule_list;
 pub mod sched;
 pub mod state;
 pub mod types;
 
 pub use clock::{WireDuration, WireInstant};
+pub use extended::{BodyShape, Channel, DpoeOpcode, ExtensionMessage};
 pub use fibre::{Fibre, FibreConfig};
 pub use link::Link;
-pub use peer::{Counters, Emitted, LoggedFrame, Peer, PeerConfig};
+pub use oam::Oui;
+pub use peer::{Body, Counters, Emitted, LoggedFrame, Peer, PeerConfig};
+pub use rule_list::{ActionEntry, ActionParameter, MatchEntry, RuleEntry, RuleListUpdate, SubOp};
 pub use state::MpcpState;
 pub use types::{EtherType, Llid, MacAddr};

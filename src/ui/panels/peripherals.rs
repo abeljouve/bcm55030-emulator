@@ -1,4 +1,4 @@
-//! Peripheral inspector: 14 tabs, one per BCM55030 MMIO subsystem.
+//! Peripheral inspector: 15 tabs, one per BCM55030 MMIO subsystem.
 //!
 //! Reads snapshots from `app.snapshot.peripherals` (refreshed by
 //! the CPU worker) and routes UI-driven mutations through
@@ -13,6 +13,7 @@ use crate::soc::peripheral::{
     LaneSpeed, MacsecEvent, PbcEvent, PeripheralEvent, PeripheralSnapshot,
     SerDesEvent, SfpEvent, TimerEvent, UartEvent,
 };
+use crate::soc::uni::{UniEvent, UniRxSignal};
 use crate::ui::EmulatorApp;
 
 /// Selected peripheral tab inside the inspector.
@@ -32,6 +33,7 @@ pub enum PeripheralTab {
     Fatal,
     Mpcp,
     Nco,
+    Uni,
 }
 
 /// Scratch input state for the peripheral inspector. Lives on
@@ -110,6 +112,7 @@ pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
                     PeripheralTab::Fatal => draw_fatal(ui, app),
                     PeripheralTab::Mpcp => draw_mpcp(ui, app),
                     PeripheralTab::Nco => draw_nco(ui, app),
+                    PeripheralTab::Uni => draw_uni(ui, app),
                 });
         });
 }
@@ -129,6 +132,7 @@ const TABS: &[(PeripheralTab, &str, &str)] = &[
     (PeripheralTab::Fatal, ph::WARNING, "Fatal"),
     (PeripheralTab::Mpcp, ph::TREE_STRUCTURE, "MPCP"),
     (PeripheralTab::Nco, ph::WAVE_SINE, "NCO"),
+    (PeripheralTab::Uni, ph::PLUG, "UNI port"),
 ];
 
 fn header_for(tab: PeripheralTab) -> (&'static str, &'static str) {
@@ -691,6 +695,57 @@ fn draw_mpcp(ui: &mut egui::Ui, app: &EmulatorApp) {
             let v = bank.peek_word(addr).unwrap_or(0);
             ui.monospace(format!("  0x{:08X}: 0x{:08X}", addr, v));
             addr += 4;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UNI port
+// ---------------------------------------------------------------------------
+
+/// The four signals that were measured, in the order they were read.
+const UNI_SIGNALS: &[(UniRxSignal, &str)] = &[
+    (UniRxSignal::None, "no signal"),
+    (UniRxSignal::BaseX { autoneg: false }, "1000BASE-X, no AN"),
+    (UniRxSignal::BaseX { autoneg: true }, "1000BASE-X + clause 37 AN"),
+    (UniRxSignal::TenGigCoding, "10G line coding"),
+];
+
+fn draw_uni(ui: &mut egui::Ui, app: &EmulatorApp) {
+    let Some(PeripheralSnapshot::Uni(snap)) =
+        find_snapshot(app, |p| matches!(p, PeripheralSnapshot::Uni(_)))
+    else {
+        missing(ui, app, "UNI port");
+        return;
+    };
+    let snap = snap.clone();
+    kv(ui, "Receive status", format!("0x{:08X}", snap.rx_status));
+    kv(ui, "Port status", format!("0x{:08X}", snap.port_status));
+    kv(ui, "Port armed", snap.armed.to_string());
+    kv(ui, "Counter port busy", snap.port_busy.to_string());
+    kv(
+        ui,
+        "Reads while busy",
+        snap.counters.port_reads_while_busy.to_string(),
+    );
+    kv(
+        ui,
+        "Busy-bit writes refused",
+        snap.counters.busy_bit_writes_refused.to_string(),
+    );
+    ui.separator();
+
+    let mut armed = snap.armed;
+    if ui.checkbox(&mut armed, "Port armed").changed() {
+        inject(app, PeripheralEvent::Uni(UniEvent::SetArmed(armed)));
+    }
+    ui.label("Signal on the receive pair:");
+    for (signal, label) in UNI_SIGNALS {
+        if ui
+            .add(egui::Button::selectable(snap.rx == *signal, *label))
+            .clicked()
+        {
+            inject(app, PeripheralEvent::Uni(UniEvent::SetRxSignal(*signal)));
         }
     }
 }

@@ -1,20 +1,34 @@
-//! MAC filter table — VLAN / EtherType indirect access (block 8).
+//! A 96-bit indirect table at `0x01003000`.
 //!
-//! Despite an earlier name, this is **not** the packet classifier. The
-//! classifier is a separate indirect port in the lane register file at
-//! `0x0100240C` / `0x0100280C` (see `soc/lue`); this block filters on
-//! MAC addresses and VLAN tags and has its own 96-bit table.
+//! This is **not** the packet classifier. The classifier is a separate
+//! indirect port in the lane register file at `0x0100240C` /
+//! `0x0100280C` — see `soc/lue`. That disclaimer is the established
+//! part of this module's identity.
 //!
-//! Registers `0x01003000..0x01003020`:
-//!   * `0x01003000` — VLAN_CTRL (RMW)
-//!   * `0x0100300C` — CUSTOM_VLAN_ETHERTYPE (RMW)
-//!   * `0x01003010` — INDIRECT_CMD (RW, busy/index/rw)
-//!   * `0x01003014` — INDIRECT_DATA_2 (RW, MSB of 96-bit payload)
-//!   * `0x01003018` — INDIRECT_DATA_1 (RW)
-//!   * `0x0100301C` — INDIRECT_DATA_0 (RW, LSB of 96-bit payload)
+//! ⛔ What this block matches on is **not** established, and the file
+//! name is older than the evidence. The register DB carries two
+//! competing readings of the same aperture — "VLAN / EtherType
+//! Configuration" and "Packet Filter Rule Engine", confirmed as
+//! aliases of one another on one base pointer — and **neither mentions
+//! MAC addresses**. Nothing here classifies anything either: the
+//! implementation is 256 entries of 96 bits behind a command port,
+//! plus a handful of flat words. It stores and returns; it does not
+//! match.
 //!
-//! Pattern 3 (indirect access): write index + direction to CMD,
-//! then read/write DATA registers.
+//! What is established is the access pattern, which is what the model
+//! needs: write the three data words, then write index + direction to
+//! the command port; a read command loads the data words from the
+//! entry, a write command stores them into it. The command bits do not
+//! survive the write.
+//!
+//! Words, by offset from `0x01003000` — names as the register DB gives
+//! them, not as measurements:
+//!   * `+0x00` — VLAN_CTRL (RMW)
+//!   * `+0x0C` — CUSTOM_VLAN_ETHERTYPE (RMW)
+//!   * `+0x10` — the command port (RW): index in `[7:0]`, bit 30 write,
+//!               bit 31 read
+//!   * `+0x14` / `+0x18` / `+0x1C` — the 96-bit payload, most
+//!               significant word first
 
 use crate::cpu::exception::Exception;
 

@@ -291,12 +291,39 @@ impl Discovery {
 }
 
 /// A 24-bit organizationally unique identifier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Oui(pub [u8; 3]);
 
 impl Oui {
-    /// The OUI the extended-OAM channel is carried under.
+    /// The OUI the DPoE variable channel is carried under.
     pub const DPOE: Self = Self([0x00, 0x10, 0x00]);
+
+    /// A second organization-specific container this link carries.
+    ///
+    /// A receiver switches on the 24-bit OUI *before* the octet that follows
+    /// it, so the two share no code space: an octet valid under one is not an
+    /// octet under the other. Named for what is measured about it, not for
+    /// whoever registered the identifier.
+    pub const VENDOR_EXTENSION: Self = Self([0x00, 0x0D, 0xB6]);
+
+    pub const fn as_u24(self) -> u32 {
+        let [a, b, c] = self.0;
+        ((a as u32) << 16) | ((b as u32) << 8) | c as u32
+    }
+
+    /// Read an OUI written `00-0D-B6`, `00:0d:b6` or `000db6`.
+    pub fn parse(s: &str) -> Option<Self> {
+        let digits: Vec<char> = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        if digits.len() != 6 {
+            return None;
+        }
+        let mut out = [0u8; 3];
+        for (i, b) in out.iter_mut().enumerate() {
+            let pair: String = digits[i * 2..i * 2 + 2].iter().collect();
+            *b = u8::from_str_radix(&pair, 16).ok()?;
+        }
+        Some(Self(out))
+    }
 }
 
 impl fmt::Display for Oui {
@@ -438,6 +465,23 @@ mod tests {
         assert_eq!(pdu.src, SRC);
         // The TLV starts with its type and declared length.
         assert_eq!(Pdu::tlv_bytes(&frame)[..2], [0x01, InfoTlv::LENGTH]);
+    }
+
+    #[test]
+    fn an_oui_round_trips_through_every_spelling() {
+        for oui in [Oui::DPOE, Oui::VENDOR_EXTENSION] {
+            let dashed = oui.to_string();
+            assert_eq!(Oui::parse(&dashed), Some(oui));
+            assert_eq!(Oui::parse(&dashed.replace('-', ":")), Some(oui));
+            assert_eq!(Oui::parse(&dashed.replace('-', "").to_lowercase()), Some(oui));
+        }
+        assert_eq!(Oui::DPOE.as_u24(), 0x00_1000);
+        assert_eq!(Oui::VENDOR_EXTENSION.as_u24(), 0x00_0DB6);
+        // Two containers, two identifiers: the whole point of switching on
+        // the OUI first is that these are never the same value.
+        assert_ne!(Oui::DPOE, Oui::VENDOR_EXTENSION);
+        assert_eq!(Oui::parse("00-10"), None);
+        assert_eq!(Oui::parse("zz-zz-zz"), None);
     }
 
     #[test]

@@ -23,9 +23,22 @@
 //! Block 17 "MPCP Speed Configuration" is an SRAM data structure —
 //! not MMIO, not modelled here. Block 22 "MPCP LLID Control" is
 //! inside the SerDes lane configuration range; the SerDes peripheral
-//! round-trips it correctly. Block 61 "MPCP Slot HW Command Engine"
-//! (`0x01002644`, stride `0x400`) is inside the MACsec SA programming
-//! range and is served by the MACsec command-bit shadow mechanism.
+//! round-trips it correctly.
+//!
+//! ⛔ Correction: this doc used to say that block 61 "MPCP Slot HW
+//! Command Engine" (`0x01002644`, stride `0x400`) falls in the MACsec
+//! range and is served by the MACsec command-bit shadow. That is wrong
+//! twice over. The address is served by the **SerDes** backing store,
+//! and the MACsec command-register set contains exactly one address,
+//! `0x01002A44` — not this one. The behaviour is unchanged either way;
+//! the sentence pointed a reader at the wrong module.
+//!
+//! ⛔ And the SerDes name for `0x01002644` is itself a guess: it calls
+//! the word a per-lane 1G MDIO command register at a stride of `0x238`
+//! from its base. Nothing else on this chip is laid out at `0x238` —
+//! every other per-lane stride is `0x400` — so the stride is the tell
+//! that the name was fitted to the address rather than read off it.
+//! That word belongs to another module; this is a pointer, not an edit.
 //!
 //! Most of it is a plain backing store — writes land in an internal
 //! `Vec<u32>` keyed by the claim region, reads round-trip the

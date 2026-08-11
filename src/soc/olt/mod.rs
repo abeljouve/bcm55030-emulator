@@ -34,8 +34,8 @@ use mailbox::{Command, Slot, TxAssembler};
 
 // The protocol modules are re-exported so consumers keep addressing them
 // through this module: they are the same types the peer works with.
-pub use epon_olt::{decode, extended, mpcp, oam, state, types};
-pub use epon_olt::{Counters as OltCounters, LoggedFrame as OltFrame};
+pub use epon_olt::{decode, extended, mpcp, oam, rule_list, state, types};
+pub use epon_olt::{Body as OltBody, Counters as OltCounters, LoggedFrame as OltFrame};
 
 pub use epon_olt::state::MpcpState as OltMpcpState;
 
@@ -333,15 +333,33 @@ impl Olt {
         self.tx_assembler.is_assembling()
     }
 
-    /// Build and queue an extended OAMPDU carrying `payload` after the vendor
-    /// opcode. Returns the frame as it was queued.
-    pub fn send_extended(
+    /// Build and queue an extended OAMPDU carrying `payload` after the code
+    /// octet. Returns the frame as it was queued.
+    ///
+    /// The bytes are not touched on the way: a receiver's refusal of a
+    /// malformed message is the observation, so nothing here may tidy it up.
+    pub fn send_extended(&mut self, oui: oam::Oui, code: u8, payload: &[u8]) -> Vec<u8> {
+        let frame = self.link.peer.send_extended(oui, code, payload);
+        self.carry_downstream();
+        frame
+    }
+
+    /// Build and queue a message on an organization-specific channel. The
+    /// channel carries its own identifier, so a code belonging to one
+    /// container cannot go out under the other's.
+    pub fn send_vendor(&mut self, channel: extended::Channel, body: &OltBody) -> Vec<u8> {
+        let frame = self.link.peer.send_vendor(channel, body);
+        self.carry_downstream();
+        frame
+    }
+
+    /// Build and queue a whole rule-list update as one message.
+    pub fn send_rule_list(
         &mut self,
-        oui: oam::Oui,
-        opcode: extended::Opcode,
-        payload: &[u8],
+        channel: extended::Channel,
+        update: &rule_list::RuleListUpdate,
     ) -> Vec<u8> {
-        let frame = self.link.peer.send_extended(oui, opcode, payload);
+        let frame = self.link.peer.send_rule_list(channel, update);
         self.carry_downstream();
         frame
     }

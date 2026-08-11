@@ -32,8 +32,21 @@ pub struct Slot(pub u8);
 
 impl Slot {
     /// Control-plane queue: MPCP and OAM share it.
+    ///
+    /// Well supported: read back over a boot, every rule in the table
+    /// that names a queue — five of them — ends in this one, and the
+    /// EtherTypes those rules match are the control-plane ones.
     pub const CONTROL: Self = Self(0x10);
-    /// Queue used for everything that is not control-plane.
+    /// The queue this model delivers everything else through.
+    ///
+    /// ⛔ Not the symmetric counterpart of [`Self::CONTROL`], however
+    /// the pair reads. "The queue for what is not control-plane" is a
+    /// **definition**, not a measurement: no classifier rule has ever
+    /// been read back naming this queue, and the one path that made a
+    /// rule name it needed a persistent record seeded first. Software
+    /// does derive the number at start-up, alongside `0x10` and `0x0E`,
+    /// which is why it is a plausible choice — but a plausible choice
+    /// is what this constant is.
     pub const DATA: Self = Self(0x0F);
 
     /// Queue a frame is delivered through, chosen by EtherType.

@@ -4,10 +4,16 @@
 //! so a frame reads the same way everywhere. Each field carries its byte
 //! range, which is what lets a view highlight the bytes behind a selection.
 
+use crate::extended::{Located, Span};
+use crate::rule_list::{ActionEntry, MatchEntry, RuleEntry, SubOp};
 use crate::{extended, mpcp, oam, types};
 use types::{EtherType, MacAddr};
 
 /// One row of the dissection tree.
+///
+/// `offset` is an `Option` because a caller reading a serialized field cannot
+/// assume a range exists; every row this module builds today carries one, and
+/// there is no constructor that omits it.
 #[derive(Clone, Debug, serde::Serialize, schemars::JsonSchema)]
 pub struct Field {
     /// Nesting level: 0 for a protocol layer, deeper for its contents.
@@ -28,8 +34,8 @@ impl Field {
         Self { depth, name: name.into(), value: value.into(), offset: Some(offset), len }
     }
 
-    fn note(depth: u8, name: impl Into<String>, value: impl Into<String>) -> Self {
-        Self { depth, name: name.into(), value: value.into(), offset: None, len: 0 }
+    fn span(depth: u8, name: impl Into<String>, value: impl Into<String>, span: Span) -> Self {
+        Self::at(depth, name, value, span.start, span.len)
     }
 }
 
@@ -180,41 +186,7 @@ fn dissect_oam(frame: &[u8], fields: &mut Vec<Field>) -> (String, String) {
 
     // An organization-specific PDU carries the extended channel.
     if let Some(ext) = extended::Pdu::parse(frame) {
-        fields.push(Field::layer("OAM extended", ext.opcode.to_string(), 18, frame.len().saturating_sub(18)));
-        fields.push(Field::at(1, "OUI", ext.oui.to_string(), 18, 3));
-        fields.push(Field::at(1, "Opcode", format!("{} (0x{:02X})", ext.opcode, ext.opcode.as_u8()), 21, 1));
-        for v in &ext.variables {
-            fields.push(Field::note(1, "Variable", v.descriptor().to_string()));
-            match v {
-                extended::Variable::Address { parameters, .. } => {
-                    fields.push(Field::note(2, "Asked for", "address only".to_string()));
-                    if !parameters.is_empty() {
-                        fields.push(Field::note(2, "Parameters", hex(parameters)));
-                    }
-                }
-                extended::Variable::Container(c) => {
-                    fields.push(Field::note(2, "Length", describe_length(c.length)));
-                    if !c.value.is_empty() {
-                        fields.push(Field::note(2, "Value", hex(&c.value)));
-                    }
-                }
-            }
-        }
-        let summary = if ext.variables.is_empty() {
-            format!("{} {}", ext.oui, ext.opcode)
-        } else {
-            format!(
-                "{} {} — {}",
-                ext.oui,
-                ext.opcode,
-                ext.variables
-                    .iter()
-                    .map(|v| v.descriptor().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        return ("OAM/extended".into(), summary);
+        return dissect_extended(frame, &ext, fields);
     }
 
     // Otherwise walk the information TLVs.
@@ -251,6 +223,187 @@ fn dissect_oam(frame: &[u8], fields: &mut Vec<Field>) -> (String, String) {
         offset += step;
     }
     ("OAM".into(), format!("{} flags 0x{:04X}", pdu.code, flags.as_u16()))
+}
+
+// Offsets inside an extended OAMPDU. Taken from the layer that writes them,
+// so a field cannot move in one place and stay put in the other.
+use extended::{BODY_OFFSET as EXT_BODY_OFFSET, CODE_OFFSET as EXT_CODE_OFFSET,
+    OUI_OFFSET as EXT_OUI_OFFSET};
+
+/// Dissect the organization-specific layer.
+///
+/// Every row carries the bytes it came from, including the ones inside a
+/// variable: a field with no range cannot highlight anything, which is the
+/// one thing the tree exists for.
+fn dissect_extended(
+    frame: &[u8],
+    ext: &extended::Pdu,
+    fields: &mut Vec<Field>,
+) -> (String, String) {
+    let body_len = frame.len().saturating_sub(EXT_BODY_OFFSET);
+    fields.push(Field::at(
+        0,
+        "OAM extended",
+        ext.channel.to_string(),
+        EXT_OUI_OFFSET,
+        frame.len().saturating_sub(EXT_OUI_OFFSET),
+    ));
+    fields.push(Field::at(1, "OUI", ext.oui.to_string(), EXT_OUI_OFFSET, 3));
+    // The code is shown under its identifier, because that is the only way
+    // it means anything.
+    fields.push(Field::at(
+        1,
+        "Message code",
+        format!("{} (0x{:02X}) under {}", ext.channel, ext.channel.code(), ext.oui),
+        EXT_CODE_OFFSET,
+        1,
+    ));
+
+    if let Some(span) = ext.opaque_body {
+        // Kept, not walked. One row, so the bytes are visible and the
+        // absence of a variable list is too.
+        fields.push(Field::span(
+            1,
+            "Body",
+            format!("{} bytes, not read as a variable list", span.len),
+            Span::new(span.start, span.len.min(body_len)),
+        ));
+        return (
+            "OAM/extended".into(),
+            format!("{} {} — {} opaque bytes", ext.oui, ext.channel, span.len),
+        );
+    }
+
+    for located in &ext.variables {
+        dissect_variable(fields, located);
+    }
+    let summary = if ext.variables.is_empty() {
+        format!("{} {}", ext.oui, ext.channel)
+    } else {
+        format!(
+            "{} {} — {}",
+            ext.oui,
+            ext.channel,
+            ext.variables
+                .iter()
+                .map(|l| l.variable.descriptor().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    ("OAM/extended".into(), summary)
+}
+
+fn dissect_variable(fields: &mut Vec<Field>, located: &Located) {
+    let span = located.span;
+    let descriptor = located.variable.descriptor();
+    fields.push(Field::span(1, "Variable", descriptor.to_string(), span));
+    // The address occupies the first three octets wherever it appears.
+    match &located.variable {
+        extended::Variable::Address { parameters, .. } => {
+            fields.push(Field::at(2, "Asked for", "address only", span.start, 3));
+            if !parameters.is_empty() {
+                fields.push(Field::at(
+                    2,
+                    "Parameters",
+                    hex(parameters),
+                    span.start + 3,
+                    parameters.len(),
+                ));
+            }
+        }
+        extended::Variable::Container(c) => {
+            fields.push(Field::at(2, "Length", describe_length(c.length), span.start + 3, 1));
+            let value_at = span.start + 4;
+            if !c.value.is_empty() {
+                fields.push(Field::at(2, "Value", hex(&c.value), value_at, c.value.len()));
+            }
+            if descriptor == extended::Descriptor::attribute(extended::leaf::RULE_LIST) {
+                dissect_rule_entry(fields, &c.value, value_at);
+            }
+        }
+    }
+}
+
+/// Name the octets of a rule-list entry, each at the byte it sits on.
+///
+/// The sub-operation and the type code are two adjacent octets that look
+/// alike in hex, so they get two rows rather than one — reading them the
+/// wrong way round is silent otherwise.
+fn dissect_rule_entry(fields: &mut Vec<Field>, value: &[u8], at: usize) {
+    let Some(entry) = RuleEntry::decode_value(value) else {
+        fields.push(Field::at(3, "Sub-operation", "unknown", at, value.len().min(1)));
+        return;
+    };
+    let sub_op = entry.sub_op();
+    fields.push(Field::at(
+        3,
+        "Sub-operation",
+        format!("{sub_op:?} ({})", sub_op.as_u8()),
+        at,
+        1,
+    ));
+    match &entry {
+        RuleEntry::Mark | RuleEntry::Reset => {}
+        RuleEntry::Match(m) => dissect_match_entry(fields, m, at),
+        RuleEntry::Action(a) => dissect_action_entry(fields, a, at),
+    }
+}
+
+fn dissect_match_entry(fields: &mut Vec<Field>, m: &MatchEntry, at: usize) {
+    fields.push(Field::at(3, "Type code", format!("0x{:02X}", m.type_code), at + 1, 1));
+    fields.push(Field::at(3, "Byte 6", format!("0x{:02X}", m.byte6), at + 2, 1));
+    fields.push(Field::at(
+        3,
+        "Bases",
+        format!("0x{:02X}, 0x{:02X}", m.bases.0, m.bases.1),
+        at + 3,
+        2,
+    ));
+    fields.push(Field::at(3, "Selector", m.selector.to_string(), at + 5, 1));
+    // The length octet is part of the field it measures, so the row covers
+    // both: highlighting the bits without their count hides the one number
+    // a reader checks them against.
+    let bits = if m.bits.is_empty() {
+        "0 bytes".to_string()
+    } else {
+        format!("{} bytes: {}", m.bits.len(), hex(&m.bits))
+    };
+    fields.push(Field::at(3, "Bit field", bits, at + 6, 1 + m.bits.len()));
+    if !m.trailing.is_empty() {
+        fields.push(Field::at(
+            3,
+            "Trailing",
+            hex(&m.trailing),
+            at + 7 + m.bits.len(),
+            m.trailing.len(),
+        ));
+    }
+}
+
+fn dissect_action_entry(fields: &mut Vec<Field>, a: &ActionEntry, at: usize) {
+    fields.push(Field::at(3, "Type code", format!("0x{:02X}", a.type_code), at + 1, 1));
+    let mut next = at + 2;
+    if let Some(p) = a.parameter {
+        fields.push(Field::at(3, "Parameter tag", p.tag.to_string(), next, 2));
+        fields.push(Field::at(
+            3,
+            "Parameter",
+            format!("0x{:02X}, 0x{:02X}", p.a, p.b),
+            next + 2,
+            2,
+        ));
+        next += 4;
+    }
+    if !a.trailing.is_empty() {
+        fields.push(Field::at(3, "Trailing", hex(&a.trailing), next, a.trailing.len()));
+    }
+}
+
+/// Which sub-operation an entry addresses, for a caller that wants the name
+/// without the tree.
+pub fn rule_entry_sub_op(value: &[u8]) -> Option<SubOp> {
+    RuleEntry::decode_value(value).map(|e| e.sub_op())
 }
 
 fn describe_length(l: extended::Length) -> String {
@@ -344,16 +497,14 @@ mod tests {
         assert_eq!(field(&d, "OUI").unwrap().value, "00-10-00");
     }
 
+    fn ext_header(channel: extended::Channel) -> extended::Header {
+        extended::Header { dst: ONU, src: PEER, flags: Flags::converged(), channel }
+    }
+
     #[test]
     fn an_extended_pdu_lists_its_variables() {
         let frame = extended::get_response(
-            extended::Header {
-                dst: ONU,
-                src: PEER,
-                flags: Flags::converged(),
-                oui: Oui::DPOE,
-                opcode: extended::Opcode::GetResponse,
-            },
+            ext_header(extended::Channel::Dpoe(extended::DpoeOpcode::GetResponse)),
             &[extended::Container {
                 descriptor: extended::Descriptor::attribute(extended::leaf::FIRMWARE_INFO),
                 length: extended::Length::Bytes(12),
@@ -365,6 +516,71 @@ mod tests {
         assert!(d.summary.contains("get-response"), "{}", d.summary);
         assert!(d.summary.contains("attribute/0x0003"), "{}", d.summary);
         assert_eq!(field(&d, "Length").unwrap().value, "12 bytes");
+    }
+
+    /// The contract of this module is that every field carries the bytes it
+    /// came from. The extended layer used to emit its variables with no
+    /// range at all, which made the promise vacuously true for exactly the
+    /// rows a reader most wants to point at.
+    #[test]
+    fn every_dissected_field_of_an_extended_pdu_carries_its_span() {
+        let update = crate::rule_list::RuleListUpdate {
+            reset: true,
+            mark: true,
+            match_entries: vec![crate::rule_list::MatchEntry::new(
+                0x06,
+                0x01,
+                (0x0C, 0x02),
+                3,
+                vec![0xFF, 0x0F],
+            )],
+            action_entries: vec![crate::rule_list::ActionEntry::new(
+                0x03,
+                Some(crate::rule_list::ActionParameter::new(0x10, 0)),
+            )],
+            apply: true,
+        };
+        let frame = extended::variables_message(
+            ext_header(extended::Channel::Extension(
+                extended::ExtensionMessage::Variables,
+            )),
+            &update.variables(),
+        );
+        let d = dissect(&frame);
+        assert_eq!(d.protocol, "OAM/extended");
+        for f in &d.fields {
+            let off = f.offset.unwrap_or_else(|| panic!("{} has no offset", f.name));
+            assert!(off + f.len <= frame.len(), "{} runs past the frame", f.name);
+        }
+        // And the two octets that must never be swapped are two rows.
+        let sub_ops: Vec<&Field> =
+            d.fields.iter().filter(|f| f.name == "Sub-operation").collect();
+        let types: Vec<&Field> = d.fields.iter().filter(|f| f.name == "Type code").collect();
+        assert_eq!(sub_ops.len(), 4, "reset, mark, one match, one action");
+        assert_eq!(types.len(), 2, "only the two entries carry a type code");
+        for (s, t) in sub_ops.iter().skip(2).zip(&types) {
+            assert_eq!(t.offset, s.offset.map(|o| o + 1), "the type code follows it");
+        }
+    }
+
+    /// A body nothing says is a variable list shows up as its bytes, not as
+    /// a list of containers made out of them.
+    #[test]
+    fn an_opaque_body_dissects_as_one_row_of_bytes() {
+        let body = [0xD7, 0x05, 0x01, 0x04, 0xDE, 0xAD, 0xBE, 0xEF];
+        let frame = extended::raw_message(
+            ext_header(extended::Channel::Extension(
+                extended::ExtensionMessage::Other(0x0A),
+            )),
+            &body,
+        );
+        let d = dissect(&frame);
+        assert_eq!(d.protocol, "OAM/extended");
+        assert!(field(&d, "Variable").is_none(), "nothing was walked");
+        let row = field(&d, "Body").expect("the bytes are shown");
+        assert!(row.value.contains("not read as a variable list"), "{}", row.value);
+        assert_eq!(row.offset, Some(EXT_BODY_OFFSET));
+        assert!(d.summary.contains("opaque"), "{}", d.summary);
     }
 
     #[test]
@@ -453,9 +669,18 @@ mod panel_shape {
             extended::get_request(
                 extended::Header {
                     dst: onu, src: peer, flags: oam::Flags::converged(),
-                    oui: oam::Oui::DPOE, opcode: extended::Opcode::GetRequest,
+                    channel: extended::Channel::Dpoe(extended::DpoeOpcode::GetRequest),
                 },
                 &[extended::Descriptor::attribute(extended::leaf::FIRMWARE_INFO)],
+            ),
+            extended::raw_message(
+                extended::Header {
+                    dst: onu, src: peer, flags: oam::Flags::converged(),
+                    channel: extended::Channel::Extension(
+                        extended::ExtensionMessage::Other(0x17),
+                    ),
+                },
+                &[0x01, 0x02, 0x03],
             ),
         ];
         for f in frames {

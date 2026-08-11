@@ -1,4 +1,21 @@
-//! MMIO block/register name lookup. Generated from hwregs DB — do not hand-edit.
+//! MMIO block/register name lookup.
+//!
+//! A **snapshot** of the register database, taken once and not regenerated
+//! since — **not authoritative**. The banner that used to sit here said
+//! "generated, do not hand-edit", which was worse than an admitted snapshot:
+//! this table is what the `explain_mmio` tool answers with, so an entry the
+//! database has since read differently is a wrong answer handed to a later
+//! reader, and the banner told that reader not to fix it.
+//!
+//! Every entry the database now reads differently carries a
+//! `⛔ contradicted by the register DB:` line in its `desc`, naming the
+//! competing reading. Those lines are the honest part of this file; the rest
+//! is as good as the sweep that produced it.
+//!
+//! One entry was renamed rather than only annotated: `0x01000E04` used to be
+//! called `UNI_10G_LINK_STATUS` and is read by the database as a **PON**
+//! status word. A wrong subsystem in a name is not a wrong description — it
+//! routes a search for one side of the chip into the other.
 
 /// Resolved MMIO register entry.
 pub struct RegInfo {
@@ -100,12 +117,18 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01000048, RegInfo {
         block_id: 50, block_name: "I2C / SFP Serial Bus Controller",
         reg_name: "I2C_ACK_CTRL", access: "RMW",
-        desc: "ACK/NACK controle (1=NACK end, 0=ACK continue)",
+        desc: "ACK/NACK controle (1=NACK end, 0=ACK continue). \
+               ⛔ contradicted by the register DB: block 50 reads this word as \
+               UDR_HANDSHAKE, an eFuse / UDR bus handshake register (bit 0 = \
+               READ_EN, bit 4 = START, bit 31 = BUSY) — not an I2C ack.",
     }),
     (0x0100004C, RegInfo {
         block_id: 50, block_name: "I2C / SFP Serial Bus Controller",
         reg_name: "I2C_CLK_TOGGLE", access: "RMW",
-        desc: "Set puis clear = 1 pulse horloge I2C",
+        desc: "Set puis clear = 1 pulse horloge I2C. \
+               ⛔ contradicted by the register DB: block 50 reads this word as \
+               UDR_CLK_DATA (bit 0 = software clock pulse, bit 31 = data in) on \
+               the eFuse / UDR bus, not on I2C.",
     }),
     (0x01000050, RegInfo {
         block_id: 45, block_name: "SerDes Speed Control",
@@ -180,7 +203,11 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01000120, RegInfo {
         block_id: 69, block_name: "MPCP Slot Config Queue-to-Pin",
         reg_name: "QUEUE_PIN_MAP_I", access: "RMW",
-        desc: "Champ 5-bit par index de queue",
+        desc: "Champ 5-bit par index de queue. \
+               ⛔ contradicted by the register DB: block 69 is read as a pin-mux \
+               / LED output aperture based at 0x010000F8, and this word as \
+               QUEUE_PIN_MAP_0 (queues 0..3, four 5-bit pin-function codes). \
+               The block name here still says MPCP slot config.",
     }),
     (0x01000140, RegInfo {
         block_id: 90001, block_name: "Lane State Table (DAT_ram_20032cc8)",
@@ -534,8 +561,12 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     }),
     (0x01000E04, RegInfo {
         block_id: 4, block_name: "PHY 10G / UNI 10G Link Status",
-        reg_name: "UNI_10G_LINK_STATUS", access: "RW",
-        desc: "Bit 6 set = 10G LINK UP. Write 0x40 to clear.",
+        reg_name: "PON_10G_PCS_LINK_STATUS", access: "RW",
+        desc: "Bit 6 set = 10G link up; W1C by writing 0x40. \
+               ⛔ renamed: this entry used to be called UNI_10G_LINK_STATUS. The \
+               register DB reads bit 6 as the PON downstream 10G PCS block-lock \
+               (64b/66b sync) — the opposite side of the chip. A search for the \
+               UNI side landed on a PON register.",
     }),
     (0x01000E0C, RegInfo {
         block_id: 7, block_name: "PON Lane Enable / Speed",
@@ -565,7 +596,11 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01000F80, RegInfo {
         block_id: 15, block_name: "MACsec SA Programming 10G",
         reg_name: "MACSEC_CHANNEL_ENABLE", access: "RMW",
-        desc: "Toggle enable channel -- `macsec_hw_10g_set_llid_mask`",
+        desc: "Toggle enable channel -- `macsec_hw_10g_set_llid_mask`. \
+               ⛔ three blocks claim this one word in the register DB and no \
+               measurement separates them: block 15 MACSEC_CHANNEL_ENABLE, \
+               block 23 NCO_TX_MODE_SECONDARY (bit 9) and block 25 \
+               TX_LANE_BUSY (bit 3, read). `soc/nco` serves it.",
     }),
     (0x01000F84, RegInfo {
         block_id: 15, block_name: "MACsec SA Programming 10G",
@@ -585,12 +620,22 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01000FFC, RegInfo {
         block_id: 1, block_name: "EPON MAC -- Bloc principal",
         reg_name: "CHIP_ID", access: "R",
-        desc: "Chip ID register -- BCM4701 = 0x47010203. Lu via `reg 0`.",
+        desc: "Chip ID register, read as 0x47010203. \
+               ⛔ contradicted by the register DB: nothing is mapped at this \
+               address any more. Block 1's CHIP_ID / CHIP_REV pair was moved to \
+               block 68 at 0x01000000 / 0x01000004 after a silicon read through \
+               this address returned zero. ⛔ The part number the value used to \
+               be attributed to is an inference from a magic constant, not a \
+               reading of this chip.",
     }),
     (0x01001000, RegInfo {
         block_id: 1, block_name: "EPON MAC -- Bloc principal",
         reg_name: "CHIP_REV", access: "R",
-        desc: "Chip revision / bond options -- 0xB2110816. Lu via `reg 1`.",
+        desc: "Chip revision / bond options -- 0xB2110816. Lu via `reg 1`. \
+               ⛔ contradicted by the register DB: two other blocks read this \
+               word instead — RX_MODE_CTRL (block 2, bit 18 auto mode) and \
+               GRANT_MODE_CTRL (block 16). Block 1 no longer holds a revision \
+               register at this offset.",
     }),
     (0x01001004, RegInfo {
         block_id: 2, block_name: "EPON RX Configuration",
@@ -765,7 +810,11 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01001404, RegInfo {
         block_id: 36, block_name: "DMA Channel Enable Register",
         reg_name: "CHAN_PACKET_ENABLE", access: "RMW",
-        desc: "Bit 8 (0x100) = packet processing enable",
+        desc: "Bit 8 (0x100) = packet processing enable. \
+               ⛔ contradicted by the register DB: block 36 no longer exists. It \
+               was folded into block 1801, the consolidated channel DMA / IRQ \
+               controller (base 0x010013DC, 6 channels of stride 0x200), which \
+               is where this word now lives.",
     }),
     (0x01001410, RegInfo {
         block_id: 1801, block_name: "Channel DMA / IRQ Controller -- Config Channel",
@@ -775,12 +824,19 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01001428, RegInfo {
         block_id: 1802, block_name: "Channel DMA / IRQ Controller -- IRQ Channel",
         reg_name: "CHAN_IRQ_ENABLE", access: "RMW",
-        desc: "Bitmap enable IRQ par canal (OR avec mask)",
+        desc: "Bitmap enable IRQ par canal (OR avec mask). \
+               ⛔ contradicted by the register DB: block 1802 no longer exists. \
+               Two blocks read this word — 1801 CHAN_IRQ_ENABLE (per-subchannel \
+               enable) and 1805 CHAN_ACTIVE_BITMAP (one bit per subchannel, \
+               \"currently busy\"). Which one a given access means is not settled.",
     }),
     (0x0100142C, RegInfo {
         block_id: 1802, block_name: "Channel DMA / IRQ Controller -- IRQ Channel",
         reg_name: "CHAN_IRQ_PENDING", access: "RMW",
-        desc: "Bitmap pending IRQ par canal (OR avec mask)",
+        desc: "Bitmap pending IRQ par canal (OR avec mask). \
+               ⛔ contradicted by the register DB: block 1802 no longer exists. \
+               Two blocks read this word — 1801 CHAN_IRQ_PENDING and 1804 \
+               CHAN_PENDING_BITMAP (one bit per subchannel, \"IRQ asserted\").",
     }),
     (0x0100143C, RegInfo {
         block_id: 74, block_name: "DMA Channel Queue Drain Register",
@@ -790,7 +846,13 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01001480, RegInfo {
         block_id: 37, block_name: "DMA Queue Descriptor Table",
         reg_name: "QUEUE_DESCRIPTOR", access: "RW",
-        desc: "Queue descriptor per sub-channel. Write 0 to clear, or write compound config (bi",
+        desc: "Queue descriptor per sub-channel. Write 0 to clear, or write a \
+               compound config word. \
+               ⛔ the register DB is self-inconsistent here: block 37 carries \
+               runtime base 0x01001480 and its one register an offset of 0x1480, \
+               so the DB's own arithmetic resolves it to 0x01002900. Its notes \
+               place the descriptor window at 0x01001480 (chan*0x200 + 0x1480 + \
+               subchan*4), which is what this entry assumes.",
     }),
     (0x010015C0, RegInfo {
         block_id: 1803, block_name: "Channel DMA / IRQ Controller -- Mailbox",
@@ -830,7 +892,12 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01002410, RegInfo {
         block_id: 5602, block_name: "Fatal Error Status / Mask -- Fatal Error Mask",
         reg_name: "LANE_ID_CONFIG", access: "R",
-        desc: "Lane ID / configuration initiale",
+        desc: "Lane ID / configuration initiale. \
+               ⛔ contradicted by the register DB: block 5602 was deleted, and \
+               its LANE_ID_CONFIG entry was among the ones dropped as \
+               misclassified. This address is read as block 60 LUE_DATA_3 — the \
+               most-significant word of the classifier's indirect 128-bit port \
+               (see `soc/lue`), whose instance 1 mirror is 0x01002810.",
     }),
     (0x01002484, RegInfo {
         block_id: 54, block_name: "SerDes Lane HW Enable",
@@ -905,7 +972,13 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01002804, RegInfo {
         block_id: 5601, block_name: "Fatal Error Status / Mask -- Fatal Error Status",
         reg_name: "FATAL_ERROR_STATUS", access: "R",
-        desc: "Bits 0x105c : si non-zero = erreur fatale",
+        desc: "Bits 0x105c : si non-zero = erreur fatale. \
+               ⛔ contradicted by the register DB, and the name is retracted: \
+               both FATAL_ERROR_MASK and FATAL_ERROR_STATUS were fabricated for \
+               this word. The DB reads it as the status / write-1-to-clear word \
+               of the classifier's instance 1, traced from a firmware string \
+               that names the register index this address decodes to. Two \
+               readings survive and only the second has a source.",
     }),
     (0x01002C00, RegInfo {
         block_id: 11, block_name: "MACsec Control",
@@ -960,12 +1033,22 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01003600, RegInfo {
         block_id: 46, block_name: "Filter/Mask Controller",
         reg_name: "FILTER_CHANNEL_MASK", access: "RMW",
-        desc: "Clear bits [3:0] puis set a 0xf = enable all",
+        desc: "Clear bits [3:0] puis set a 0xf = enable all. \
+               ⛔ contradicted by the register DB: block 46 is relabelled \
+               \"SerDes IRQ / Lane Mask Controller\" with the explicit note that \
+               it is NOT a packet filter. Four accessors share this word — one \
+               sets the low four bits, one clears arbitrary bits, one ORs a \
+               mask in — so it reads as an IRQ / lane enable mask.",
     }),
     (0x01003604, RegInfo {
         block_id: 46, block_name: "Filter/Mask Controller",
         reg_name: "FILTER_TABLE_PTR", access: "W",
-        desc: "Pointeur table de filtrage (DAT_20011980)",
+        desc: "Pointeur table de filtrage. \
+               ⛔ contradicted by the register DB: same block 46 relabelling. \
+               The value written here is a mask bitmap, not a table pointer, and \
+               a fourth accessor reads the word back for an error field in bits \
+               [19:4]. `soc/fatal_filter` serves this address; its module doc \
+               carries the same caveat.",
     }),
     (0x01003800, RegInfo {
         block_id: 67, block_name: "Channel Config Register",
@@ -974,9 +1057,93 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     }),
 ];
 
+/// The marker every entry the register database now reads differently
+/// carries in its `desc`. Kept as a constant so the annotations can be
+/// found — and asserted on — rather than trusted to survive editing.
+pub const CONTRADICTED_MARKER: &str = "⛔";
+
 /// Look up an MMIO address in the register database.
 /// Returns `Some(RegInfo)` if the address is known, `None` otherwise.
 pub fn lookup(addr: u32) -> Option<&'static RegInfo> {
     MMIO_REGISTERS.binary_search_by_key(&addr, |(a, _)| *a).ok()
         .map(|i| &MMIO_REGISTERS[i].1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `lookup` binary-searches, so a table that is not strictly ascending
+    /// answers some addresses with `None` and others with the wrong entry —
+    /// silently, and only for the addresses that happen to fall on the wrong
+    /// side of a probe. Hand-editing this file is now allowed, so the
+    /// ordering needs a guard rather than a banner.
+    #[test]
+    fn the_table_is_strictly_ascending_so_the_binary_search_is_valid() {
+        for pair in MMIO_REGISTERS.windows(2) {
+            assert!(
+                pair[0].0 < pair[1].0,
+                "{:#010x} does not precede {:#010x}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+        // And every entry is reachable through the public accessor.
+        for (addr, info) in MMIO_REGISTERS {
+            let found = lookup(*addr).expect("every listed address resolves");
+            assert_eq!(found.reg_name, info.reg_name, "at {addr:#010x}");
+        }
+    }
+
+    /// The addresses the register database has since read differently must
+    /// keep saying so. Dropping the marker while editing a `desc` is the
+    /// exact failure this file's old banner used to cause: a stale answer
+    /// that reads as a confident one.
+    #[test]
+    fn every_known_divergence_still_carries_its_marker() {
+        const CONTRADICTED: &[u32] = &[
+            0x01000048, // reads as an eFuse / UDR handshake word
+            0x0100004C, // reads as the eFuse / UDR clock + data word
+            0x01000120, // block 69 reads as a pin-mux / LED aperture
+            0x01000E04, // read as a PON status word, not a UNI one
+            0x01000F80, // three blocks claim this one word
+            0x01000FFC, // no register mapped here any more
+            0x01001000, // read by two other blocks
+            0x01001404, // block 36 no longer exists
+            0x01001428, // block 1802 no longer exists
+            0x0100142C, // block 1802 no longer exists
+            0x01001480, // the DB's own arithmetic lands elsewhere
+            0x01002410, // block 5602 deleted; reads as a classifier data word
+            0x01002804, // both names for this word are retracted
+            0x01003600, // block 46 is explicitly not a packet filter
+            0x01003604, // same block 46 relabelling
+        ];
+        for &addr in CONTRADICTED {
+            let info = lookup(addr).expect("a contradicted address is still listed");
+            assert!(
+                info.desc.contains(CONTRADICTED_MARKER),
+                "{addr:#010x} ({}) lost its divergence note",
+                info.reg_name
+            );
+        }
+    }
+
+    /// A name that carries the wrong subsystem is not a wrong description:
+    /// it routes a search for one side of the chip into the other. This one
+    /// was renamed for that reason and must not drift back.
+    #[test]
+    fn the_pon_status_word_is_not_named_after_the_other_side_of_the_chip() {
+        let info = lookup(0x01000E04).expect("listed");
+        assert!(!info.reg_name.contains("UNI"), "reg_name: {}", info.reg_name);
+        assert!(info.reg_name.contains("PON"), "reg_name: {}", info.reg_name);
+    }
+
+    /// `explain_mmio` is asserted on this name by the MCP round-trip test,
+    /// which must stay green.
+    #[test]
+    fn the_first_word_of_the_register_file_keeps_the_name_the_mcp_test_expects() {
+        let info = lookup(0x01000000).expect("listed");
+        assert_eq!(info.reg_name, "HW_STATE_REG_N");
+        assert_eq!(info.block_id, 49);
+    }
 }

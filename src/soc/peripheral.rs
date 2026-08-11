@@ -96,6 +96,7 @@ pub enum PeripheralEvent {
     Timer(TimerEvent),
     Efuse(EfuseEvent),
     FatalFilter(FatalFilterEvent),
+    Uni(crate::soc::uni::UniEvent),
     Olt(crate::soc::olt::OltEvent),
 }
 
@@ -249,6 +250,7 @@ pub enum PeripheralSnapshot {
     Timer(TimerSnapshot),
     Efuse(EfuseSnapshot),
     FatalFilter(FatalFilterSnapshot),
+    Uni(crate::soc::uni::UniSnapshot),
     Olt(crate::soc::olt::OltSnapshot),
 }
 
@@ -272,6 +274,7 @@ impl PeripheralSnapshot {
             Self::Timer(_) => "timer",
             Self::Efuse(_) => "efuse_udr",
             Self::FatalFilter(_) => "fatal_filter",
+            Self::Uni(_) => "uni",
             Self::Olt(_) => "olt",
         }
     }

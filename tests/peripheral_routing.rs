@@ -18,7 +18,8 @@
 //!    `sysreg_shim` instead of the intended peripheral.
 
 use bcm55030_emulator::soc::bank::{BootMode, PeripheralBank};
-use bcm55030_emulator::soc::peripheral::PeripheralSnapshot;
+use bcm55030_emulator::soc::peripheral::{PeripheralEvent, PeripheralSnapshot};
+use bcm55030_emulator::soc::uni::{UniEvent, UniRxSignal};
 
 /// Residual sysreg addresses are a plain backing store — writes
 /// round-trip unmodified. The bits `[31:27]` command-bit auto-
@@ -137,7 +138,11 @@ fn bank_routes_known_peripherals_without_sysreg_fallback() {
 fn snapshot_all_exposes_sfp_row() {
     let bank = PeripheralBank::new(BootMode::Warm);
     let rows = bank.snapshot_all();
-    assert_eq!(rows.len(), 13, "13 peripheral rows expected (12 original + OLT)");
+    assert_eq!(
+        rows.len(),
+        14,
+        "14 peripheral rows expected (12 original + OLT + UNI port)"
+    );
     assert!(
         matches!(rows[3], PeripheralSnapshot::Sfp(_)),
         "row 3 should be PeripheralSnapshot::Sfp, got {:?}",
@@ -245,4 +250,82 @@ fn an_arriving_frame_moves_the_counter_of_its_own_queue() {
     // this port has no timeout.
     bank.write_word(cmd, 0x8000_000C).unwrap();
     assert_eq!(bank.read_word(cmd).unwrap() & 0x8000_0000, 0);
+}
+
+/// The UNI port block has to be reachable through **all eight** dispatch
+/// chains — read and write, at word, half and byte width — and through
+/// the peek path. It is the only place where an omission would be
+/// silent: the fallback below it is a separate backing store that
+/// answers every access without complaint, so a chain that missed the
+/// port would keep working and quietly report the wrong register file.
+///
+/// Cross-width round trips are what catch that: a word written through
+/// one store and a half read out of another cannot agree.
+#[test]
+fn the_uni_window_is_reachable_at_all_four_access_widths() {
+    let mut bank = PeripheralBank::new(BootMode::Warm);
+
+    for addr in [0x0100_2D00u32, 0x0100_2D14, 0x0100_2D1C, 0x0100_2D2C, 0x0100_2D3C] {
+        assert_eq!(
+            bank.peripheral_for(addr),
+            Some("uni"),
+            "{addr:#010X} must route to the UNI port"
+        );
+    }
+
+    // Plain-store words: every width has to land in the same store.
+    for addr in [0x0100_2D00u32, 0x0100_2D3C] {
+        bank.write_word(addr, 0x1234_5678).unwrap();
+        assert_eq!(bank.read_word(addr).unwrap(), 0x1234_5678);
+        assert_eq!(bank.read_half(addr).unwrap(), 0x1234);
+        assert_eq!(bank.read_half(addr + 2).unwrap(), 0x5678);
+        assert_eq!(bank.read_byte(addr).unwrap(), 0x12);
+        assert_eq!(bank.read_byte(addr + 3).unwrap(), 0x78);
+        assert_eq!(bank.peek_word(addr).unwrap(), 0x1234_5678);
+
+        bank.write_half(addr, 0xABCD).unwrap();
+        assert_eq!(bank.read_word(addr).unwrap(), 0xABCD_5678);
+        bank.write_byte(addr + 3, 0xEF).unwrap();
+        assert_eq!(bank.read_word(addr).unwrap(), 0xABCD_56EF);
+    }
+
+    // The busy bit is the hardware's at every write width. A chain that
+    // fell through to the residual store would let any of these clear
+    // it, because that store has no idea the bit is not software's.
+    bank.write_word(0x0100_2D1C, 0x0000_001E).unwrap();
+    assert_eq!(bank.read_word(0x0100_2D1C).unwrap(), 0x8000_001E);
+    bank.write_half(0x0100_2D1C, 0x0000).unwrap();
+    assert_eq!(bank.read_word(0x0100_2D1C).unwrap(), 0x8000_001E);
+    bank.write_byte(0x0100_2D1C, 0x00).unwrap();
+    assert_eq!(bank.read_word(0x0100_2D1C).unwrap(), 0x8000_001E);
+
+    // The derived words follow the injected signal at every read width.
+    bank.inject_event(&PeripheralEvent::Uni(UniEvent::SetArmed(true)));
+    bank.inject_event(&PeripheralEvent::Uni(UniEvent::SetRxSignal(
+        UniRxSignal::BaseX { autoneg: true },
+    )));
+    assert_eq!(bank.read_word(0x0100_2D14).unwrap(), 0x0000_4001);
+    assert_eq!(bank.read_half(0x0100_2D14).unwrap(), 0x0000);
+    assert_eq!(bank.read_half(0x0100_2D16).unwrap(), 0x4001);
+    assert_eq!(bank.read_byte(0x0100_2D16).unwrap(), 0x40);
+    assert_eq!(bank.read_byte(0x0100_2D17).unwrap(), 0x01);
+    assert_eq!(bank.peek_word(0x0100_2D14).unwrap(), 0x0000_4001);
+
+    assert_eq!(bank.read_word(0x0100_2D2C).unwrap(), 0x0000_012C);
+    assert_eq!(bank.read_half(0x0100_2D2E).unwrap(), 0x012C);
+    assert_eq!(bank.read_byte(0x0100_2D2F).unwrap(), 0x2C);
+    assert_eq!(bank.peek_word(0x0100_2D2C).unwrap(), 0x0000_012C);
+}
+
+/// The port has no link partner unless one is injected, and the model
+/// says so rather than answering with a plausible constant.
+#[test]
+fn the_uni_port_starts_with_no_partner_and_the_reading_says_so() {
+    let bank = PeripheralBank::new(BootMode::Warm);
+    assert_eq!(bank.uni.rx_signal(), UniRxSignal::None);
+    assert!(!bank.uni.armed());
+    assert!(bank.uni.port_busy(), "the counter port starts busy");
+    // Both derived words read exactly the value the reset table holds.
+    assert_eq!(bank.peek_word(0x0100_2D14).unwrap(), 0x0000_0001);
+    assert_eq!(bank.peek_word(0x0100_2D2C).unwrap(), 0x0000_0100);
 }

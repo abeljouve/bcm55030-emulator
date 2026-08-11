@@ -22,9 +22,10 @@
 use std::collections::VecDeque;
 
 use crate::clock::{WireDuration, WireInstant};
-use crate::extended;
+use crate::extended::{self, BodyShape, Channel, DpoeOpcode, Variable};
 use crate::mpcp::{self, GateFlags, Grant, RegisterFlag, RegisterReqFlag};
 use crate::oam;
+use crate::rule_list::RuleListUpdate;
 use crate::sched::Scheduler;
 use crate::state::MpcpState;
 use crate::types::{EtherType, Llid, MacAddr};
@@ -249,6 +250,11 @@ pub struct Counters {
     pub oam_keepalives_sent: u64,
     pub attribute_requests_sent: u64,
     pub attribute_replies_seen: u64,
+    /// Extended OAMPDUs whose body nothing says is a variable list. They
+    /// used to be walked as one, and each fabricated container was
+    /// counted as a reply — which put a number on messages that answer
+    /// no request.
+    pub extended_opaque_bodies_seen: u64,
     pub registrations: u64,
     pub deregistrations: u64,
 }
@@ -276,6 +282,32 @@ impl Counters {
                 + self.register_req_window_passed
                 + self.register_req_malformed
                 + self.register_req_deregister
+    }
+}
+
+/// What goes after the code octet of an extended OAMPDU.
+///
+/// The raw arm is not a convenience: a receiver's refusal of a malformed
+/// message is the only observable it offers, and an encoder that could only
+/// emit well-formed bodies would make that unmeasurable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Body {
+    Variables(Vec<Variable>),
+    /// Bytes exactly as given.
+    Raw(Vec<u8>),
+}
+
+impl Body {
+    /// The body a channel's shape says is well-formed for it, when the
+    /// caller has variables to send.
+    ///
+    /// Returns `None` for an opaque channel: nothing says what its body is,
+    /// so there is nothing to build one out of. Send [`Body::Raw`] there.
+    pub fn for_shape(shape: BodyShape, variables: Vec<Variable>) -> Option<Self> {
+        match shape {
+            BodyShape::Opaque => None,
+            _ => Some(Self::Variables(variables)),
+        }
     }
 }
 
@@ -652,12 +684,25 @@ impl Peer {
         format!("OAM {} flags=0x{:04X} ({} bytes)", pdu.code, pdu.flags.as_u16(), frame.len())
     }
 
+    /// A message on the extended channel.
+    ///
+    /// Only a body that was actually read as a list of containers can hold a
+    /// reply. A body whose shape is [`BodyShape::Opaque`] was never parsed, so
+    /// counting anything in it as an answered variable puts a number on
+    /// containers that were never there.
     fn on_extended(&mut self, pdu: extended::Pdu) -> String {
+        if let Some(span) = pdu.opaque_body {
+            self.counters.extended_opaque_bodies_seen += 1;
+            return format!(
+                "{} {} ({} bytes, not a variable list)",
+                pdu.oui, pdu.channel, span.len
+            );
+        }
         for c in pdu.containers() {
             self.counters.attribute_replies_seen += 1;
             self.log(format!(
                 "{} {} -> {:?} ({} bytes)",
-                pdu.opcode,
+                pdu.channel,
                 c.descriptor,
                 c.length,
                 c.value.len()
@@ -667,7 +712,7 @@ impl Peer {
             }
             self.attribute_replies.push_back(c.clone());
         }
-        format!("{} {} ({} variables)", pdu.oui, pdu.opcode, pdu.variables.len())
+        format!("{} {} ({} variables)", pdu.oui, pdu.channel, pdu.variables.len())
     }
 
     // ── Registration ────────────────────────────────────────────────
@@ -798,26 +843,41 @@ impl Peer {
         self.registered_at
     }
 
-    /// Send an extended OAMPDU carrying `payload` after the vendor opcode.
-    /// Returns the frame as it was queued.
-    pub fn send_extended(
-        &mut self,
-        oui: oam::Oui,
-        opcode: extended::Opcode,
-        payload: &[u8],
-    ) -> Vec<u8> {
-        let mut w = crate::types::FrameWriter::ethernet(
-            self.oam_destination(),
-            self.config.mac,
-            EtherType::SlowProtocol,
-        );
-        w.u8(oam::SUBTYPE_OAM)
-            .u16(self.discovery.flags().as_u16())
-            .u8(oam::Code::OrganizationSpecific.as_u8())
-            .bytes(&oui.0)
-            .u8(opcode.as_u8())
-            .bytes(payload);
-        self.emit(w.pad_to(crate::types::MIN_FRAME_LEN), "extended request")
+    /// The header every extended OAMPDU this peer builds starts with.
+    fn extended_header(&self, channel: Channel) -> extended::Header {
+        extended::Header {
+            dst: self.oam_destination(),
+            src: self.config.mac,
+            flags: self.discovery.flags(),
+            channel,
+        }
+    }
+
+    /// Send a message on an organization-specific channel.
+    ///
+    /// The channel carries its own identifier, so a code belonging to one
+    /// container cannot go out under the other's.
+    pub fn send_vendor(&mut self, channel: Channel, body: &Body) -> Vec<u8> {
+        let header = self.extended_header(channel);
+        let frame = match body {
+            Body::Variables(vars) => extended::variables_message(header, vars),
+            Body::Raw(bytes) => extended::raw_message(header, bytes),
+        };
+        self.emit(frame, "extended request")
+    }
+
+    /// Send a rule-list update as one message.
+    pub fn send_rule_list(&mut self, channel: Channel, update: &RuleListUpdate) -> Vec<u8> {
+        self.send_vendor(channel, &Body::Variables(update.variables()))
+    }
+
+    /// Send an extended OAMPDU carrying `payload` after the code octet.
+    ///
+    /// The bytes go out exactly as given: this is the path a deliberately
+    /// malformed message takes, and a receiver's refusal is only measurable
+    /// if nothing normalises it on the way.
+    pub fn send_extended(&mut self, oui: oam::Oui, code: u8, payload: &[u8]) -> Vec<u8> {
+        self.send_vendor(Channel::decode(oui, code), &Body::Raw(payload.to_vec()))
     }
 
     /// Read one attribute now, rather than waiting for the rotation.
@@ -943,13 +1003,7 @@ impl Peer {
 
     fn build_attribute_request(&self, leaf: u16) -> Vec<u8> {
         extended::get_request(
-            extended::Header {
-                dst: self.oam_destination(),
-                src: self.config.mac,
-                flags: self.discovery.flags(),
-                oui: oam::Oui::DPOE,
-                opcode: extended::Opcode::GetRequest,
-            },
+            self.extended_header(Channel::Dpoe(DpoeOpcode::GetRequest)),
             &[extended::Descriptor::attribute(leaf)],
         )
     }
@@ -1374,6 +1428,127 @@ mod tests {
         peer.advance_to(at(100_000));
         assert_eq!(peer.counters.gates_sent, gates, "a dead link sends nothing");
         assert_eq!(peer.counters.deregistrations, 0, "and tears nothing down");
+    }
+
+    /// The extension container's other codes carry bodies that are not
+    /// variable lists. Walking one produced containers made of whatever
+    /// bytes followed, and every one of them was counted as a reply to a
+    /// request the peer never sent.
+    #[test]
+    fn an_opaque_body_is_not_counted_as_an_attribute_reply() {
+        let mut peer = live_peer();
+        peer.advance_to(at(0));
+        let body = [0xD7, 0x05, 0x01, 0x04, 0xDE, 0xAD, 0xBE, 0xEF];
+        let frame = extended::raw_message(
+            extended::Header {
+                dst: DEFAULT_OLT_MAC,
+                src: ONU,
+                flags: oam::Flags::converged(),
+                channel: Channel::Extension(extended::ExtensionMessage::Other(0x0A)),
+            },
+            &body,
+        );
+        peer.deliver(&frame, at(1));
+        assert_eq!(peer.counters.attribute_replies_seen, 0);
+        assert_eq!(peer.counters.extended_opaque_bodies_seen, 1);
+        assert!(peer.attribute_replies().is_empty());
+
+        // Negative control: the same bytes under the one code whose body is
+        // a list do produce a container, so the test above is measuring the
+        // shape and not a parser that stopped working.
+        let frame = extended::raw_message(
+            extended::Header {
+                dst: DEFAULT_OLT_MAC,
+                src: ONU,
+                flags: oam::Flags::converged(),
+                channel: Channel::Extension(extended::ExtensionMessage::Variables),
+            },
+            &body,
+        );
+        peer.deliver(&frame, at(2));
+        assert_eq!(peer.counters.attribute_replies_seen, 1);
+        assert_eq!(peer.counters.extended_opaque_bodies_seen, 1);
+    }
+
+    /// A rule-list update leaves the peer as one frame the far end can read
+    /// back into the same update.
+    #[test]
+    fn a_rule_list_update_goes_out_as_one_message_and_parses_back() {
+        let mut peer = live_peer();
+        peer.advance_to(at(0));
+        let update = RuleListUpdate {
+            reset: true,
+            mark: true,
+            match_entries: vec![crate::rule_list::MatchEntry::new(
+                0x06,
+                0x01,
+                (0x0C, 0x02),
+                3,
+                vec![0xFF, 0x0F],
+            )],
+            action_entries: vec![crate::rule_list::ActionEntry::new(
+                0x03,
+                Some(crate::rule_list::ActionParameter::new(0x10, 0x00)),
+            )],
+            apply: true,
+        };
+        peer.take_downstream();
+        let frame = peer.send_rule_list(
+            Channel::Extension(extended::ExtensionMessage::Variables),
+            &update,
+        );
+        let pdu = extended::Pdu::parse(&frame).expect("parses");
+        assert_eq!(pdu.oui, oam::Oui::VENDOR_EXTENSION);
+        assert_eq!(pdu.channel, Channel::Extension(extended::ExtensionMessage::Variables));
+        let vars: Vec<Variable> = pdu.variables().cloned().collect();
+        assert_eq!(RuleListUpdate::from_variables(&vars), Some(update));
+        // And it reached the line, FCS included, like everything else.
+        assert_eq!(peer.take_downstream().len(), 1);
+    }
+
+    /// The raw arm exists so a receiver's refusal stays measurable: nothing
+    /// between the caller and the wire may tidy the bytes up.
+    #[test]
+    fn a_raw_body_reaches_the_wire_exactly_as_given() {
+        let mut peer = live_peer();
+        peer.advance_to(at(0));
+        // A length octet promising far more than follows it.
+        let body = [0xD7, 0x05, 0x01, 0x7F, 0x01, 0x02];
+        let frame = peer.send_vendor(
+            Channel::Extension(extended::ExtensionMessage::Variables),
+            &Body::Raw(body.to_vec()),
+        );
+        use extended::BODY_OFFSET as BODY_AT;
+        assert_eq!(&frame[BODY_AT..BODY_AT + body.len()], &body);
+        // send_extended is the same path, and still names its channel by
+        // the identifier plus the octet under it.
+        let same = peer.send_extended(oam::Oui::VENDOR_EXTENSION, 0x03, &body);
+        assert_eq!(&same[BODY_AT..BODY_AT + body.len()], &body);
+        assert_eq!(
+            extended::Pdu::parse(&same).expect("parses").channel,
+            Channel::Extension(extended::ExtensionMessage::Variables)
+        );
+    }
+
+    /// The same octet under the other identifier is a different message, and
+    /// the peer writes out whichever identifier the channel names.
+    #[test]
+    fn the_channel_decides_which_identifier_goes_on_the_wire() {
+        let mut peer = live_peer();
+        peer.advance_to(at(0));
+        for (channel, oui) in [
+            (Channel::Dpoe(DpoeOpcode::SetRequest), oam::Oui::DPOE),
+            (
+                Channel::Extension(extended::ExtensionMessage::Variables),
+                oam::Oui::VENDOR_EXTENSION,
+            ),
+        ] {
+            let frame = peer.send_vendor(channel, &Body::Raw(vec![0x00]));
+            let pdu = extended::Pdu::parse(&frame).expect("parses");
+            assert_eq!(pdu.oui, oui);
+            assert_eq!(pdu.channel, channel);
+            assert_eq!(pdu.channel.code(), extended::ExtensionMessage::VARIABLES_CODE);
+        }
     }
 
     #[test]

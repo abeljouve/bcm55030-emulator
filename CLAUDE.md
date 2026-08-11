@@ -59,6 +59,7 @@ cargo run -p epon-olt --bin olt -- dissect <hex>
 | `mpcp.rs` | MPCPDU encode/decode (clause 64) |
 | `oam.rs` | OAMPDU encode/decode (clause 57) |
 | `extended.rs` | organization-specific OAMPDUs and their variables |
+| `rule_list.rs` | classifier rule lists carried as extended-OAM variables |
 | `decode.rs` | frame dissection, shared by the MCP tools and the GUI |
 
 What stays in `src/soc/olt` is the join: the frame-queue mailbox, and the

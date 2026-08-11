@@ -19,6 +19,7 @@ use crate::soc::serdes::SerDes;
 use crate::soc::sysreg_shim::SysregShim;
 use crate::soc::timer::EponTimer;
 use crate::soc::uart::Uart;
+use crate::soc::uni::Uni;
 use crate::soc::lue::Lue;
 use crate::soc::mac_filter::MacFilter;
 
@@ -32,6 +33,7 @@ pub struct PeripheralBankSaveState {
     pub use_classifier: bool,
     pub classifier_binding: crate::soc::lue::ClassifierBinding,
     pub serdes: SerDes,
+    pub uni: Uni,
     pub epon_mac: EponMac,
     pub macsec: Macsec,
     pub dma: DmaChannelController,

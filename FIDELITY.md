@@ -38,10 +38,46 @@ behaviour of the SerDes / PCS. Known divergences from real silicon:
   on silicon the access takes time and gates on the SerDes clock.
 - **eFUSE speed-capability reads are a constant.** The eFUSE snapshot is not
   fully modelled; the default returns a fixed capability value.
+- **The statistics counters behind the port block are plain storage.** The busy
+  bit firmware spins on before taking a count — bit 31 of `0x01002D1C` — *is*
+  modelled as the hardware's, so the wait itself behaves as it does on silicon.
+  The counter words behind it are not: they hold their reset values and never
+  advance with traffic, so a statistics read returns zero. It also reads zero on
+  silicon, where those counters were measured flat while the port was carrying
+  signal. **Agreement on that number therefore proves nothing**, and the
+  statistics commands are not an oracle for conformance in either direction.
+- **One word of the port block has no rule.** `0x01002D0C` reads `0x00008807` on
+  silicon once the port is up, from a reset value of `0x00000003`, and no write
+  produces it — so it is hardware-driven, but what drives it is not established.
+  It is left as plain storage rather than given a guessed rule, and stays at the
+  reset value here.
 
 In short: anything that depends on the **analog PHY, real clock domains, or
 lane-calibration timing** is approximated. The register-level and CPU-level
 behaviour is the faithful part.
+
+## Not a divergence — two state-matching traps
+
+**The UNI-side port starts with no link partner.** The words at `0x01002D14` and
+`0x01002D2C` follow what arrives on the receive pair — one tracks the presence of
+clause 37 auto-negotiation and takes a distinct signature under 10G line coding,
+the other carries that state plus the port's own armed bit. That is modelled, but
+the signal is an **input**, not something the model invents: with nothing injected
+the port reads unarmed with no partner, which is a faithful reading of that state
+and not a missing feature. Supply one with `--uni-rx none|basex|basex-an|10g`
+before comparing these words against a capture taken with a partner attached.
+
+The contents of the classifier tables **depend on the state of the link**: one
+rule with the peer down, five once the link is established, six in between.
+Software installs the sixth on its teardown path and erases it again on the
+bring-up path, so the emulator is not missing it — the two inventories were
+simply taken in different states.
+
+An inventory of those tables compared without saying which state it was taken in
+is therefore a confounded measurement, not a fidelity result. Whatever
+produces such an inventory has to record the link state alongside the
+table contents; until it does,
+record it by hand.
 
 Contributions improving fidelity are welcome. The guiding rule (see
 [`CLAUDE.md`](CLAUDE.md)) is to model observed hardware behaviour, never to

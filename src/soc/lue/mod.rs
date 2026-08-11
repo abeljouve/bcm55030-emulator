@@ -30,8 +30,13 @@ pub mod port;
 pub mod rule;
 
 pub use engine::{Engine, EngineCounters, RuleStart, Verdict};
-pub use rule::{Action, ActionPayload, Clause, Entry, Field, Link, Op, Rule, RuleError, RuleRead};
-pub use port::{Cmd, LuePort, PortCounters, Quad, CMD_ERROR, CMD_GO, CMD_WRITE};
+pub use rule::{
+    looks_like_clause_tag, Action, ActionPayload, Clause, Entry, Field, Link, Op, Rule, RuleError,
+    RuleRead,
+};
+pub use port::{
+    Cmd, EntryLog, LoggedSlot, LuePort, PortCounters, Quad, CMD_ERROR, CMD_GO, CMD_WRITE,
+};
 
 use crate::cpu::exception::Exception;
 
@@ -63,6 +68,15 @@ const WORDS_PER_INSTANCE: u32 = 5;
 /// The old default named it only because it was the one that could be
 /// read off a running device.
 ///
+/// ⚠ "Five rules" is a reading **taken in one link state**, and the count
+/// moves with the state: registered it is five, unregistered it is six.
+/// The sixth is installed by the teardown path and then **cleared by the
+/// link-establishment path** — software's own doing, not a gap in this
+/// model. An inventory of these tables that does not say which state it
+/// was taken in is a confounded measurement, and comparing two taken in
+/// different states invents a discrepancy. `LuePort::cleared_slots` is
+/// what makes the disappearance visible rather than merely absent.
+///
 /// Three measurements since then say the default is not merely the least
 /// bad choice, without saying it is what the hardware consults:
 ///
@@ -77,15 +91,24 @@ const WORDS_PER_INSTANCE: u32 = 5;
 ///   table 8 — each carries one terminal clause on its own link index and
 ///   three on the others (see `engine::LINK_INDEX`). A pair cannot
 ///   express "the table follows the frame's link", which is the concrete
-///   form the wrong shape takes.
+///   form the wrong shape takes. ⛔ This one now rests on an
+///   identification that has gone back to being a hypothesis — read the
+///   ⛔ on `engine::LINK_INDEX` before leaning on it.
 /// * The one rule in the whole image that names the **data** queue lands
 ///   in instance 1 table 8. It is programmed from a persistent
 ///   configuration record, and seeding that record is what made it
 ///   appear; without the record the boot programs no rule naming that
 ///   queue anywhere, which is why the pair looked control-only.
 ///
+/// * A fourth, independent of the three above and of the readback path:
+///   the rule-assembly commands a device exposes install into this pair
+///   by default. That is a third route to the same instance and table,
+///   and unlike the sweep it does not depend on any reading of what the
+///   tables contain.
+///
 /// ⛔ None of this reads a classification result back, so "the only pair
-/// that decides" still is not "the pair the hardware consults".
+/// that decides" still is not "the pair the hardware consults". The ⛔ at
+/// the head of this comment stands untouched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClassifierBinding {
     pub instance: usize,

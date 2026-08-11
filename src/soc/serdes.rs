@@ -19,9 +19,9 @@
 //!     until bit 31 clears. The emulator auto-clears bit 31 on the
 //!     next read. Three addresses carry that handshake: `0x0100240C`,
 //!     `0x01002644`, `0x0100280C`. `+0x20` in each bank does **not**
-//!     — see `is_cmd_bit_register`.
-//!
-//!   * **`0x01002D00..0x01002D40`** — Lane Mode Controller.
+//!     — see `is_cmd_bit_register`. Ten addresses inside this window
+//!     belong to `soc::lue` and are tested before it on every dispatch
+//!     chain, so they never reach this peripheral through the bank.
 //!
 //! SerDes link lock is a derived bit that depends on the per-lane
 //! `locked` state, which the UI can toggle via
@@ -59,15 +59,23 @@ pub const SERDES_MAIN_END: u32 = 0x0100_01F8;
 pub const SERDES_LANE_BASE: u32 = 0x0100_2400;
 pub const SERDES_LANE_END: u32 = 0x0100_2A00;
 
-/// Fatal Error Status / Mask — split register at the same address.
-/// Write = FATAL_ERROR_MASK (bits to mask out of fatal detection).
-/// Read  = FATAL_ERROR_STATUS (current fatal error state, 0 = none).
-/// hwregs block 62 (mask, W) + block 5601 (status, R).
-const REG_FATAL_ERROR_STATUS_MASK: u32 = 0x0100_2804;
-
-/// Lane Mode Controller window.
-pub const SERDES_MODE_BASE: u32 = 0x0100_2D00;
-pub const SERDES_MODE_END: u32 = 0x0100_2D40;
+/// A word inside the lane window that this peripheral answers as zero
+/// on every read and swallows on every write.
+///
+/// ⛔ **Role not established.** The two names it used to carry —
+/// "fatal error status" on the read side, "fatal error mask" on the
+/// write side — were fabricated and have been retracted; nothing
+/// measured says this word aggregates faults. The register DB now reads
+/// it as the status / write-one-to-clear word of classifier instance 1,
+/// which is traceable: a firmware string naming register `0xa01` puts it
+/// at `0x01000000 + 0xa01 * 4`, this address.
+///
+/// The read-as-zero is a **workaround, not a measurement**: letting a
+/// write come back out of the same word made the firmware's hardware
+/// state poller see bits appear and take a shutdown path. Keeping the
+/// two directions apart is what stops that; which of them the hardware
+/// actually implements is open.
+const REG_ZERO_READ_WORKAROUND: u32 = 0x0100_2804;
 
 /// SerDes Lane Status File window — a 256-entry × 8-byte per-lane
 /// status table. Reads return a lane-indexed register file.
@@ -76,17 +84,22 @@ pub const SERDES_WINDOW_END: u32 = 0x224A_0800;
 
 const SERDES_MAIN_WORDS: usize = ((SERDES_MAIN_END - SERDES_MAIN_BASE) / 4) as usize;
 const SERDES_LANE_WORDS: usize = ((SERDES_LANE_END - SERDES_LANE_BASE) / 4) as usize;
-const SERDES_MODE_WORDS: usize = ((SERDES_MODE_END - SERDES_MODE_BASE) / 4) as usize;
 
 /// Lane count. The BCM55030 exposes four electrical lanes: PON RX, PON
 /// TX, UNI lane 1, UNI lane 2 — the firmware assigns them as lanes
 /// 0..3 depending on the product SKU.
 pub const LANE_COUNT: usize = 4;
 
+/// The block at `0x01002D00..0x01002D40` is **not** here. It is the
+/// UNI-side Ethernet port (`soc::uni`): two of its words follow the line
+/// coding and the auto-negotiation state of whatever is plugged into the
+/// far end of that port, which is not something a lane-mode controller
+/// can be. This peripheral claimed it as a flat store and served it
+/// ahead of the MACsec copy of the same window, so the MACsec one was
+/// dead code.
 const SERDES_RANGES: &[AddressRange] = &[
     AddressRange::new(SERDES_MAIN_BASE, SERDES_MAIN_END),
     AddressRange::new(SERDES_LANE_BASE, SERDES_LANE_END),
-    AddressRange::new(SERDES_MODE_BASE, SERDES_MODE_END),
     AddressRange::new(SERDES_WINDOW_BASE, SERDES_WINDOW_END),
 ];
 
@@ -155,8 +168,6 @@ pub struct SerDes {
     raw_store: [u32; SERDES_MAIN_WORDS],
     /// Backing store for the Lane MDIO / HW Enable window.
     lane_store: Vec<u32>,
-    /// Backing store for the Lane Mode Controller window.
-    mode_store: Vec<u32>,
     /// Addresses where bit 31 was written as 1 ("go" command).  The
     /// next `read_word` returns with bit 31 cleared and removes the
     /// entry — matching the hardware's "operation complete" semantics.
@@ -178,7 +189,6 @@ impl SerDes {
         Self {
             raw_store: [0u32; SERDES_MAIN_WORDS],
             lane_store: vec![0u32; SERDES_LANE_WORDS],
-            mode_store: vec![0u32; SERDES_MODE_WORDS],
             cmd_pending_clear: HashSet::new(),
             lane_lock_countdown: [0; LANE_COUNT],
             lanes: [LaneState::cold(); LANE_COUNT],
@@ -192,18 +202,12 @@ impl SerDes {
     pub fn claims(&self, addr: u32) -> bool {
         (SERDES_MAIN_BASE..SERDES_MAIN_END).contains(&addr)
             || (SERDES_LANE_BASE..SERDES_LANE_END).contains(&addr)
-            || (SERDES_MODE_BASE..SERDES_MODE_END).contains(&addr)
             || (SERDES_WINDOW_BASE..SERDES_WINDOW_END).contains(&addr)
     }
 
     #[inline]
     fn lane_idx(addr: u32) -> usize {
         ((addr - SERDES_LANE_BASE) / 4) as usize
-    }
-
-    #[inline]
-    fn mode_idx(addr: u32) -> usize {
-        ((addr - SERDES_MODE_BASE) / 4) as usize
     }
 
     /// Registers whose bit 31 is a "go/busy" handshake: firmware writes
@@ -218,50 +222,36 @@ impl SerDes {
         matches!(addr, 0x0100_240C | 0x0100_2644 | 0x0100_280C)
     }
 
-    /// Return a descriptive per-lane MDIO tag for MMIO history entries.
-    /// Per-lane MDIO controller base = 0x010023D8 + lane*0x400.
-    /// CMD at base+0x34, DATA3..DATA0 at base+0x38..+0x44.
+    /// Return a descriptive tag for MMIO history entries inside the lane
+    /// window.
+    ///
+    /// Only addresses this peripheral is actually reached at are named.
+    /// The ten that make up the classifier's two indirect ports —
+    /// `0x0100240C..0x0100241C` and `0x0100280C..0x0100281C` — used to
+    /// be listed here as per-lane MDIO command and data registers; they
+    /// are unreachable, because every dispatch chain tests
+    /// `lue.claims()` before this peripheral. See `soc::lue`. The name
+    /// they were derived from ("per-lane MDIO controller base
+    /// `0x010023D8`") has since been replaced in the register DB by a
+    /// 128-bit indirect port, so the labels were wrong as well as dead.
     pub fn mdio_peripheral_tag(addr: u32) -> &'static str {
         if !(SERDES_LANE_BASE..SERDES_LANE_END).contains(&addr) {
             return "serdes";
         }
         let off = addr - SERDES_LANE_BASE;
-        // 1G bank: lanes 0-1 at offset 0x00 + lane*0x400
-        // 10G bank: lanes 0-1 at offset 0x400 + lane*0x400
-        // Per-lane MDIO registers at lane_base+0x0C..+0x1C
-        // Lane 0 1G: CMD=0x240C DATA3=0x2410 DATA2=0x2414 DATA1=0x2418 DATA0=0x241C
-        // Lane 0 1G HW_EN: 0x2420
-        // Lane 1 1G: CMD=0x2644 (stride 0x238 in the 1G bank)
-        // Lane 0 10G: CMD=0x280C DATA3=0x2810..
-        // Lane 0 10G HW_EN: 0x2820
         match addr {
-            // 1G lane 0 MDIO
-            0x0100_240C => "serdes_l0_1g_mdio_cmd",
-            0x0100_2410 => "serdes_l0_1g_mdio_data3",
-            0x0100_2414 => "serdes_l0_1g_mdio_data2",
-            0x0100_2418 => "serdes_l0_1g_mdio_data1",
-            0x0100_241C => "serdes_l0_1g_mdio_data0",
             0x0100_2420 => "serdes_l0_1g_vlan_ethertype",
-            // 1G lane 1 MDIO (stride 0x238 from lane 0)
+            // ⛔ INFERRED, and the stride is the tell: naming this lane 1
+            // of the 1G bank puts it 0x238 from lane 0, a step that
+            // appears nowhere else on this chip — every other bank is
+            // 0x400 apart.
             0x0100_2644 => "serdes_l1_1g_mdio_cmd",
             0x0100_2648 => "serdes_l1_1g_mdio_data3",
             0x0100_264C => "serdes_l1_1g_mdio_data2",
             0x0100_2650 => "serdes_l1_1g_mdio_data1",
             0x0100_2654 => "serdes_l1_1g_mdio_data0",
             0x0100_2658 => "serdes_l1_1g_hw_enable",
-            // 10G lane 0 MDIO
-            0x0100_280C => "serdes_l0_10g_mdio_cmd",
-            0x0100_2810 => "serdes_l0_10g_mdio_data3",
-            0x0100_2814 => "serdes_l0_10g_mdio_data2",
-            0x0100_2818 => "serdes_l0_10g_mdio_data1",
-            0x0100_281C => "serdes_l0_10g_mdio_data0",
             0x0100_2820 => "serdes_l0_10g_vlan_ethertype",
-            // 10G lane 1 MDIO
-            0x0100_2A44 => "serdes_l1_10g_mdio_cmd",
-            0x0100_2A48 => "serdes_l1_10g_mdio_data3",
-            0x0100_2A4C => "serdes_l1_10g_mdio_data2",
-            0x0100_2A50 => "serdes_l1_10g_mdio_data1",
-            0x0100_2A54 => "serdes_l1_10g_mdio_data0",
             _ => {
                 // Generic lane-region fallback with 0x400 stride
                 let lane = off / 0x400;
@@ -335,9 +325,6 @@ impl SerDes {
             } else if (SERDES_LANE_BASE..SERDES_LANE_END).contains(&abs) {
                 let idx = Self::lane_idx(abs);
                 self.lane_store[idx] = val;
-            } else if (SERDES_MODE_BASE..SERDES_MODE_END).contains(&abs) {
-                let idx = Self::mode_idx(abs);
-                self.mode_store[idx] = val;
             }
         }
     }
@@ -362,7 +349,7 @@ impl Peripheral for SerDes {
             return Ok((b0 << 24) | (b1 << 16) | (b2 << 8) | b3);
         }
         if (SERDES_LANE_BASE..SERDES_LANE_END).contains(&addr) {
-            if addr == REG_FATAL_ERROR_STATUS_MASK {
+            if addr == REG_ZERO_READ_WORKAROUND {
                 return Ok(0);
             }
             let idx = Self::lane_idx(addr);
@@ -372,9 +359,6 @@ impl Peripheral for SerDes {
                 self.lane_store[idx] = val;
             }
             return Ok(val);
-        }
-        if (SERDES_MODE_BASE..SERDES_MODE_END).contains(&addr) {
-            return Ok(self.mode_store[Self::mode_idx(addr)]);
         }
         match addr {
             REG_LANE01_PRESENT_MASK => Ok(self.compute_lane_lock(0)),
@@ -393,7 +377,7 @@ impl Peripheral for SerDes {
             return Ok(());
         }
         if (SERDES_LANE_BASE..SERDES_LANE_END).contains(&addr) {
-            if addr == REG_FATAL_ERROR_STATUS_MASK {
+            if addr == REG_ZERO_READ_WORKAROUND {
                 return Ok(());
             }
             let idx = Self::lane_idx(addr);
@@ -401,10 +385,6 @@ impl Peripheral for SerDes {
             if Self::is_cmd_bit_register(addr) && (val & 0x8000_0000) != 0 {
                 self.cmd_pending_clear.insert(addr);
             }
-            return Ok(());
-        }
-        if (SERDES_MODE_BASE..SERDES_MODE_END).contains(&addr) {
-            self.mode_store[Self::mode_idx(addr)] = val;
             return Ok(());
         }
         let idx = Self::main_idx(addr);
@@ -478,7 +458,6 @@ impl Peripheral for SerDes {
     fn reset_cold(&mut self) {
         self.raw_store = [0u32; SERDES_MAIN_WORDS];
         self.lane_store.fill(0);
-        self.mode_store.fill(0);
         self.cmd_pending_clear.clear();
         self.lane_lock_countdown = [0; LANE_COUNT];
         self.lanes = [LaneState::cold(); LANE_COUNT];
@@ -648,8 +627,24 @@ mod tests {
         assert!(!s.claims(0x0100_01F8));
         assert!(s.claims(0x0100_240C));
         assert!(s.claims(0x0100_2820));
-        assert!(s.claims(0x0100_2D00));
         assert!(!s.claims(0x0100_2A00));
+    }
+
+    /// The UNI port block is not this peripheral's. Two of its words
+    /// follow what a link partner puts on the receive pair; a lane-mode
+    /// store cannot report that, and claiming the window here hid the
+    /// question behind a value that never moved.
+    #[test]
+    fn serdes_no_longer_claims_the_uni_port() {
+        let s = SerDes::new();
+        for addr in [0x0100_2D00u32, 0x0100_2D14, 0x0100_2D1C, 0x0100_2D2C, 0x0100_2D3C] {
+            assert!(!s.claims(addr), "{addr:#010X} belongs to soc::uni");
+        }
+        // The neighbours it does keep, unchanged.
+        assert!(s.claims(0x0100_2400));
+        assert!(s.claims(0x0100_29FC));
+        assert!(s.claims(0x0100_0174));
+        assert!(s.claims(0x224A_0000));
     }
 
     #[test]
@@ -727,13 +722,6 @@ mod tests {
         let mut s = SerDes::new();
         s.write_word(0x0100_2418, 0x0010_0C01).unwrap();
         assert_eq!(s.read_word(0x0100_2418).unwrap(), 0x0010_0C01);
-    }
-
-    #[test]
-    fn mode_store_roundtrip() {
-        let mut s = SerDes::new();
-        s.write_word(0x0100_2D00, 0xDEAD_BEEF).unwrap();
-        assert_eq!(s.read_word(0x0100_2D00).unwrap(), 0xDEAD_BEEF);
     }
 
     #[test]
