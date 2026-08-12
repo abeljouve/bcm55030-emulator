@@ -10,10 +10,9 @@
 //!
 //! Which words are stored and which are produced is not a judgement
 //! call: a boot traced over the whole block says who writes what. Of the
-//! seven words that move when the port comes up, `0x2D00`, `0x2D04`,
-//! `0x2D18` and `0x2D28` are written by software and are plain store
-//! here. The other three are never given their value by a write, so the
-//! model has to produce them:
+//! seven words that move when the port comes up, `0x2D00`, `0x2D04` and
+//! `0x2D18` are written by software and are plain store here. The rest
+//! are never given their value by a write, so the model produces them:
 //!
 //!   * [`REG_RX_STATUS`] — never read and never written by the firmware
 //!     traced, and it moves with the far end's mode. Derived from the
@@ -21,14 +20,37 @@
 //!   * [`REG_PORT_STATUS`] — read, never written, in a boot that brought
 //!     the port up. Its armed bit is therefore an acknowledgement from
 //!     the hardware, which is what the model makes it.
-//!   * [`REG_BUSY`] bit 31 — see [`BUSY_BIT`].
+//!   * [`REG_LINK_MODE`] — see [`link_mode_word`].
+//!   * [`REG_STAT_CMD`] bit 31 — see [`BUSY_BIT`].
+//!   * [`REG_STAT_DATA`] — the read side of the statistics window below.
 //!
-//! ⛔ One word of that list is still missing here: `0x01002D0C` reads
-//! `0x00008807` on silicon once the port is up, from a pre-arm value of
-//! `0x00000003`, and no write produces it. It is a plain store in this
-//! model, so it stays at the seeded value. What the value means is not
-//! established — it looks like an EtherType and is not one that is
-//! known — so it is left as a stated gap rather than a guessed rule.
+//! ## The statistics window
+//!
+//! Two of these words are not independent registers: they are the
+//! address and data halves of one indexed window onto a counter file.
+//! Software writes an index to [`REG_STAT_CMD`], waits for its bit 31 to
+//! clear, and takes the value out of [`REG_STAT_DATA`]. Over one traced
+//! boot it wrote the command port twenty-one thousand times and read the
+//! data port very nearly as often, in that order — which is what says
+//! the pair is a window and not two registers that happen to be adjacent.
+//!
+//! Modelling it as two plain words is what this file used to do, and it
+//! makes the data port answer zero for a reason that has nothing to do
+//! with the hardware. The window is modelled here so the zero has a
+//! cause: nothing in this emulator feeds the counter file, and
+//! [`UniEvent::SetStatCounter`] is how a test puts something in it.
+//!
+//! ⛔ Two stated gaps remain:
+//!
+//!   * `0x01002D0C` reads `0x00008807` on silicon once the port is up,
+//!     from a pre-arm value of `0x00000003`, and no write produces it.
+//!     It is a plain store here, so it stays at the seeded value. What
+//!     the value means is not established.
+//!   * **Nothing increments the counter file.** This block has no receive
+//!     datapath in the model at all, so every counter reads zero unless a
+//!     test injects one. A boot that spins on the window and a boot that
+//!     receives nothing are indistinguishable here, which is exactly why
+//!     [`UniCounters::stat_selects`] exists.
 //!
 //! **No firmware hook.** What arms the port and what arrives on the
 //! receive pair are inputs ([`UniEvent`]), not something this module
@@ -56,10 +78,21 @@ pub const REG_RX_STATUS: u32 = 0x0100_2D14;
 /// signal.
 pub const REG_PORT_STATUS: u32 = 0x0100_2D2C;
 
-/// The word whose bit 31 the firmware spins on — with a timeout, and
-/// returning a hard zero without re-reading the result when the wait
-/// expires — before taking a statistics count out of this block.
-pub const REG_BUSY: u32 = 0x0100_2D1C;
+/// The statistics window's command port: software writes the index of
+/// the counter it wants here, and bit 31 is the hardware's busy flag.
+///
+/// The firmware spins on that bit — with a timeout, and returning a hard
+/// zero without re-reading the result when the wait expires — on both
+/// sides of the write.
+pub const REG_STAT_CMD: u32 = 0x0100_2D1C;
+
+/// The statistics window's data port: the counter [`REG_STAT_CMD`]
+/// selected reads out here.
+pub const REG_STAT_DATA: u32 = 0x0100_2D20;
+
+/// The word that carries the port's link mode. Two readings exist, one
+/// on each side of arming, and three writes to it were refused.
+pub const REG_LINK_MODE: u32 = 0x0100_2D28;
 
 // ---------------------------------------------------------------------------
 // Bit layout — one place, next to the encode / decode pair it serves.
@@ -112,7 +145,7 @@ const PORT_NO_1G_SYNC: u32 = 1 << 4;
 /// other. Two bits, one observation: kept as a pair.
 const PORT_AN_STATE: u32 = (1 << 2) | (1 << 5);
 
-/// Bit 31 of [`REG_BUSY`].
+/// Bit 31 of [`REG_STAT_CMD`].
 ///
 /// Two readings exist and they disagree. The value the reset table holds
 /// has it set, and it stays set across the first hundred reads of a
@@ -130,6 +163,107 @@ const PORT_AN_STATE: u32 = (1 << 2) | (1 << 5);
 /// *why* is not established. Falsifier: a reading of this word taken
 /// with the port unarmed and the bit already clear.
 const BUSY_BIT: u32 = 1 << 31;
+
+/// Bit 17 of [`REG_STAT_CMD`] selects which of the two counter banks the
+/// index addresses.
+///
+/// OBSERVED in the indices software writes: it writes `0..=0x1E` with
+/// this bit clear and then restarts from zero with it set, which is the
+/// shape of two banks and not one run of forty-nine.
+const STAT_BANK_BIT: u32 = 1 << 17;
+
+/// The index field of [`REG_STAT_CMD`], below the bank bit.
+const STAT_INDEX_MASK: u32 = STAT_BANK_BIT - 1;
+
+/// How many counters each bank holds, in bank order.
+///
+/// OBSERVED from where software restarts its index: it walks `0..=0x1E`
+/// in bank 0 and `0..=0x11` in bank 1. Thirty-one then eighteen.
+pub const STAT_BANK_LEN: [usize; 2] = [31, 18];
+
+const STAT_COUNT: usize = STAT_BANK_LEN[0] + STAT_BANK_LEN[1];
+
+/// [`REG_LINK_MODE`] with the port unarmed — the reading the reset table
+/// holds.
+const LINK_MODE_UNARMED: u32 = 0x0000_8000;
+
+/// [`REG_LINK_MODE`] with the port armed.
+///
+/// ⚠ One armed reading, taken with clause 37 auto-negotiation on the
+/// receive pair. Whether this word moves with the signal the way
+/// [`REG_PORT_STATUS`] does is **not** established — no reading splits
+/// it — so the model ties it to arming alone. A second armed reading of
+/// `0x0000_0140` exists, taken after a different arming path; this model
+/// does not reproduce it, and what separates the two is unknown.
+const LINK_MODE_ARMED: u32 = 0x0000_1140;
+
+/// Which counter a command word selects.
+///
+/// Out-of-range indices get a variant of their own rather than being
+/// clamped: what the hardware answers for one is not established, and a
+/// silent clamp would hand back a neighbour's count as if it were real.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum StatSelect {
+    Counter { bank: usize, index: usize },
+    OutOfRange,
+}
+
+impl StatSelect {
+    /// Decode a command word. Bit 31 is the hardware's and carries no
+    /// selection, so it is masked off before decoding.
+    pub fn decode(cmd: u32) -> Self {
+        let bank = usize::from(cmd & STAT_BANK_BIT != 0);
+        let index = (cmd & STAT_INDEX_MASK) as usize;
+        if index < STAT_BANK_LEN[bank] {
+            Self::Counter { bank, index }
+        } else {
+            Self::OutOfRange
+        }
+    }
+
+    /// True when this names a counter the window actually has. A bank
+    /// number from outside the model is checked here too, so a caller
+    /// cannot index the length table out of bounds.
+    fn in_range(self) -> bool {
+        match self {
+            Self::Counter { bank, index } => {
+                STAT_BANK_LEN.get(bank).is_some_and(|&len| index < len)
+            }
+            Self::OutOfRange => false,
+        }
+    }
+
+    /// The command word that selects this counter, as software writes it.
+    pub fn encode(self) -> Option<u32> {
+        match self {
+            Self::Counter { bank, index } if self.in_range() => {
+                Some(index as u32 | if bank == 1 { STAT_BANK_BIT } else { 0 })
+            }
+            _ => None,
+        }
+    }
+
+    /// Position in one flat counter file, so the two banks can share a
+    /// backing array without either one's length leaking into the caller.
+    fn flat(self) -> Option<usize> {
+        match self {
+            Self::Counter { bank, index } if self.in_range() => {
+                Some(bank * STAT_BANK_LEN[0] + index)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Assemble the link-mode word. Two readings, one on each side of
+/// arming, and nothing else measured to gate it on.
+fn link_mode_word(armed: bool) -> u32 {
+    if armed {
+        LINK_MODE_ARMED
+    } else {
+        LINK_MODE_UNARMED
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The receive signal
@@ -237,19 +371,37 @@ pub const MEASURED_ARMED_READINGS: [(UniRxSignal, u32, u32); 4] = [
 pub enum UniEvent {
     SetRxSignal(UniRxSignal),
     SetArmed(bool),
+    /// Put a value in the counter file. Nothing in this emulator feeds
+    /// it, so this is the only way a read of the data port comes back
+    /// non-zero — and having it means a test can tell "the window works
+    /// and the counter is zero" from "the window is not modelled".
+    SetStatCounter { bank: usize, index: usize, value: u32 },
 }
 
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct UniCounters {
-    /// Reads of [`REG_BUSY`] that found bit 31 still set. The firmware's
-    /// wait on that bit has a timeout and gives up by returning zero, so
-    /// without this number a boot that spins here and a boot that never
-    /// looks read the same.
+    /// Reads of [`REG_STAT_CMD`] that found bit 31 still set. The
+    /// firmware's wait on that bit has a timeout and gives up by
+    /// returning zero, so without this number a boot that spins here and
+    /// a boot that never looks read the same.
     pub port_reads_while_busy: u64,
-    /// Writes to [`REG_BUSY`] that carried bit 31 clear while the
-    /// hardware held it set. A refusal nobody counts cannot be told from
-    /// a write that was never made.
-    pub busy_bit_writes_refused: u64,
+    /// Writes to [`REG_STAT_CMD`] made while the hardware held bit 31.
+    ///
+    /// The bit is the hardware's and no write takes it away. What the
+    /// write *does* carry is a counter index, so this is not a refused
+    /// attempt to clear the flag — it is software selecting a counter
+    /// before the window said it was ready.
+    pub stat_cmd_writes_while_busy: u64,
+    /// Writes to [`REG_STAT_CMD`] that named a counter in range.
+    pub stat_selects: u64,
+    /// Writes to [`REG_STAT_CMD`] whose index is past the end of its
+    /// bank. A window driven with an index nobody implements answers
+    /// zero, which reads exactly like a counter that never moved.
+    pub stat_selects_out_of_range: u64,
+    /// Reads of [`REG_STAT_DATA`] taken with no counter selected.
+    pub stat_reads_unselected: u64,
+    /// Writes to [`REG_LINK_MODE`], which the hardware refuses.
+    pub link_mode_writes_refused: u64,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -258,7 +410,10 @@ pub struct UniSnapshot {
     pub armed: bool,
     pub rx_status: u32,
     pub port_status: u32,
+    pub link_mode: u32,
     pub port_busy: bool,
+    /// What the command port currently selects, if anything.
+    pub stat_selected: Option<StatSelect>,
     pub counters: UniCounters,
 }
 
@@ -274,9 +429,15 @@ pub struct Uni {
     store: [u32; UNI_WORDS],
     rx: UniRxSignal,
     armed: bool,
-    /// Bit 31 of [`REG_BUSY`], owned by the hardware. Seeded from the
-    /// reset table rather than from a literal, so the two cannot drift.
+    /// Bit 31 of [`REG_STAT_CMD`], owned by the hardware. Seeded from
+    /// the reset table rather than from a literal, so the two cannot
+    /// drift.
     port_busy: bool,
+    /// The counter file behind the statistics window. Nothing in this
+    /// emulator increments it; see the module note.
+    stat_counters: [u32; STAT_COUNT],
+    /// What the last command-port write selected.
+    stat_selected: Option<StatSelect>,
     pub counters: UniCounters,
 }
 
@@ -293,6 +454,8 @@ impl Uni {
             rx: UniRxSignal::None,
             armed: false,
             port_busy: false,
+            stat_counters: [0u32; STAT_COUNT],
+            stat_selected: None,
             counters: UniCounters::default(),
         };
         uni.apply_silicon_power_on();
@@ -331,13 +494,38 @@ impl Uni {
         port_status_word(self.rx, self.armed)
     }
 
-    fn busy_word(&self) -> u32 {
-        let stored = self.store[Self::idx(REG_BUSY)] & !BUSY_BIT;
+    /// The link-mode word as it reads right now.
+    pub fn link_mode(&self) -> u32 {
+        link_mode_word(self.armed)
+    }
+
+    /// What the command port currently selects, if anything.
+    pub fn stat_selected(&self) -> Option<StatSelect> {
+        self.stat_selected
+    }
+
+    /// The counter file, in flat order: bank 0 then bank 1.
+    pub fn stat_counters(&self) -> &[u32] {
+        &self.stat_counters
+    }
+
+    fn stat_cmd_word(&self) -> u32 {
+        let stored = self.store[Self::idx(REG_STAT_CMD)] & !BUSY_BIT;
         if self.port_busy {
             stored | BUSY_BIT
         } else {
             stored
         }
+    }
+
+    /// The data port. A selection that names no counter answers zero —
+    /// which is what an unimplemented index looks like, and why the read
+    /// is counted rather than left silent.
+    fn stat_data_word(&self) -> u32 {
+        self.stat_selected
+            .and_then(StatSelect::flat)
+            .map(|i| self.stat_counters[i])
+            .unwrap_or(0)
     }
 
     /// Seed the block from the reset table.
@@ -356,18 +544,24 @@ impl Uni {
         // The busy bit is the hardware's, so take its seed from the same
         // table the rest of the block comes from and keep it out of the
         // store.
-        let seed = self.store[Self::idx(REG_BUSY)];
+        let seed = self.store[Self::idx(REG_STAT_CMD)];
         self.port_busy = (seed & BUSY_BIT) != 0;
-        self.store[Self::idx(REG_BUSY)] = seed & !BUSY_BIT;
+        self.store[Self::idx(REG_STAT_CMD)] = seed & !BUSY_BIT;
+        // A reset leaves the window pointing at nothing: the seeded
+        // command word is a reading, not a selection software made.
+        self.stat_selected = None;
+        self.stat_counters = [0u32; STAT_COUNT];
     }
 
     /// Side-effect-free read. Shared with [`Peripheral::peek_word`];
-    /// the only side effect a real read has is the busy counter.
+    /// the only side effects a real read has are the counters.
     fn value_at(&self, addr: u32) -> u32 {
         match addr & !3 {
             REG_RX_STATUS => self.rx_status(),
             REG_PORT_STATUS => self.port_status(),
-            REG_BUSY => self.busy_word(),
+            REG_LINK_MODE => self.link_mode(),
+            REG_STAT_CMD => self.stat_cmd_word(),
+            REG_STAT_DATA => self.stat_data_word(),
             word => self.store[Self::idx(word)],
         }
     }
@@ -383,8 +577,12 @@ impl Peripheral for Uni {
     }
 
     fn read_word(&mut self, addr: u32) -> Result<u32, Exception> {
-        if addr & !3 == REG_BUSY && self.port_busy {
-            self.counters.port_reads_while_busy += 1;
+        match addr & !3 {
+            REG_STAT_CMD if self.port_busy => self.counters.port_reads_while_busy += 1,
+            REG_STAT_DATA if self.stat_selected.and_then(StatSelect::flat).is_none() => {
+                self.counters.stat_reads_unselected += 1
+            }
+            _ => {}
         }
         Ok(self.value_at(addr))
     }
@@ -395,16 +593,29 @@ impl Peripheral for Uni {
 
     fn write_word(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
         let word = addr & !3;
-        if word == REG_BUSY {
-            if self.port_busy && (val & BUSY_BIT) == 0 {
-                self.counters.busy_bit_writes_refused += 1;
+        if word == REG_STAT_CMD {
+            if self.port_busy {
+                self.counters.stat_cmd_writes_while_busy += 1;
             }
+            let select = StatSelect::decode(val);
+            match select {
+                StatSelect::Counter { .. } => self.counters.stat_selects += 1,
+                StatSelect::OutOfRange => self.counters.stat_selects_out_of_range += 1,
+            }
+            self.stat_selected = Some(select);
             self.store[Self::idx(word)] = val & !BUSY_BIT;
             return Ok(());
         }
-        // The two derived words keep a slot so a write is not lost to
-        // the reader of a dump, but the read path does not consult it:
-        // what those words report is the signal and the port state.
+        if word == REG_LINK_MODE {
+            // Three writes to this word were refused on hardware and
+            // none was accepted, so the model refuses all of them. The
+            // slot still takes the value, for the reader of a dump.
+            self.counters.link_mode_writes_refused += 1;
+        }
+        // The derived words keep a slot so a write is not lost to the
+        // reader of a dump, but the read path does not consult it: what
+        // those words report is the signal, the port state, and — for
+        // the data port — the counter the window selects.
         self.store[Self::idx(word)] = val;
         Ok(())
     }
@@ -430,7 +641,9 @@ impl Peripheral for Uni {
             armed: self.armed,
             rx_status: self.rx_status(),
             port_status: self.port_status(),
+            link_mode: self.link_mode(),
             port_busy: self.port_busy,
+            stat_selected: self.stat_selected,
             counters: self.counters,
         })
     }
@@ -448,6 +661,20 @@ impl Peripheral for Uni {
                         self.port_busy = false;
                     }
                     Ok(())
+                }
+                UniEvent::SetStatCounter { bank, index, value } => {
+                    match (StatSelect::Counter {
+                        bank: *bank,
+                        index: *index,
+                    })
+                    .flat()
+                    {
+                        Some(i) => {
+                            self.stat_counters[i] = *value;
+                            Ok(())
+                        }
+                        None => Err(PeripheralError::UnsupportedEvent),
+                    }
                 }
             },
             _ => Err(PeripheralError::UnsupportedEvent),
@@ -535,21 +762,22 @@ mod tests {
     /// reads that find it still set are counted, because the firmware's
     /// wait ends by returning zero either way.
     #[test]
-    fn the_counter_port_busy_bit_is_not_cleared_by_a_write() {
+    fn the_command_port_busy_bit_is_not_cleared_by_a_write() {
         let mut u = Uni::new();
         u.reset_warm();
-        assert_eq!(u.read_word(REG_BUSY).unwrap(), 0x8000_001E);
-        u.write_word(REG_BUSY, 0x0000_001E).unwrap();
+        assert_eq!(u.read_word(REG_STAT_CMD).unwrap(), 0x8000_001E);
+        u.write_word(REG_STAT_CMD, 0x0000_001E).unwrap();
         assert_eq!(
-            u.read_word(REG_BUSY).unwrap(),
+            u.read_word(REG_STAT_CMD).unwrap(),
             0x8000_001E,
             "bit 31 belongs to the hardware"
         );
-        assert_eq!(u.counters.busy_bit_writes_refused, 1);
+        assert_eq!(u.counters.stat_cmd_writes_while_busy, 1);
         assert_eq!(u.counters.port_reads_while_busy, 2);
-        // The rest of the word is software's own and round-trips.
-        u.write_word(REG_BUSY, 0x0000_00AB).unwrap();
-        assert_eq!(u.read_word(REG_BUSY).unwrap(), 0x8000_00AB);
+        // The rest of the word is the index software wrote, and it
+        // round-trips.
+        u.write_word(REG_STAT_CMD, 0x0000_0005).unwrap();
+        assert_eq!(u.read_word(REG_STAT_CMD).unwrap(), 0x8000_0005);
     }
 
     /// Arming is the one event measured alongside the bit dropping, and
@@ -561,8 +789,176 @@ mod tests {
         assert!(u.port_busy());
         u.inject_event(&PeripheralEvent::Uni(UniEvent::SetArmed(true)))
             .unwrap();
-        assert_eq!(u.read_word(REG_BUSY).unwrap(), 0x0000_001E);
+        assert_eq!(u.read_word(REG_STAT_CMD).unwrap(), 0x0000_001E);
         assert_eq!(u.counters.port_reads_while_busy, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // The statistics window
+    // -----------------------------------------------------------------
+
+    /// Every counter the window can name, encoded and decoded back.
+    #[test]
+    fn a_selection_round_trips_through_the_command_word() {
+        for (bank, &len) in STAT_BANK_LEN.iter().enumerate() {
+            for index in 0..len {
+                let sel = StatSelect::Counter { bank, index };
+                let word = sel.encode().expect("in range");
+                assert_eq!(StatSelect::decode(word), sel, "bank {bank} index {index}");
+            }
+            // One past the end of each bank is not a counter, and the
+            // encoder refuses to name it.
+            let past = StatSelect::Counter { bank, index: len };
+            assert_eq!(past.encode(), None);
+            assert_eq!(
+                StatSelect::decode(len as u32 | if bank == 1 { STAT_BANK_BIT } else { 0 }),
+                StatSelect::OutOfRange
+            );
+        }
+    }
+
+    /// The bank bit is what separates the two runs: index 0 of bank 1 is
+    /// not index 0 of bank 0.
+    #[test]
+    fn the_bank_bit_selects_a_different_counter_at_the_same_index() {
+        let mut u = armed_with(UniRxSignal::BaseX { autoneg: true });
+        for (bank, value) in [(0usize, 0x1111_1111u32), (1, 0x2222_2222)] {
+            u.inject_event(&PeripheralEvent::Uni(UniEvent::SetStatCounter {
+                bank,
+                index: 0,
+                value,
+            }))
+            .unwrap();
+        }
+        for (bank, expected) in [(0usize, 0x1111_1111u32), (1, 0x2222_2222)] {
+            let cmd = StatSelect::Counter { bank, index: 0 }.encode().unwrap();
+            u.write_word(REG_STAT_CMD, cmd).unwrap();
+            assert_eq!(u.read_word(REG_STAT_DATA).unwrap(), expected, "bank {bank}");
+        }
+    }
+
+    /// The whole point of modelling the window: the data port answers
+    /// with the counter the command port named, so a zero there means
+    /// the counter is zero and not that the window is missing.
+    #[test]
+    fn the_data_port_answers_with_the_selected_counter() {
+        let mut u = armed_with(UniRxSignal::BaseX { autoneg: true });
+        u.inject_event(&PeripheralEvent::Uni(UniEvent::SetStatCounter {
+            bank: 0,
+            index: 7,
+            value: 0xDEAD_BEEF,
+        }))
+        .unwrap();
+
+        // Nothing selected yet: zero, and the read is counted so it
+        // cannot be mistaken for a counter that never moved.
+        assert_eq!(u.read_word(REG_STAT_DATA).unwrap(), 0);
+        assert_eq!(u.counters.stat_reads_unselected, 1);
+
+        u.write_word(REG_STAT_CMD, StatSelect::Counter { bank: 0, index: 7 }.encode().unwrap())
+            .unwrap();
+        assert_eq!(u.read_word(REG_STAT_DATA).unwrap(), 0xDEAD_BEEF);
+        assert_eq!(u.counters.stat_selects, 1);
+        assert_eq!(u.counters.stat_reads_unselected, 1, "that read was selected");
+
+        // A neighbour the test never wrote still reads zero, so the
+        // window is not just handing back the last value it saw.
+        u.write_word(REG_STAT_CMD, StatSelect::Counter { bank: 0, index: 8 }.encode().unwrap())
+            .unwrap();
+        assert_eq!(u.read_word(REG_STAT_DATA).unwrap(), 0);
+    }
+
+    /// An index past the end of its bank answers zero — which is what a
+    /// counter that never moved answers too, so it is counted apart.
+    #[test]
+    fn an_index_past_the_end_of_its_bank_is_counted_not_clamped() {
+        let mut u = armed_with(UniRxSignal::BaseX { autoneg: true });
+        u.inject_event(&PeripheralEvent::Uni(UniEvent::SetStatCounter {
+            bank: 0,
+            index: STAT_BANK_LEN[0] - 1,
+            value: 0x5555_5555,
+        }))
+        .unwrap();
+        u.write_word(REG_STAT_CMD, STAT_BANK_LEN[0] as u32).unwrap();
+        assert_eq!(u.stat_selected(), Some(StatSelect::OutOfRange));
+        assert_eq!(
+            u.read_word(REG_STAT_DATA).unwrap(),
+            0,
+            "it must not fall back on the last counter of the bank"
+        );
+        assert_eq!(u.counters.stat_selects_out_of_range, 1);
+        assert_eq!(u.counters.stat_selects, 0);
+        assert_eq!(u.counters.stat_reads_unselected, 1);
+    }
+
+    /// Injecting into a bank the model does not have is refused rather
+    /// than panicking on the length table.
+    #[test]
+    fn injecting_outside_the_counter_file_is_refused() {
+        let mut u = Uni::new();
+        for (bank, index) in [(2usize, 0usize), (0, STAT_BANK_LEN[0]), (1, STAT_BANK_LEN[1])] {
+            assert!(u
+                .inject_event(&PeripheralEvent::Uni(UniEvent::SetStatCounter {
+                    bank,
+                    index,
+                    value: 1,
+                }))
+                .is_err());
+        }
+    }
+
+    /// A reset leaves the window pointing at nothing and the file empty,
+    /// so a counter injected by one test cannot survive into the next.
+    #[test]
+    fn a_reset_empties_the_counter_file_and_the_selection() {
+        let mut u = armed_with(UniRxSignal::None);
+        u.inject_event(&PeripheralEvent::Uni(UniEvent::SetStatCounter {
+            bank: 1,
+            index: 3,
+            value: 0x1234_5678,
+        }))
+        .unwrap();
+        u.write_word(REG_STAT_CMD, StatSelect::Counter { bank: 1, index: 3 }.encode().unwrap())
+            .unwrap();
+        assert_eq!(u.read_word(REG_STAT_DATA).unwrap(), 0x1234_5678);
+        u.reset_cold();
+        assert_eq!(u.stat_selected(), None);
+        assert!(u.stat_counters().iter().all(|&c| c == 0));
+        assert_eq!(u.read_word(REG_STAT_DATA).unwrap(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // The link-mode word
+    // -----------------------------------------------------------------
+
+    /// Both readings, and the refusal that says the word is not a store.
+    #[test]
+    fn the_link_mode_word_follows_arming_and_refuses_writes() {
+        let mut u = Uni::new();
+        u.reset_warm();
+        assert_eq!(u.read_word(REG_LINK_MODE).unwrap(), LINK_MODE_UNARMED);
+
+        u.write_word(REG_LINK_MODE, 0x0000_5140).unwrap();
+        assert_eq!(
+            u.read_word(REG_LINK_MODE).unwrap(),
+            LINK_MODE_UNARMED,
+            "three writes to this word were refused on hardware"
+        );
+        assert_eq!(u.counters.link_mode_writes_refused, 1);
+
+        u.inject_event(&PeripheralEvent::Uni(UniEvent::SetArmed(true)))
+            .unwrap();
+        assert_eq!(u.read_word(REG_LINK_MODE).unwrap(), LINK_MODE_ARMED);
+        u.write_word(REG_LINK_MODE, 0x0000_0000).unwrap();
+        assert_eq!(u.read_word(REG_LINK_MODE).unwrap(), LINK_MODE_ARMED);
+        assert_eq!(u.counters.link_mode_writes_refused, 2);
+    }
+
+    /// The unarmed reading is the table's, not a literal that can drift
+    /// away from it.
+    #[test]
+    fn the_unarmed_link_mode_is_the_seeded_reading() {
+        assert_eq!(LINK_MODE_UNARMED, seed(REG_LINK_MODE));
     }
 
     /// Every word of this block the reset table names, in address order.
@@ -583,16 +979,16 @@ mod tests {
             .unwrap_or_else(|| panic!("the reset table names no {addr:#010X}"))
     }
 
-    /// The three derived words reproduce their seed **without storing
-    /// it** — which is the claim, and the only part of the eleven that is
-    /// not the table read back against itself.
+    /// The derived words reproduce their seed **without storing it** —
+    /// which is the claim, and the only part of the eleven that is not
+    /// the table read back against itself.
     #[test]
     fn the_derived_words_reproduce_their_seed_without_storing_it() {
         let mut u = Uni::new();
         u.reset_warm();
-        // Two of the three are produced whole, so a marker cannot
-        // displace them: what comes back is still the measured reading.
-        for addr in [REG_RX_STATUS, REG_PORT_STATUS] {
+        // These are produced whole, so a marker cannot displace them:
+        // what comes back is still the measured reading.
+        for addr in [REG_RX_STATUS, REG_PORT_STATUS, REG_LINK_MODE] {
             assert_eq!(
                 u.read_word(addr).unwrap(),
                 seed(addr),
@@ -605,41 +1001,46 @@ mod tests {
                 "a write cannot become the reading at {addr:#010X}"
             );
         }
-        // The third is produced one bit at a time: bit 31 survives a
-        // write that clears it, and the bits around it — which are
-        // software's — do not.
-        assert_eq!(u.read_word(REG_BUSY).unwrap(), seed(REG_BUSY));
-        u.write_word(REG_BUSY, 0x0000_0000).unwrap();
+        // The command port is produced one bit at a time: bit 31
+        // survives a write that clears it, and the index bits around it
+        // — which are software's — do not.
+        assert_eq!(u.read_word(REG_STAT_CMD).unwrap(), seed(REG_STAT_CMD));
+        u.write_word(REG_STAT_CMD, 0x0000_0000).unwrap();
         assert_eq!(
-            u.read_word(REG_BUSY).unwrap(),
+            u.read_word(REG_STAT_CMD).unwrap(),
             BUSY_BIT,
-            "bit 31 is produced, the rest of the word is stored"
+            "bit 31 is produced, the index is stored"
         );
     }
 
     /// Which words are derived and which are stored, swept rather than
     /// asserted: a marker written to each of the sixteen comes back out
-    /// of every word except the two that are produced, and out of every
-    /// bit of the busy word except bit 31.
+    /// of every word the model does not produce.
     #[test]
     fn exactly_the_documented_words_are_derived_and_the_rest_are_stored() {
-        const MARKER: u32 = 0x5A5A_A5A5; // bit 31 clear, so the busy word
-                                         // can show which bit it keeps
+        // Bit 31 clear, so the command word can show which bit it keeps,
+        // and an index field that names no counter, so the data port
+        // stays unselected.
+        const MARKER: u32 = 0x5A5A_A5A5;
         for word in (UNI_BASE..UNI_END).step_by(4) {
             let mut u = Uni::new();
             u.reset_warm();
             u.write_word(word, MARKER).unwrap();
             let back = u.read_word(word).unwrap();
             match word {
-                REG_RX_STATUS | REG_PORT_STATUS => assert_eq!(
+                REG_RX_STATUS | REG_PORT_STATUS | REG_LINK_MODE => assert_eq!(
                     back,
                     seed(word),
                     "{word:#010X} is derived: a write must not reach the reading"
                 ),
-                REG_BUSY => assert_eq!(
+                REG_STAT_CMD => assert_eq!(
                     back,
                     MARKER | BUSY_BIT,
-                    "{word:#010X} stores every bit but the one the hardware owns"
+                    "{word:#010X} stores the index but not the bit the hardware owns"
+                ),
+                REG_STAT_DATA => assert_eq!(
+                    back, 0,
+                    "{word:#010X} is the read side of the window, never a store"
                 ),
                 _ => assert_eq!(back, MARKER, "{word:#010X} is a plain store"),
             }
@@ -670,10 +1071,14 @@ mod tests {
         );
         for word in (UNI_BASE..UNI_END).step_by(4) {
             match seeded.iter().find(|&&(abs, _)| abs == word) {
-                // The derived three answer from a rule, not from the
+                // The derived words answer from a rule, not from the
                 // store, so they cannot witness the seeding loop; their
                 // own test does that.
-                Some(_) if matches!(word, REG_RX_STATUS | REG_PORT_STATUS | REG_BUSY) => {}
+                Some(_)
+                    if matches!(
+                        word,
+                        REG_RX_STATUS | REG_PORT_STATUS | REG_LINK_MODE | REG_STAT_CMD
+                    ) => {}
                 Some(&(_, val)) => assert_eq!(
                     u.read_word(word).unwrap(),
                     val,

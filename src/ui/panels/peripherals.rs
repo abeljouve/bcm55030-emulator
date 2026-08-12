@@ -13,7 +13,7 @@ use crate::soc::peripheral::{
     LaneSpeed, MacsecEvent, PbcEvent, PeripheralEvent, PeripheralSnapshot,
     SerDesEvent, SfpEvent, TimerEvent, UartEvent,
 };
-use crate::soc::uni::{UniEvent, UniRxSignal};
+use crate::soc::uni::{StatSelect, UniEvent, UniRxSignal};
 use crate::ui::EmulatorApp;
 
 /// Selected peripheral tab inside the inspector.
@@ -721,8 +721,21 @@ fn draw_uni(ui: &mut egui::Ui, app: &EmulatorApp) {
     let snap = snap.clone();
     kv(ui, "Receive status", format!("0x{:08X}", snap.rx_status));
     kv(ui, "Port status", format!("0x{:08X}", snap.port_status));
+    kv(ui, "Link mode", format!("0x{:08X}", snap.link_mode));
     kv(ui, "Port armed", snap.armed.to_string());
-    kv(ui, "Counter port busy", snap.port_busy.to_string());
+    ui.separator();
+
+    ui.label("Statistics window:");
+    kv(
+        ui,
+        "Selected",
+        match snap.stat_selected {
+            Some(StatSelect::Counter { bank, index }) => format!("bank {bank}, index {index}"),
+            Some(StatSelect::OutOfRange) => "out of range".to_string(),
+            None => "nothing".to_string(),
+        },
+    );
+    kv(ui, "Command port busy", snap.port_busy.to_string());
     kv(
         ui,
         "Reads while busy",
@@ -730,8 +743,24 @@ fn draw_uni(ui: &mut egui::Ui, app: &EmulatorApp) {
     );
     kv(
         ui,
-        "Busy-bit writes refused",
-        snap.counters.busy_bit_writes_refused.to_string(),
+        "Selects while busy",
+        snap.counters.stat_cmd_writes_while_busy.to_string(),
+    );
+    kv(ui, "Selects", snap.counters.stat_selects.to_string());
+    kv(
+        ui,
+        "Selects out of range",
+        snap.counters.stat_selects_out_of_range.to_string(),
+    );
+    kv(
+        ui,
+        "Data reads with nothing selected",
+        snap.counters.stat_reads_unselected.to_string(),
+    );
+    kv(
+        ui,
+        "Link-mode writes refused",
+        snap.counters.link_mode_writes_refused.to_string(),
     );
     ui.separator();
 
