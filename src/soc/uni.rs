@@ -40,12 +40,24 @@
 //! cause: nothing in this emulator feeds the counter file, and
 //! [`UniEvent::SetStatCounter`] is how a test puts something in it.
 //!
-//! ⛔ Two stated gaps remain:
+//! ⛔ Three stated gaps remain:
 //!
 //!   * `0x01002D0C` reads `0x00008807` on silicon once the port is up,
-//!     from a pre-arm value of `0x00000003`, and no write produces it.
-//!     It is a plain store here, so it stays at the seeded value. What
-//!     the value means is not established.
+//!     from a pre-arm value of `0x00000003`.
+//!   * `0x01002D34` reads `0x000041A0` once the port is up, from zero
+//!     before — a word the reset table does not name at all.
+//!
+//!     Both are plain stores here, so both stay where they started and
+//!     diverge from silicon on an armed port. They are **not** derived
+//!     the way [`REG_LINK_MODE`] is, and the difference is evidence, not
+//!     taste: that word has three measured write refusals behind it, so
+//!     a reading it produces cannot be one software put there. These two
+//!     have no such test, so "the hardware produces it" and "software
+//!     wrote it somewhere the trace did not cover" are not yet
+//!     separable. What separates them is one experiment — write each on
+//!     hardware and read it back — and until it is run, a rule here
+//!     would be a guess wearing the same clothes as the rest of the file.
+//!
 //!   * **Nothing increments the counter file.** This block has no receive
 //!     datapath in the model at all, so every counter reads zero unless a
 //!     test injects one. A boot that spins on the window and a boot that
