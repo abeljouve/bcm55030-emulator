@@ -764,6 +764,27 @@ fn draw_uni(ui: &mut egui::Ui, app: &EmulatorApp) {
     );
     ui.separator();
 
+    ui.label("Receive path:");
+    kv(ui, "Frames offered", snap.counters.rx_offered.to_string());
+    kv(ui, "Accepted", snap.counters.rx_accepted.to_string());
+    kv(
+        ui,
+        "Dropped, port unarmed",
+        snap.counters.rx_dropped_unarmed.to_string(),
+    );
+    kv(
+        ui,
+        "Dropped, nothing on the pair",
+        snap.counters.rx_dropped_no_signal.to_string(),
+    );
+    kv(
+        ui,
+        "Dropped, queue full",
+        snap.counters.rx_dropped_queue_full.to_string(),
+    );
+    kv(ui, "Waiting for the datapath", snap.rx_queued.to_string());
+    ui.separator();
+
     let mut armed = snap.armed;
     if ui.checkbox(&mut armed, "Port armed").changed() {
         inject(app, PeripheralEvent::Uni(UniEvent::SetArmed(armed)));

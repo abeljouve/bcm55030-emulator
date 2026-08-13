@@ -468,6 +468,62 @@ impl Olt {
         self.refresh_bitmap();
     }
 
+    /// Put a frame that did **not** come off the fibre into the mailbox.
+    ///
+    /// The mailbox is the join between the datapath and the firmware,
+    /// and it is shared: a queue pin is a queue pin whichever port fed
+    /// it. What is not shared is the fallback. A frame off the fibre
+    /// that the classifier cannot place still lands somewhere, because
+    /// the EtherType fallback is what the model did before a classifier
+    /// existed. A frame from another port has no such history, so there
+    /// is nothing to fall back *to*: with no rule naming a queue, it is
+    /// dropped and the refusal is returned rather than routed by guess.
+    ///
+    /// Returns the slot it reached, or `None` for every way it did not.
+    pub fn deliver_port_frame(
+        &mut self,
+        classifier: Option<(&Lue, ClassifierBinding)>,
+        frame: &[u8],
+    ) -> Option<Slot> {
+        if self.total_pending_count() >= MAILBOX_DEPTH {
+            return None;
+        }
+        let (lue, binding) = classifier?;
+        self.classifier_counters.classified += 1;
+        let (verdict, refusals) = lue.classify(binding, frame);
+        self.classifier_counters.refusals.add(&refusals);
+        let queue = match verdict {
+            Verdict::Match { actions, .. } => {
+                match actions.iter().find_map(|a| a.destination_queue()) {
+                    Some(q) => q,
+                    None => {
+                        self.classifier_counters.match_without_a_queue += 1;
+                        return None;
+                    }
+                }
+            }
+            Verdict::NoMatch => {
+                self.classifier_counters.no_match += 1;
+                return None;
+            }
+            Verdict::Undecidable { .. } => {
+                self.classifier_counters.undecidable += 1;
+                return None;
+            }
+        };
+        let Ok(q) = u8::try_from(queue) else {
+            self.classifier_counters.matched_queue_outside_the_slot_space += 1;
+            return None;
+        };
+        self.classifier_counters.matched += 1;
+        let slot = Slot(q);
+        let words = mailbox::encode_frame(frame);
+        self.mailbox_pending.entry(slot.0).or_default().push_back(words);
+        *self.arrivals.entry(slot.0).or_insert(0) += 1;
+        self.refresh_bitmap();
+        Some(slot)
+    }
+
     /// Which queue a frame goes to, and why.
     ///
     /// Only one action result names a queue, and

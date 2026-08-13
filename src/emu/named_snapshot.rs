@@ -32,6 +32,7 @@ pub struct PeripheralBankSaveState {
     pub lue: Lue,
     pub use_classifier: bool,
     pub classifier_binding: crate::soc::lue::ClassifierBinding,
+    pub uni_classifier_binding: crate::soc::lue::ClassifierBinding,
     pub serdes: SerDes,
     pub uni: Uni,
     pub epon_mac: EponMac,

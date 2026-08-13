@@ -200,6 +200,21 @@ pub struct PeripheralBank {
     /// only path every downstream frame takes.
     pub use_classifier: bool,
     pub classifier_binding: crate::soc::lue::ClassifierBinding,
+    /// Which classifier instance sees frames arriving on the UNI port.
+    ///
+    /// ⛔ **Not established.** The firmware calls one direction
+    /// "Upstream" and the other "Dnstream", but that selector belongs to
+    /// a statistics read and nothing ties it to the instance numbering
+    /// here, which is positional in the address map. Instance 0 is the
+    /// default because it is the one whose rules name no queue, so this
+    /// model predicts what was measured on silicon: a frame pushed into that
+    /// port reaches no queue and the firmware never sees it.
+    ///
+    /// That is a prediction, not a fact, and it is the useful shape for
+    /// one: set this to the other instance and the model says the frame
+    /// arrives. Falsifier: which command register the "Upstream" path
+    /// writes.
+    pub uni_classifier_binding: crate::soc::lue::ClassifierBinding,
     pub serdes: SerDes,
     /// The UNI-side Ethernet port. Its block sits inside what the SerDes
     /// and the MACsec engine both used to claim, so it is tested before
@@ -338,6 +353,10 @@ impl PeripheralBank {
             lue: Lue::new(),
             use_classifier: false,
             classifier_binding: Default::default(),
+            uni_classifier_binding: crate::soc::lue::ClassifierBinding {
+                instance: 0,
+                table: 8,
+            },
             efuse_udr: EfuseUdr::new(),
             fatal_filter: FatalFilter::new(),
             mpcp: Mpcp::new(),
@@ -427,6 +446,19 @@ impl PeripheralBank {
             .use_classifier
             .then_some((&self.lue, self.classifier_binding));
         self.olt.load_frames_into_mailbox(classifier);
+        // Frames the subscriber port accepted go through the same
+        // mailbox, but through their own classifier binding: the two
+        // directions do not share a rule table, and routing UNI ingress
+        // with the downstream binding would answer a question nobody
+        // measured. With the classifier gate shut there is no binding at
+        // all and the frames are dropped — the EtherType fallback is the
+        // fibre's history, not this port's.
+        let uni_classifier = self
+            .use_classifier
+            .then_some((&self.lue, self.uni_classifier_binding));
+        for frame in self.uni.take_rx_frames() {
+            self.olt.deliver_port_frame(uni_classifier, &frame);
+        }
         // The MAC holds the counters software latches; the OLT is where a
         // frame is known to have landed. Carrying the number across is the
         // datapath's job, and it is the bank that owns the datapath.
@@ -908,6 +940,7 @@ impl PeripheralBank {
             lue: self.lue.clone(),
             use_classifier: self.use_classifier,
             classifier_binding: self.classifier_binding,
+            uni_classifier_binding: self.uni_classifier_binding,
             serdes: self.serdes.clone(),
             uni: self.uni.clone(),
             epon_mac: self.epon_mac.clone(),
@@ -940,6 +973,7 @@ impl PeripheralBank {
         self.lue = state.lue;
         self.use_classifier = state.use_classifier;
         self.classifier_binding = state.classifier_binding;
+        self.uni_classifier_binding = state.uni_classifier_binding;
         self.serdes = state.serdes;
         self.uni = state.uni;
         self.epon_mac = state.epon_mac;

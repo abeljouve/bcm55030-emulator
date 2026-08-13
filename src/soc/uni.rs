@@ -58,11 +58,36 @@
 //!     hardware and read it back — and until it is run, a rule here
 //!     would be a guess wearing the same clothes as the rest of the file.
 //!
-//!   * **Nothing increments the counter file.** This block has no receive
-//!     datapath in the model at all, so every counter reads zero unless a
-//!     test injects one. A boot that spins on the window and a boot that
-//!     receives nothing are indistinguishable here, which is exactly why
-//!     [`UniCounters::stat_selects`] exists.
+//!   * **Nothing increments the counter file.** A frame crossing this
+//!     port moves the harness counters below and no entry of the counter
+//!     file, because no measurement names one: nothing observed says
+//!     which index counts frames, octets, or anything else. Wiring the
+//!     ingress to an index would put a number where a guess is, and
+//!     `stats`-style firmware would then print it as a reading. So the
+//!     file stays fed only by [`UniEvent::SetStatCounter`], and the
+//!     falsifier is one measurement naming one index.
+//!
+//! ## The receive datapath
+//!
+//! A frame arrives as [`UniEvent::ReceiveFrame`] and gets past this
+//! block only through gates that were measured:
+//!
+//!   * the port must be **armed** — unarmed, nothing about this port
+//!     works, which is the one thing every reading of it agrees on;
+//!   * something must be **on the receive pair** — a frame arriving with
+//!     [`UniRxSignal::None`] contradicts its own premise, so it is
+//!     dropped and counted rather than quietly accepted.
+//!
+//! What happens after that is **not** this block's decision. The frame
+//! goes to the classifier, and only a rule that names a queue sends it
+//! anywhere. That is the whole point of routing it rather than
+//! delivering it: on hardware, frames pushed into this port were never
+//! seen by the firmware, and a model that delivered them anyway would
+//! be contradicting silicon to make the emulator look livelier.
+//!
+//! ⛔ Which classifier instance sees this ingress is **not established**
+//! — see `Bank::uni_classifier_binding`, which carries the default and
+//! the falsifier.
 //!
 //! **No firmware hook.** What arms the port and what arrives on the
 //! receive pair are inputs ([`UniEvent`]), not something this module
@@ -388,7 +413,16 @@ pub enum UniEvent {
     /// non-zero — and having it means a test can tell "the window works
     /// and the counter is zero" from "the window is not modelled".
     SetStatCounter { bank: usize, index: usize, value: u32 },
+    /// A frame arrives on the receive pair.
+    ReceiveFrame(Vec<u8>),
 }
+
+/// How deep the port holds frames the datapath has not taken yet.
+///
+/// Finite on purpose: a queue that never drops turns a burst into a
+/// backlog delivered late, and the loss is counted so a full queue
+/// cannot be read as a link that received nothing.
+const RX_QUEUE_DEPTH: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct UniCounters {
@@ -414,6 +448,22 @@ pub struct UniCounters {
     pub stat_reads_unselected: u64,
     /// Writes to [`REG_LINK_MODE`], which the hardware refuses.
     pub link_mode_writes_refused: u64,
+
+    // The receive datapath. Every frame offered to the port lands in
+    // exactly one of these, so the four always add up to `rx_offered`
+    // minus what is still queued — a frame that vanishes without a
+    // counter is the fault this split exists to make visible.
+    /// Frames offered to the port, whatever became of them.
+    pub rx_offered: u64,
+    /// Dropped because the port was not armed.
+    pub rx_dropped_unarmed: u64,
+    /// Dropped because nothing was on the receive pair. A frame and
+    /// [`UniRxSignal::None`] cannot both be true.
+    pub rx_dropped_no_signal: u64,
+    /// Dropped because the port's queue was already full.
+    pub rx_dropped_queue_full: u64,
+    /// Taken past the port's own gates and handed to the datapath.
+    pub rx_accepted: u64,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -426,6 +476,8 @@ pub struct UniSnapshot {
     pub port_busy: bool,
     /// What the command port currently selects, if anything.
     pub stat_selected: Option<StatSelect>,
+    /// Frames the port has accepted and the datapath has not taken.
+    pub rx_queued: usize,
     pub counters: UniCounters,
 }
 
@@ -450,6 +502,8 @@ pub struct Uni {
     stat_counters: [u32; STAT_COUNT],
     /// What the last command-port write selected.
     stat_selected: Option<StatSelect>,
+    /// Frames past the port's gates, waiting for the datapath.
+    rx_pending: std::collections::VecDeque<Vec<u8>>,
     pub counters: UniCounters,
 }
 
@@ -468,6 +522,7 @@ impl Uni {
             port_busy: false,
             stat_counters: [0u32; STAT_COUNT],
             stat_selected: None,
+            rx_pending: std::collections::VecDeque::new(),
             counters: UniCounters::default(),
         };
         uni.apply_silicon_power_on();
@@ -519,6 +574,43 @@ impl Uni {
     /// The counter file, in flat order: bank 0 then bank 1.
     pub fn stat_counters(&self) -> &[u32] {
         &self.stat_counters
+    }
+
+    /// How many accepted frames are waiting for the datapath.
+    pub fn rx_queued(&self) -> usize {
+        self.rx_pending.len()
+    }
+
+    /// Offer a frame to the receive pair.
+    ///
+    /// The two gates are the port state and the signal, because those
+    /// are the two things about this port that were measured. Nothing
+    /// here inspects the frame: what a frame is worth is the
+    /// classifier's decision, not the port's.
+    fn receive_frame(&mut self, frame: &[u8]) {
+        self.counters.rx_offered += 1;
+        if !self.armed {
+            self.counters.rx_dropped_unarmed += 1;
+            return;
+        }
+        if self.rx == UniRxSignal::None {
+            self.counters.rx_dropped_no_signal += 1;
+            return;
+        }
+        if self.rx_pending.len() >= RX_QUEUE_DEPTH {
+            self.counters.rx_dropped_queue_full += 1;
+            return;
+        }
+        self.counters.rx_accepted += 1;
+        self.rx_pending.push_back(frame.to_vec());
+    }
+
+    /// Take the frames the port has accepted.
+    ///
+    /// Draining rather than reading means a frame leaves this block
+    /// once, however often the datapath asks.
+    pub fn take_rx_frames(&mut self) -> Vec<Vec<u8>> {
+        self.rx_pending.drain(..).collect()
     }
 
     fn stat_cmd_word(&self) -> u32 {
@@ -637,6 +729,7 @@ impl Peripheral for Uni {
     fn reset_cold(&mut self) {
         self.rx = UniRxSignal::None;
         self.armed = false;
+        self.rx_pending.clear();
         self.counters = UniCounters::default();
         self.apply_silicon_power_on();
     }
@@ -656,6 +749,7 @@ impl Peripheral for Uni {
             link_mode: self.link_mode(),
             port_busy: self.port_busy,
             stat_selected: self.stat_selected,
+            rx_queued: self.rx_pending.len(),
             counters: self.counters,
         })
     }
@@ -671,7 +765,16 @@ impl Peripheral for Uni {
                     self.armed = *armed;
                     if *armed {
                         self.port_busy = false;
+                    } else {
+                        // A port taken out of service does not keep the
+                        // frames it had in hand; they are counted lost
+                        // where they were accepted.
+                        self.rx_pending.clear();
                     }
+                    Ok(())
+                }
+                UniEvent::ReceiveFrame(frame) => {
+                    self.receive_frame(frame);
                     Ok(())
                 }
                 UniEvent::SetStatCounter { bank, index, value } => {
@@ -937,6 +1040,104 @@ mod tests {
         assert_eq!(u.stat_selected(), None);
         assert!(u.stat_counters().iter().all(|&c| c == 0));
         assert_eq!(u.read_word(REG_STAT_DATA).unwrap(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // The receive datapath
+    // -----------------------------------------------------------------
+
+    fn frame(len: usize) -> Vec<u8> {
+        (0..len).map(|i| i as u8).collect()
+    }
+
+    fn offer(u: &mut Uni, f: Vec<u8>) {
+        u.inject_event(&PeripheralEvent::Uni(UniEvent::ReceiveFrame(f)))
+            .unwrap();
+    }
+
+    /// The two gates, each on its own, and the accepted case that says
+    /// the gates are gates and not a closed door.
+    #[test]
+    fn a_frame_needs_an_armed_port_and_something_on_the_pair() {
+        // Unarmed, with a signal: refused on the port state.
+        let mut u = Uni::new();
+        u.inject_event(&PeripheralEvent::Uni(UniEvent::SetRxSignal(
+            UniRxSignal::BaseX { autoneg: true },
+        )))
+        .unwrap();
+        offer(&mut u, frame(64));
+        assert_eq!(u.counters.rx_dropped_unarmed, 1);
+        assert_eq!(u.rx_queued(), 0);
+
+        // Armed, with nothing on the pair: a frame contradicts its own
+        // premise, so it is refused on the signal.
+        let mut u = armed_with(UniRxSignal::None);
+        offer(&mut u, frame(64));
+        assert_eq!(u.counters.rx_dropped_no_signal, 1);
+        assert_eq!(u.rx_queued(), 0);
+
+        // Both gates open: taken.
+        let mut u = armed_with(UniRxSignal::BaseX { autoneg: true });
+        offer(&mut u, frame(64));
+        assert_eq!(u.counters.rx_accepted, 1);
+        assert_eq!(u.rx_queued(), 1);
+        assert_eq!(u.take_rx_frames(), vec![frame(64)]);
+        assert_eq!(u.rx_queued(), 0, "draining takes the frame once");
+    }
+
+    /// Every frame offered lands in exactly one counter. A frame that
+    /// vanishes without one is the fault this test exists to catch.
+    #[test]
+    fn every_offered_frame_is_accounted_for() {
+        let mut u = armed_with(UniRxSignal::BaseX { autoneg: false });
+        for _ in 0..RX_QUEUE_DEPTH + 3 {
+            offer(&mut u, frame(64));
+        }
+        u.inject_event(&PeripheralEvent::Uni(UniEvent::SetRxSignal(
+            UniRxSignal::None,
+        )))
+        .unwrap();
+        offer(&mut u, frame(64));
+
+        let c = u.counters;
+        assert_eq!(c.rx_offered, RX_QUEUE_DEPTH as u64 + 4);
+        assert_eq!(
+            c.rx_accepted + c.rx_dropped_unarmed + c.rx_dropped_no_signal + c.rx_dropped_queue_full,
+            c.rx_offered,
+            "the four outcomes must add up to what was offered"
+        );
+        assert_eq!(c.rx_dropped_queue_full, 3);
+        assert_eq!(c.rx_dropped_no_signal, 1);
+        assert_eq!(u.rx_queued(), RX_QUEUE_DEPTH);
+    }
+
+    /// A port taken out of service does not keep what it was holding.
+    #[test]
+    fn disarming_the_port_lets_go_of_the_queued_frames() {
+        let mut u = armed_with(UniRxSignal::BaseX { autoneg: true });
+        offer(&mut u, frame(64));
+        assert_eq!(u.rx_queued(), 1);
+        u.inject_event(&PeripheralEvent::Uni(UniEvent::SetArmed(false)))
+            .unwrap();
+        assert_eq!(u.rx_queued(), 0);
+        assert_eq!(u.take_rx_frames(), Vec::<Vec<u8>>::new());
+    }
+
+    /// ⭐ The receive path moves no entry of the counter file. Nothing
+    /// measured says which index counts a frame, so putting one there
+    /// would be a guess that firmware would print as a reading.
+    #[test]
+    fn a_received_frame_moves_no_entry_of_the_counter_file() {
+        let mut u = armed_with(UniRxSignal::BaseX { autoneg: true });
+        for _ in 0..5 {
+            offer(&mut u, frame(64));
+        }
+        let _ = u.take_rx_frames();
+        assert!(
+            u.stat_counters().iter().all(|&c| c == 0),
+            "no index is known to count frames, so none may be made to"
+        );
+        assert_eq!(u.counters.rx_accepted, 5, "the harness counter is what moved");
     }
 
     // -----------------------------------------------------------------
