@@ -126,16 +126,6 @@ const REG_SPECIAL_0064: u32 = 0x0100_0064;
 /// true when `(val & 6) == 4` (bit 2 set, bit 1 clear).
 const REG_DISCOVERY_STATUS: u32 = 0x0100_1040;
 
-/// LLID 0/31 anchor registers — the HW clears bit 0 on every write.
-/// The firmware programs the rest of the bitfields; bit 0 is the
-/// "write to latch" trigger that should never read back as 1.
-const LLID_ANCHOR_ADDRS: [u32; 4] = [
-    0x0100_043C,
-    0x0100_04B8,
-    0x0100_0D00,
-    0x0100_0D7C,
-];
-
 /// Address carveouts inside the table / LLID windows that belong to
 /// **other** peripherals. `claims()` excludes them so routing still
 /// reaches SerDes / PBC / BSC first.
@@ -679,14 +669,13 @@ impl Peripheral for EponMac {
         }
 
         if (EPON_TABLE_BASE..EPON_TABLE_END).contains(&addr) {
-            // LLID anchor registers clear bit 0 on write.
-            let final_val = if LLID_ANCHOR_ADDRS.contains(&addr) {
-                val & !0x1
-            } else {
-                val
-            };
+            // OBSERVED on hardware: a CPU write to these registers reads back
+            // verbatim -- bit 0 is NOT cleared. An earlier INFERRED model had the
+            // "LLID anchor" registers clear bit 0 on write (a supposed write-to-latch
+            // trigger); a direct register read-back refuted it (writing ...0001 reads
+            // back ...0001). Store the value as written.
             let idx = Self::table_idx(addr);
-            self.table_store[idx] = final_val;
+            self.table_store[idx] = val;
             return Ok(());
         }
 
@@ -797,12 +786,16 @@ mod tests {
     }
 
     #[test]
-    fn llid_anchor_bit0_clears_on_write() {
+    fn llid_anchor_registers_preserve_bit0() {
+        // OBSERVED on hardware: a CPU write to these registers reads back
+        // verbatim -- bit 0 is NOT cleared. An earlier INFERRED model cleared
+        // bit 0 on write (a supposed write-to-latch trigger); a direct register
+        // read-back refuted it (writing ...7FFF reads back ...7FFF).
         let mut m = EponMac::new();
         m.write_word(0x0100_043C, 0x0001_7FFF).unwrap();
-        assert_eq!(m.read_word(0x0100_043C).unwrap(), 0x0001_7FFE);
+        assert_eq!(m.read_word(0x0100_043C).unwrap(), 0x0001_7FFF);
         m.write_word(0x0100_0D00, 0xFFFF_FFFF).unwrap();
-        assert_eq!(m.read_word(0x0100_0D00).unwrap(), 0xFFFF_FFFE);
+        assert_eq!(m.read_word(0x0100_0D00).unwrap(), 0xFFFF_FFFF);
     }
 
     #[test]
