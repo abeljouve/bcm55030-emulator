@@ -2,10 +2,6 @@ pub mod condition;
 pub mod exception;
 pub mod registers;
 pub mod state_dom;
-#[cfg(test)]
-mod legacy_step;
-#[cfg(test)]
-mod step_differential;
 
 use std::collections::HashMap;
 use std::sync::Arc;
