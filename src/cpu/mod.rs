@@ -254,9 +254,11 @@ impl Cpu {
         // would survive into the next `load_firmware` and the new
         // bootloader's `0x0..0x80` IVT/code would be fetched stale —
         // diverging from silicon (PC=0xFFFFFFFF crash). Mirrors
-        // `warm_reboot_from_flash`, which already does this.
-        self.mem.dcache_invalidate_all().ok();
-        self.mem.icache_invalidate_all();
+        // `warm_reboot_from_flash`, which already does this. It is a reset,
+        // not a write-back invalidate: dirty lines are dropped rather than
+        // written over the SRAM just cleared, and the D-cache control returns
+        // to its reset value together with the `DC_CTRL` shadow in `state`.
+        self.mem.reset_caches();
 
         self.tight_loop_count = 0;
         self.tight_loop_last_pc = u32::MAX;

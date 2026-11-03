@@ -775,11 +775,13 @@ impl Worker {
         self.cpu.state = snap.cpu_state.clone();
         self.cpu.mem.restore_sram(&snap.sram);
 
-        // Invalidate both caches — SRAM already has correct data, the
-        // firmware re-warms caches naturally. Avoids cloning boxed cache
-        // arrays through private fields.
-        let _ = self.cpu.mem.dcache_invalidate_all();
-        self.cpu.mem.icache_invalidate_all();
+        // The caches are part of the machine state. With write-back, the
+        // snapshot's dirty lines hold data its SRAM image does not, and the
+        // current dirty lines must not be written over the restored SRAM: put
+        // the saved caches back wholesale, never invalidate-with-writeback.
+        self.cpu
+            .mem
+            .restore_cache_state(snap.dcache.clone(), snap.icache.clone());
 
         if let Some(ref bank_state) = snap.bank_state {
             if let Some(bank) = self.cpu.bank() {

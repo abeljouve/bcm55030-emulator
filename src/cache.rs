@@ -70,6 +70,7 @@ pub struct DCache {
     ram_addr: u32,
 }
 
+#[derive(Clone)]
 pub struct DcacheSaveState {
     lines: Box<[[CacheLine; NUM_WAYS]; NUM_SETS]>,
     next_way: Box<[u8; NUM_SETS]>,
@@ -422,6 +423,7 @@ pub struct ICache {
     enabled: bool,
 }
 
+#[derive(Clone)]
 pub struct IcacheSaveState {
     lines: Box<[ICacheLine; IC_NUM_SETS]>,
     enabled: bool,
