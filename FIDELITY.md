@@ -14,8 +14,39 @@ where it diverges from a textbook ARC700:
   *executing* it raises an Instruction Error exception, exactly as the silicon
   does; interrupt and exception return is done with `j.f [ilink1]` /
   `j.f [ilink2]`.
-- Delay slots, zero-overhead loops, the cache model (direct-mapped I-cache,
-  2-way D-cache) and the NORM extension follow the observed core behaviour.
+- **Unimplemented opcodes fault.** Every MPY variant, the saturating/DSP group
+  (ADDS, SUBS, DIVAW, ASLS, ASRS, ADDSDW, SUBSDW, SAT16, RND16, ABSS, ABSSW,
+  NEGS, NEGSW) and EX raise an Instruction Error, as on silicon; EX leaves
+  memory untouched. They still decode, so the disassembler labels them. The
+  barrel shifts, NORM, NORMW, SWAP, MIN and MAX execute.
+- **Exceptions are vectored as measured.** An Instruction Error (including an
+  undecodable opcode), SWI and TRAP_S enter slot 2 of the vector table at
+  `INT_VECTOR_BASE` (never the NCO alias that serves interrupt vectors), with
+  ILINK2 = the address execution would have continued at (the branch target
+  in a delay slot), STATUS32_L2 = STATUS32, STATUS32 unchanged and
+  `AUX_IRQ_LV12` bit 1 set; `j.f [ilink2]` resumes. What an exception does to
+  E1/E2 when interrupts are enabled is not measured. Bus errors, misaligned and
+  privileged accesses, whose entry is not measured either, still stop the
+  emulation, as does a fault on the vector itself. `arc700 --stop-on-exception`
+  (or `Cpu::stop_on_exception`) stops on every exception, for diagnosis.
+- **No exception-state auxiliary registers.** ERET, ERBTA, ERSTATUS, ECR, EFA,
+  ICAUSE1/2, BTA, BTA_L1/L2 and IENABLE are absent: they read `IDENTITY` and
+  ignore writes. Aux `0x11` is MULHI, a plain register reading `0x2` after
+  reset; there is no I-cache control register.
+- **Flags follow the core, not the textbook.** Register shift counts are taken
+  modulo 32, C is the last bit shifted out and is cleared by a zero count, and
+  V is kept. The one-bit `ASL.F` and `RLC.F` write V = N xor C. `NORM.F` and
+  `NORMW.F` set Z and N from the source operand and keep C and V. `MIN.F` /
+  `MAX.F` set C when the second operand is the one selected. `TST`, `CMP`,
+  `RCMP` and `BTST` with B = 62 read a LIMM in every format.
+- Delay slots, zero-overhead loops and the cache model (direct-mapped I-cache,
+  2-way D-cache) follow the observed core behaviour.
+- **Not modelled: the `LP_COUNT` setup hazard.** Silicon needs four instruction
+  words between the write of `LP_COUNT` and the end of the first iteration; a
+  shorter distance can lose an iteration. Whether it does depends on fetch
+  timing (it was seen once, on a cold first execution), so the emulator always
+  applies the new count. Code that violates the distance behaves here as if it
+  did not.
 
 ## SoC peripherals — where it simplifies
 
