@@ -2,14 +2,21 @@ pub mod condition;
 pub mod exception;
 pub mod registers;
 pub mod state_dom;
+#[cfg(test)]
+mod legacy_step;
+#[cfg(test)]
+mod step_differential;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use arc_isa::dom::Dom;
+use arc_isa::sem::step as sem_step;
 use exception::Exception;
-use registers::{CpuState, DelayState, REG_BLINK, REG_ILINK1, REG_ILINK2, REG_LP_COUNT};
+use state_dom::StateDom;
+use registers::{CpuState, DelayState, REG_BLINK, REG_ILINK1, REG_ILINK2};
 
 use crate::debug_info::DebugInfo;
 use crate::decoder;
@@ -134,9 +141,6 @@ enum FaultSite {
     /// continued at.
     Execute(u32),
 }
-
-/// `AUX_IRQ_LV12` bit 1: set on entry to a level-2 handler.
-const LV12_L2: u32 = 1 << 1;
 
 impl Cpu {
     /// Create a CPU with flat memory (for tests / simple use).
@@ -376,26 +380,11 @@ impl Cpu {
             return Ok(());
         }
 
-        // Save and clear delay state
-        let delay_info = match self.state.delay_state {
-            DelayState::DelaySlot { target, is_link } => {
-                self.state.delay_state = DelayState::None;
-                Some((target, is_link))
-            }
-            DelayState::None => None,
-        };
-
-        // Zero-overhead loop check (not during delay slots)
-        if delay_info.is_none() && !self.state.flag_l {
-            let lp_count = self.state.core_regs[REG_LP_COUNT as usize];
-            if self.state.pc == self.state.aux_lp_end && lp_count > 0 {
-                let new_count = lp_count - 1;
-                self.state.core_regs[REG_LP_COUNT as usize] = new_count;
-                if new_count > 0 {
-                    self.state.pc = self.state.aux_lp_start;
-                    return Ok(());
-                }
-            }
+        // Architectural sequencing is `arc_isa::sem::step`: consume a pending
+        // delay slot, then the zero-overhead loop, whose jump back ends the step.
+        let (delay_info, looped) = sem_step::begin(&mut StateDom(&mut self.state));
+        if looped {
+            return Ok(());
         }
 
         // Fetch and decode. A fault leaves the PC on the faulting
@@ -439,10 +428,8 @@ impl Cpu {
             }
         }
 
-        // For BL.D/JL.D: set blink to address AFTER the delay slot
-        if let Some((_target, true)) = delay_info {
-            self.state.write_core_reg(REG_BLINK, next_pc)?;
-        }
+        // In the delay slot of BL.D/JL.D, BLINK is already the address after the slot.
+        sem_step::link_slot(&mut StateDom(&mut self.state), delay_info, next_pc)?;
 
         // Update CPU context on the bank for watchpoint / trace output.
         // Also set the .di flag from the current instruction so MMIO
@@ -473,8 +460,7 @@ impl Cpu {
         };
 
         // Execute
-        self.state.pc_written = false;
-        self.state.link_executed = false;
+        StateDom(&mut self.state).begin_insn();
         executor::execute(&decoded, &mut self.state, &mut self.mem).inspect_err(|_| {
             self.fault_site = FaultSite::Execute(delay_info.map_or(next_pc, |(target, _)| target));
         })?;
@@ -494,14 +480,7 @@ impl Cpu {
             }
         }
 
-        // PC update logic
-        if let Some((target, _is_link)) = delay_info {
-            self.state.pc = target;
-        } else if matches!(self.state.delay_state, DelayState::DelaySlot { .. }) {
-            self.state.pc = next_pc;
-        } else if !self.state.pc_written {
-            self.state.pc = next_pc;
-        }
+        sem_step::finish(&mut StateDom(&mut self.state), delay_info, next_pc);
 
         self.state.instruction_count += 1;
 
@@ -693,11 +672,7 @@ aliasing_fetch_line={:?} set_index={:?} starve={} cyc={} \
         if fault_pc == vector {
             return Err(e);
         }
-        self.state.delay_state = DelayState::None;
-        self.state.aux_status32_l2 = self.state.status32();
-        self.state.core_regs[REG_ILINK2 as usize] = resume;
-        self.state.aux_irq_lv12 |= LV12_L2;
-        self.state.pc = vector;
+        sem_step::exception_entry(&mut StateDom(&mut self.state), e.vector_number() as u32, resume);
         self.exceptions_taken += 1;
         if self.trace {
             eprintln!(

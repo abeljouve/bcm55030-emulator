@@ -75,6 +75,82 @@ impl FlatMachine {
     }
 }
 
+impl crate::decoder::InstructionFetch for FlatMachine {
+    fn fetch_half(&self, addr: u32) -> Result<u16, Exception> {
+        if addr & 1 != 0 {
+            return Err(Exception::MisalignedAccess { address: addr });
+        }
+        Ok(self.read(addr, DataSize::HalfWord)? as u16)
+    }
+    fn fetch_word(&self, addr: u32) -> Result<u32, Exception> {
+        if addr & 1 != 0 {
+            return Err(Exception::MisalignedAccess { address: addr });
+        }
+        let hi = self.read(addr, DataSize::HalfWord)?;
+        let lo = self.read(addr.wrapping_add(2), DataSize::HalfWord)?;
+        Ok((hi << 16) | lo)
+    }
+}
+
+impl FlatMachine {
+    /// One architectural step: the zero-overhead loop and delay slot, decode,
+    /// execute, the PC update, and the entry into a vectored exception (an
+    /// Instruction Error, SWI or TRAP goes to slot 2; any other exception is
+    /// returned, as is a fault on the vector itself). A halted or sleeping
+    /// machine does nothing.
+    pub fn step(&mut self) -> Result<(), Exception> {
+        use crate::sem::step;
+        if self.halted || self.sleeping {
+            return Ok(());
+        }
+        let (delay, looped) = step::begin(self);
+        if looped {
+            return Ok(());
+        }
+        let pc = self.pc;
+        let decoded = match crate::decoder::decode_with(pc, &*self) {
+            Ok(d) => d,
+            Err(e) => {
+                // The major opcode still gives the length of an undecodable one.
+                let size = match self.fetch_half_of(pc) {
+                    Some(hw) if (hw >> 11) >= 0x0C => 2,
+                    _ => 4,
+                };
+                let resume = delay.map_or(pc.wrapping_add(size), |(t, _)| t);
+                return self.vector(e, resume);
+            }
+        };
+        let next_pc = pc.wrapping_add(decoded.total_size());
+        let resume = delay.map_or(next_pc, |(t, _)| t);
+        if let Err(e) = step::link_slot(self, delay, next_pc) {
+            return self.vector(e, resume);
+        }
+        self.begin_insn();
+        if let Err(e) = crate::sem::execute(self, &decoded) {
+            return self.vector(e, resume);
+        }
+        step::finish(self, delay, next_pc);
+        Ok(())
+    }
+
+    fn fetch_half_of(&self, pc: u32) -> Option<u16> {
+        self.read(pc, DataSize::HalfWord).ok().map(|v| v as u16)
+    }
+
+    fn vector(&mut self, e: Exception, resume: u32) -> Result<(), Exception> {
+        if !e.is_vectored() {
+            return Err(e);
+        }
+        let slot = e.vector_number() as u32;
+        let target = self.aux(AuxReg::IntVectorBase).wrapping_add(slot * 8);
+        if target == self.pc {
+            return Err(e);
+        }
+        crate::sem::step::exception_entry(self, slot, resume);
+        Ok(())
+    }
+}
+
 fn size_bytes(size: DataSize) -> usize {
     match size {
         DataSize::Word => 4,
@@ -154,6 +230,22 @@ impl Dom for FlatMachine {
     fn sleep(&mut self) {
         self.sleeping = true;
     }
+    fn take_delay(&mut self) -> Option<(u32, bool)> {
+        self.delay.take()
+    }
+    fn delay_pending(&mut self) -> bool {
+        self.delay.is_some()
+    }
+    fn begin_insn(&mut self) {
+        self.pc_written = false;
+        self.link_executed = false;
+    }
+    fn pc_written(&mut self) -> bool {
+        self.pc_written
+    }
+    fn set_pc(&mut self, pc: u32) {
+        self.pc = pc;
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +253,28 @@ mod tests {
     use super::*;
     use crate::condition::ConditionCode;
     use crate::sem::regs::*;
+
+    #[test]
+    fn steps_a_zero_overhead_loop_and_takes_an_exception() {
+        use crate::regs::REG_ILINK2;
+        let alu = |sub: u32, b: u32, c: u32, a: u32, p: u32| {
+            (0x04u32 << 27) | ((b & 7) << 24) | (p << 22) | (sub << 16) | (((b >> 3) & 7) << 12) | (c << 6) | a
+        };
+        let mut m = FlatMachine::new(0x4000);
+        // mov lp_count, 3 ; lp (LP_END = 0x10C) ; add r4, r4, 1 ; rtie (Instruction Error)
+        let prog = [alu(0x0A, 60, 3, 0, 1), alu(0x28, 0, 4, 0, 1), alu(0x00, 4, 1, 4, 1), 0x246F_003F];
+        for (i, w) in prog.iter().enumerate() {
+            m.write(0x100 + 4 * i as u32, DataSize::Word, *w).unwrap();
+        }
+        m.pc = 0x100;
+        m.set_aux(AuxReg::IntVectorBase, 0x1000);
+        while m.pc != 0x1010 {
+            m.step().unwrap();
+        }
+        assert_eq!(m.regs[4], 3, "the loop body ran LP_COUNT times");
+        assert_eq!(m.regs[REG_ILINK2 as usize], 0x110, "ILINK2 = the instruction after rtie");
+        assert_eq!(m.aux(AuxReg::IrqLv12) & 2, 2);
+    }
 
     #[test]
     fn memory_is_big_endian_and_bounded() {
