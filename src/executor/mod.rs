@@ -5,6 +5,8 @@ pub mod emu_dom;
 pub(crate) mod legacy;
 #[cfg(test)]
 pub(crate) mod differential;
+#[cfg(test)]
+mod golden;
 
 use crate::cpu::exception::Exception;
 use crate::cpu::registers::CpuState;
