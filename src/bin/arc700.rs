@@ -34,6 +34,7 @@ fn usage(prog: &str) {
     eprintln!("  --warm-boot                 Start with SYSREG_INIT_VALUES (default)");
     eprintln!("  --dump-mmio-trace-cold <F>  Cold-boot + dump MMIO trace catalog to <F>");
     eprintln!("  --unmapped-exception        Trap unclaimed MMIO as MemoryError");
+    eprintln!("  --stop-on-exception         Stop at an Instruction Error/SWI/TRAP instead of vectoring it");
     eprintln!("  --trace-mmio-seq <FILE>     Write per-access MMIO trace as JSON Lines to FILE");
     eprintln!("  --trace-mmio-range S:E      Restrict --trace-mmio-seq to [S,E) (hex, repeatable)");
     eprintln!("  --scenario <FILE>           Load a JSON scenario file at startup");
@@ -63,6 +64,7 @@ struct Config {
     /// Trap unclaimed MMIO reads / writes as
     /// `MemoryError` exceptions instead of returning zero.
     unmapped_exception: bool,
+    stop_on_exception: bool,
     boot_mode: BootMode,
     /// Path to an ELF file carrying DWARF debug info. Used to
     /// annotate `--trace` output with source file / line.
@@ -123,6 +125,7 @@ fn parse_args() -> Config {
         watch_dccm: None,
         dump_mmio_trace: None,
         unmapped_exception: false,
+        stop_on_exception: false,
         boot_mode: BootMode::Warm,
         debug_elf: None,
         trace_mmio_seq: None,
@@ -227,6 +230,7 @@ fn parse_args() -> Config {
                 cfg.boot_mode = BootMode::Cold;
             }
             "--unmapped-exception" => cfg.unmapped_exception = true,
+            "--stop-on-exception" => cfg.stop_on_exception = true,
             "--cold-boot" => cfg.boot_mode = BootMode::Cold,
             "--warm-boot" => cfg.boot_mode = BootMode::Warm,
             "--debug-elf" => {
@@ -670,6 +674,7 @@ fn main() {
         let mut bank = cpu.bank().unwrap().write();
         bank.sysreg.mmio_trace = Some(std::collections::HashMap::new());
     }
+    cpu.stop_on_exception = cfg.stop_on_exception;
     if cfg.unmapped_exception {
         cpu.bank().unwrap().write().unmapped_exception = true;
         bcm55030_emulator::vlog!("[BCM55030] Unmapped-access policy = Exception");
@@ -803,6 +808,14 @@ fn main() {
     eprintln!("=== Final State ===");
     eprintln!("PC: 0x{:08X}", cpu.state.pc);
     eprintln!("Instructions: {}", cpu.state.instruction_count);
+    if cpu.exceptions_taken != 0 {
+        if let Some((pc, ref e)) = cpu.last_exception {
+            eprintln!(
+                "Exceptions taken: {} (last: {:?} at PC=0x{:08X})",
+                cpu.exceptions_taken, e, pc
+            );
+        }
+    }
     eprintln!(
         "Flags: Z={} N={} C={} V={}",
         cpu.state.flag_z as u8,

@@ -1191,8 +1191,8 @@ impl Memory {
             // actual jump-to-garbage symptom. Returning early here
             // lets `fetch_half`/`fetch_word` fall through to the
             // SRAM-bounds check and raise `Exception::MemoryError`,
-            // which vectors to the firmware's instruction-error
-            // handler and surfaces the faulting PC.
+            // which stops the emulation at the faulting PC (a bus error
+            // is not vectored: its entry on silicon is not measured).
             let Some(off) = self.sram_offset(line_addr) else {
                 return;
             };
