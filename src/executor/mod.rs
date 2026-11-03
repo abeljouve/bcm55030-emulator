@@ -1,10 +1,6 @@
 pub mod emu_dom;
 
-/// Frozen reference implementation for the differential tests.
-#[cfg(test)]
-pub(crate) mod legacy;
-#[cfg(test)]
-pub(crate) mod differential;
+/// Golden fingerprints of the semantics.
 #[cfg(test)]
 mod golden;
 

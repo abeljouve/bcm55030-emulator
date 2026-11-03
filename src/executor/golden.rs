@@ -248,7 +248,7 @@ pub(crate) fn fingerprint_memory(exec: Exec) -> u64 {
     h.0
 }
 
-/// Whole steps (`step` is `Cpu::step` or its frozen copy) over short random
+/// Whole steps (`step` is `Cpu::step`) over short random
 /// programs, hashing the state after every step.
 pub(crate) fn fingerprint_steps(step: &dyn Fn(&mut Cpu) -> Result<(), Exception>) -> u64 {
     let mut rng = Rng::new(0x6011_0003);
@@ -295,12 +295,4 @@ fn memory_semantics_fingerprint() {
 fn step_fingerprint() {
     let h = fingerprint_steps(&|c| c.step());
     assert_eq!(h, STEPS, "step sequencing changed (fingerprint {h:#018x})");
-}
-
-/// One-off: the frozen implementation gives the same fingerprints.
-#[test]
-fn legacy_fingerprints() {
-    println!("legacy registers {:#018x}", fingerprint_registers(&|d, s, m| super::legacy::execute(d, s, m)));
-    println!("legacy memory    {:#018x}", fingerprint_memory(&|d, s, m| super::legacy::execute(d, s, m)));
-    println!("legacy steps     {:#018x}", fingerprint_steps(&|c| c.legacy_step()));
 }
