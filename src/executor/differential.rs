@@ -6,7 +6,10 @@
 use std::collections::HashMap;
 
 use arc_isa::condition::ConditionCode;
-use arc_isa::decoder::instruction::{AluOp, ExtArithOp, Instruction, Operand, SingleOp};
+use arc_isa::decoder::instruction::{
+    AluOp, BrCompareKind, DecodedInstruction, DelayMode, ExtArithOp, Instruction, Operand, SingleOp,
+    ZeroOp,
+};
 use arc_isa::dom::{Dom, Flag};
 use arc_isa::sem::{self, regs};
 
@@ -28,8 +31,14 @@ impl Rng {
         self.0 ^= self.0 >> 27;
         self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
+    /// Uniform in `0..n`, from the high bits: the low bits of consecutive
+    /// outputs are correlated, and selecting on them leaves combinations
+    /// unreachable.
+    pub(crate) fn below(&mut self, n: u64) -> u64 {
+        ((self.next() >> 32) * n) >> 32
+    }
     pub(crate) fn bool(&mut self) -> bool {
-        self.next() & 1 != 0
+        self.next() >> 63 != 0
     }
     /// Half uniform, half from values that sit on edges.
     pub(crate) fn word(&mut self) -> u32 {
@@ -38,7 +47,7 @@ impl Rng {
             0x80, 3, 7, 0x1F,
         ];
         let r = self.next();
-        if r & 1 == 0 { (r >> 32) as u32 } else { EDGES[(r >> 8) as usize % EDGES.len()] }
+        if r >> 63 == 0 { (r >> 16) as u32 } else { EDGES[((r >> 32) % EDGES.len() as u64) as usize] }
     }
 }
 
@@ -57,8 +66,15 @@ pub(crate) fn random_state(rng: &mut Rng) -> CpuState {
     s.flag_a1 = rng.bool();
     s.flag_a2 = rng.bool();
     s.flag_l = rng.bool();
-    s.flag_u = rng.next().is_multiple_of(4);
+    s.flag_u = rng.below(4) == 0;
     s.pc = (rng.next() as u32) & 0x0007_FFFE;
+    s.aux_status32_l1 = rng.word();
+    s.aux_status32_l2 = rng.word();
+    s.aux_bta = rng.word();
+    s.aux_bta_l1 = rng.word();
+    s.aux_bta_l2 = rng.word();
+    s.aux_lp_start = rng.word() & !1;
+    s.aux_lp_end = rng.word() & !1;
     s
 }
 
@@ -152,7 +168,7 @@ fn cases() -> u64 {
 /// as often as ordinary ones.
 fn pick_reg(rng: &mut Rng) -> u8 {
     const SPECIAL: [u8; 10] = [26, 27, 28, 29, 30, 31, 60, 61, 62, 63];
-    if rng.bool() { SPECIAL[rng.next() as usize % SPECIAL.len()] } else { (rng.next() % 26) as u8 }
+    if rng.bool() { SPECIAL[rng.below(SPECIAL.len() as u64) as usize] } else { rng.below(26) as u8 }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -163,7 +179,7 @@ enum Form {
 }
 
 fn pick_operand(rng: &mut Rng, allow_none: bool) -> (Operand, Form) {
-    match rng.next() % if allow_none { 3 } else { 2 } {
+    match rng.below(if allow_none { 3 } else { 2 }) {
         0 => (Operand::Reg(pick_reg(rng)), Form::R),
         1 => (Operand::Imm(rng.word()), Form::I),
         _ => (Operand::None, Form::N),
@@ -171,7 +187,7 @@ fn pick_operand(rng: &mut Rng, allow_none: bool) -> (Operand, Form) {
 }
 
 fn pick_cc(rng: &mut Rng) -> Option<ConditionCode> {
-    let q = rng.next() % 17;
+    let q = rng.below(17);
     if q == 16 { None } else { ConditionCode::from_u8(q as u8) }
 }
 
@@ -190,7 +206,7 @@ fn alu_matches_legacy() {
     let mut m = Memory::new(0x100);
     let mut cover: HashMap<(u8, bool, bool, Form, Form, Form), u64> = HashMap::new();
     for _ in 0..cases() {
-        let op = ops[rng.next() as usize % ops.len()];
+        let op = ops[rng.below(ops.len() as u64) as usize];
         let f = rng.bool();
         let cc = pick_cc(&mut rng);
         let (dst, fd) = pick_operand(&mut rng, true);
@@ -275,7 +291,7 @@ fn single_op_matches_legacy() {
     let mut m = Memory::new(0x100);
     let mut cover: HashMap<(usize, bool, bool, Form, Form), u64> = HashMap::new();
     for _ in 0..cases() {
-        let i = rng.next() as usize % SINGLE_OPS.len();
+        let i = rng.below(SINGLE_OPS.len() as u64) as usize;
         let f = rng.bool();
         let cc = pick_cc(&mut rng);
         let (dst, fd) = pick_operand(&mut rng, true);
@@ -304,7 +320,7 @@ fn ext_arith_matches_legacy() {
     let mut m = Memory::new(0x100);
     let mut cover: HashMap<(usize, bool, bool, Form, Form, Form), u64> = HashMap::new();
     for _ in 0..cases() {
-        let i = rng.next() as usize % EXT_OPS.len();
+        let i = rng.below(EXT_OPS.len() as u64) as usize;
         let f = rng.bool();
         let cc = pick_cc(&mut rng);
         let (dst, fd) = pick_operand(&mut rng, true);
@@ -344,4 +360,94 @@ fn ext_arith_matches_legacy() {
             check_ext(op, Operand::Reg(2), Operand::Reg(0), Operand::None, true, None, s.clone(), &mut m);
         }
     }
+}
+
+fn pick_delay(rng: &mut Rng) -> DelayMode {
+    if rng.bool() { DelayMode::Delay } else { DelayMode::NoDelay }
+}
+
+/// A decoded instruction at the state's PC, as the legacy control executors
+/// read their PC and length from it.
+fn at_pc(inst: Instruction, s: &CpuState, rng: &mut Rng) -> DecodedInstruction {
+    let size = if rng.bool() { 2 } else { 4 };
+    DecodedInstruction { inst, size, has_limm: size == 4 && rng.bool(), pc: s.pc }
+}
+
+#[test]
+fn control_matches_legacy() {
+    const KINDS: [BrCompareKind; 8] = [
+        BrCompareKind::Breq, BrCompareKind::Brne, BrCompareKind::Brlt, BrCompareKind::Brge,
+        BrCompareKind::Brlo, BrCompareKind::Brhs, BrCompareKind::Bbit0, BrCompareKind::Bbit1,
+    ];
+    let mut rng = Rng::new(0xB2_0001);
+    let mut m = Memory::new(0x100);
+    let mut cover: HashMap<(u8, bool, bool, bool), u64> = HashMap::new();
+    for _ in 0..cases() {
+        let base = random_state(&mut rng);
+        let (mut a, mut b) = (base.clone(), base);
+        let cc = pick_cc(&mut rng);
+        let delay = pick_delay(&mut rng);
+        let link = rng.bool();
+        let offset = (rng.next() as i32) >> 10 & !1;
+        let which = rng.below(6) as u8;
+        let (ra, rb) = match which {
+            0 => {
+                let dec = at_pc(Instruction::Branch { offset, cc, delay, link }, &a, &mut rng);
+                let ra = legacy::branch::execute_branch(&dec, offset, cc, delay, link, &mut a);
+                let rb = sem::branch::branch(&mut EmuDom::new(&mut b, &mut m), offset, cc, delay, link,
+                                             dec.total_size());
+                (ra, rb)
+            }
+            1 => {
+                let kind = KINDS[rng.below(KINDS.len() as u64) as usize];
+                let (src1, _) = pick_operand(&mut rng, false);
+                let (src2, _) = pick_operand(&mut rng, false);
+                let dec = at_pc(Instruction::BranchCompare { kind, src1, src2, offset, delay }, &a, &mut rng);
+                let ra = legacy::branch::execute_branch_compare(kind, src1, src2, offset, delay, &dec, &mut a);
+                let rb = sem::branch::branch_compare(&mut EmuDom::new(&mut b, &mut m), kind, src1, src2,
+                                                     offset, delay);
+                (ra, rb)
+            }
+            2 => {
+                let (target, _) = pick_operand(&mut rng, false);
+                let flag_restore = rng.bool();
+                let dec = at_pc(Instruction::Jump { target, cc, delay, link, flag_restore }, &a, &mut rng);
+                let ra = legacy::branch::execute_jump(&dec, target, cc, delay, link, flag_restore, &mut a);
+                let rb = sem::branch::jump(&mut EmuDom::new(&mut b, &mut m), target, cc, delay, link,
+                                           flag_restore, dec.total_size());
+                (ra, rb)
+            }
+            3 => {
+                let zop = match rng.below(7) {
+                    0 => ZeroOp::Nop,
+                    1 => ZeroOp::Sleep { u6: rng.below(64) as u8 },
+                    2 => ZeroOp::Swi,
+                    3 => ZeroOp::Brk,
+                    4 => ZeroOp::Trap { param: rng.below(64) as u8 },
+                    5 => ZeroOp::Rtie,
+                    _ => ZeroOp::Sync,
+                };
+                let ra = legacy::special::execute_zero_op(&zop, &mut a);
+                let rb = sem::special::zero_op(&mut EmuDom::new(&mut b, &mut m), &zop);
+                (ra, rb)
+            }
+            4 => {
+                let off = (rng.next() as u32) & 0x0FFE;
+                let dec = at_pc(Instruction::Loop { offset: off, cc }, &a, &mut rng);
+                let ra = legacy::special::execute_loop(off, cc, &dec, &mut a);
+                let rb = sem::special::lp(&mut EmuDom::new(&mut b, &mut m), off, cc, dec.total_size());
+                (ra, rb)
+            }
+            _ => {
+                let (src, _) = pick_operand(&mut rng, false);
+                let src = if rng.below(4) == 0 { Operand::Imm(rng.word() | 1) } else { src };
+                let ra = legacy::special::execute_flag(src, cc, &mut a);
+                let rb = sem::special::flag(&mut EmuDom::new(&mut b, &mut m), src, cc);
+                (ra, rb)
+            }
+        };
+        assert_same(&(which, cc, delay, link, offset), &ra, &rb, &a, &b);
+        *cover.entry((which, cc.is_some(), delay == DelayMode::Delay, link)).or_default() += 1;
+    }
+    assert_eq!(cover.len(), 6 * 8, "control coverage: {} of 48", cover.len());
 }

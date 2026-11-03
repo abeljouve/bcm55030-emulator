@@ -1,7 +1,5 @@
-pub mod branch;
 pub mod emu_dom;
 pub mod load_store;
-pub mod special;
 
 /// Frozen reference implementation for the differential tests.
 #[cfg(test)]
@@ -70,7 +68,7 @@ pub fn execute(
             )?;
         }
         Instruction::ZeroOp(zop) => {
-            special::execute_zero_op(zop, state)?;
+            arc_isa::sem::special::zero_op(&mut emu_dom::EmuDom::new(state, mem), zop)?;
         }
         Instruction::Branch {
             offset,
@@ -78,7 +76,14 @@ pub fn execute(
             delay,
             link,
         } => {
-            branch::execute_branch(decoded, *offset, *cc, *delay, *link, state)?;
+            arc_isa::sem::branch::branch(
+                &mut emu_dom::EmuDom::new(state, mem),
+                *offset,
+                *cc,
+                *delay,
+                *link,
+                decoded.total_size(),
+            )?;
         }
         Instruction::BranchCompare {
             kind,
@@ -87,8 +92,13 @@ pub fn execute(
             offset,
             delay,
         } => {
-            branch::execute_branch_compare(
-                *kind, *src1, *src2, *offset, *delay, decoded, state,
+            arc_isa::sem::branch::branch_compare(
+                &mut emu_dom::EmuDom::new(state, mem),
+                *kind,
+                *src1,
+                *src2,
+                *offset,
+                *delay,
             )?;
         }
         Instruction::Jump {
@@ -98,7 +108,15 @@ pub fn execute(
             link,
             flag_restore,
         } => {
-            branch::execute_jump(decoded, *target, *cc, *delay, *link, *flag_restore, state)?;
+            arc_isa::sem::branch::jump(
+                &mut emu_dom::EmuDom::new(state, mem),
+                *target,
+                *cc,
+                *delay,
+                *link,
+                *flag_restore,
+                decoded.total_size(),
+            )?;
         }
         Instruction::Load {
             dst,
@@ -134,7 +152,12 @@ pub fn execute(
             )?;
         }
         Instruction::Loop { offset, cc } => {
-            special::execute_loop(*offset, *cc, decoded, state)?;
+            arc_isa::sem::special::lp(
+                &mut emu_dom::EmuDom::new(state, mem),
+                *offset,
+                *cc,
+                decoded.total_size(),
+            )?;
         }
         Instruction::LoadAux { dst, addr } => {
             let addr_val = resolve_value(*addr, state)?;
@@ -203,7 +226,7 @@ pub fn execute(
             }
         }
         Instruction::Flag { src, cc } => {
-            special::execute_flag(*src, *cc, state)?;
+            arc_isa::sem::special::flag(&mut emu_dom::EmuDom::new(state, mem), *src, *cc)?;
         }
         Instruction::ExtArith {
             op,
