@@ -1,8 +1,6 @@
 pub mod branch;
 pub mod emu_dom;
-pub mod extended;
 pub mod load_store;
-pub mod single_op;
 pub mod special;
 
 /// Frozen reference implementation for the differential tests.
@@ -62,7 +60,14 @@ pub fn execute(
             set_flags,
             cc,
         } => {
-            single_op::execute_single_op(*op, *dst, *src, *set_flags, *cc, state)?;
+            arc_isa::sem::single_op::single_op(
+                &mut emu_dom::EmuDom::new(state, mem),
+                *op,
+                *dst,
+                *src,
+                *set_flags,
+                *cc,
+            )?;
         }
         Instruction::ZeroOp(zop) => {
             special::execute_zero_op(zop, state)?;
@@ -208,7 +213,15 @@ pub fn execute(
             set_flags,
             cc,
         } => {
-            extended::execute_ext_arith(*op, *dst, *src1, *src2, *set_flags, *cc, state)?;
+            arc_isa::sem::extended::ext_arith(
+                &mut emu_dom::EmuDom::new(state, mem),
+                *op,
+                *dst,
+                *src1,
+                *src2,
+                *set_flags,
+                *cc,
+            )?;
         }
         Instruction::Prefetch => {}
     }
