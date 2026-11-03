@@ -23,9 +23,10 @@ see [README.md](README.md) for architecture and usage.
 ## Layout
 
 ```
-src/cpu       core: registers, execution state, delay slots
-src/decoder   16/32-bit ARCompact decoder + formatter
-src/executor  instruction semantics (ALU, extended, memory, special)
+crates/arc-isa  instruction set: decoder, formatter, semantics over `Dom`, FlatMachine
+src/cpu       core: registers, execution state, step loop around arc_isa::sem::step
+src/decoder   re-export of arc_isa::decoder, fetch from live memory
+src/executor  EmuDom (semantics on live state), one entry per instruction class
 src/cache     I/D-cache model
 src/memory    SRAM / flat memory, MMIO routing
 src/soc       on-chip peripherals (one module per block)
@@ -77,6 +78,27 @@ conversion between the two clocks. Rules for working on it:
   link.
 - Keep protocol logic out of `bank.rs`: the bank routes MMIO and owns the
   datapath, the peer owns frame semantics.
+
+### The instruction set lives in `crates/arc-isa`
+
+- **One semantics.** Instruction behaviour is written once, in
+  `arc_isa::sem`, generic over `arc_isa::dom::Dom`. Do not add semantics to
+  the executor: it only instantiates them (`EmuDom`) and keeps the platform
+  (caches, MMIO, NCO, timers) behind the domain's memory and AUX hooks.
+- **No branching on values in `sem`.** Use the primitives, `when` for a
+  guarded effect, `fault_if` for a data-dependent fault; `as_const` only for
+  the AUX register number. Static decode fields (op, register index, `.f`,
+  size, mode, condition present) may be matched.
+- **No dependencies in `arc-isa`**, tests included.
+- **A change in behaviour moves a golden fingerprint**
+  (`src/executor/golden.rs`, `tests/decoder_fingerprint.rs`). Update the
+  constant in the same commit and say why.
+- **Performance.** Measure with host instructions retired (`/usr/bin/time -l`
+  on macOS) as well as wall time; per program with
+  `ISS_BENCH_ONLY=<name> cargo run --release --example iss_bench`. Two
+  traps met so far: inlining every semantics into one dispatcher made it
+  slower (keep one out-of-line function per instruction class), and in a
+  `match` on a register index the ordinary registers must come first.
 
 ## Build & test
 

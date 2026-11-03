@@ -85,10 +85,14 @@ from any MCP-capable client.
 ## Architecture
 
 ```
+crates/arc-isa/ the instruction set, with no dependencies: decoder, formatter,
+│               condition codes, exceptions, register numbers, and the
+│               instruction semantics written once over a value domain (`Dom`),
+│               with `FlatMachine`, a self-contained concrete domain
 src/
-├── cpu/        ARC700 core: registers, execution state, delay slots
-├── decoder/    16/32-bit ARCompact instruction decoder + formatter
-├── executor/   instruction semantics (ALU, extended, memory, special)
+├── cpu/        ARC700 core: registers, execution state, step loop
+├── decoder/    re-exports `arc_isa::decoder`, plus fetch from live memory
+├── executor/   `EmuDom`: the semantics on the live CPU state and memory
 ├── cache/      I/D-cache model
 ├── memory/     SRAM / flat memory, MMIO routing
 ├── soc/        on-chip peripherals (uart, timer, spi_flash, bsc_i2c, efuse,
@@ -97,6 +101,14 @@ src/
 ├── mcp/        embedded MCP server (rmcp + axum)
 └── ui/         egui/eframe GUI (feature `ui`)
 ```
+
+The instruction semantics never branch on a value: they compute with
+primitives that each map onto one SMT-LIB bit-vector operator, and express
+conditions, data-dependent faults and control transfers as effects of the
+domain. The emulator instantiates them with `u32`/`bool` on its own state;
+the same code can be instantiated with symbolic terms. Golden fingerprints
+(`src/executor/golden.rs`, `tests/decoder_fingerprint.rs`) pin what they do.
+`cargo run --release --example iss_bench` measures throughput.
 
 ## Fidelity
 
