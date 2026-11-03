@@ -1106,6 +1106,18 @@ impl Memory {
         }
     }
 
+    /// Put both caches back to their reset state: every line invalid, nothing
+    /// written back, DC_CTRL at its reset value. This is a reset, not an
+    /// invalidate: a reset does not flush dirty lines into memory.
+    pub fn reset_caches(&mut self) {
+        if let Some(ref mut dc) = self.dcache {
+            *dc = DCache::new();
+        }
+        if let Some(ref ic) = self.icache {
+            *ic.borrow_mut() = ICache::new();
+        }
+    }
+
     pub fn dcache_invalidate_all(&mut self) -> Result<(), Exception> {
         let evicted = if let Some(ref mut dc) = self.dcache {
             dc.invalidate_all()
