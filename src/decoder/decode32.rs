@@ -424,9 +424,10 @@ fn decode_alu_op(
             let c_reg = extract_c_reg(word);
             let a_reg = extract_a_reg(word);
 
-            // For MOV/test-only, B is destination-only (not source), so B=62 means
-            // LP_COUNT register, NOT LIMM. Only check C for LIMM in those cases.
-            let (limm_val, has_limm) = if op.is_mov() || op.is_test_only() {
+            // For MOV, B is destination-only, so B=62 is not a LIMM. The test
+            // ops (TST/CMP/RCMP/BTST) read B as a source: `tst limm,c` takes
+            // its LIMM through B=62 (ISA; observed on silicon).
+            let (limm_val, has_limm) = if op.is_mov() {
                 let needs = c_reg == 62;
                 if needs {
                     let limm = mem.fetch_word(pc + 4)?;
@@ -549,8 +550,8 @@ fn decode_alu_op(
             if m == 0 {
                 // COND_REG: B = B op C
                 let c_reg = extract_c_reg(word);
-                // For MOV/test-only, B is dest-only, B=62 means LP_COUNT not LIMM
-                let (limm_val, has_limm) = if op.is_mov() || op.is_test_only() {
+                // MOV only: B is dest-only. Test ops read B, so B=62 is a LIMM.
+                let (limm_val, has_limm) = if op.is_mov() {
                     let needs = c_reg == 62;
                     if needs {
                         let limm = mem.fetch_word(pc + 4)?;
@@ -1471,6 +1472,35 @@ mod tests {
         let decoded = decode_32bit(0x264C7000, 0, &fetch).unwrap();
         assert!(decoded.has_limm, "CMP with B=62 in P=1 must fetch LIMM");
         assert_eq!(decoded.size, 4);
+    }
+
+    #[test]
+    fn test_ops_b62_reg_forms_have_limm() {
+        // `tst/cmp/rcmp/btst limm,c` in the REG_REG (P=00) and COND_REG
+        // (P=11, M=0) forms: B=62 is a source, so the LIMM is consumed.
+        const LIMM: u32 = 0x1234_5678;
+        const B62_LO: u32 = 62 & 7;
+        const B62_HI: u32 = 62 >> 3;
+        for (sub, op) in [(0x0B, AluOp::Tst), (0x0C, AluOp::Cmp), (0x0D, AluOp::Rcmp), (0x11, AluOp::Btst)] {
+            for p in [0b00u32, 0b11] {
+                let word = (0x04 << 27) | (B62_LO << 24) | (p << 22) | (sub << 16) | (1 << 15)
+                    | (B62_HI << 12) | (1 << 6);
+                let mut bytes = word.to_be_bytes().to_vec();
+                bytes.extend_from_slice(&LIMM.to_be_bytes());
+                let fetch = ByteSliceFetch::new(&bytes, 0);
+                let d = decode_32bit(word, 0, &fetch).unwrap();
+                assert!(d.has_limm, "{op:?} P={p:02b}: B=62 must fetch the LIMM");
+                assert_eq!(d.total_size(), 8, "{op:?} P={p:02b}");
+                match d.inst {
+                    Instruction::Alu { op: got, src1, src2, .. } => {
+                        assert_eq!(got, op);
+                        assert_eq!(src1, Operand::Imm(LIMM), "{op:?} P={p:02b}");
+                        assert_eq!(src2, Operand::Reg(1), "{op:?} P={p:02b}");
+                    }
+                    other => panic!("{op:?} P={p:02b}: decoded {other:?}"),
+                }
+            }
+        }
     }
 
     // BCM55030 silicon-faithful interrupt-return idiom.
