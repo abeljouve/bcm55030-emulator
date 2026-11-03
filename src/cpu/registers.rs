@@ -23,6 +23,10 @@ pub const AUX_PC: u32 = 0x06;
 pub const AUX_STATUS32: u32 = 0x0A;
 pub const AUX_STATUS32_L1: u32 = 0x0B;
 pub const AUX_STATUS32_L2: u32 = 0x0C;
+/// A plain read/write register; not IC_CTRL, whatever the generic ARC 700
+/// map says. It reads 0x2 after reset and writes have no effect on the
+/// I-cache. -- OBSERVED on silicon.
+pub const AUX_MULHI: u32 = 0x11;
 pub const AUX_COUNT0: u32 = 0x21;
 pub const AUX_CONTROL0: u32 = 0x22;
 pub const AUX_LIMIT0: u32 = 0x23;
@@ -34,6 +38,12 @@ pub const AUX_CONTROL1: u32 = 0x101;
 pub const AUX_LIMIT1: u32 = 0x102;
 pub const AUX_IRQ_LEV: u32 = 0x200;
 pub const AUX_IRQ_HINT: u32 = 0x201;
+// Exception-state registers of the generic ARC 700. ERET..EFA (0x400-0x404),
+// ICAUSE1/2 and BTA, BTA_L1/L2 are NOT implemented on this integration: a read
+// returns `IDENTITY_VALUE` and a write is discarded, like any absent aux. The
+// names stay so the disassembler can label them. The core still keeps the
+// interrupt cause and branch-target state internally (`aux_icause*`,
+// `aux_bta*`), it just does not expose it. -- OBSERVED on silicon.
 pub const AUX_ERET: u32 = 0x400;
 pub const AUX_ERBTA: u32 = 0x401;
 pub const AUX_ERSTATUS: u32 = 0x402;
@@ -160,6 +170,7 @@ pub struct CpuState {
     pub aux_status32_l1: u32,
     pub aux_status32_l2: u32,
     pub aux_int_vector_base: u32,
+    pub aux_mulhi: u32,
     pub aux_macmode: u32,
     pub aux_irq_lv12: u32,
     pub aux_irq_lev: u32,
@@ -181,12 +192,7 @@ pub struct CpuState {
     // the tick-counter handler at vec 7, and AUX_IRQ_LEV bit 7 set in HW).
     pub timer1_irq: u32,
 
-    // Exception registers
-    pub aux_eret: u32,
-    pub aux_erbta: u32,
-    pub aux_erstatus: u32,
-    pub aux_ecr: u32,
-    pub aux_efa: u32,
+    // Interrupt cause, kept internally (ICAUSE1/2 are not readable here).
     pub aux_icause1: u32,
     pub aux_icause2: u32,
     // No `aux_ienable`: aux 0x40C is unimplemented on the BCM55030 (§6.1).
@@ -267,6 +273,7 @@ impl CpuState {
             aux_status32_l1: 0,
             aux_status32_l2: 0,
             aux_int_vector_base: 0,
+            aux_mulhi: 0x2,
             aux_macmode: 0,
             aux_irq_lv12: 0,
             aux_irq_lev: 0,
@@ -278,11 +285,6 @@ impl CpuState {
             aux_control1: 0,
             aux_limit1: 0,
             timer1_irq: 4,
-            aux_eret: 0,
-            aux_erbta: 0,
-            aux_erstatus: 0,
-            aux_ecr: 0,
-            aux_efa: 0,
             aux_icause1: 0,
             aux_icause2: 0,
             aux_itrigger: 0,
@@ -426,6 +428,7 @@ impl CpuState {
             AUX_CONTROL0 => Ok(self.aux_control0),
             AUX_LIMIT0 => Ok(self.aux_limit0),
             AUX_INT_VECTOR_BASE => Ok(self.aux_int_vector_base),
+            AUX_MULHI => Ok(self.aux_mulhi),
             AUX_MACMODE => Ok(self.aux_macmode),
             AUX_IRQ_LV12 => Ok(self.aux_irq_lv12),
             AUX_COUNT1 => Ok(self.aux_count1),
@@ -433,19 +436,10 @@ impl CpuState {
             AUX_LIMIT1 => Ok(self.aux_limit1),
             AUX_IRQ_LEV => Ok(self.aux_irq_lev),
             AUX_IRQ_HINT => Ok(self.aux_irq_hint),
-            AUX_ERET => Ok(self.aux_eret),
-            AUX_ERBTA => Ok(self.aux_erbta),
-            AUX_ERSTATUS => Ok(self.aux_erstatus),
-            AUX_ECR => Ok(self.aux_ecr),
-            AUX_EFA => Ok(self.aux_efa),
-            AUX_ICAUSE1 => Ok(self.aux_icause1),
-            AUX_ICAUSE2 => Ok(self.aux_icause2),
-            // AUX_IENABLE (0x40C) intentionally absent — see the `_` arm.
+            // ERET..EFA, ICAUSE1/2, AUX_IENABLE and BTA, BTA_L1/L2 are
+            // absent: they fall through to the `_` arm.
             AUX_ITRIGGER => Ok(self.aux_itrigger),
             AUX_XPU => Ok(self.aux_xpu),
-            AUX_BTA => Ok(self.aux_bta),
-            AUX_BTA_L1 => Ok(self.aux_bta_l1),
-            AUX_BTA_L2 => Ok(self.aux_bta_l2),
             AUX_IRQ_PENDING => Ok(self.aux_irq_pending),
             // BCR registers (read-only build config)
             // All values verified against real BCM55030 hardware.
@@ -464,7 +458,7 @@ impl CpuState {
             // 8-way" — both way counts and the I-cache size were wrong, and
             // contradicted `cache.rs` sitting next to them. The VALUES below
             // were always right; only the comments were not.
-            0x47 => Ok(0x00),                      // IC_CTRL
+            0x47 => Ok(0x00),                      // DC_IVDC (write-only command)
             0x48 => Ok(self.aux_dc_ctrl),          // DC_CTRL (shadow, synced to DCache in Memory)
             0x49 => Ok(0x00),                      // CACHE_BYPASS
             AUX_D_CACHE_BUILD => Ok(0x00013001),   // 4KB D-cache present
@@ -499,8 +493,7 @@ impl CpuState {
                 // entered in practice, so neither behaviour has been measured;
                 // consistency with the other absent addresses is the tie-breaker.
                 AUX_STATUS32 | AUX_STATUS32_L1 | AUX_STATUS32_L2 | AUX_INT_VECTOR_BASE
-                | AUX_ITRIGGER | AUX_IRQ_LEV | AUX_IRQ_HINT
-                | AUX_ERET | AUX_ERBTA | AUX_ERSTATUS | AUX_EFA | AUX_IRQ_PULSE_CANCEL => {
+                | AUX_ITRIGGER | AUX_IRQ_LEV | AUX_IRQ_HINT | AUX_IRQ_PULSE_CANCEL => {
                     return Err(Exception::PrivilegeViolation { address: self.pc });
                 }
                 _ => {}
@@ -548,6 +541,10 @@ impl CpuState {
                 self.aux_int_vector_base = val & 0xFFFFFC00;
                 Ok(())
             }
+            AUX_MULHI => {
+                self.aux_mulhi = val;
+                Ok(())
+            }
             AUX_MACMODE => {
                 self.aux_macmode = val;
                 Ok(())
@@ -578,38 +575,14 @@ impl CpuState {
                 self.aux_irq_hint = val & 0x1F;
                 Ok(())
             }
-            AUX_ERET => {
-                self.aux_eret = val;
-                Ok(())
-            }
-            AUX_ERBTA => {
-                self.aux_erbta = val;
-                Ok(())
-            }
-            AUX_ERSTATUS => {
-                self.aux_erstatus = val;
-                Ok(())
-            }
-            AUX_EFA => {
-                self.aux_efa = val;
-                Ok(())
-            }
-            // AUX_IENABLE (0x40C): unimplemented — the write is discarded by
-            // the `_` arm, exactly like any other absent auxiliary address.
+            // ERET..EFA, ICAUSE1/2, AUX_IENABLE and BTA, BTA_L1/L2 are
+            // absent: the write is discarded by the `_` arm.
             AUX_ITRIGGER => {
                 self.aux_itrigger = val;
                 Ok(())
             }
             AUX_XPU => {
                 self.aux_xpu = val;
-                Ok(())
-            }
-            AUX_BTA_L1 => {
-                self.aux_bta_l1 = val;
-                Ok(())
-            }
-            AUX_BTA_L2 => {
-                self.aux_bta_l2 = val;
                 Ok(())
             }
             AUX_IRQ_PULSE_CANCEL => {
@@ -630,8 +603,7 @@ impl CpuState {
             // entire I-cache on any write). No state stored here.
             0x10 => Ok(()),
             // Read-only registers — writes silently ignored on real HW
-            AUX_STATUS | AUX_IDENTITY | AUX_DEBUG | AUX_PC | AUX_ECR | AUX_ICAUSE1
-            | AUX_ICAUSE2 | AUX_IRQ_PENDING | AUX_BTA => Ok(()),
+            AUX_STATUS | AUX_IDENTITY | AUX_DEBUG | AUX_PC | AUX_IRQ_PENDING => Ok(()),
             // BCR registers are read-only — writes silently ignored
             0x60..=0x7F | 0xC0..=0xFF => Ok(()),
             // Non-existent aux regs: writes silently absorbed on real HW
