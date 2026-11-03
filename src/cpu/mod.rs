@@ -118,6 +118,20 @@ pub struct Cpu {
     pub exceptions_taken: u64,
     /// The last exception taken through the vector table, and its PC.
     pub last_exception: Option<(u32, Exception)>,
+    /// Where the last fault of `step_raw` happened, written on the error
+    /// path only.
+    fault_site: FaultSite,
+}
+
+/// What `take_exception` needs to know about a fault to compute ILINK2.
+#[derive(Debug, Clone, Copy)]
+enum FaultSite {
+    /// The decoder rejected the instruction; carries the pending branch
+    /// target when it sits in a delay slot.
+    Decode(Option<u32>),
+    /// The executor faulted; carries the address execution would have
+    /// continued at.
+    Execute(u32),
 }
 
 /// `AUX_IRQ_LV12` bit 1: set on entry to a level-2 handler.
@@ -147,6 +161,7 @@ impl Cpu {
             stop_on_exception: false,
             exceptions_taken: 0,
             last_exception: None,
+            fault_site: FaultSite::Execute(0),
         }
     }
 
@@ -178,6 +193,7 @@ impl Cpu {
             stop_on_exception: false,
             exceptions_taken: 0,
             last_exception: None,
+            fault_site: FaultSite::Execute(0),
         }
     }
 
@@ -295,6 +311,9 @@ impl Cpu {
     /// SPI flash (which may have been modified by FDS writes), resets
     /// CPU + peripherals, re-DMAs the bootloader into SRAM, and
     /// resumes from PC=0 with interrupts enabled.
+    // Out of line: it sits under the timer tick, which runs every step.
+    #[cold]
+    #[inline(never)]
     pub fn warm_reboot_from_flash(&mut self) {
         let dma_bytes = if let Some(bank) = self.bank.as_ref() {
             let guard = bank.read();
@@ -314,7 +333,17 @@ impl Cpu {
         self.shadow_call_stack.clear();
     }
 
+    /// Execute one step. A synchronous exception the core vectors is taken
+    /// here, out of line, so `step_raw` keeps the shape of the hot path.
+    #[inline]
     pub fn step(&mut self) -> Result<(), Exception> {
+        match self.step_raw() {
+            Ok(()) => Ok(()),
+            Err(e) => self.take_exception(e),
+        }
+    }
+
+    fn step_raw(&mut self) -> Result<(), Exception> {
         if self.state.halted || self.state.paused {
             return Ok(());
         }
@@ -355,16 +384,6 @@ impl Cpu {
             DelayState::None => None,
         };
 
-        match self.step_body(delay_info) {
-            Ok(()) => Ok(()),
-            Err(e) => self.take_exception(e, delay_info.map(|(target, _)| target)),
-        }
-    }
-
-    /// Fetch, decode and execute one instruction. An error leaves the PC on
-    /// the faulting instruction: the executor never moves it before failing.
-    #[inline(always)]
-    fn step_body(&mut self, delay_info: Option<(u32, bool)>) -> Result<(), Exception> {
         // Zero-overhead loop check (not during delay slots)
         if delay_info.is_none() && !self.state.flag_l {
             let lp_count = self.state.core_regs[REG_LP_COUNT as usize];
@@ -378,8 +397,13 @@ impl Cpu {
             }
         }
 
-        // Fetch and decode
-        let decoded = decoder::decode(self.state.pc, &self.mem)?;
+        // Fetch and decode. A fault leaves the PC on the faulting
+        // instruction (the executor never moves it before failing); the
+        // `inspect_err`s record what the exception entry needs, on the error path
+        // only, so the hot path keeps its shape.
+        let decoded = decoder::decode(self.state.pc, &self.mem).inspect_err(|_| {
+            self.fault_site = FaultSite::Decode(delay_info.map(|(target, _)| target));
+        })?;
         let next_pc = self.state.pc + decoded.total_size();
 
         if self.trace {
@@ -450,7 +474,9 @@ impl Cpu {
         // Execute
         self.state.pc_written = false;
         self.state.link_executed = false;
-        executor::execute(&decoded, &mut self.state, &mut self.mem)?;
+        executor::execute(&decoded, &mut self.state, &mut self.mem).inspect_err(|_| {
+            self.fault_site = FaultSite::Execute(delay_info.map_or(next_pc, |(target, _)| target));
+        })?;
 
         // SR trace: log AUX register writes and record in history buffer.
         if let Instruction::StoreAux { src, addr } = &decoded.inst {
@@ -644,12 +670,16 @@ aliasing_fetch_line={:?} set_index={:?} starve={} cyc={} \
     /// and so stop the emulation.
     #[cold]
     #[inline(never)]
-    fn take_exception(&mut self, e: Exception, delay_target: Option<u32>) -> Result<(), Exception> {
+    fn take_exception(&mut self, e: Exception) -> Result<(), Exception> {
         if self.stop_on_exception || !e.is_vectored() {
             return Err(e);
         }
         let fault_pc = self.state.pc;
-        let fallthrough = fault_pc.wrapping_add(self.faulting_size());
+        let resume = match self.fault_site {
+            FaultSite::Execute(resume) => resume,
+            FaultSite::Decode(Some(target)) => target,
+            FaultSite::Decode(None) => fault_pc.wrapping_add(self.undecodable_size()),
+        };
         // From the vector table in SRAM at INT_VECTOR_BASE, never through the
         // NCO alias that serves interrupt vectors: with both a `j @limm` NCO
         // channel 2 and an SRAM slot 2 installed, silicon took the SRAM one.
@@ -664,7 +694,7 @@ aliasing_fetch_line={:?} set_index={:?} starve={} cyc={} \
         }
         self.state.delay_state = DelayState::None;
         self.state.aux_status32_l2 = self.state.status32();
-        self.state.core_regs[REG_ILINK2 as usize] = delay_target.unwrap_or(fallthrough);
+        self.state.core_regs[REG_ILINK2 as usize] = resume;
         self.state.aux_irq_lv12 |= LV12_L2;
         self.state.pc = vector;
         self.exceptions_taken += 1;
@@ -678,21 +708,20 @@ aliasing_fetch_line={:?} set_index={:?} starve={} cyc={} \
         Ok(())
     }
 
-    /// Size of the faulting instruction at the PC. For one the decoder
-    /// rejects, the major opcode still says whether it is a 16- or a 32-bit
-    /// encoding; INFERRED: a LIMM such an encoding might carry is not counted.
-    fn faulting_size(&self) -> u32 {
-        match decoder::decode(self.state.pc, &self.mem) {
-            Ok(d) => d.total_size(),
-            Err(_) => match self.mem.fetch_half(self.state.pc) {
-                Ok(hw) if (hw >> 11) >= 0x0C => 2,
-                _ => 4,
-            },
+    /// Size of an instruction the decoder rejected: the major opcode still
+    /// says whether it is a 16- or a 32-bit encoding. INFERRED: a LIMM such an
+    /// encoding might carry is not counted.
+    fn undecodable_size(&self) -> u32 {
+        match self.mem.fetch_half(self.state.pc) {
+            Ok(hw) if (hw >> 11) >= 0x0C => 2,
+            _ => 4,
         }
     }
 
     /// Where the core fetches interrupt vector `n` from: the NCO channel when
     /// one holds a `j @target` vector, otherwise the vector table in SRAM.
+    // Inlined: `check_interrupts` runs every step.
+    #[inline(always)]
     fn irq_vector_address(&self, n: u32) -> u32 {
         let nco_target = self
             .bank
