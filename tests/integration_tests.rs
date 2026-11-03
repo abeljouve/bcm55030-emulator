@@ -1,4 +1,5 @@
 use bcm55030_emulator::cpu::Cpu;
+use bcm55030_emulator::cpu::exception::Exception;
 
 // === Instruction encoding helpers ===
 
@@ -404,16 +405,17 @@ fn test_zero_overhead_loop() {
 }
 
 #[test]
-fn test_multiply() {
-    // MPY r0, r1, r2 (sub=0x1A)
-    let cpu = Program::new()
+fn test_multiply_is_absent() {
+    // MPY r0, r1, r2 (sub=0x1A) is not implemented on this core: an
+    // Instruction Error, r0 untouched.
+    let mut cpu = Program::new()
         .emit16(mov_s(1, 7))
         .emit16(mov_s(2, 6))
         .emit32(alu32(0x1A, 1, 2, 0, 0b00, false))  // MPY r0, r1, r2
         .emit16(brk_s())
-        .run(10);
-
-    assert_eq!(cpu.state.core_regs[0], 42); // 7 * 6 = 42
+        .run(2);
+    assert_eq!(cpu.step(), Err(Exception::InstructionError { address: 4 }));
+    assert_eq!(cpu.state.core_regs[0], 0);
 }
 
 #[test]
@@ -593,7 +595,7 @@ fn test_max_flags_a_greater() {
     assert_eq!(cpu.state.core_regs[0], 5);  // max(5,3) = 5
     assert!(!cpu.state.flag_z);  // 5-3=2, not zero
     assert!(!cpu.state.flag_n);  // 5-3=2, not negative
-    assert!(!cpu.state.flag_c);  // no borrow (5 >= 3)
+    assert!(!cpu.state.flag_c);  // first operand (5) selected
     assert!(!cpu.state.flag_v);  // no overflow
 }
 
@@ -610,7 +612,7 @@ fn test_max_flags_equal() {
     assert_eq!(cpu.state.core_regs[0], 3);  // max(3,3) = 3
     assert!(cpu.state.flag_z);   // 3-3=0, Z must be set from comparison
     assert!(!cpu.state.flag_n);  // 3-3=0, not negative
-    assert!(!cpu.state.flag_c);  // no borrow (3 >= 3)
+    assert!(cpu.state.flag_c);   // C = second operand selected, ties included
 }
 
 #[test]
@@ -626,7 +628,7 @@ fn test_max_flags_a_less() {
     assert_eq!(cpu.state.core_regs[0], 5);  // max(1,5) = 5
     assert!(!cpu.state.flag_z);  // 1-5=-4, not zero
     assert!(cpu.state.flag_n);   // 1-5=-4, N must be set from comparison
-    assert!(cpu.state.flag_c);   // borrow (1 < 5)
+    assert!(cpu.state.flag_c);   // second operand (5) selected
 }
 
 #[test]
@@ -642,7 +644,7 @@ fn test_min_flags_a_less() {
     assert_eq!(cpu.state.core_regs[0], 2);  // min(2,10) = 2
     assert!(!cpu.state.flag_z);  // 2-10=-8, not zero
     assert!(cpu.state.flag_n);   // 2-10=-8, N from comparison
-    assert!(cpu.state.flag_c);   // borrow (2 < 10)
+    assert!(!cpu.state.flag_c);  // first operand (2) selected
 }
 
 #[test]
@@ -658,7 +660,7 @@ fn test_min_flags_equal() {
     assert_eq!(cpu.state.core_regs[0], 7);  // min(7,7) = 7
     assert!(cpu.state.flag_z);   // 7-7=0, Z from comparison
     assert!(!cpu.state.flag_n);
-    assert!(!cpu.state.flag_c);  // no borrow (7 >= 7)
+    assert!(cpu.state.flag_c);   // C = second operand selected, ties included
 }
 
 // === ABS flag tests (Bug fix: V must be explicitly set to 0 for non-overflow cases) ===
