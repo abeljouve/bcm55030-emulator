@@ -1,5 +1,6 @@
 pub mod alu;
 pub mod branch;
+pub mod emu_dom;
 pub mod extended;
 pub mod load_store;
 pub mod single_op;
@@ -8,6 +9,8 @@ pub mod special;
 /// Frozen reference implementation for the differential tests.
 #[cfg(test)]
 pub(crate) mod legacy;
+#[cfg(test)]
+mod differential;
 
 use crate::cpu::exception::Exception;
 use crate::cpu::registers::CpuState;
