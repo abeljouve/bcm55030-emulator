@@ -93,6 +93,13 @@ impl AluOp {
     pub fn is_mov(self) -> bool {
         matches!(self, Self::Mov)
     }
+
+    /// Opcodes this core does not implement: they decode (so they can be
+    /// disassembled) but raise an Instruction Error when executed. Observed
+    /// on silicon for every MPY variant (`MULTIPLY_BUILD` = 0 agrees).
+    pub fn is_absent_on_core(self) -> bool {
+        matches!(self, Self::Mpy | Self::Mpyh | Self::Mpyu | Self::Mpyhu)
+    }
 }
 
 /// Single-operand sub-sub-opcodes (major 0x04, sub-opcode 0x2F)
@@ -173,6 +180,18 @@ pub enum ExtArithOp {
     Negsw,    // a=0x06
     Negs,     // a=0x07
     Normw,    // a=0x08
+}
+
+impl ExtArithOp {
+    /// Opcodes this core does not implement: they decode but raise an
+    /// Instruction Error when executed. Observed on silicon for the whole
+    /// saturating/DSP group; the barrel shifts, NORM, NORMW and SWAP execute.
+    pub fn is_absent_on_core(self) -> bool {
+        !matches!(
+            self,
+            Self::Asl | Self::Lsr | Self::Asr | Self::Ror | Self::Swap | Self::Norm | Self::Normw
+        )
+    }
 }
 
 /// Data sizes for load/store

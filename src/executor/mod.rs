@@ -2,7 +2,6 @@ pub mod alu;
 pub mod branch;
 pub mod extended;
 pub mod load_store;
-pub mod multiply;
 pub mod single_op;
 pub mod special;
 
@@ -49,7 +48,7 @@ pub fn execute(
             set_flags,
             cc,
         } => {
-            single_op::execute_single_op(*op, *dst, *src, *set_flags, *cc, state, mem)?;
+            single_op::execute_single_op(*op, *dst, *src, *set_flags, *cc, state)?;
         }
         Instruction::ZeroOp(zop) => {
             special::execute_zero_op(zop, state)?;
