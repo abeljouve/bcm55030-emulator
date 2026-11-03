@@ -4,26 +4,26 @@ use crate::condition::ConditionCode;
 use crate::decoder::instruction::Operand;
 use crate::dom::{Dom, Flag};
 use crate::exception::Exception;
-use crate::regs::{REG_ILINK1, REG_ILINK2, REG_LIMM, REG_PCL, REG_RESERVED};
+use crate::regs::{REG_ILINK1, REG_ILINK2, REG_LIMM, REG_PCL};
 
 /// Read core register `r` as an operand. ILINK1/2 fault in user mode, r61 is
 /// reserved, r62 (the long-immediate marker) reads 0 once the decoder has
 /// resolved it, r63 is PCL.
 #[inline(always)]
 pub fn read_core_reg<D: Dom>(d: &mut D, r: u8) -> Result<D::V, Exception> {
+    // The ordinary registers first: the arm order shapes the generated code.
     match r {
+        0..=28 | 31..=60 => Ok(d.reg(r)),
         REG_ILINK1 | REG_ILINK2 => {
             let u = d.flag(Flag::U);
             d.fault_if(u, Exception::PrivilegeViolation { address: d.pc() })?;
             Ok(d.reg(r))
         }
-        REG_RESERVED => Err(Exception::InstructionError { address: d.pc() }),
         REG_LIMM => Ok(d.k(0)),
         REG_PCL => {
             let pcl = d.pc() & !3;
             Ok(d.k(pcl))
         }
-        0..=60 => Ok(d.reg(r)),
         _ => Err(Exception::InstructionError { address: d.pc() }),
     }
 }
@@ -33,18 +33,17 @@ pub fn read_core_reg<D: Dom>(d: &mut D, r: u8) -> Result<D::V, Exception> {
 #[inline(always)]
 pub fn write_core_reg<D: Dom>(d: &mut D, r: u8, v: D::V) -> Result<(), Exception> {
     match r {
+        0..=28 | 31..=60 => {
+            d.set_reg(r, v);
+            Ok(())
+        }
         REG_ILINK1 | REG_ILINK2 => {
             let u = d.flag(Flag::U);
             d.fault_if(u, Exception::PrivilegeViolation { address: d.pc() })?;
             d.set_reg(r, v);
             Ok(())
         }
-        REG_RESERVED | REG_PCL => Err(Exception::InstructionError { address: d.pc() }),
         REG_LIMM => Ok(()),
-        0..=60 => {
-            d.set_reg(r, v);
-            Ok(())
-        }
         _ => Err(Exception::InstructionError { address: d.pc() }),
     }
 }

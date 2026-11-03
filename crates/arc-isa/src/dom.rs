@@ -201,6 +201,11 @@ pub trait Dom {
     /// Platform side effects of `sr`, after the instruction set's own write
     /// (cache invalidation and control). `v` is the source value.
     fn aux_write_hook(&mut self, addr: u32, v: Self::V) -> Result<(), Exception>;
+    /// `lr` / `sr` whose register number is not a known constant. A concrete
+    /// domain never gets here (`as_const` always answers); a symbolic one
+    /// records an unknown auxiliary access and marks the code uncertain.
+    fn aux_read_dynamic(&mut self, addr: Self::V) -> Result<Self::V, Exception>;
+    fn aux_write_dynamic(&mut self, addr: Self::V, v: Self::V) -> Result<(), Exception>;
 
     // ---- control effects ---------------------------------------------------
 

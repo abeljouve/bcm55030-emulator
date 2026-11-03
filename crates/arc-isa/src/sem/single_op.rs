@@ -21,13 +21,12 @@ pub fn single_op<D: Dom>(
     if matches!(op, SingleOp::Ex) {
         return Err(Exception::InstructionError { address: d.pc() });
     }
-    match cc {
-        None => body(d, op, dst, src, set_flags),
-        Some(cc) => {
-            let g = cond_holds(d, cc);
-            d.when(g, |d| body(d, op, dst, src, set_flags))
-        }
-    }
+    // One copy of the body, guarded: no condition is "always".
+    let g = match cc {
+        None => d.kb(true),
+        Some(cc) => cond_holds(d, cc),
+    };
+    d.when(g, move |d| body(d, op, dst, src, set_flags))
 }
 
 #[inline(always)]
