@@ -1,0 +1,10 @@
+[package]
+name = "arc-isa"
+version = "0.1.0"
+edition = "2021"
+description = "ARCompact instruction set of the BCM55030 core: decoder, formatter and semantics"
+license = "AGPL-3.0-only"
+repository = "https://github.com/abeljouve/bcm55030-emulator"
+
+# No dependencies, tests included: the semantics must be checkable on their own.
+[dependencies]

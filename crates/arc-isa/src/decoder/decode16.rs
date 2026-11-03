@@ -1,11 +1,12 @@
-use crate::cpu::condition::ConditionCode;
-use crate::cpu::exception::Exception;
-use crate::cpu::registers::{REG_BLINK, REG_GP, REG_SP};
+use crate::condition::ConditionCode;
+use crate::exception::Exception;
+use crate::regs::{REG_BLINK, REG_GP, REG_SP};
 use crate::decoder::fields::*;
 use crate::decoder::instruction::*;
 use crate::decoder::InstructionFetch;
 
 /// Decode a 16-bit instruction
+#[inline]
 pub fn decode_16bit(
     half: u16,
     pc: u32,

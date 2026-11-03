@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/epon-olt"]
+members = ["crates/arc-isa", "crates/epon-olt"]
 
 [package]
 name = "bcm55030-emulator"
@@ -30,6 +30,7 @@ ui  = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:egui-phosphor", "dep:rf
 timing = []
 
 [dependencies]
+arc-isa = { path = "crates/arc-isa" }
 epon-olt = { path = "crates/epon-olt" }
 libc = "0.2"
 parking_lot = "0.12"

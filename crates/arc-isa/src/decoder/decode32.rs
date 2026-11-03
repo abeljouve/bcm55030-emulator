@@ -1,10 +1,11 @@
-use crate::cpu::condition::ConditionCode;
-use crate::cpu::exception::Exception;
+use crate::condition::ConditionCode;
+use crate::exception::Exception;
 use crate::decoder::fields::*;
 use crate::decoder::instruction::*;
 use crate::decoder::InstructionFetch;
 
 /// Decode a 32-bit instruction word
+#[inline]
 pub fn decode_32bit(
     word: u32,
     pc: u32,
