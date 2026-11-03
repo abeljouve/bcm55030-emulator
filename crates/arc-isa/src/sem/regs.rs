@@ -1,6 +1,7 @@
 //! Core registers, STATUS32 and condition codes.
 
 use crate::condition::ConditionCode;
+use crate::decoder::instruction::Operand;
 use crate::dom::{Dom, Flag};
 use crate::exception::Exception;
 use crate::regs::{REG_ILINK1, REG_ILINK2, REG_LIMM, REG_PCL, REG_RESERVED};
@@ -8,7 +9,7 @@ use crate::regs::{REG_ILINK1, REG_ILINK2, REG_LIMM, REG_PCL, REG_RESERVED};
 /// Read core register `r` as an operand. ILINK1/2 fault in user mode, r61 is
 /// reserved, r62 (the long-immediate marker) reads 0 once the decoder has
 /// resolved it, r63 is PCL.
-#[inline]
+#[inline(always)]
 pub fn read_core_reg<D: Dom>(d: &mut D, r: u8) -> Result<D::V, Exception> {
     match r {
         REG_ILINK1 | REG_ILINK2 => {
@@ -29,7 +30,7 @@ pub fn read_core_reg<D: Dom>(d: &mut D, r: u8) -> Result<D::V, Exception> {
 
 /// Write core register `r` as a destination. ILINK1/2 fault in user mode,
 /// r61 and r63 are not writable, and a write to r62 is discarded.
-#[inline]
+#[inline(always)]
 pub fn write_core_reg<D: Dom>(d: &mut D, r: u8, v: D::V) -> Result<(), Exception> {
     match r {
         REG_ILINK1 | REG_ILINK2 => {
@@ -72,7 +73,7 @@ pub fn set_status32<D: Dom>(d: &mut D, v: D::V) {
 }
 
 /// Whether condition `cc` holds on the current flags (ARCompact Table 50).
-#[inline]
+#[inline(always)]
 pub fn cond_holds<D: Dom>(d: &mut D, cc: ConditionCode) -> D::B {
     let z = d.flag(Flag::Z);
     let n = d.flag(Flag::N);
@@ -117,5 +118,24 @@ pub fn cond_holds<D: Dom>(d: &mut D, cc: ConditionCode) -> D::B {
             let nz = d.bnot(z);
             d.band(nn, nz)
         }
+    }
+}
+
+/// Value of a decoded operand: a register, an immediate, or nothing (0).
+#[inline(always)]
+pub fn operand<D: Dom>(d: &mut D, op: Operand) -> Result<D::V, Exception> {
+    match op {
+        Operand::Reg(r) => read_core_reg(d, r),
+        Operand::Imm(v) => Ok(d.k(v)),
+        Operand::None => Ok(d.k(0)),
+    }
+}
+
+/// Write a result to a destination operand; anything but a register discards it.
+#[inline(always)]
+pub fn write_dest<D: Dom>(d: &mut D, op: Operand, v: D::V) -> Result<(), Exception> {
+    match op {
+        Operand::Reg(r) => write_core_reg(d, r, v),
+        _ => Ok(()),
     }
 }

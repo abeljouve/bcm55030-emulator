@@ -36,7 +36,7 @@ pub enum PauseReason {
     BusDeadlock,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuState {
     // Core registers r0-r59, r60 (LP_COUNT)
     // r61 is reserved, r62 is LIMM indicator, r63 is PCL

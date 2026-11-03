@@ -3,9 +3,14 @@
 //! compares the result (exception variant and address included) and the
 //! whole `CpuState`, field by field.
 
+use std::collections::HashMap;
+
 use arc_isa::condition::ConditionCode;
+use arc_isa::decoder::instruction::{AluOp, Instruction, Operand};
 use arc_isa::dom::{Dom, Flag};
-use arc_isa::sem::regs;
+use arc_isa::sem::{self, regs};
+
+use crate::cpu::exception::Exception;
 
 use super::emu_dom::EmuDom;
 use super::legacy;
@@ -136,4 +141,100 @@ fn status32_read_and_write() {
             assert_eq!(e.flag(f), bit, "{f:?}");
         }
     }
+}
+
+/// Cases per differential module: `ARC_DIFF_CASES`, or 200 000.
+fn cases() -> u64 {
+    std::env::var("ARC_DIFF_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(200_000)
+}
+
+/// Registers that exercise special handling (ILINK, BLINK, LP_COUNT, r61-r63)
+/// as often as ordinary ones.
+fn pick_reg(rng: &mut Rng) -> u8 {
+    const SPECIAL: [u8; 10] = [26, 27, 28, 29, 30, 31, 60, 61, 62, 63];
+    if rng.bool() { SPECIAL[rng.next() as usize % SPECIAL.len()] } else { (rng.next() % 26) as u8 }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Form {
+    R,
+    I,
+    N,
+}
+
+fn pick_operand(rng: &mut Rng, allow_none: bool) -> (Operand, Form) {
+    match rng.next() % if allow_none { 3 } else { 2 } {
+        0 => (Operand::Reg(pick_reg(rng)), Form::R),
+        1 => (Operand::Imm(rng.word()), Form::I),
+        _ => (Operand::None, Form::N),
+    }
+}
+
+fn pick_cc(rng: &mut Rng) -> Option<ConditionCode> {
+    let q = rng.next() % 17;
+    if q == 16 { None } else { ConditionCode::from_u8(q as u8) }
+}
+
+fn assert_same(what: &dyn std::fmt::Debug, ra: &Result<(), Exception>, rb: &Result<(), Exception>,
+               a: &CpuState, b: &CpuState) {
+    assert_eq!(ra, rb, "{what:?}: result");
+    if a != b {
+        panic!("{what:?}: state differs: {:?}", state_diff(a, b));
+    }
+}
+
+#[test]
+fn alu_matches_legacy() {
+    let ops: Vec<AluOp> = (0..64u8).filter_map(AluOp::from_u8).collect();
+    let mut rng = Rng::new(0xA1_0001);
+    let mut m = Memory::new(0x100);
+    let mut cover: HashMap<(u8, bool, bool, Form, Form, Form), u64> = HashMap::new();
+    for _ in 0..cases() {
+        let op = ops[rng.next() as usize % ops.len()];
+        let f = rng.bool();
+        let cc = pick_cc(&mut rng);
+        let (dst, fd) = pick_operand(&mut rng, true);
+        let (src1, f1) = pick_operand(&mut rng, true);
+        let (src2, f2) = pick_operand(&mut rng, true);
+        let base = random_state(&mut rng);
+        let (mut a, mut b) = (base.clone(), base);
+        let ra = legacy::alu::execute_alu(op, dst, src1, src2, f, cc, &mut a);
+        let rb = sem::alu::alu(&mut EmuDom::new(&mut b, &mut m), op, dst, src1, src2, f, cc);
+        assert_same(&(op, dst, src1, src2, f, cc), &ra, &rb, &a, &b);
+        *cover.entry((op as u8, f, cc.is_some(), fd, f1, f2)).or_default() += 1;
+    }
+    // Every op x .f x cc-present x operand forms must have been exercised.
+    let cells = ops.len() * 2 * 2 * 27;
+    assert_eq!(cover.len(), cells, "ALU coverage: {} of {cells} cells", cover.len());
+}
+
+/// Random encodings through the real decoder, executed by the frozen executor
+/// and by the live one (which delegates to the generic semantics step by step).
+#[test]
+fn execute_random_encodings_matches_legacy() {
+    let mut rng = Rng::new(0xE0_0001);
+    let base_pc = 0x1000u32;
+    let (mut decoded, mut rejected) = (0u64, 0u64);
+    for _ in 0..cases() {
+        let w = rng.next();
+        let bytes = w.to_be_bytes();
+        let Ok(dec) = crate::decoder::decode_bytes(base_pc, &bytes, base_pc) else {
+            rejected += 1;
+            continue;
+        };
+        // Memory-touching and AUX instructions get their own differential.
+        if matches!(dec.inst, Instruction::Load { .. } | Instruction::Store { .. }
+            | Instruction::LoadAux { .. } | Instruction::StoreAux { .. }) {
+            continue;
+        }
+        decoded += 1;
+        let mut base = random_state(&mut rng);
+        base.pc = base_pc;
+        let (mut a, mut b) = (base.clone(), base);
+        let (mut ma, mut mb) = (Memory::new(0x100), Memory::new(0x100));
+        let ra = legacy::execute(&dec, &mut a, &mut ma);
+        let rb = super::execute(&dec, &mut b, &mut mb);
+        assert_same(&dec.inst, &ra, &rb, &a, &b);
+    }
+    assert!(decoded > cases() / 4, "decoded {decoded}, rejected {rejected}");
 }

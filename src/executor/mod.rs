@@ -1,4 +1,3 @@
-pub mod alu;
 pub mod branch;
 pub mod emu_dom;
 pub mod extended;
@@ -46,7 +45,15 @@ pub fn execute(
             set_flags,
             cc,
         } => {
-            alu::execute_alu(*op, *dst, *src1, *src2, *set_flags, *cc, state)?;
+            arc_isa::sem::alu::alu(
+                &mut emu_dom::EmuDom::new(state, mem),
+                *op,
+                *dst,
+                *src1,
+                *src2,
+                *set_flags,
+                *cc,
+            )?;
         }
         Instruction::SingleOp {
             op,
