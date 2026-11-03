@@ -217,4 +217,19 @@ pub trait Dom {
     fn lp_skip(&mut self, target: u32);
     fn halt(&mut self);
     fn sleep(&mut self);
+
+    // ---- step sequencing ---------------------------------------------------
+
+    /// The delay slot left pending by the previous instruction, consumed:
+    /// the branch target, and whether the branch links.
+    fn take_delay(&mut self) -> Option<(Self::V, bool)>;
+    /// Whether the instruction just executed left a delay slot pending.
+    fn delay_pending(&mut self) -> Self::B;
+    /// Start of an instruction's execution: no branch has been taken yet.
+    fn begin_insn(&mut self);
+    /// Whether the instruction transferred control itself (a taken branch
+    /// without delay slot, or a failed conditional LP) since `begin_insn`.
+    fn pc_written(&mut self) -> Self::B;
+    /// Move the PC: sequencing, a zero-overhead-loop jump, exception entry.
+    fn set_pc(&mut self, pc: Self::V);
 }

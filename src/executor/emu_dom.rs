@@ -131,4 +131,25 @@ impl<'a> Dom for EmuDom<'a> {
     fn sleep(&mut self) {
         self.state.sleeping = true;
     }
+    #[inline(always)]
+    fn take_delay(&mut self) -> Option<(u32, bool)> {
+        self.state.take_delay()
+    }
+    #[inline(always)]
+    fn delay_pending(&mut self) -> bool {
+        matches!(self.state.delay_state, crate::cpu::registers::DelayState::DelaySlot { .. })
+    }
+    #[inline(always)]
+    fn begin_insn(&mut self) {
+        self.state.pc_written = false;
+        self.state.link_executed = false;
+    }
+    #[inline(always)]
+    fn pc_written(&mut self) -> bool {
+        self.state.pc_written
+    }
+    #[inline(always)]
+    fn set_pc(&mut self, pc: u32) {
+        self.state.pc = pc;
+    }
 }

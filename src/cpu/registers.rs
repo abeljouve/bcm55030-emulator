@@ -358,6 +358,18 @@ impl CpuState {
         0x0040_0000 | ((self.debug_load_pending as u32) << 31)
     }
 
+    /// The pending delay slot, consumed.
+    #[inline(always)]
+    pub fn take_delay(&mut self) -> Option<(u32, bool)> {
+        match self.delay_state {
+            DelayState::DelaySlot { target, is_link } => {
+                self.delay_state = DelayState::None;
+                Some((target, is_link))
+            }
+            DelayState::None => None,
+        }
+    }
+
     /// A taken branch: with a delay slot it is left pending, otherwise the PC
     /// moves now and a link writes BLINK.
     #[inline(always)]
