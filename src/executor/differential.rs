@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use arc_isa::condition::ConditionCode;
-use arc_isa::decoder::instruction::{AluOp, Instruction, Operand};
+use arc_isa::decoder::instruction::{AluOp, ExtArithOp, Instruction, Operand, SingleOp};
 use arc_isa::dom::{Dom, Flag};
 use arc_isa::sem::{self, regs};
 
@@ -237,4 +237,111 @@ fn execute_random_encodings_matches_legacy() {
         assert_same(&dec.inst, &ra, &rb, &a, &b);
     }
     assert!(decoded > cases() / 4, "decoded {decoded}, rejected {rejected}");
+}
+
+const SINGLE_OPS: [SingleOp; 13] = [
+    SingleOp::Asl, SingleOp::Asr, SingleOp::Lsr, SingleOp::Ror, SingleOp::Rrc, SingleOp::Sexb,
+    SingleOp::Sexw, SingleOp::Extb, SingleOp::Extw, SingleOp::Abs, SingleOp::Not, SingleOp::Rlc,
+    SingleOp::Ex,
+];
+
+const EXT_OPS: [ExtArithOp; 20] = [
+    ExtArithOp::Asl, ExtArithOp::Lsr, ExtArithOp::Asr, ExtArithOp::Ror, ExtArithOp::Adds,
+    ExtArithOp::Subs, ExtArithOp::Divaw, ExtArithOp::Asls, ExtArithOp::Asrs, ExtArithOp::Addsdw,
+    ExtArithOp::Subsdw, ExtArithOp::Swap, ExtArithOp::Norm, ExtArithOp::Sat16, ExtArithOp::Rnd16,
+    ExtArithOp::Abssw, ExtArithOp::Abss, ExtArithOp::Negsw, ExtArithOp::Negs, ExtArithOp::Normw,
+];
+
+fn check_single(op: SingleOp, dst: Operand, src: Operand, f: bool, cc: Option<ConditionCode>,
+                base: CpuState, m: &mut Memory) {
+    let (mut a, mut b) = (base.clone(), base);
+    let ra = legacy::single_op::execute_single_op(op, dst, src, f, cc, &mut a);
+    let rb = sem::single_op::single_op(&mut EmuDom::new(&mut b, m), op, dst, src, f, cc);
+    assert_same(&(op, dst, src, f, cc), &ra, &rb, &a, &b);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_ext(op: ExtArithOp, dst: Operand, src1: Operand, src2: Operand, f: bool,
+             cc: Option<ConditionCode>, base: CpuState, m: &mut Memory) {
+    let (mut a, mut b) = (base.clone(), base);
+    let ra = legacy::extended::execute_ext_arith(op, dst, src1, src2, f, cc, &mut a);
+    let rb = sem::extended::ext_arith(&mut EmuDom::new(&mut b, m), op, dst, src1, src2, f, cc);
+    assert_same(&(op, dst, src1, src2, f, cc), &ra, &rb, &a, &b);
+}
+
+#[test]
+fn single_op_matches_legacy() {
+    let mut rng = Rng::new(0x51_0001);
+    let mut m = Memory::new(0x100);
+    let mut cover: HashMap<(usize, bool, bool, Form, Form), u64> = HashMap::new();
+    for _ in 0..cases() {
+        let i = rng.next() as usize % SINGLE_OPS.len();
+        let f = rng.bool();
+        let cc = pick_cc(&mut rng);
+        let (dst, fd) = pick_operand(&mut rng, true);
+        let (src, fs) = pick_operand(&mut rng, true);
+        let base = random_state(&mut rng);
+        check_single(SINGLE_OPS[i], dst, src, f, cc, base, &mut m);
+        *cover.entry((i, f, cc.is_some(), fd, fs)).or_default() += 1;
+    }
+    let cells = SINGLE_OPS.len() * 2 * 2 * 9;
+    assert_eq!(cover.len(), cells, "single-op coverage: {} of {cells}", cover.len());
+    // Exhaustive on the extension operations' input width.
+    let mut s = CpuState::new();
+    for op in [SingleOp::Sexb, SingleOp::Sexw, SingleOp::Extb, SingleOp::Extw] {
+        for v in 0..=0xFFFFu32 {
+            for hi in [0, 0xABCD_0000] {
+                s.core_regs[0] = v | hi;
+                check_single(op, Operand::Reg(1), Operand::Reg(0), true, None, s.clone(), &mut m);
+            }
+        }
+    }
+}
+
+#[test]
+fn ext_arith_matches_legacy() {
+    let mut rng = Rng::new(0xE7_0001);
+    let mut m = Memory::new(0x100);
+    let mut cover: HashMap<(usize, bool, bool, Form, Form, Form), u64> = HashMap::new();
+    for _ in 0..cases() {
+        let i = rng.next() as usize % EXT_OPS.len();
+        let f = rng.bool();
+        let cc = pick_cc(&mut rng);
+        let (dst, fd) = pick_operand(&mut rng, true);
+        let (src1, f1) = pick_operand(&mut rng, true);
+        let (src2, f2) = pick_operand(&mut rng, true);
+        let base = random_state(&mut rng);
+        check_ext(EXT_OPS[i], dst, src1, src2, f, cc, base, &mut m);
+        *cover.entry((i, f, cc.is_some(), fd, f1, f2)).or_default() += 1;
+    }
+    let cells = EXT_OPS.len() * 2 * 2 * 27;
+    assert_eq!(cover.len(), cells, "ext-arith coverage: {} of {cells}", cover.len());
+    // Every shift count 0..=40 on every barrel operation, carry in either way.
+    let mut s = CpuState::new();
+    for op in [ExtArithOp::Asl, ExtArithOp::Lsr, ExtArithOp::Asr, ExtArithOp::Ror] {
+        for count in 0..=40u32 {
+            for v in [0, 1, 0x8000_0000, 0xFFFF_FFFF, 0x1234_5678, 0x8765_4321] {
+                for c in [false, true] {
+                    s.core_regs[0] = v;
+                    s.core_regs[1] = count;
+                    s.flag_c = c;
+                    check_ext(op, Operand::Reg(2), Operand::Reg(0), Operand::Reg(1), true, None,
+                              s.clone(), &mut m);
+                }
+            }
+        }
+    }
+    // NORM/NORMW on the values that sit on their edges.
+    let mut edges = vec![0u32, 1, 0xFFFF_FFFF, 0xFFFF_FFFE, 0x7FFF_FFFF, 0x8000_0000];
+    for i in 0..32 {
+        edges.push(1 << i);
+        edges.push(!(1u32 << i));
+        edges.push((1u32 << i).wrapping_neg());
+    }
+    for op in [ExtArithOp::Norm, ExtArithOp::Normw] {
+        for &v in &edges {
+            s.core_regs[0] = v;
+            check_ext(op, Operand::Reg(2), Operand::Reg(0), Operand::None, true, None, s.clone(), &mut m);
+        }
+    }
 }
