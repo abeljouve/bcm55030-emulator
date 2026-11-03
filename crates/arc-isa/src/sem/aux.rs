@@ -10,6 +10,28 @@ use crate::regs::*;
 
 use super::regs::{operand, status32, write_dest};
 
+/// Every auxiliary address whose `lr` or `sr` does anything but read IDENTITY
+/// and absorb the write, as inclusive ranges. Outside these, an address
+/// behaves as absent (checked by a test), so a symbolic `lr`/`sr` with an
+/// unknown number can be written exactly as a case split over this list.
+pub const DEFINED: &[(u32, u32)] = &[
+    (AUX_STATUS, AUX_PC),
+    (AUX_STATUS32, AUX_STATUS32_L2),
+    (AUX_MULHI, AUX_MULHI),
+    (AUX_COUNT0, AUX_LIMIT0),
+    (AUX_INT_VECTOR_BASE, AUX_INT_VECTOR_BASE),
+    (AUX_MACMODE, AUX_MACMODE),
+    (AUX_IRQ_LV12, AUX_IRQ_LV12),
+    (0x47, 0x49),
+    (0x60, 0x7F),
+    (0xC0, 0xFF),
+    (AUX_COUNT1, AUX_LIMIT1),
+    (AUX_IRQ_LEV, AUX_IRQ_HINT),
+    (AUX_ITRIGGER, AUX_ITRIGGER),
+    (AUX_XPU, AUX_XPU),
+    (AUX_IRQ_PULSE_CANCEL, AUX_IRQ_PENDING),
+];
+
 /// `lr dst, [addr]`.
 #[inline]
 pub fn lr<D: Dom>(d: &mut D, dst: Operand, addr: Operand) -> Result<(), Exception> {
@@ -177,4 +199,34 @@ pub fn write<D: Dom>(d: &mut D, n: u32, v: D::V) -> Result<(), Exception> {
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flat::FlatMachine;
+
+    fn defined(n: u32) -> bool {
+        DEFINED.iter().any(|&(lo, hi)| (lo..=hi).contains(&n))
+    }
+
+    #[test]
+    fn addresses_outside_the_defined_list_behave_as_absent() {
+        let mut addrs: Vec<u32> = (0..0x2000).collect();
+        addrs.extend([0x1_0000, 0x7FFF_FFFF, 0x8000_0000, u32::MAX]);
+        for user in [false, true] {
+            let mut m = FlatMachine::new(0);
+            m.pc = 0x1234;
+            m.set_flag(Flag::U, user);
+            for (i, a) in AuxReg::ALL.iter().enumerate() {
+                m.set_aux(*a, 0x1111_0000 + i as u32);
+            }
+            for &n in addrs.iter().filter(|&&n| !defined(n)) {
+                assert_eq!(read(&mut m, n), Ok(IDENTITY_VALUE), "read {n:#x}");
+                let before = m.clone();
+                assert_eq!(write(&mut m, n, 0xA5A5_A5A5), Ok(()), "write {n:#x}");
+                assert_eq!(m, before, "write {n:#x} changed the state");
+            }
+        }
+    }
 }
