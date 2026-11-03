@@ -1,4 +1,8 @@
+use arc_isa::decoder::instruction::DelayMode;
+use arc_isa::dom::{AuxReg, Flag};
+
 use crate::cpu::exception::Exception;
+use crate::cpu::state_dom::StateDom;
 
 pub use arc_isa::regs::*;
 
@@ -295,216 +299,93 @@ impl CpuState {
         }
     }
 
-    /// Read an auxiliary register
-    pub fn read_aux_reg(&self, addr: u32) -> Result<u32, Exception> {
-        match addr {
-            AUX_STATUS => {
-                // Legacy STATUS: Z,N,C,V,E2,E1,H,R | PC[25:2]
-                let flags = ((self.flag_z as u32) << 31)
-                    | ((self.flag_n as u32) << 30)
-                    | ((self.flag_c as u32) << 29)
-                    | ((self.flag_v as u32) << 28)
-                    | ((self.flag_e2 as u32) << 27)
-                    | ((self.flag_e1 as u32) << 26)
-                    | ((self.flag_h as u32) << 25);
-                Ok(flags | ((self.pc >> 2) & 0x03FFFFFF))
-            }
-            AUX_SEMAPHORE => Ok(self.aux_semaphore),
-            AUX_LP_START => Ok(self.aux_lp_start),
-            AUX_LP_END => Ok(self.aux_lp_end),
-            AUX_IDENTITY => Ok(IDENTITY_VALUE),
-            // bit 22 set (verified on real HW); bit 31 = DEBUG.LD (Load
-            // Pending), driven only by the optional `timing` overlay — false
-            // (and thus absent) in the default build.
-            AUX_DEBUG => Ok(0x00400000 | ((self.debug_load_pending as u32) << 31)),
-            AUX_PC => Ok(self.pc & 0xFFFFFFFE),
-            AUX_STATUS32 => Ok(self.status32()),
-            AUX_STATUS32_L1 => Ok(self.aux_status32_l1),
-            AUX_STATUS32_L2 => Ok(self.aux_status32_l2),
-            AUX_COUNT0 => Ok(self.aux_count0),
-            AUX_CONTROL0 => Ok(self.aux_control0),
-            AUX_LIMIT0 => Ok(self.aux_limit0),
-            AUX_INT_VECTOR_BASE => Ok(self.aux_int_vector_base),
-            AUX_MULHI => Ok(self.aux_mulhi),
-            AUX_MACMODE => Ok(self.aux_macmode),
-            AUX_IRQ_LV12 => Ok(self.aux_irq_lv12),
-            AUX_COUNT1 => Ok(self.aux_count1),
-            AUX_CONTROL1 => Ok(self.aux_control1),
-            AUX_LIMIT1 => Ok(self.aux_limit1),
-            AUX_IRQ_LEV => Ok(self.aux_irq_lev),
-            AUX_IRQ_HINT => Ok(self.aux_irq_hint),
-            // ERET..EFA, ICAUSE1/2, AUX_IENABLE and BTA, BTA_L1/L2 are
-            // absent: they fall through to the `_` arm.
-            AUX_ITRIGGER => Ok(self.aux_itrigger),
-            AUX_XPU => Ok(self.aux_xpu),
-            AUX_IRQ_PENDING => Ok(self.aux_irq_pending),
-            // BCR registers (read-only build config)
-            // All values verified against real BCM55030 hardware.
-            AUX_BCR_VER => Ok(0x02),
-            AUX_BTA_LINK_BUILD => Ok(0x00),       // absent on real HW
-            AUX_EA_BUILD => Ok(0x00),              // absent on real HW
-            AUX_VECBASE_AC_BUILD => Ok(0x00),      // absent on real HW
-            AUX_RF_BUILD => Ok(0x01),              // register file v1
-            AUX_TIMER_BUILD => Ok(0x0303),         // v3, T0+T1
-            AUX_DCCM_BUILD => Ok(0x00),            // no DCCM (unified SRAM)
-            AUX_ICCM_BUILD => Ok(0x00),            // no ICCM (unified SRAM)
-            // Cache control registers. The geometry is in `cache.rs`: D-cache
-            // 4 KB / 32 B lines, I-cache 4 KB / 1-way / 128 sets / 32 B lines,
-            // the latter measured by execution on silicon (see that file).
-            // The labels here used to read "D-cache 4KB 8-way, I-cache 8KB
-            // 8-way" — both way counts and the I-cache size were wrong, and
-            // contradicted `cache.rs` sitting next to them. The VALUES below
-            // were always right; only the comments were not.
-            0x47 => Ok(0x00),                      // DC_IVDC (write-only command)
-            0x48 => Ok(self.aux_dc_ctrl),          // DC_CTRL (shadow, synced to DCache in Memory)
-            0x49 => Ok(0x00),                      // CACHE_BYPASS
-            AUX_D_CACHE_BUILD => Ok(0x00013001),   // 4KB D-cache present
-            AUX_I_CACHE_BUILD => Ok(0x00023001),   // 4KB I-cache present
-            AUX_MULTIPLY_BUILD => Ok(0x00),        // absent on real HW
-            AUX_SWAP_BUILD => Ok(0x01),
-            AUX_NORM_BUILD => Ok(0x02),
-            AUX_MINMAX_BUILD => Ok(0x00),          // absent on real HW
-            AUX_BARREL_BUILD => Ok(0x00),          // absent on real HW
-            // BCM55030-specific BCRs (verified on real HW)
-            0x62 => Ok(0x01),                      // unknown BCM55030 BCR
-            0x67 => Ok(0x05),                      // unknown (possibly IRQ config)
-            0x69 => Ok(0x00FC0001),                // contains UART address prefix
-            // Other BCR registers (0x60-0x7F, 0xC0-0xFF): return 0
-            0x60..=0x7F => Ok(0x00),
-            0xC0..=0xFF => Ok(0x00),
-            // Non-existent aux regs return IDENTITY on real HW (not exception).
-            // The emulator uses struct fields for internal interrupt/exception
-            // state, so this only affects firmware LR reads of unknown regs.
-            _ => Ok(IDENTITY_VALUE),
+    /// The `CpuState` field holding flag `f`.
+    #[inline(always)]
+    pub fn flag_mut(&mut self, f: Flag) -> &mut bool {
+        match f {
+            Flag::Z => &mut self.flag_z,
+            Flag::N => &mut self.flag_n,
+            Flag::C => &mut self.flag_c,
+            Flag::V => &mut self.flag_v,
+            Flag::E1 => &mut self.flag_e1,
+            Flag::E2 => &mut self.flag_e2,
+            Flag::A1 => &mut self.flag_a1,
+            Flag::A2 => &mut self.flag_a2,
+            Flag::AE => &mut self.flag_ae,
+            Flag::DE => &mut self.flag_de,
+            Flag::U => &mut self.flag_u,
+            Flag::L => &mut self.flag_l,
+            Flag::H => &mut self.flag_h,
         }
     }
 
-    /// Write an auxiliary register
-    pub fn write_aux_reg(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
-        // User mode cannot write most aux regs
-        if self.flag_u {
-            match addr {
-                // AUX_IENABLE is not listed: an absent address is not a
-                // privileged register. A user-mode write to it is absorbed
-                // like any other absent aux. -- INFERRED: user mode is never
-                // entered in practice, so neither behaviour has been measured;
-                // consistency with the other absent addresses is the tie-breaker.
-                AUX_STATUS32 | AUX_STATUS32_L1 | AUX_STATUS32_L2 | AUX_INT_VECTOR_BASE
-                | AUX_ITRIGGER | AUX_IRQ_LEV | AUX_IRQ_HINT | AUX_IRQ_PULSE_CANCEL => {
-                    return Err(Exception::PrivilegeViolation { address: self.pc });
+    /// The `CpuState` field holding auxiliary register `a`.
+    #[inline(always)]
+    pub fn aux_mut(&mut self, a: AuxReg) -> &mut u32 {
+        match a {
+            AuxReg::Semaphore => &mut self.aux_semaphore,
+            AuxReg::LpStart => &mut self.aux_lp_start,
+            AuxReg::LpEnd => &mut self.aux_lp_end,
+            AuxReg::Status32L1 => &mut self.aux_status32_l1,
+            AuxReg::Status32L2 => &mut self.aux_status32_l2,
+            AuxReg::Count0 => &mut self.aux_count0,
+            AuxReg::Control0 => &mut self.aux_control0,
+            AuxReg::Limit0 => &mut self.aux_limit0,
+            AuxReg::IntVectorBase => &mut self.aux_int_vector_base,
+            AuxReg::Mulhi => &mut self.aux_mulhi,
+            AuxReg::Macmode => &mut self.aux_macmode,
+            AuxReg::IrqLv12 => &mut self.aux_irq_lv12,
+            AuxReg::Count1 => &mut self.aux_count1,
+            AuxReg::Control1 => &mut self.aux_control1,
+            AuxReg::Limit1 => &mut self.aux_limit1,
+            AuxReg::IrqLev => &mut self.aux_irq_lev,
+            AuxReg::IrqHint => &mut self.aux_irq_hint,
+            AuxReg::Itrigger => &mut self.aux_itrigger,
+            AuxReg::Xpu => &mut self.aux_xpu,
+            AuxReg::IrqPulseCancel => &mut self.aux_irq_pulse_cancel,
+            AuxReg::IrqPending => &mut self.aux_irq_pending,
+            AuxReg::DcCtrl => &mut self.aux_dc_ctrl,
+            AuxReg::Bta => &mut self.aux_bta,
+            AuxReg::BtaL1 => &mut self.aux_bta_l1,
+            AuxReg::BtaL2 => &mut self.aux_bta_l2,
+        }
+    }
+
+    /// DEBUG as this emulator reads it: bit 22 (measured on silicon), and bit
+    /// 31 (DEBUG.LD, load pending), driven only by the optional timing overlay.
+    #[inline(always)]
+    pub fn debug_aux(&self) -> u32 {
+        0x0040_0000 | ((self.debug_load_pending as u32) << 31)
+    }
+
+    /// A taken branch: with a delay slot it is left pending, otherwise the PC
+    /// moves now and a link writes BLINK.
+    #[inline(always)]
+    pub fn take_branch(&mut self, target: u32, delay: DelayMode, link: Option<u32>) {
+        match delay {
+            DelayMode::Delay => {
+                self.delay_state = DelayState::DelaySlot { target, is_link: link.is_some() };
+            }
+            DelayMode::NoDelay => {
+                if let Some(ret) = link {
+                    self.core_regs[REG_BLINK as usize] = ret;
+                    self.link_executed = true;
                 }
-                _ => {}
+                self.pc = target;
+                self.pc_written = true;
             }
         }
-        match addr {
-            AUX_SEMAPHORE => {
-                self.aux_semaphore = val;
-                Ok(())
-            }
-            AUX_LP_START => {
-                self.aux_lp_start = val & 0xFFFFFFFE;
-                Ok(())
-            }
-            AUX_LP_END => {
-                self.aux_lp_end = val & 0xFFFFFFFE;
-                Ok(())
-            }
-            AUX_STATUS32 => {
-                // STATUS32 is read-only via SR; use FLAG instruction to modify
-                Err(Exception::InstructionError { address: self.pc })
-            }
-            AUX_STATUS32_L1 => {
-                self.aux_status32_l1 = val;
-                Ok(())
-            }
-            AUX_STATUS32_L2 => {
-                self.aux_status32_l2 = val;
-                Ok(())
-            }
-            AUX_COUNT0 => {
-                self.aux_count0 = val;
-                Ok(())
-            }
-            AUX_CONTROL0 => {
-                // IP bit (bit 3) is read-only; preserve it
-                self.aux_control0 = (val & !0x08) | (self.aux_control0 & 0x08);
-                Ok(())
-            }
-            AUX_LIMIT0 => {
-                self.aux_limit0 = val;
-                Ok(())
-            }
-            AUX_INT_VECTOR_BASE => {
-                self.aux_int_vector_base = val & 0xFFFFFC00;
-                Ok(())
-            }
-            AUX_MULHI => {
-                self.aux_mulhi = val;
-                Ok(())
-            }
-            AUX_MACMODE => {
-                self.aux_macmode = val;
-                Ok(())
-            }
-            AUX_IRQ_LV12 => {
-                // Sticky clear: write 1 to clear
-                self.aux_irq_lv12 &= !val;
-                Ok(())
-            }
-            AUX_COUNT1 => {
-                self.aux_count1 = val;
-                Ok(())
-            }
-            AUX_CONTROL1 => {
-                // IP bit (bit 3) is read-only; preserve it
-                self.aux_control1 = (val & !0x08) | (self.aux_control1 & 0x08);
-                Ok(())
-            }
-            AUX_LIMIT1 => {
-                self.aux_limit1 = val;
-                Ok(())
-            }
-            AUX_IRQ_LEV => {
-                self.aux_irq_lev = val;
-                Ok(())
-            }
-            AUX_IRQ_HINT => {
-                self.aux_irq_hint = val & 0x1F;
-                Ok(())
-            }
-            // ERET..EFA, ICAUSE1/2, AUX_IENABLE and BTA, BTA_L1/L2 are
-            // absent: the write is discarded by the `_` arm.
-            AUX_ITRIGGER => {
-                self.aux_itrigger = val;
-                Ok(())
-            }
-            AUX_XPU => {
-                self.aux_xpu = val;
-                Ok(())
-            }
-            AUX_IRQ_PULSE_CANCEL => {
-                self.aux_irq_pulse_cancel = val;
-                Ok(())
-            }
-            // Cache control registers
-            0x47 => Ok(()),  // DC_IVDC: write handled by executor post-processing
-            0x48 => {
-                // DC_CTRL: update shadow register. Executor syncs to DCache.
-                // RW mask 0xE7 applied per hardware verification.
-                // Only bits 0, 1, 2, 5, 6, 7 are writable.
-                self.aux_dc_ctrl = val & 0xE7;
-                Ok(())
-            }
-            0x49 => Ok(()),  // DC_LDL / CACHE_BYPASS: ignored for now
-            // IC_IVIC (aux 0x10): side effect handled by executor (invalidates
-            // entire I-cache on any write). No state stored here.
-            0x10 => Ok(()),
-            // Read-only registers — writes silently ignored on real HW
-            AUX_STATUS | AUX_IDENTITY | AUX_DEBUG | AUX_PC | AUX_IRQ_PENDING => Ok(()),
-            // BCR registers are read-only — writes silently ignored
-            0x60..=0x7F | 0xC0..=0xFF => Ok(()),
-            // Non-existent aux regs: writes silently absorbed on real HW
-            _ => Ok(()),
-        }
+    }
+
+    /// Read an auxiliary register, as `lr` would (without the platform's
+    /// cache probes, which need the memory).
+    pub fn read_aux_reg(&mut self, addr: u32) -> Result<u32, Exception> {
+        arc_isa::sem::aux::read(&mut StateDom(self), addr)
+    }
+
+    /// Write an auxiliary register, as `sr` would (without the platform's
+    /// cache side effects, which need the memory).
+    pub fn write_aux_reg(&mut self, addr: u32, val: u32) -> Result<(), Exception> {
+        arc_isa::sem::aux::write(&mut StateDom(self), addr, val)
     }
 }

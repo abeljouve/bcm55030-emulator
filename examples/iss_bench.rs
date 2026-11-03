@@ -4,7 +4,7 @@
 //!
 //! Each program is a small hand-assembled loop run in SoC mode (caches, timers
 //! and the peripheral bank ticking, as in a firmware run) for `steps` steps
-//! (default 50 M). Before timing, every program is disassembled and run for a
+//! (default 50 M); `ISS_BENCH_ONLY=<name>` runs one program. Before timing, every program is disassembled and run for a
 //! few thousand steps with its expected effect checked, so a broken encoding
 //! fails loudly instead of benchmarking a runaway PC.
 
@@ -180,7 +180,11 @@ fn fresh(p: &Prog) -> Cpu {
 fn main() {
     let steps: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(50_000_000);
     let end = |p: &Prog| CODE + p.bytes.len() as u32;
+    let only = std::env::var("ISS_BENCH_ONLY").ok();
     for p in programs() {
+        if only.as_deref().is_some_and(|o| o != p.name) {
+            continue;
+        }
         // Disassemble, then check the expected effect over a short run.
         let mut pc = CODE;
         while pc < end(&p) {

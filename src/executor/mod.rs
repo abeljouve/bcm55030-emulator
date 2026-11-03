@@ -1,5 +1,4 @@
 pub mod emu_dom;
-pub mod load_store;
 
 /// Frozen reference implementation for the differential tests.
 #[cfg(test)]
@@ -32,221 +31,117 @@ pub fn execute(
     state: &mut CpuState,
     mem: &mut Memory,
 ) -> Result<(), Exception> {
+    // One out-of-line function per instruction class, as before the semantics
+    // went generic: inlined into one dispatcher they made it seven times
+    // larger and measurably slower.
     match &decoded.inst {
-        Instruction::Alu {
-            op,
-            dst,
-            src1,
-            src2,
-            set_flags,
-            cc,
-        } => {
-            arc_isa::sem::alu::alu(
-                &mut emu_dom::EmuDom::new(state, mem),
-                *op,
-                *dst,
-                *src1,
-                *src2,
-                *set_flags,
-                *cc,
-            )?;
+        Instruction::Alu { op, dst, src1, src2, set_flags, cc } => {
+            run::alu(state, mem, *op, *dst, *src1, *src2, *set_flags, *cc)
         }
-        Instruction::SingleOp {
-            op,
-            dst,
-            src,
-            set_flags,
-            cc,
-        } => {
-            arc_isa::sem::single_op::single_op(
-                &mut emu_dom::EmuDom::new(state, mem),
-                *op,
-                *dst,
-                *src,
-                *set_flags,
-                *cc,
-            )?;
+        Instruction::SingleOp { op, dst, src, set_flags, cc } => {
+            run::single_op(state, mem, *op, *dst, *src, *set_flags, *cc)
         }
-        Instruction::ZeroOp(zop) => {
-            arc_isa::sem::special::zero_op(&mut emu_dom::EmuDom::new(state, mem), zop)?;
+        Instruction::ZeroOp(zop) => run::zero_op(state, mem, zop),
+        Instruction::Branch { offset, cc, delay, link } => {
+            run::branch(state, mem, *offset, *cc, *delay, *link, decoded.total_size())
         }
-        Instruction::Branch {
-            offset,
-            cc,
-            delay,
-            link,
-        } => {
-            arc_isa::sem::branch::branch(
-                &mut emu_dom::EmuDom::new(state, mem),
-                *offset,
-                *cc,
-                *delay,
-                *link,
-                decoded.total_size(),
-            )?;
+        Instruction::BranchCompare { kind, src1, src2, offset, delay } => {
+            run::branch_compare(state, mem, *kind, *src1, *src2, *offset, *delay)
         }
-        Instruction::BranchCompare {
-            kind,
-            src1,
-            src2,
-            offset,
-            delay,
-        } => {
-            arc_isa::sem::branch::branch_compare(
-                &mut emu_dom::EmuDom::new(state, mem),
-                *kind,
-                *src1,
-                *src2,
-                *offset,
-                *delay,
-            )?;
+        Instruction::Jump { target, cc, delay, link, flag_restore } => run::jump(
+            state, mem, *target, *cc, *delay, *link, *flag_restore, decoded.total_size(),
+        ),
+        Instruction::Load { dst, base, offset, data_size, sign_extend, writeback, cache_bypass } => {
+            run::load(state, mem, *dst, *base, *offset, *data_size, *sign_extend, *writeback,
+                      *cache_bypass)
         }
-        Instruction::Jump {
-            target,
-            cc,
-            delay,
-            link,
-            flag_restore,
-        } => {
-            arc_isa::sem::branch::jump(
-                &mut emu_dom::EmuDom::new(state, mem),
-                *target,
-                *cc,
-                *delay,
-                *link,
-                *flag_restore,
-                decoded.total_size(),
-            )?;
+        Instruction::Store { src, base, offset, data_size, writeback, cache_bypass } => {
+            run::store(state, mem, *src, *base, *offset, *data_size, *writeback, *cache_bypass)
         }
-        Instruction::Load {
-            dst,
-            base,
-            offset,
-            data_size,
-            sign_extend: do_sign_ext,
-            writeback,
-            cache_bypass,
-        } => {
-            load_store::execute_load(
-                *dst,
-                *base,
-                *offset,
-                *data_size,
-                *do_sign_ext,
-                *writeback,
-                *cache_bypass,
-                state,
-                mem,
-            )?;
+        Instruction::Loop { offset, cc } => run::lp(state, mem, *offset, *cc, decoded.total_size()),
+        Instruction::LoadAux { dst, addr } => run::lr(state, mem, *dst, *addr),
+        Instruction::StoreAux { src, addr } => run::sr(state, mem, *src, *addr),
+        Instruction::Flag { src, cc } => run::flag(state, mem, *src, *cc),
+        Instruction::ExtArith { op, dst, src1, src2, set_flags, cc } => {
+            run::ext_arith(state, mem, *op, *dst, *src1, *src2, *set_flags, *cc)
         }
-        Instruction::Store {
-            src,
-            base,
-            offset,
-            data_size,
-            writeback,
-            cache_bypass,
-        } => {
-            load_store::execute_store(
-                *src, *base, *offset, *data_size, *writeback, *cache_bypass, state, mem,
-            )?;
-        }
-        Instruction::Loop { offset, cc } => {
-            arc_isa::sem::special::lp(
-                &mut emu_dom::EmuDom::new(state, mem),
-                *offset,
-                *cc,
-                decoded.total_size(),
-            )?;
-        }
-        Instruction::LoadAux { dst, addr } => {
-            let addr_val = resolve_value(*addr, state)?;
-            // Intercept D-cache debug registers: DC_TAG (0x59) and DC_DATA (0x5B).
-            // These return cache state based on DC_RAM_ADDR (0x58) previously set.
-            match addr_val {
-                0x59 => {
-                    let val = mem.dcache_read_tag();
-                    write_dest(*dst, val, state)?;
-                }
-                0x5B => {
-                    let val = mem.dcache_read_data();
-                    write_dest(*dst, val, state)?;
-                }
-                _ => {
-                    load_store::execute_load_aux(*dst, *addr, state)?;
-                }
-            }
-        }
-        Instruction::StoreAux { src, addr } => {
-            let addr_val = resolve_value(*addr, state)?;
-            load_store::execute_store_aux(*src, *addr, state)?;
-            // Post-process D-cache control writes
-            match addr_val {
-                0x47 => {
-                    // DC_IVDC: invalidate entire D-cache
-                    let val = resolve_value(*src, state)?;
-                    if val & 1 != 0 {
-                        mem.dcache_invalidate_all()?;
-                    }
-                }
-                0x48 => {
-                    // DC_CTRL: sync cache enable/IM/LM state
-                    let val = state.read_aux_reg(0x48)?;
-                    mem.dcache_sync_ctrl(val);
-                }
-                0x4A => {
-                    // DC_IVDL: invalidate single cache line
-                    let val = resolve_value(*src, state)?;
-                    mem.dcache_invalidate_line(val)?;
-                }
-                // 0x4B (DC_FLSH): no handler needed — DC_FLSH is a no-op on
-                // real BCM55030 (verified against real hardware). write_aux_reg
-                // silently absorbs the write via the default fallthrough.
-                0x58 => {
-                    // DC_RAM_ADDR: set probe address for DC_TAG/DC_DATA reads
-                    let val = resolve_value(*src, state)?;
-                    mem.dcache_set_ram_addr(val);
-                }
-                0x10 => {
-                    // IC_IVIC: invalidate entire I-cache on any write.
-                    // Firmware may write 0 as the flush trigger, so gating on a
-                    // bit value would miss the real flush path — any write flushes.
-                    let _ = resolve_value(*src, state)?;
-                    mem.icache_invalidate_all();
-                }
-                0x19 => {
-                    // IC_IVIL: single-line I-cache invalidate. NO-OP on
-                    // BCM55030 — verified against real hardware (DATASHEET §5.2).
-                    // Only IC_IVIC (0x10) actually flushes. The address operand
-                    // is still resolved/consumed so a side-effecting source
-                    // register is read as on silicon.
-                    let _ = resolve_value(*src, state)?;
-                }
-                _ => {}
-            }
-        }
-        Instruction::Flag { src, cc } => {
-            arc_isa::sem::special::flag(&mut emu_dom::EmuDom::new(state, mem), *src, *cc)?;
-        }
-        Instruction::ExtArith {
-            op,
-            dst,
-            src1,
-            src2,
-            set_flags,
-            cc,
-        } => {
-            arc_isa::sem::extended::ext_arith(
-                &mut emu_dom::EmuDom::new(state, mem),
-                *op,
-                *dst,
-                *src1,
-                *src2,
-                *set_flags,
-                *cc,
-            )?;
-        }
-        Instruction::Prefetch => {}
+        Instruction::Prefetch => Ok(()),
     }
-    Ok(())
+}
+
+/// The generic semantics instantiated on `EmuDom`, one function per class.
+#[allow(clippy::too_many_arguments)]
+mod run {
+    use arc_isa::condition::ConditionCode;
+    use arc_isa::sem;
+
+    use super::emu_dom::EmuDom;
+    use crate::cpu::exception::Exception;
+    use crate::cpu::registers::CpuState;
+    use crate::decoder::instruction::*;
+    use crate::memory::Memory;
+
+    type R = Result<(), Exception>;
+
+    #[inline(never)]
+    pub fn alu(s: &mut CpuState, m: &mut Memory, op: AluOp, dst: Operand, a: Operand, b: Operand,
+               f: bool, cc: Option<ConditionCode>) -> R {
+        sem::alu::alu(&mut EmuDom::new(s, m), op, dst, a, b, f, cc)
+    }
+    #[inline(never)]
+    pub fn single_op(s: &mut CpuState, m: &mut Memory, op: SingleOp, dst: Operand, src: Operand,
+                     f: bool, cc: Option<ConditionCode>) -> R {
+        sem::single_op::single_op(&mut EmuDom::new(s, m), op, dst, src, f, cc)
+    }
+    #[inline(never)]
+    pub fn ext_arith(s: &mut CpuState, m: &mut Memory, op: ExtArithOp, dst: Operand, a: Operand,
+                     b: Operand, f: bool, cc: Option<ConditionCode>) -> R {
+        sem::extended::ext_arith(&mut EmuDom::new(s, m), op, dst, a, b, f, cc)
+    }
+    #[inline(never)]
+    pub fn zero_op(s: &mut CpuState, m: &mut Memory, zop: &ZeroOp) -> R {
+        sem::special::zero_op(&mut EmuDom::new(s, m), zop)
+    }
+    #[inline(never)]
+    pub fn branch(s: &mut CpuState, m: &mut Memory, offset: i32, cc: Option<ConditionCode>,
+                  delay: DelayMode, link: bool, size: u32) -> R {
+        sem::branch::branch(&mut EmuDom::new(s, m), offset, cc, delay, link, size)
+    }
+    #[inline(never)]
+    pub fn branch_compare(s: &mut CpuState, m: &mut Memory, kind: BrCompareKind, a: Operand,
+                          b: Operand, offset: i32, delay: DelayMode) -> R {
+        sem::branch::branch_compare(&mut EmuDom::new(s, m), kind, a, b, offset, delay)
+    }
+    #[inline(never)]
+    pub fn jump(s: &mut CpuState, m: &mut Memory, target: Operand, cc: Option<ConditionCode>,
+                delay: DelayMode, link: bool, flag_restore: bool, size: u32) -> R {
+        sem::branch::jump(&mut EmuDom::new(s, m), target, cc, delay, link, flag_restore, size)
+    }
+    #[inline(never)]
+    pub fn load(s: &mut CpuState, m: &mut Memory, dst: Operand, base: Operand, off: Operand,
+                size: DataSize, sx: bool, wb: WritebackMode, di: bool) -> R {
+        sem::load_store::load(&mut EmuDom::new(s, m), dst, base, off, size, sx, wb, di)
+    }
+    #[inline(never)]
+    pub fn store(s: &mut CpuState, m: &mut Memory, src: Operand, base: Operand, off: Operand,
+                 size: DataSize, wb: WritebackMode, di: bool) -> R {
+        sem::load_store::store(&mut EmuDom::new(s, m), src, base, off, size, wb, di)
+    }
+    #[inline(never)]
+    pub fn lp(s: &mut CpuState, m: &mut Memory, offset: u32, cc: Option<ConditionCode>,
+              size: u32) -> R {
+        sem::special::lp(&mut EmuDom::new(s, m), offset, cc, size)
+    }
+    #[inline(never)]
+    pub fn lr(s: &mut CpuState, m: &mut Memory, dst: Operand, addr: Operand) -> R {
+        sem::aux::lr(&mut EmuDom::new(s, m), dst, addr)
+    }
+    #[inline(never)]
+    pub fn sr(s: &mut CpuState, m: &mut Memory, src: Operand, addr: Operand) -> R {
+        sem::aux::sr(&mut EmuDom::new(s, m), src, addr)
+    }
+    #[inline(never)]
+    pub fn flag(s: &mut CpuState, m: &mut Memory, src: Operand, cc: Option<ConditionCode>) -> R {
+        sem::special::flag(&mut EmuDom::new(s, m), src, cc)
+    }
 }

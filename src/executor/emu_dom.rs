@@ -7,7 +7,7 @@ use arc_isa::decoder::instruction::{DataSize, DelayMode};
 use arc_isa::dom::{AuxReg, Dom, Flag};
 
 use crate::cpu::exception::Exception;
-use crate::cpu::registers::{CpuState, DelayState, REG_BLINK};
+use crate::cpu::registers::{CpuState, AUX_DEBUG};
 use crate::memory::Memory;
 
 pub struct EmuDom<'a> {
@@ -19,58 +19,6 @@ impl<'a> EmuDom<'a> {
     #[inline(always)]
     pub fn new(state: &'a mut CpuState, mem: &'a mut Memory) -> Self {
         Self { state, mem }
-    }
-
-    #[inline(always)]
-    fn flag_mut(&mut self, f: Flag) -> &mut bool {
-        let s = &mut *self.state;
-        match f {
-            Flag::Z => &mut s.flag_z,
-            Flag::N => &mut s.flag_n,
-            Flag::C => &mut s.flag_c,
-            Flag::V => &mut s.flag_v,
-            Flag::E1 => &mut s.flag_e1,
-            Flag::E2 => &mut s.flag_e2,
-            Flag::A1 => &mut s.flag_a1,
-            Flag::A2 => &mut s.flag_a2,
-            Flag::AE => &mut s.flag_ae,
-            Flag::DE => &mut s.flag_de,
-            Flag::U => &mut s.flag_u,
-            Flag::L => &mut s.flag_l,
-            Flag::H => &mut s.flag_h,
-        }
-    }
-
-    #[inline(always)]
-    fn aux_mut(&mut self, a: AuxReg) -> &mut u32 {
-        let s = &mut *self.state;
-        match a {
-            AuxReg::Semaphore => &mut s.aux_semaphore,
-            AuxReg::LpStart => &mut s.aux_lp_start,
-            AuxReg::LpEnd => &mut s.aux_lp_end,
-            AuxReg::Status32L1 => &mut s.aux_status32_l1,
-            AuxReg::Status32L2 => &mut s.aux_status32_l2,
-            AuxReg::Count0 => &mut s.aux_count0,
-            AuxReg::Control0 => &mut s.aux_control0,
-            AuxReg::Limit0 => &mut s.aux_limit0,
-            AuxReg::IntVectorBase => &mut s.aux_int_vector_base,
-            AuxReg::Mulhi => &mut s.aux_mulhi,
-            AuxReg::Macmode => &mut s.aux_macmode,
-            AuxReg::IrqLv12 => &mut s.aux_irq_lv12,
-            AuxReg::Count1 => &mut s.aux_count1,
-            AuxReg::Control1 => &mut s.aux_control1,
-            AuxReg::Limit1 => &mut s.aux_limit1,
-            AuxReg::IrqLev => &mut s.aux_irq_lev,
-            AuxReg::IrqHint => &mut s.aux_irq_hint,
-            AuxReg::Itrigger => &mut s.aux_itrigger,
-            AuxReg::Xpu => &mut s.aux_xpu,
-            AuxReg::IrqPulseCancel => &mut s.aux_irq_pulse_cancel,
-            AuxReg::IrqPending => &mut s.aux_irq_pending,
-            AuxReg::DcCtrl => &mut s.aux_dc_ctrl,
-            AuxReg::Bta => &mut s.aux_bta,
-            AuxReg::BtaL1 => &mut s.aux_bta_l1,
-            AuxReg::BtaL2 => &mut s.aux_bta_l2,
-        }
     }
 }
 
@@ -91,11 +39,11 @@ impl<'a> Dom for EmuDom<'a> {
     }
     #[inline(always)]
     fn flag(&mut self, f: Flag) -> bool {
-        *self.flag_mut(f)
+        *self.state.flag_mut(f)
     }
     #[inline(always)]
     fn set_flag(&mut self, f: Flag, b: bool) {
-        *self.flag_mut(f) = b;
+        *self.state.flag_mut(f) = b;
     }
 
     /// `Memory` aligns and logs misaligned accesses itself, so it gets the
@@ -120,18 +68,20 @@ impl<'a> Dom for EmuDom<'a> {
 
     #[inline(always)]
     fn aux(&mut self, a: AuxReg) -> u32 {
-        *self.aux_mut(a)
+        *self.state.aux_mut(a)
     }
     #[inline(always)]
     fn set_aux(&mut self, a: AuxReg, v: u32) {
-        *self.aux_mut(a) = v;
+        *self.state.aux_mut(a) = v;
     }
 
     /// D-cache probe registers DC_TAG (0x59) and DC_DATA (0x5B) answer from the
-    /// cache model, for the address set in DC_RAM_ADDR (0x58).
+    /// cache model, for the address set in DC_RAM_ADDR (0x58); DEBUG carries
+    /// the timing model's load-pending bit.
     #[inline]
     fn aux_read_hook(&mut self, addr: u32) -> Option<Result<u32, Exception>> {
         match addr {
+            AUX_DEBUG => Some(Ok(self.state.debug_aux())),
             0x59 => Some(Ok(self.mem.dcache_read_tag())),
             0x5B => Some(Ok(self.mem.dcache_read_data())),
             _ => None,
@@ -165,19 +115,7 @@ impl<'a> Dom for EmuDom<'a> {
     #[inline(always)]
     fn branch(&mut self, target: u32, delay: DelayMode, link: Option<u32>)
         -> Result<(), Exception> {
-        match delay {
-            DelayMode::Delay => {
-                self.state.delay_state = DelayState::DelaySlot { target, is_link: link.is_some() };
-            }
-            DelayMode::NoDelay => {
-                if let Some(ret) = link {
-                    self.state.core_regs[REG_BLINK as usize] = ret;
-                    self.state.link_executed = true;
-                }
-                self.state.pc = target;
-                self.state.pc_written = true;
-            }
-        }
+        self.state.take_branch(target, delay, link);
         Ok(())
     }
     #[inline(always)]

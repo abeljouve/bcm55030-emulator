@@ -119,6 +119,13 @@ macro_rules! concrete_primitives {
         fn as_const(&self, v: u32) -> Option<u32> {
             Some(v)
         }
+        fn aux_read_dynamic(&mut self, _addr: u32) -> Result<u32, $crate::exception::Exception> {
+            unreachable!("a concrete domain always knows the auxiliary register number")
+        }
+        fn aux_write_dynamic(&mut self, _addr: u32, _v: u32)
+            -> Result<(), $crate::exception::Exception> {
+            unreachable!("a concrete domain always knows the auxiliary register number")
+        }
         #[inline(always)]
         fn when(
             &mut self,

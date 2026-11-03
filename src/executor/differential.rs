@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use arc_isa::condition::ConditionCode;
 use arc_isa::decoder::instruction::{
-    AluOp, BrCompareKind, DecodedInstruction, DelayMode, ExtArithOp, Instruction, Operand, SingleOp,
-    ZeroOp,
+    AluOp, BrCompareKind, DataSize, DecodedInstruction, DelayMode, ExtArithOp, Instruction, Operand,
+    SingleOp, WritebackMode, ZeroOp,
 };
 use arc_isa::dom::{Dom, Flag};
 use arc_isa::sem::{self, regs};
@@ -450,4 +450,135 @@ fn control_matches_legacy() {
         *cover.entry((which, cc.is_some(), delay == DelayMode::Delay, link)).or_default() += 1;
     }
     assert_eq!(cover.len(), 6 * 8, "control coverage: {} of 48", cover.len());
+}
+
+/// Loads, stores, `lr` and `sr`, on two SoC memories that evolve in lockstep:
+/// same initial SRAM, same instruction stream, one run by the frozen executor
+/// and one by the generic semantics. Besides the result and the `CpuState`,
+/// each case compares the misaligned-access log and the MMIO history; the
+/// D-cache and SRAM are compared every few cases and at the end (a divergence
+/// persists, so the window names the culprit to within a few instructions).
+#[test]
+fn memory_and_aux_match_legacy() {
+    use crate::memory::SRAM_SIZE;
+    use crate::soc::bank::BootMode;
+    use std::collections::VecDeque;
+
+    const DATA: u32 = 0x0001_0000;
+    const DATA_LEN: u32 = 0x0006_0000;
+    // Unclaimed MMIO: reads give 0, writes are dropped, both are logged.
+    const MMIO: u32 = 0x0300_0000;
+    const AUX_CHOICES: [u32; 24] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x0A, 0x0B, 0x0C, 0x10, 0x11, 0x19, 0x21, 0x22,
+        0x25, 0x43, 0x47, 0x48, 0x4A, 0x58, 0x59, 0x5B, 0x101,
+    ];
+
+    let mut rng = Rng::new(0x3E_0001);
+    let mut ma = Memory::new_soc(SRAM_SIZE, BootMode::Cold);
+    let mut mb = Memory::new_soc(SRAM_SIZE, BootMode::Cold);
+    let mut sram = vec![0u8; SRAM_SIZE];
+    for b in sram.iter_mut() {
+        *b = rng.next() as u8;
+    }
+    ma.load_binary(0, &sram);
+    mb.load_binary(0, &sram);
+
+    let sizes = [DataSize::Word, DataSize::HalfWord, DataSize::Byte];
+    let wbs = [WritebackMode::None, WritebackMode::PreWrite, WritebackMode::PostWrite, WritebackMode::Scaled];
+    let mut recent: VecDeque<String> = VecDeque::new();
+    let mut cover: HashMap<(u8, u8, u8, bool), u64> = HashMap::new();
+    let n = cases();
+    for i in 0..n {
+        let mut base = random_state(&mut rng);
+        base.flag_u = rng.below(8) == 0;
+        // Base register r1 points at SRAM data (any alignment), the vector
+        // area (the NCO aperture for `.di` stores) or unclaimed MMIO.
+        let region = rng.below(3) as u8;
+        base.core_regs[1] = match region {
+            0 => DATA + rng.below(DATA_LEN as u64) as u32,
+            1 => rng.below(0x80) as u32,
+            _ => MMIO + rng.below(0x100) as u32,
+        };
+        base.core_regs[2] = rng.below(64) as u32;
+        let kind = rng.below(4) as u8;
+        let size = sizes[rng.below(3) as usize];
+        let wb = wbs[rng.below(4) as usize];
+        let di = rng.bool();
+        let sx = rng.bool();
+        let off = if rng.bool() { Operand::Reg(2) } else { Operand::Imm(rng.below(64) as u32) };
+        let reg = |rng: &mut Rng| if rng.below(4) == 0 { pick_reg(rng) } else { 3 + rng.below(20) as u8 };
+        let inst = match kind {
+            0 => Instruction::Load {
+                dst: if rng.below(8) == 0 { Operand::None } else { Operand::Reg(reg(&mut rng)) },
+                base: Operand::Reg(1), offset: off, data_size: size, sign_extend: sx,
+                writeback: wb, cache_bypass: di,
+            },
+            1 => Instruction::Store {
+                src: Operand::Reg(reg(&mut rng)), base: Operand::Reg(1), offset: off,
+                data_size: size, writeback: wb, cache_bypass: di,
+            },
+            _ => {
+                let a = if rng.below(4) == 0 { rng.word() & 0x7FF } else {
+                    AUX_CHOICES[rng.below(AUX_CHOICES.len() as u64) as usize]
+                };
+                let src_or_dst = Operand::Reg(reg(&mut rng));
+                let addr = if rng.bool() { Operand::Imm(a) } else {
+                    base.core_regs[4] = a;
+                    Operand::Reg(4)
+                };
+                if kind == 2 {
+                    Instruction::LoadAux { dst: src_or_dst, addr }
+                } else {
+                    Instruction::StoreAux { src: src_or_dst, addr }
+                }
+            }
+        };
+        let dec = DecodedInstruction { inst: inst.clone(), size: 4, has_limm: false, pc: base.pc };
+        let (mut a, mut b) = (base.clone(), base);
+        let ra = legacy::execute(&dec, &mut a, &mut ma);
+        let rb = super::execute(&dec, &mut b, &mut mb);
+        recent.push_back(format!("#{i} {inst:?}"));
+        if recent.len() > 16 {
+            recent.pop_front();
+        }
+        assert_eq!(ra, rb, "{inst:?}: result");
+        if a != b {
+            panic!("{inst:?}: state differs: {:?}", state_diff(&a, &b));
+        }
+        assert_eq!(ma.misaligned_data.count, mb.misaligned_data.count, "{inst:?}: misaligned count");
+        assert_eq!(ma.misaligned_data.hits.last(), mb.misaligned_data.hits.last(), "{inst:?}: misaligned log");
+        {
+            let (ba, bb) = (ma.bank().unwrap().read(), mb.bank().unwrap().read());
+            assert_eq!(ba.mmio_history.len(), bb.mmio_history.len(), "{inst:?}: MMIO history length");
+            assert_eq!(format!("{:?}", ba.mmio_history.back()), format!("{:?}", bb.mmio_history.back()),
+                       "{inst:?}: MMIO history");
+        }
+        if i % 64 == 63 || i + 1 == n {
+            assert_eq!(format!("{:?}", ma.dcache_snapshot()), format!("{:?}", mb.dcache_snapshot()),
+                       "D-cache differs; last instructions: {recent:?}");
+        }
+        if i % 8192 == 8191 || i + 1 == n {
+            assert!(ma.sram_snapshot() == mb.sram_snapshot(), "SRAM differs; last instructions: {recent:?}");
+        }
+        *cover.entry((kind, region, size as u8, di)).or_default() += 1;
+    }
+    assert_eq!(cover.len(), 4 * 3 * 3 * 2, "memory/AUX coverage: {} of 72", cover.len());
+}
+
+/// The register-level AUX API of `CpuState` (now the generic semantics over
+/// `StateDom`) against the frozen one, on every address below 0x800.
+#[test]
+fn cpu_state_aux_api_matches_legacy() {
+    let mut rng = Rng::new(0xA0_0001);
+    for _ in 0..50 {
+        let base = random_state(&mut rng);
+        for addr in 0..0x800u32 {
+            let (mut a, mut b) = (base.clone(), base.clone());
+            assert_eq!(b.read_aux_reg(addr), legacy::regs::read_aux_reg(&a, addr), "read {addr:#x}");
+            let v = rng.word();
+            let ra = legacy::regs::write_aux_reg(&mut a, addr, v);
+            let rb = b.write_aux_reg(addr, v);
+            assert_same(&("write", addr, v), &ra, &rb, &a, &b);
+        }
+    }
 }

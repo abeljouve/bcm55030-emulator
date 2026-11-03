@@ -23,7 +23,7 @@ use bcm55030_emulator::soc::bank::BootMode;
 
 #[test]
 fn reading_aux_40c_returns_identity() {
-    let state = CpuState::new();
+    let mut state = CpuState::new();
     assert_eq!(
         state.read_aux_reg(AUX_IENABLE).unwrap(),
         IDENTITY_VALUE,
