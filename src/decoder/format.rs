@@ -180,10 +180,7 @@ fn format_mnemonic_and_operands(dec: &DecodedInstruction) -> (String, String) {
         ),
         Instruction::Flag { src, cc } => {
             let mut m = "flag".to_string();
-            if let Some(c) = cc {
-                m.push('.');
-                m.push_str(format_cond(*c));
-            }
+            push_cond(&mut m, *cc);
             (m, format_operand(*src))
         }
         Instruction::ExtArith {
@@ -319,10 +316,7 @@ fn format_branch(
 ) -> (String, String) {
     let base = if link { "bl" } else { "b" };
     let mut mnemonic = base.to_string();
-    if let Some(c) = cc {
-        mnemonic.push('.');
-        mnemonic.push_str(format_cond(c));
-    }
+    push_cond(&mut mnemonic, cc);
     if matches!(delay, DelayMode::Delay) {
         mnemonic.push_str(".d");
     }
@@ -375,10 +369,7 @@ fn format_jump(
 ) -> (String, String) {
     let base = if link { "jl" } else { "j" };
     let mut mnemonic = base.to_string();
-    if let Some(c) = cc {
-        mnemonic.push('.');
-        mnemonic.push_str(format_cond(c));
-    }
+    push_cond(&mut mnemonic, cc);
     if matches!(delay, DelayMode::Delay) {
         mnemonic.push_str(".d");
     }
@@ -475,10 +466,7 @@ fn writeback_suffix(wb: WritebackMode) -> &'static str {
 
 fn format_loop(pc: u32, offset: u32, cc: Option<ConditionCode>) -> (String, String) {
     let mut m = String::from("lp");
-    if let Some(c) = cc {
-        m.push('.');
-        m.push_str(format_cond(c));
-    }
+    push_cond(&mut m, cc);
     let target = (pc & !3).wrapping_add(offset); // PCL-relative (executor/special.rs uses pc & ~3)
     (m, format!("0x{:08X}", target))
 }
@@ -602,10 +590,7 @@ fn build_suffix(
     delay: bool,
 ) -> String {
     let mut m = base.to_string();
-    if let Some(c) = cc {
-        m.push('.');
-        m.push_str(format_cond(c));
-    }
+    push_cond(&mut m, cc);
     if set_flags {
         m.push_str(".f");
     }
@@ -613,6 +598,17 @@ fn build_suffix(
         m.push_str(".d");
     }
     m
+}
+
+/// Append `.<cond>` for a condition that is not "always"; AL has no suffix.
+fn push_cond(m: &mut String, cc: Option<ConditionCode>) {
+    if let Some(c) = cc {
+        let s = format_cond(c);
+        if !s.is_empty() {
+            m.push('.');
+            m.push_str(s);
+        }
+    }
 }
 
 fn format_cond(c: ConditionCode) -> &'static str {
@@ -674,4 +670,20 @@ fn hex_dump(raw: &[u8], insn_size: u8) -> String {
         out.push_str(&format!("{:02X}", b));
     }
     out
+}
+
+#[cfg(test)]
+mod cond_suffix_tests {
+    use super::*;
+
+    #[test]
+    fn always_condition_has_no_suffix() {
+        let mut m = "b".to_string();
+        push_cond(&mut m, Some(ConditionCode::AL));
+        m.push_str(".d");
+        assert_eq!(m, "b.d");
+        let mut m = "add".to_string();
+        push_cond(&mut m, Some(ConditionCode::NE));
+        assert_eq!(m, "add.ne");
+    }
 }
