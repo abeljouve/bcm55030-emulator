@@ -109,7 +109,19 @@ pub struct Cpu {
     /// with the feature off this field does not exist and the ISS is unchanged.
     #[cfg(feature = "timing")]
     pub timing_shadow: Option<crate::timing::TimingShadow>,
+
+    /// Diagnostic mode: when `true`, a vectored exception (Instruction Error,
+    /// SWI, TRAP) is returned from `step()` instead of being taken through the
+    /// vector table. Default `false`, which is what silicon does.
+    pub stop_on_exception: bool,
+    /// Exceptions taken through the vector table since construction.
+    pub exceptions_taken: u64,
+    /// The last exception taken through the vector table, and its PC.
+    pub last_exception: Option<(u32, Exception)>,
 }
+
+/// `AUX_IRQ_LV12` bit 1: set on entry to a level-2 handler.
+const LV12_L2: u32 = 1 << 1;
 
 impl Cpu {
     /// Create a CPU with flat memory (for tests / simple use).
@@ -132,6 +144,9 @@ impl Cpu {
             tight_loop_halts: false,
             #[cfg(feature = "timing")]
             timing_shadow: None,
+            stop_on_exception: false,
+            exceptions_taken: 0,
+            last_exception: None,
         }
     }
 
@@ -160,6 +175,9 @@ impl Cpu {
             tight_loop_halts: false,
             #[cfg(feature = "timing")]
             timing_shadow: None,
+            stop_on_exception: false,
+            exceptions_taken: 0,
+            last_exception: None,
         }
     }
 
@@ -337,6 +355,16 @@ impl Cpu {
             DelayState::None => None,
         };
 
+        match self.step_body(delay_info) {
+            Ok(()) => Ok(()),
+            Err(e) => self.take_exception(e, delay_info.map(|(target, _)| target)),
+        }
+    }
+
+    /// Fetch, decode and execute one instruction. An error leaves the PC on
+    /// the faulting instruction: the executor never moves it before failing.
+    #[inline(always)]
+    fn step_body(&mut self, delay_info: Option<(u32, bool)>) -> Result<(), Exception> {
         // Zero-overhead loop check (not during delay slots)
         if delay_info.is_none() && !self.state.flag_l {
             let lp_count = self.state.core_regs[REG_LP_COUNT as usize];
@@ -597,6 +625,85 @@ aliasing_fetch_line={:?} set_index={:?} starve={} cyc={} \
         Ok(())
     }
 
+    /// Take a synchronous exception, as this core does. Measured on silicon
+    /// for Instruction Error (unimplemented opcode, `rtie`), SWI and TRAP_S:
+    ///
+    /// - the core fetches from slot 2 of the vector table at INT_VECTOR_BASE;
+    /// - ILINK2 receives the address execution would have continued at: the
+    ///   next instruction, or the branch target when the faulting
+    ///   instruction sits in a delay slot;
+    /// - STATUS32_L2 receives STATUS32, and STATUS32 itself is left as it was
+    ///   (no AE, no A2, E1/E2 untouched while interrupts were masked; their
+    ///   fate with interrupts enabled is not measured);
+    /// - AUX_IRQ_LV12 bit 1 is set; BLINK, SP and the other registers are not
+    ///   touched, and a second exception taken without clearing anything
+    ///   behaves exactly like the first.
+    ///
+    /// `j.f [ilink2]` then resumes at the saved address with the saved flags.
+    /// Exception classes whose entry is not measured are returned unchanged,
+    /// and so stop the emulation.
+    #[cold]
+    #[inline(never)]
+    fn take_exception(&mut self, e: Exception, delay_target: Option<u32>) -> Result<(), Exception> {
+        if self.stop_on_exception || !e.is_vectored() {
+            return Err(e);
+        }
+        let fault_pc = self.state.pc;
+        let fallthrough = fault_pc.wrapping_add(self.faulting_size());
+        // From the vector table in SRAM at INT_VECTOR_BASE, never through the
+        // NCO alias that serves interrupt vectors: with both a `j @limm` NCO
+        // channel 2 and an SRAM slot 2 installed, silicon took the SRAM one.
+        let vector = self
+            .state
+            .aux_int_vector_base
+            .wrapping_add(e.vector_number() as u32 * 8);
+        // A fault on the vector itself would re-enter forever: there is
+        // nothing left to observe, so stop with the state intact instead.
+        if fault_pc == vector {
+            return Err(e);
+        }
+        self.state.delay_state = DelayState::None;
+        self.state.aux_status32_l2 = self.state.status32();
+        self.state.core_regs[REG_ILINK2 as usize] = delay_target.unwrap_or(fallthrough);
+        self.state.aux_irq_lv12 |= LV12_L2;
+        self.state.pc = vector;
+        self.exceptions_taken += 1;
+        if self.trace {
+            eprintln!(
+                "[EXC] {:?} at PC=0x{:08X} -> 0x{:08X}, ILINK2=0x{:08X}",
+                e, fault_pc, vector, self.state.core_regs[REG_ILINK2 as usize]
+            );
+        }
+        self.last_exception = Some((fault_pc, e));
+        Ok(())
+    }
+
+    /// Size of the faulting instruction at the PC. For one the decoder
+    /// rejects, the major opcode still says whether it is a 16- or a 32-bit
+    /// encoding; INFERRED: a LIMM such an encoding might carry is not counted.
+    fn faulting_size(&self) -> u32 {
+        match decoder::decode(self.state.pc, &self.mem) {
+            Ok(d) => d.total_size(),
+            Err(_) => match self.mem.fetch_half(self.state.pc) {
+                Ok(hw) if (hw >> 11) >= 0x0C => 2,
+                _ => 4,
+            },
+        }
+    }
+
+    /// Where the core fetches interrupt vector `n` from: the NCO channel when
+    /// one holds a `j @target` vector, otherwise the vector table in SRAM.
+    fn irq_vector_address(&self, n: u32) -> u32 {
+        let nco_target = self
+            .bank
+            .as_ref()
+            .and_then(|b| b.read().nco.interrupt_vector(n as u8));
+        match nco_target {
+            Some(target) => target,
+            None => self.state.aux_int_vector_base.wrapping_add(n * 8),
+        }
+    }
+
     pub fn run(&mut self, max_steps: u64) -> Result<(), Exception> {
         for _ in 0..max_steps {
             if self.state.halted || self.state.sleeping {
@@ -817,17 +924,10 @@ aliasing_fetch_line={:?} set_index={:?} starve={} cyc={} \
         // table serving as the ARC interrupt-vector table is verified
         // against real hardware. When the channel was never programmed
         // as a `j @limm` vector the model falls
-        // back to the SRAM IVT slot — covering reset, exception
-        // vectors, and any not-yet-installed channel.
-        let vector = irq;
-        let nco_target = self
-            .bank
-            .as_ref()
-            .and_then(|b| b.read().nco.interrupt_vector(vector as u8));
-        self.state.pc = match nco_target {
-            Some(target) => target,
-            None => self.state.aux_int_vector_base + vector * 8,
-        };
+        // back to the SRAM IVT slot — covering any not-yet-installed
+        // channel. Exceptions do not come through here: they always
+        // fetch from SRAM (`take_exception`).
+        self.state.pc = self.irq_vector_address(irq);
         self.state.pc_written = true;
 
         if self.trace {

@@ -15,7 +15,7 @@ pub enum Exception {
     /// Privilege violation: user mode accessing kernel resources (vector 0x06)
     PrivilegeViolation { address: u32 },
 
-    /// Trap / SWI (vector 0x07 for TRAP, 0x07 for SWI)
+    /// Trap / SWI (slot 2 on this core)
     Trap { param: u8 },
 
     /// Extension exception (vector 0x08)
@@ -45,7 +45,9 @@ impl Exception {
             Exception::InstructionError { .. } | Exception::MisalignedAccess { .. } => 0x02,
             Exception::MachineCheck => 0x04,
             Exception::PrivilegeViolation { .. } => 0x06,
-            Exception::Trap { .. } => 0x07,
+            // SWI and TRAP_S enter slot 2 on this core, like an Instruction
+            // Error, not the generic ARC 700 trap vector. -- OBSERVED on silicon.
+            Exception::Trap { .. } => 0x02,
             Exception::Extension => 0x08,
             Exception::Interrupt1 { irq } => 16 + irq,
             Exception::Interrupt2 { irq } => 16 + irq,
@@ -53,19 +55,11 @@ impl Exception {
         }
     }
 
-    /// Encode ECR: [31:24] reserved | [23:16] vector | [15:8] cause | [7:0] param
-    pub fn encode_ecr(&self) -> u32 {
-        let vector = self.vector_number() as u32;
-        let (cause, param) = match self {
-            Exception::MemoryError { is_write, .. } => {
-                (if *is_write { 0x02 } else { 0x01 }, 0x00)
-            }
-            Exception::InstructionError { .. } => (0x02, 0x00),
-            Exception::MisalignedAccess { .. } => (0x01, 0x00),
-            Exception::PrivilegeViolation { .. } => (0x01, 0x00),
-            Exception::Trap { param } => (0x01, *param as u32),
-            _ => (0x00, 0x00),
-        };
-        (vector << 16) | (cause << 8) | param
+    /// Whether the core takes this exception through its vector table. Only
+    /// the classes whose entry was measured on silicon are vectored; the
+    /// others (bus errors, misaligned or privileged accesses) still stop the
+    /// emulation, because what this core does on them is not known.
+    pub fn is_vectored(&self) -> bool {
+        matches!(self, Exception::InstructionError { .. } | Exception::Trap { .. })
     }
 }

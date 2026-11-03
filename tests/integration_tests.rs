@@ -414,6 +414,7 @@ fn test_multiply_is_absent() {
         .emit32(alu32(0x1A, 1, 2, 0, 0b00, false))  // MPY r0, r1, r2
         .emit16(brk_s())
         .run(2);
+    cpu.stop_on_exception = true;
     assert_eq!(cpu.step(), Err(Exception::InstructionError { address: 4 }));
     assert_eq!(cpu.state.core_regs[0], 0);
 }
