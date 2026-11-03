@@ -19,7 +19,7 @@
 //! variant the formatter doesn't yet handle — the UI sees a raw
 //! debug string rather than a missing line.
 
-use crate::cpu::condition::ConditionCode;
+use crate::condition::ConditionCode;
 use crate::decoder::instruction::{
     AluOp, BrCompareKind, DataSize, DecodedInstruction, DelayMode, ExtArithOp, Instruction,
     Operand, SingleOp, WritebackMode, ZeroOp,

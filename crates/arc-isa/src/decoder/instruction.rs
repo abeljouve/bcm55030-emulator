@@ -1,4 +1,4 @@
-use crate::cpu::condition::ConditionCode;
+use crate::condition::ConditionCode;
 
 /// Operand for a decoded instruction
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +48,7 @@ pub enum AluOp {
 }
 
 impl AluOp {
+    #[inline]
     pub fn from_u8(val: u8) -> Option<Self> {
         match val {
             0x00 => Some(Self::Add),
@@ -85,11 +86,13 @@ impl AluOp {
     }
 
     /// Whether this op discards the result (only sets flags)
+    #[inline]
     pub fn is_test_only(self) -> bool {
         matches!(self, Self::Tst | Self::Cmp | Self::Rcmp | Self::Btst)
     }
 
     /// Whether this is a MOV (single source operand from C, not B)
+    #[inline]
     pub fn is_mov(self) -> bool {
         matches!(self, Self::Mov)
     }
@@ -97,6 +100,7 @@ impl AluOp {
     /// Opcodes this core does not implement: they decode (so they can be
     /// disassembled) but raise an Instruction Error when executed. Observed
     /// on silicon for every MPY variant (`MULTIPLY_BUILD` = 0 agrees).
+    #[inline]
     pub fn is_absent_on_core(self) -> bool {
         matches!(self, Self::Mpy | Self::Mpyh | Self::Mpyu | Self::Mpyhu)
     }
@@ -118,27 +122,6 @@ pub enum SingleOp {
     Not,    // 0x0A - bitwise NOT
     Rlc,    // 0x0B - rotate left through carry
     Ex,     // 0x16 - atomic exchange
-}
-
-impl SingleOp {
-    pub fn from_u8(val: u8) -> Option<Self> {
-        match val {
-            0x00 => Some(Self::Asl),
-            0x01 => Some(Self::Lsr),
-            0x02 => Some(Self::Asr),
-            0x03 => Some(Self::Ror),
-            0x04 => Some(Self::Rrc),
-            0x05 => Some(Self::Sexb),
-            0x06 => Some(Self::Sexw),
-            0x07 => Some(Self::Extb),
-            0x08 => Some(Self::Extw),
-            0x09 => Some(Self::Abs),
-            0x0A => Some(Self::Not),
-            0x0B => Some(Self::Rlc),
-            0x16 => Some(Self::Ex),
-            _ => None,
-        }
-    }
 }
 
 /// Zero-operand instructions
@@ -186,6 +169,7 @@ impl ExtArithOp {
     /// Opcodes this core does not implement: they decode but raise an
     /// Instruction Error when executed. Observed on silicon for the whole
     /// saturating/DSP group; the barrel shifts, NORM, NORMW and SWAP execute.
+    #[inline]
     pub fn is_absent_on_core(self) -> bool {
         !matches!(
             self,
@@ -232,6 +216,7 @@ pub enum BrCompareKind {
 }
 
 impl BrCompareKind {
+    #[inline]
     pub fn from_u8(val: u8) -> Option<Self> {
         match val {
             0x00 => Some(Self::Breq),
@@ -371,6 +356,7 @@ pub struct DecodedInstruction {
 
 impl DecodedInstruction {
     /// Total size in bytes including LIMM
+    #[inline]
     pub fn total_size(&self) -> u32 {
         self.size as u32 + if self.has_limm { 4 } else { 0 }
     }
