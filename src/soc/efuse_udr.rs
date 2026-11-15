@@ -20,9 +20,18 @@
 //! This peripheral preserves that exact behaviour and removes the
 //! last special arms from `sysreg_shim`.
 //!
-//! The eFuse blob itself lives in SRAM (80 bytes). It is not
-//! modelled as MMIO here — the firmware already copies it into
-//! SRAM during its own init sequence.
+//! ## The scan-out
+//!
+//! The 640-bit array is shifted out on bit 31 of `0x04C` once bit 0 of
+//! `0x048` (read enable) is set: the first bit is present at once, each
+//! clock pulse brings the next. Bits come most significant first, from
+//! the last byte of the 80-byte array down to the first. Observed on
+//! hardware: a reader that follows that order reproduces the array a
+//! device prints. Outside a scan-out the data line reads high.
+//!
+//! The array ships as all ones, a synthetic placeholder that reads the
+//! same as the idle data line: a real device's contents are loaded at
+//! run time ([`EfuseUdr::load_array`]).
 
 use crate::cpu::exception::Exception;
 use crate::soc::peripheral::{
@@ -43,6 +52,13 @@ const EFUSE_RANGES: &[AddressRange] = &[AddressRange::new(0x0100_0040, 0x0100_00
 /// peripheral owns its own clear semantic.
 const CMD_BIT_MASK: u32 = 0xF800_0000;
 
+/// Bytes in the fuse array (640 bits).
+pub const ARRAY_LEN: usize = 80;
+/// `0x048` bit 0: read enable, the scan-out is running.
+const READ_EN: u32 = 1 << 0;
+/// Bit 31 of `0x048` / `0x04C`: the handshake flag and the serial data.
+const LINE: u32 = 1 << 31;
+
 #[derive(Clone)]
 pub struct EfuseUdr {
     reg_clk_reset: u32,
@@ -52,7 +68,10 @@ pub struct EfuseUdr {
     sda_clear: u32,
     scl_clear: u32,
     clock_toggles: u32,
-    efuse_snapshot: Vec<u8>,
+    /// The fuse array, as a device prints it (byte 0 first).
+    array: [u8; ARRAY_LEN],
+    /// Bits shifted out since read enable was set.
+    shift_pos: usize,
     pub trace: bool,
 }
 
@@ -66,9 +85,30 @@ impl EfuseUdr {
             sda_clear: 0,
             scl_clear: 0,
             clock_toggles: 0,
-            efuse_snapshot: vec![0xFFu8; 80],
+            array: [0xFF; ARRAY_LEN],
+            shift_pos: 0,
             trace: false,
         }
+    }
+
+    /// Replace the fuse array with a device's own, exactly [`ARRAY_LEN`]
+    /// bytes in the order a device prints them.
+    pub fn load_array(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let array: [u8; ARRAY_LEN] = bytes
+            .try_into()
+            .map_err(|_| format!("eFuse array must be {ARRAY_LEN} bytes, got {}", bytes.len()))?;
+        self.array = array;
+        Ok(())
+    }
+
+    /// The serial data line: the array bit under the shift position while a
+    /// scan-out runs, high otherwise and past the end of the array.
+    fn data_line(&self) -> bool {
+        if self.reg_sda & READ_EN == 0 || self.shift_pos >= ARRAY_LEN * 8 {
+            return true;
+        }
+        let byte = self.array[ARRAY_LEN - 1 - self.shift_pos / 8];
+        byte & (0x80 >> (self.shift_pos % 8)) != 0
     }
 
     #[inline]
@@ -133,7 +173,7 @@ impl Peripheral for EfuseUdr {
                     self.reg_scl &= !self.scl_clear;
                     self.scl_clear = 0;
                 }
-                Ok(base | 0x8000_0000)
+                Ok(if self.data_line() { base | LINE } else { base & !LINE })
             }
             _ => Ok(0),
         }
@@ -153,6 +193,10 @@ impl Peripheral for EfuseUdr {
                 }
             }
             REG_I2C_UDR_SDA => {
+                // Read enable rising: the scan-out starts at the first bit.
+                if val & READ_EN != 0 && self.reg_sda & READ_EN == 0 {
+                    self.shift_pos = 0;
+                }
                 self.reg_sda = val;
                 if cmd_bits != 0 {
                     self.sda_clear = cmd_bits;
@@ -162,6 +206,9 @@ impl Peripheral for EfuseUdr {
                 // Bit 0 rising edge = SCL clock pulse.
                 if (val & 1) != 0 && (self.reg_scl & 1) == 0 {
                     self.clock_toggles = self.clock_toggles.wrapping_add(1);
+                    if self.reg_sda & READ_EN != 0 {
+                        self.shift_pos = self.shift_pos.saturating_add(1);
+                    }
                 }
                 self.reg_scl = val;
                 if cmd_bits != 0 {
@@ -183,6 +230,8 @@ impl Peripheral for EfuseUdr {
         self.sda_clear = 0;
         self.scl_clear = 0;
         self.clock_toggles = 0;
+        // The array itself is fuses: a reset does not change it.
+        self.shift_pos = 0;
         self.apply_silicon_power_on();
     }
 
@@ -202,10 +251,12 @@ impl Peripheral for EfuseUdr {
         match event {
             PeripheralEvent::Efuse(ev) => match ev {
                 EfuseEvent::SetSnapshot(bytes) => {
-                    self.efuse_snapshot = bytes.iter().take(80).copied().collect();
-                    while self.efuse_snapshot.len() < 80 {
-                        self.efuse_snapshot.push(0xFF);
+                    // A short input leaves the rest at the placeholder value.
+                    let mut array = [0xFFu8; ARRAY_LEN];
+                    for (dst, src) in array.iter_mut().zip(bytes.iter()) {
+                        *dst = *src;
                     }
+                    self.array = array;
                     Ok(())
                 }
             },
@@ -233,9 +284,78 @@ mod tests {
     }
 
     #[test]
-    fn scl_always_high_bit() {
+    fn data_line_high_outside_a_scan_out() {
         let mut e = EfuseUdr::new();
-        assert_eq!(e.read_word(REG_I2C_UDR_SCL).unwrap() & 0x8000_0000, 0x8000_0000);
+        assert_eq!(e.read_word(REG_I2C_UDR_SCL).unwrap() & LINE, LINE);
+    }
+
+    fn pulse(e: &mut EfuseUdr) {
+        let v = e.read_word(REG_I2C_UDR_SCL).unwrap();
+        e.write_word(REG_I2C_UDR_SCL, v | 1).unwrap();
+        let v = e.read_word(REG_I2C_UDR_SCL).unwrap();
+        e.write_word(REG_I2C_UDR_SCL, v & !1).unwrap();
+    }
+
+    fn data_bit(e: &mut EfuseUdr) -> u8 {
+        (e.read_word(REG_I2C_UDR_SCL).unwrap() >> 31) as u8
+    }
+
+    /// The scan-out a reader performs: enable, preamble, start handshake,
+    /// 640 bits most significant first into a buffer filled from its last
+    /// byte down, trailer.
+    fn scan_out(e: &mut EfuseUdr) -> [u8; ARRAY_LEN] {
+        e.write_word(REG_I2C_UDR_SDA, 0).unwrap();
+        e.write_word(REG_I2C_UDR_CLK_RESET, 0x8000).unwrap();
+        for _ in 0..16 {
+            pulse(e);
+        }
+        e.write_word(REG_I2C_UDR_SDA, 0x10).unwrap();
+        pulse(e);
+        assert_eq!(e.read_word(REG_I2C_UDR_SDA).unwrap() & LINE, 0);
+        e.write_word(REG_I2C_UDR_SDA, 0).unwrap();
+        pulse(e);
+        assert_eq!(e.read_word(REG_I2C_UDR_SDA).unwrap() & LINE, LINE);
+        e.write_word(REG_I2C_UDR_SDA, READ_EN).unwrap();
+        let mut buf = [0u8; ARRAY_LEN];
+        for bit in 0..ARRAY_LEN * 8 {
+            if bit != 0 {
+                pulse(e);
+            }
+            buf[ARRAY_LEN - 1 - bit / 8] |= data_bit(e) << (7 - bit % 8);
+        }
+        e.write_word(REG_I2C_UDR_SDA, 0).unwrap();
+        for _ in 0..16 {
+            pulse(e);
+        }
+        e.write_word(REG_I2C_UDR_CLK_RESET, 0).unwrap();
+        buf
+    }
+
+    #[test]
+    fn scan_out_returns_the_loaded_array() {
+        let mut e = EfuseUdr::new();
+        let array: [u8; ARRAY_LEN] = core::array::from_fn(|i| (i as u8).wrapping_mul(37) ^ 0x5A);
+        e.load_array(&array).unwrap();
+        assert_eq!(scan_out(&mut e), array);
+        // A second scan-out starts again from the first bit.
+        assert_eq!(scan_out(&mut e), array);
+    }
+
+    #[test]
+    fn placeholder_array_by_default_and_kept_across_reset() {
+        let mut e = EfuseUdr::new();
+        assert_eq!(scan_out(&mut e), [0xFF; ARRAY_LEN]);
+        let array = [0xA5; ARRAY_LEN];
+        e.load_array(&array).unwrap();
+        e.reset_cold();
+        assert_eq!(scan_out(&mut e), array);
+    }
+
+    #[test]
+    fn load_array_refuses_a_wrong_length() {
+        let mut e = EfuseUdr::new();
+        assert!(e.load_array(&[0; ARRAY_LEN - 1]).is_err());
+        assert!(e.load_array(&[0; ARRAY_LEN + 1]).is_err());
     }
 
     #[test]

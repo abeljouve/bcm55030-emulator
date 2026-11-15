@@ -40,6 +40,7 @@ fn usage(prog: &str) {
     eprintln!("  --trace-mmio-range S:E      Restrict --trace-mmio-seq to [S,E) (hex, repeatable)");
     eprintln!("  --scenario <FILE>           Load a JSON scenario file at startup");
     eprintln!("  --sfp-eeprom <FILE>         Load SFP EEPROM pages from a raw dump (256B A0h, or 512B A0h+A2h)");
+    eprintln!("  --efuse <FILE>              Load the 80-byte eFuse array from a raw dump (all ones by default)");
     eprintln!("  --mcp-port <PORT>           Start MCP server on PORT (enables worker mode)");
     eprintln!("  --olt-mac <MAC>             OLT MAC address (AA:BB:CC:DD:EE:FF)");
     eprintln!("  --olt-attributes <L,L,..>   Attribute leaves the peer reads, hex (e.g. 3,6,e)");
@@ -81,6 +82,7 @@ struct Config {
     trace_mmio_ranges: Vec<(u32, u32)>,
     scenario_path: Option<String>,
     sfp_eeprom_path: Option<String>,
+    efuse_path: Option<String>,
     mcp_port: Option<u16>,
     olt_mac: Option<[u8; 6]>,
     /// `--olt-attributes`: leaves the peer reads in rotation. Widen it to
@@ -140,6 +142,7 @@ fn parse_args() -> Config {
         trace_mmio_ranges: Vec::new(),
         scenario_path: None,
         sfp_eeprom_path: None,
+        efuse_path: None,
         mcp_port: None,
         olt_mac: None,
         olt_attributes: None,
@@ -295,6 +298,14 @@ fn parse_args() -> Config {
                     process::exit(1);
                 }
                 cfg.sfp_eeprom_path = Some(args[i].clone());
+            }
+            "--efuse" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --efuse requires a file path");
+                    process::exit(1);
+                }
+                cfg.efuse_path = Some(args[i].clone());
             }
             "--mcp-port" => {
                 i += 1;
@@ -776,6 +787,19 @@ fn main() {
             Ok(n) => eprintln!("[scenario] loaded {} entries from {}", n, path),
             Err(e) => {
                 eprintln!("Error loading --scenario {}: {}", path, e);
+                process::exit(1);
+            }
+        }
+    }
+
+    if let Some(ref path) = cfg.efuse_path {
+        let loaded = std::fs::read(path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| cpu.bank().unwrap().write().efuse_udr.load_array(&bytes));
+        match loaded {
+            Ok(()) => eprintln!("[efuse] loaded {}", path),
+            Err(e) => {
+                eprintln!("Error in --efuse {}: {}", path, e);
                 process::exit(1);
             }
         }
