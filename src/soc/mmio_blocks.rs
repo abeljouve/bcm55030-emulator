@@ -411,8 +411,8 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     }),
     (0x01000C04, RegInfo {
         block_id: 15, block_name: "MACsec SA Programming 10G",
-        reg_name: "SA_CONFIG_2", access: "W",
-        desc: "Config secondaire (0xffffffff = all enabled)",
+        reg_name: "C00_EVENT_LATCH", access: "W1C",
+        desc: "Latched events, write 1 to clear (written all ones at init, reads back 0)",
     }),
     (0x01000C0C, RegInfo {
         block_id: 13, block_name: "MACsec PN Threshold Engine",

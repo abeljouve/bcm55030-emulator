@@ -115,6 +115,11 @@ const REG_MDIO_COMMAND: u32 = 0x0100_0060;
 /// 1G PHY link status. Bit 1 = link change (W1C).
 const REG_1G_LINK_STATUS: u32 = 0x0100_0410;
 const REG_HW_STATE_STATUS: u32 = 0x0100_0E04;
+/// Latched events of the block at `0x0100_0C00`, write-1-to-clear. Observed
+/// on hardware: a word written all ones reads back `0` without signal and
+/// `0x10` on a receiving unit, never the ones written. Nothing in this model
+/// raises an event here, so it reads `0`.
+const REG_C00_EVENT_LATCH: u32 = 0x0100_0C04;
 const REG_SPECIAL_0064: u32 = 0x0100_0064;
 /// MPCP-adjacent command latch. The firmware writes a value with bits
 /// `[31:27]` set (command opcode) and polls the register for those bits
@@ -179,6 +184,7 @@ pub struct EponMac {
     active_flags: u32,
     link_status_1g: u32,
     hw_state_status: u32,
+    c00_event_latch: u32,
     discovery_status: u32,
     /// REG_SPECIAL_0064 backing store. Silicon power-on is zero
     /// (observed on hardware); firmware programs this register during
@@ -211,6 +217,7 @@ impl EponMac {
             active_flags: 0,
             link_status_1g: 0,
             hw_state_status: 0,
+            c00_event_latch: 0,
             discovery_status: 0,
             special_0064: 0,
             trace: false,
@@ -299,7 +306,8 @@ impl EponMac {
             | REG_LLID_MASK_CONTROL | REG_LLID_COUNTER_MASK | REG_TX_GRANT_MASK
             | REG_RX_GRANT_MASK | REG_IRQ_MASK | REG_EPON_STATUS | REG_ACTIVE_FLAGS
             | REG_MDIO_COMMAND | REG_SPECIAL_0064
-            | REG_1G_LINK_STATUS | REG_HW_STATE_STATUS | REG_DISCOVERY_STATUS => true,
+            | REG_1G_LINK_STATUS | REG_HW_STATE_STATUS | REG_C00_EVENT_LATCH
+            | REG_DISCOVERY_STATUS => true,
             _ => {
                 (EPON_TABLE_BASE..EPON_TABLE_END).contains(&addr)
                     || (EPON_LLID_BASE..EPON_LLID_TOP).contains(&addr)
@@ -431,7 +439,7 @@ impl EponMac {
     fn write_store_no_side_effects(&mut self, addr: u32, val: u32) {
         match addr {
             REG_CHIP_ID | REG_CHIP_REV | REG_MDIO_COMMAND
-            | REG_HW_STATE_STATUS => {
+            | REG_HW_STATE_STATUS | REG_C00_EVENT_LATCH => {
                 // Fixed / read-only values — ignore power-on seed.
             }
             REG_SPECIAL_0064 => self.special_0064 = val,
@@ -494,6 +502,7 @@ impl Peripheral for EponMac {
             REG_SPECIAL_0064 => return Ok(self.special_0064),
             REG_1G_LINK_STATUS => return Ok(self.link_status_1g),
             REG_HW_STATE_STATUS => return Ok(self.hw_state_status),
+            REG_C00_EVENT_LATCH => return Ok(self.c00_event_latch),
             REG_DISCOVERY_STATUS => return Ok(self.discovery_status),
             _ => {}
         }
@@ -537,6 +546,7 @@ impl Peripheral for EponMac {
             REG_MDIO_COMMAND => return Ok(0),
             REG_1G_LINK_STATUS => return Ok(self.link_status_1g),
             REG_HW_STATE_STATUS => return Ok(self.hw_state_status),
+            REG_C00_EVENT_LATCH => return Ok(self.c00_event_latch),
             REG_SPECIAL_0064 => return Ok(self.special_0064),
             REG_DISCOVERY_STATUS => return Ok(self.discovery_status),
             _ => {}
@@ -619,6 +629,11 @@ impl Peripheral for EponMac {
             REG_HW_STATE_STATUS => {
                 // W1C: bits written as 1 are cleared.
                 self.hw_state_status &= !val;
+                return Ok(());
+            }
+            REG_C00_EVENT_LATCH => {
+                // W1C: bits written as 1 are cleared.
+                self.c00_event_latch &= !val;
                 return Ok(());
             }
             REG_SPECIAL_0064 => {
@@ -715,6 +730,7 @@ impl Peripheral for EponMac {
         self.active_flags = 0;
         self.link_status_1g = 0;
         self.hw_state_status = 0;
+        self.c00_event_latch = 0;
         self.discovery_status = 0;
         self.special_0064 = 0;
         // Apply silicon power-on snapshot (covers table_store /
@@ -990,4 +1006,17 @@ mod tests {
         m.write_word(0x0100_143C, 0x0F).unwrap();
         assert_ne!(m.read_word(0x0100_143C).unwrap() & 0x100, 0);
     }
+    #[test]
+    fn c00_event_latch_does_not_read_back_written_ones() {
+        let mut m = EponMac::new();
+        m.write_word(REG_C00_EVENT_LATCH, 0xFFFF_FFFF).unwrap();
+        assert_eq!(m.read_word(REG_C00_EVENT_LATCH).unwrap(), 0);
+        // A latched event is cleared by writing a one to it, and only then.
+        m.c00_event_latch = 0x10;
+        m.write_word(REG_C00_EVENT_LATCH, 0x01).unwrap();
+        assert_eq!(m.read_word(REG_C00_EVENT_LATCH).unwrap(), 0x10);
+        m.write_word(REG_C00_EVENT_LATCH, 0x10).unwrap();
+        assert_eq!(m.read_word(REG_C00_EVENT_LATCH).unwrap(), 0);
+    }
+
 }
