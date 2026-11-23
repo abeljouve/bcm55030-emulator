@@ -90,6 +90,9 @@ pub struct OltConfig {
     /// Attribute leaves read in rotation. Widen it to survey what the ONU
     /// answers to.
     pub polled_attributes: Vec<u16>,
+    /// OAMPDUs go to the ONU's own address once it is known, rather than to
+    /// the slow-protocol group address.
+    pub unicast_oam: bool,
 }
 
 impl Default for OltConfig {
@@ -103,6 +106,7 @@ impl Default for OltConfig {
             onu_mac_override: None,
             time_scale: DEFAULT_TIME_SCALE,
             polled_attributes: peer.polled_attributes,
+            unicast_oam: peer.unicast_oam,
         }
     }
 }
@@ -354,6 +358,11 @@ impl Olt {
 
     /// Have the peer play `script` once OAM discovery has converged.
     pub fn set_script(&mut self, script: epon_olt::script::Script) {
+        // The configuration is pushed to the peer on every tick, so what the
+        // script says about addressing has to live there to outlast one.
+        if let Some(multicast) = script.multicast_oam {
+            self.config.unicast_oam = !multicast;
+        }
         self.link.peer.set_script(script);
         self.carry_downstream();
     }
@@ -824,6 +833,7 @@ fn peer_config(config: &OltConfig) -> PeerConfig {
         oam_interval: WireDuration::from_ms(config.oam_interval_ms.max(1)),
         gate_interval: WireDuration::from_ms(config.gate_interval_ms.max(1)),
         polled_attributes: config.polled_attributes.clone(),
+        unicast_oam: config.unicast_oam,
         ..PeerConfig::default()
     }
 }

@@ -401,3 +401,14 @@ fn cold_reset_keeps_the_configured_llid() {
     olt.reset_cold();
     assert_eq!(olt.assigned_llid(), 0x3C67);
 }
+
+/// The configuration is pushed to the peer on every tick, so a choice the
+/// script makes has to be part of it or it lasts one tick.
+#[test]
+fn what_a_script_says_about_addressing_outlasts_a_tick() {
+    let mut olt = live_olt();
+    assert!(olt.link.peer.config.unicast_oam, "the default is the ONU's own address");
+    olt.set_script(script::Script::parse("oam-destination multicast\n").expect("the fixture parses"));
+    run(&mut olt, 3);
+    assert!(!olt.link.peer.config.unicast_oam);
+}
