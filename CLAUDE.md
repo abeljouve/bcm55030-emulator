@@ -61,6 +61,7 @@ cargo run -p epon-olt --bin olt -- dissect <hex>
 | `oam.rs` | OAMPDU encode/decode (clause 57) |
 | `extended.rs` | organization-specific OAMPDUs and their variables |
 | `rule_list.rs` | classifier rule lists carried as extended-OAM variables |
+| `script.rs` | a provisioning exchange read from a file, played reactively |
 | `decode.rs` | frame dissection, shared by the MCP tools and the GUI |
 
 What stays in `src/soc/olt` is the join: the frame-queue mailbox, and the

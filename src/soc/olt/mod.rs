@@ -34,7 +34,7 @@ use mailbox::{Command, Slot, TxAssembler};
 
 // The protocol modules are re-exported so consumers keep addressing them
 // through this module: they are the same types the peer works with.
-pub use epon_olt::{decode, extended, mpcp, oam, rule_list, state, types};
+pub use epon_olt::{decode, extended, mpcp, oam, rule_list, script, state, types};
 pub use epon_olt::{Body as OltBody, Counters as OltCounters, LoggedFrame as OltFrame};
 
 pub use epon_olt::state::MpcpState as OltMpcpState;
@@ -350,6 +350,28 @@ impl Olt {
         let frame = self.link.peer.send_extended(oui, code, payload);
         self.carry_downstream();
         frame
+    }
+
+    /// Have the peer play `script` once OAM discovery has converged.
+    pub fn set_script(&mut self, script: epon_olt::script::Script) {
+        self.link.peer.set_script(script);
+        self.carry_downstream();
+    }
+
+    /// The script the peer is playing, if it was given one.
+    pub fn script(&self) -> Option<&epon_olt::script::Player> {
+        self.link.peer.script()
+    }
+
+    /// Keep every frame the firmware transmits, for [`Self::take_upstream`].
+    pub fn tap_upstream(&mut self) {
+        self.link.peer.tap_upstream();
+    }
+
+    /// Take the transmitted frames kept since the last call, as they reached
+    /// the peer.
+    pub fn take_upstream(&mut self) -> Vec<OltFrame> {
+        self.link.peer.take_upstream()
     }
 
     /// Build and queue a message on an organization-specific channel. The

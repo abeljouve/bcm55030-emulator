@@ -27,6 +27,7 @@ use crate::mpcp::{self, GateFlags, Grant, RegisterFlag, RegisterReqFlag};
 use crate::oam;
 use crate::rule_list::RuleListUpdate;
 use crate::sched::Scheduler;
+use crate::script::{self, Player, Script};
 use crate::state::MpcpState;
 use crate::types::{EtherType, Llid, MacAddr};
 
@@ -141,6 +142,8 @@ pub enum Timer {
     /// Issue the next normal GATE. Only armed while registered — a grant
     /// window means nothing to an ONU that has no LLID.
     NormalGate,
+    /// Carry on with the script: a wait, a deadline or a teardown is due.
+    Script,
 }
 
 /// How the peer behaves. Every interval is link time.
@@ -367,6 +370,13 @@ pub struct Peer {
     llid_assignment: Option<u16>,
     /// A registration completed and the host has not been told yet.
     registration_complete: bool,
+
+    /// The exchange to play once discovery has converged, in place of the
+    /// attribute rotation and of the registration's fixed lifetime.
+    script: Option<Player>,
+    /// Every upstream frame as it arrived, when the host asked for them.
+    /// The frame logs are capped for a display; a comparison needs them all.
+    upstream_tap: Option<Vec<LoggedFrame>>,
 }
 
 impl Default for Peer {
@@ -400,6 +410,8 @@ impl Peer {
             counters: Counters::default(),
             llid_assignment: None,
             registration_complete: false,
+            script: None,
+            upstream_tap: None,
         }
     }
 
@@ -483,7 +495,62 @@ impl Peer {
                 self.settling = false;
                 self.register_requests_seen = 0;
             }
+            Timer::Script => {
+                let now = self.now;
+                let commands = self.script.as_mut().map(|p| p.resume(now)).unwrap_or_default();
+                self.obey(commands);
+            }
         }
+    }
+
+    // ── Script ──────────────────────────────────────────────────────
+
+    /// Play `script` once discovery has converged.
+    ///
+    /// A scripted peer leaves the extended channel to the script: it does not
+    /// read attributes in rotation, and it does not end the registration on a
+    /// timer of its own. Both would be traffic the script did not ask for.
+    pub fn set_script(&mut self, script: Script) {
+        self.script = Some(Player::new(script));
+        self.sched.cancel(Timer::AttributePoll);
+        self.sched.cancel(Timer::Lifetime);
+        if self.discovery.converged() {
+            self.start_script();
+        }
+    }
+
+    /// The script being played, if there is one.
+    pub fn script(&self) -> Option<&Player> {
+        self.script.as_ref()
+    }
+
+    fn start_script(&mut self) {
+        let now = self.now;
+        let commands = self.script.as_mut().map(|p| p.start(now)).unwrap_or_default();
+        self.obey(commands);
+    }
+
+    /// Do what the script decided.
+    fn obey(&mut self, commands: Vec<script::Command>) {
+        for command in commands {
+            match command {
+                script::Command::Send { oui, code, body } => {
+                    self.send_extended(oui, code, &body);
+                }
+                script::Command::Deregister => self.tear_down_registration(),
+                script::Command::WakeAt(at) => self.sched.arm_at(Timer::Script, at),
+            }
+        }
+    }
+
+    /// Keep every upstream frame for the host to take, from now on.
+    pub fn tap_upstream(&mut self) {
+        self.upstream_tap.get_or_insert_with(Vec::new);
+    }
+
+    /// Take the upstream frames kept since the last call.
+    pub fn take_upstream(&mut self) -> Vec<LoggedFrame> {
+        self.upstream_tap.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
     // ── Link ────────────────────────────────────────────────────────
@@ -536,6 +603,9 @@ impl Peer {
             }
         };
         let entry = self.frame_entry(frame, &description);
+        if let Some(tap) = self.upstream_tap.as_mut() {
+            tap.push(entry.clone());
+        }
         push_capped(&mut self.tx_log, entry);
     }
 
@@ -640,7 +710,9 @@ impl Peer {
         self.registration_complete = true;
         self.registered_at = Some(self.now);
         self.counters.registrations += 1;
-        self.sched.arm_in(Timer::Lifetime, self.now, self.config.registration_lifetime);
+        if self.script.is_none() {
+            self.sched.arm_in(Timer::Lifetime, self.now, self.config.registration_lifetime);
+        }
         // The grant windows start once there is an LLID to address them to.
         self.sched.arm_in(Timer::NormalGate, self.now, self.config.normal_gate_interval);
         let c = self.counters;
@@ -658,7 +730,7 @@ impl Peer {
 
     fn on_oam(&mut self, frame: &[u8]) -> String {
         if let Some(pdu) = extended::Pdu::parse(frame) {
-            return self.on_extended(pdu);
+            return self.on_extended(pdu, frame);
         }
         let Some(pdu) = oam::Pdu::parse(frame) else {
             return "malformed OAMPDU".into();
@@ -690,7 +762,22 @@ impl Peer {
     /// reply. A body whose shape is [`BodyShape::Opaque`] was never parsed, so
     /// counting anything in it as an answered variable puts a number on
     /// containers that were never there.
-    fn on_extended(&mut self, pdu: extended::Pdu) -> String {
+    fn on_extended(&mut self, pdu: extended::Pdu, frame: &[u8]) -> String {
+        if self.script.is_some() {
+            let now = self.now;
+            // A frame check sequence is the MAC's, not the message's; a frame
+            // handed over without one keeps all its octets.
+            let fcs = if crate::fcs::is_valid(frame) { crate::fcs::FCS_LEN } else { 0 };
+            let end = (frame.len() - fcs).max(extended::BODY_OFFSET);
+            let body = frame.get(extended::BODY_OFFSET..end).unwrap_or(&[]);
+            let (oui, code) = (pdu.oui, pdu.channel.code());
+            let commands = self
+                .script
+                .as_mut()
+                .map(|p| p.on_upstream(oui, code, body, now))
+                .unwrap_or_default();
+            self.obey(commands);
+        }
         if let Some(span) = pdu.opaque_body {
             self.counters.extended_opaque_bodies_seen += 1;
             return format!(
@@ -765,7 +852,11 @@ impl Peer {
     /// it — rather than being tried every time round the loop.
     fn on_discovery_entered(&mut self, state: oam::DiscoveryState) {
         if state == oam::DiscoveryState::Converged {
-            self.sched.arm_at(Timer::AttributePoll, self.now);
+            if self.script.is_some() {
+                self.start_script();
+            } else {
+                self.sched.arm_at(Timer::AttributePoll, self.now);
+            }
         } else {
             self.sched.cancel(Timer::AttributePoll);
         }
@@ -1580,5 +1671,120 @@ mod tests {
         assert!(peer.discovery().converged());
         peer.advance_to(at(30_002));
         assert_eq!(peer.counters.attribute_requests_sent, 1);
+    }
+
+    /// An identifier no container on this link uses, for scripted traffic.
+    const SCRIPT_OUI: oam::Oui = oam::Oui([0xAA, 0xBB, 0xCC]);
+    const SCRIPT_REQUEST: u8 = 0x10;
+    const SCRIPT_ANSWER: u8 = 0x11;
+
+    /// One request whose answer has to start with `80`.
+    const SCRIPT: &str = "\
+        send   AABBCC/10 01\n\
+        expect AABBCC/11 80 within 500 mismatch deregister-after 10 timeout deregister-after 2000\n\
+        send   AABBCC/10 02\n";
+
+    /// A registered, converged peer playing [`SCRIPT`], and the instant the
+    /// script started at.
+    fn scripted_peer() -> (Peer, u64) {
+        let mut peer = live_peer();
+        peer.set_script(Script::parse(SCRIPT).expect("the fixture parses"));
+        peer.advance_to(at(0));
+        register(&mut peer, 1);
+        peer.advance_to(at(30_000));
+        let stable = oam::information(
+            peer.config.mac,
+            ONU,
+            oam::Flags::local_stable(),
+            oam::InfoTlv {
+                is_local: true,
+                oam_version: 1,
+                revision: 0,
+                state: 0,
+                configuration: 0x14,
+                max_pdu_size: 0x0600,
+                oui: oam::Oui::DPOE,
+                vendor_specific: [0; 4],
+            },
+        );
+        peer.deliver(&stable, at(30_001));
+        assert!(peer.discovery().converged());
+        (peer, 30_001)
+    }
+
+    /// What the ONU sends back on the scripted channel.
+    fn scripted_answer(code: u8, body: &[u8]) -> Vec<u8> {
+        crate::fcs::appended(extended::raw_message(
+            extended::Header {
+                dst: DEFAULT_OLT_MAC,
+                src: ONU,
+                flags: oam::Flags::converged(),
+                channel: Channel::decode(SCRIPT_OUI, code),
+            },
+            body,
+        ))
+    }
+
+    /// Bodies of the scripted requests the peer has put on the line.
+    fn scripted_requests(peer: &Peer) -> Vec<u8> {
+        peer.rx_log()
+            .iter()
+            .filter_map(|f| {
+                let pdu = extended::Pdu::parse(&f.data)?;
+                (pdu.oui == SCRIPT_OUI && pdu.channel.code() == SCRIPT_REQUEST)
+                    .then(|| f.data[extended::BODY_OFFSET])
+            })
+            .collect()
+    }
+
+    fn deregisters_sent(peer: &Peer) -> usize {
+        peer.rx_log().iter().filter(|f| f.description == "REGISTER deregister").count()
+    }
+
+    #[test]
+    fn a_scripted_peer_plays_its_script_instead_of_the_rotation() {
+        let (mut peer, started) = scripted_peer();
+        assert_eq!(scripted_requests(&peer), vec![0x01]);
+        // No attribute is read, and the registration outlives its usual term.
+        peer.advance_to(at(started + 400));
+        assert_eq!(peer.counters.attribute_requests_sent, 0);
+        peer.deliver(&scripted_answer(SCRIPT_ANSWER, &[0x80, 0x00]), at(started + 401));
+        assert_eq!(scripted_requests(&peer), vec![0x01, 0x02]);
+        peer.advance_to(at(started + 10 * REGISTRATION_LIFETIME.as_ms()));
+        assert_eq!(peer.counters.deregistrations, 0);
+        assert!(peer.script().expect("scripted").finished());
+    }
+
+    #[test]
+    fn a_wrong_answer_is_torn_down_at_the_delay_the_script_gives() {
+        let (mut peer, started) = scripted_peer();
+        peer.deliver(&scripted_answer(SCRIPT_ANSWER, &[0x00, 0x00]), at(started + 3));
+        peer.advance_to(at(started + 12));
+        assert_eq!(deregisters_sent(&peer), 0);
+        peer.advance_to(at(started + 13));
+        assert_eq!(deregisters_sent(&peer), 1);
+        assert_eq!(scripted_requests(&peer), vec![0x01], "nothing is played after a teardown");
+    }
+
+    #[test]
+    fn silence_is_torn_down_at_the_deadline_plus_its_own_delay() {
+        let (mut peer, started) = scripted_peer();
+        peer.advance_to(at(started + 2_499));
+        assert_eq!(deregisters_sent(&peer), 0);
+        peer.advance_to(at(started + 2_500));
+        assert_eq!(deregisters_sent(&peer), 1);
+    }
+
+    #[test]
+    fn the_upstream_tap_keeps_every_frame_it_was_open_for() {
+        let (mut peer, started) = scripted_peer();
+        assert!(peer.take_upstream().is_empty(), "nothing is kept until asked");
+        peer.tap_upstream();
+        let answer = scripted_answer(SCRIPT_ANSWER, &[0x80]);
+        peer.deliver(&answer, at(started + 1));
+        let kept = peer.take_upstream();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].data, answer);
+        assert!(peer.take_upstream().is_empty());
     }
 }
