@@ -35,6 +35,10 @@
 //! - `deregister` tears the registration down.
 //! - `ignore <oui>/<code|*>` names messages the far end sends on its own
 //!   initiative. They are counted and never judged.
+//! - `oam-destination multicast|unicast` says where the peer addresses its
+//!   OAMPDUs, for the whole run: the slow-protocol group address, or the
+//!   ONU's own once it is known. Equipment differs on this, and an answer
+//!   built from the request carries the choice back.
 //!
 //! A reaction is `continue`, `stop`, or `deregister-after <ms>`. Every
 //! duration is link time, in milliseconds.
@@ -117,6 +121,9 @@ pub struct Step {
 pub struct Script {
     pub steps: Vec<Step>,
     pub ignored: Vec<Selector>,
+    /// Where OAMPDUs are addressed, when the script says: `true` for the
+    /// slow-protocol group address. `None` leaves the peer as configured.
+    pub multicast_oam: Option<bool>,
 }
 
 /// A line that could not be read.
@@ -150,6 +157,14 @@ impl Script {
                         return Err(err("ignore takes one <oui>/<code>".into()));
                     };
                     script.ignored.push(parse_selector(selector).map_err(err)?);
+                    continue;
+                }
+                "oam-destination" => {
+                    script.multicast_oam = Some(match rest[..] {
+                        ["multicast"] => true,
+                        ["unicast"] => false,
+                        _ => return Err(err("oam-destination is `multicast` or `unicast`".into())),
+                    });
                     continue;
                 }
                 "send" => {
@@ -541,6 +556,14 @@ mod tests {
                 Step { line: 6, action: Action::Deregister },
             ]
         );
+    }
+
+    #[test]
+    fn the_destination_of_oampdus_is_left_alone_unless_the_script_says() {
+        assert_eq!(script("wait 1\n").multicast_oam, None);
+        assert_eq!(script("oam-destination multicast\n").multicast_oam, Some(true));
+        assert_eq!(script("oam-destination unicast\n").multicast_oam, Some(false));
+        assert_eq!(Script::parse("oam-destination broadcast\n").unwrap_err().line, 1);
     }
 
     #[test]

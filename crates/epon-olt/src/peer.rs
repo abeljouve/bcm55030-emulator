@@ -511,6 +511,9 @@ impl Peer {
     /// read attributes in rotation, and it does not end the registration on a
     /// timer of its own. Both would be traffic the script did not ask for.
     pub fn set_script(&mut self, script: Script) {
+        if let Some(multicast) = script.multicast_oam {
+            self.config.unicast_oam = !multicast;
+        }
         self.script = Some(Player::new(script));
         self.sched.cancel(Timer::AttributePoll);
         self.sched.cancel(Timer::Lifetime);
@@ -1687,8 +1690,12 @@ mod tests {
     /// A registered, converged peer playing [`SCRIPT`], and the instant the
     /// script started at.
     fn scripted_peer() -> (Peer, u64) {
+        scripted_peer_playing(SCRIPT)
+    }
+
+    fn scripted_peer_playing(text: &str) -> (Peer, u64) {
         let mut peer = live_peer();
-        peer.set_script(Script::parse(SCRIPT).expect("the fixture parses"));
+        peer.set_script(Script::parse(text).expect("the fixture parses"));
         peer.advance_to(at(0));
         register(&mut peer, 1);
         peer.advance_to(at(30_000));
@@ -1753,6 +1760,22 @@ mod tests {
         peer.advance_to(at(started + 10 * REGISTRATION_LIFETIME.as_ms()));
         assert_eq!(peer.counters.deregistrations, 0);
         assert!(peer.script().expect("scripted").finished());
+    }
+
+    #[test]
+    fn a_script_can_have_oampdus_sent_to_the_group_address() {
+        let (peer, _) = scripted_peer();
+        let request = |p: &Peer| {
+            p.rx_log()
+                .iter()
+                .rev()
+                .find_map(|f| oam::Pdu::parse(&f.data).filter(|_| extended::Pdu::parse(&f.data).is_some()))
+                .expect("a scripted request went out")
+        };
+        assert_eq!(request(&peer).dst, ONU, "the peer's own default is the ONU's address");
+
+        let (peer, _) = scripted_peer_playing(&format!("oam-destination multicast\n{SCRIPT}"));
+        assert_eq!(request(&peer).dst, MacAddr::SLOW_PROTOCOL_MULTICAST);
     }
 
     #[test]
