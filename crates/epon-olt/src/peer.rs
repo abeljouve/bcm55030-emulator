@@ -47,7 +47,7 @@ use crate::mpcp::{self, GateFlags, Grant, RegisterFlag, RegisterReqFlag};
 use crate::oam;
 use crate::rule_list::RuleListUpdate;
 use crate::sched::Scheduler;
-use crate::script::{self, Player, Script};
+use crate::script::{self, DiscoveryFault, Player, Script};
 use crate::state::MpcpState;
 use crate::types::{EtherType, Llid, MacAddr};
 
@@ -263,6 +263,13 @@ pub struct Counters {
     pub register_req_malformed: u64,
     /// The request asked to be torn down, not admitted.
     pub register_req_deregister: u64,
+    /// Left unanswered by a scripted discovery fault.
+    pub register_req_fault_ignored: u64,
+    /// Answered with a refusing REGISTER by a scripted discovery fault.
+    pub register_req_nacked: u64,
+    /// Admitted, and the REGISTER that granted it lost on the line by a
+    /// scripted discovery fault. Counted in `register_req_accepted` too.
+    pub registers_lost: u64,
 
     pub register_ack_seen: u64,
     /// Ignored because no handshake was waiting for one.
@@ -331,6 +338,8 @@ impl Counters {
                 + self.register_req_window_passed
                 + self.register_req_malformed
                 + self.register_req_deregister
+                + self.register_req_fault_ignored
+                + self.register_req_nacked
     }
 }
 
@@ -424,6 +433,10 @@ pub struct Peer {
     unanswered_grant: Option<WireInstant>,
     /// Cuts the script asked for, for the host to put on the line.
     fibre_cuts: Vec<crate::fibre::Cut>,
+    /// Discovery faults still to apply, one per request.
+    discovery_faults: VecDeque<DiscoveryFault>,
+    /// The fault the pending answer carries out, if any.
+    pending_fault: Option<DiscoveryFault>,
 
     /// The exchange to play once discovery has converged, in place of the
     /// attribute rotation and of the registration's fixed lifetime.
@@ -467,6 +480,8 @@ impl Peer {
             reported: false,
             unanswered_grant: None,
             fibre_cuts: Vec::new(),
+            discovery_faults: VecDeque::new(),
+            pending_fault: None,
             script: None,
             upstream_tap: None,
         }
@@ -597,6 +612,7 @@ impl Peer {
         if let Some(multicast) = script.multicast_oam {
             self.config.unicast_oam = !multicast;
         }
+        self.discovery_faults = script.discovery_faults.iter().copied().collect();
         self.script = Some(Player::new(script));
         self.sched.cancel(Timer::AttributePoll);
         self.sched.cancel(Timer::Lifetime);
@@ -765,11 +781,29 @@ impl Peer {
                         self.onu_mac, self.register_requests_seen
                     );
                 }
-                self.counters.register_req_accepted += 1;
+                let fault = self.discovery_faults.pop_front();
+                match fault {
+                    Some(DiscoveryFault::Ignore) => {
+                        self.counters.register_req_fault_ignored += 1;
+                        self.log(format!("REGISTER_REQ from {} left unanswered (scripted)", self.onu_mac));
+                        return format!("REGISTER_REQ from {} (unanswered: scripted fault)", self.onu_mac);
+                    }
+                    Some(DiscoveryFault::Nack) => self.counters.register_req_nacked += 1,
+                    Some(DiscoveryFault::DropRegister) | None => self.counters.register_req_accepted += 1,
+                }
+                self.pending_fault = fault;
                 self.log(format!("REGISTER_REQ from {}", self.onu_mac));
                 self.mpcp_state = MpcpState::Discovery;
                 self.sched.arm_in(Timer::RegisterResponse, self.now, self.config.processing_delay);
-                format!("REGISTER_REQ from {}", self.onu_mac)
+                match fault {
+                    Some(DiscoveryFault::Nack) => {
+                        format!("REGISTER_REQ from {} (to be refused: scripted fault)", self.onu_mac)
+                    }
+                    Some(DiscoveryFault::DropRegister) => {
+                        format!("REGISTER_REQ from {} (grant to be lost: scripted fault)", self.onu_mac)
+                    }
+                    _ => format!("REGISTER_REQ from {}", self.onu_mac),
+                }
             }
             mpcp::Opcode::RegisterAck => {
                 self.counters.register_ack_seen += 1;
@@ -945,13 +979,36 @@ impl Peer {
         if self.mpcp_state != MpcpState::Discovery || self.settling {
             return;
         }
-        // Ack is the value that grants an LLID; 1 and 2 deregister.
-        let frame = self.build_register(RegisterFlag::Ack);
-        self.log(format!("REGISTER LLID={} to {}", self.assigned_llid, self.onu_mac));
-        self.emit(frame, "REGISTER");
-        self.llid_assignment = Some(self.assigned_llid.as_u16());
-        self.mpcp_state = MpcpState::WaitAck;
-        self.sched.arm_in(Timer::AckTimeout, self.now, self.config.register_ack_timeout);
+        match self.pending_fault.take() {
+            Some(DiscoveryFault::Nack) => {
+                // Nack grants nothing: the peer is back to waiting for a
+                // request, and no LLID is published.
+                let frame = self.build_register(RegisterFlag::Nack);
+                self.log(format!("REGISTER Nack to {} (scripted)", self.onu_mac));
+                self.emit(frame, "REGISTER Nack");
+                self.mpcp_state = MpcpState::Idle;
+            }
+            Some(DiscoveryFault::DropRegister) => {
+                let frame = self.build_register(RegisterFlag::Ack);
+                self.log(format!(
+                    "REGISTER LLID={} to {} lost on the line (scripted)",
+                    self.assigned_llid, self.onu_mac
+                ));
+                self.lose(frame, "REGISTER (lost)");
+                self.counters.registers_lost += 1;
+                self.mpcp_state = MpcpState::WaitAck;
+                self.sched.arm_in(Timer::AckTimeout, self.now, self.config.register_ack_timeout);
+            }
+            Some(DiscoveryFault::Ignore) | None => {
+                // Ack is the value that grants an LLID; 1 and 2 deregister.
+                let frame = self.build_register(RegisterFlag::Ack);
+                self.log(format!("REGISTER LLID={} to {}", self.assigned_llid, self.onu_mac));
+                self.emit(frame, "REGISTER");
+                self.llid_assignment = Some(self.assigned_llid.as_u16());
+                self.mpcp_state = MpcpState::WaitAck;
+                self.sched.arm_in(Timer::AckTimeout, self.now, self.config.register_ack_timeout);
+            }
+        }
     }
 
     fn tear_down_registration(&mut self) {
@@ -1150,6 +1207,11 @@ impl Peer {
         self.sched.cancel(Timer::Lifetime);
         self.reported = false;
         self.unanswered_grant = None;
+        // Faults are meant for the real end's requests: whatever the
+        // synthesized traffic used up is given back.
+        self.pending_fault = None;
+        self.discovery_faults =
+            self.script.as_ref().map(|p| p.discovery_faults().iter().copied().collect()).unwrap_or_default();
     }
 
     // ── Downlink builders ───────────────────────────────────────────
@@ -1273,6 +1335,16 @@ impl Peer {
             description: description.to_string(),
         });
         frame
+    }
+
+    /// A frame the peer built and sent that never reaches the line: logged
+    /// and counted like any other, so the loss is visible, and kept off the
+    /// downstream.
+    fn lose(&mut self, frame: Vec<u8>, description: &str) {
+        let frame = crate::fcs::appended(frame);
+        let entry = self.frame_entry(&frame, description);
+        push_capped(&mut self.rx_log, entry);
+        self.counters.frames_sent += 1;
     }
 
     fn frame_entry(&self, frame: &[u8], description: &str) -> LoggedFrame {
@@ -2200,6 +2272,110 @@ mod tests {
         assert!(scripted_requests(&peer).is_empty());
         peer.advance_to(at(started + 3000));
         assert_eq!(scripted_requests(&peer), vec![0x01], "the step ends when the light is back");
+    }
+
+    /// A peer that will play `faults` on the requests it would admit.
+    fn faulted_peer(faults: &str) -> Peer {
+        let mut peer = live_peer();
+        peer.set_script(Script::parse(&format!("{faults}\nwait 1\n")).expect("parses"));
+        peer.advance_to(at(0));
+        peer.take_downstream();
+        peer
+    }
+
+    /// Hand the peer a request at `t` and let its answer go out.
+    fn request(peer: &mut Peer, t: u64) -> Vec<Emitted> {
+        peer.deliver(&register_req(ONU), at(t));
+        peer.advance_to(at(t + PROCESSING_DELAY.as_ms()));
+        peer.take_downstream()
+            .into_iter()
+            .filter(|e| e.description.starts_with("REGISTER"))
+            .collect()
+    }
+
+    fn register_flag(e: &Emitted) -> Option<RegisterFlag> {
+        match mpcp::Pdu::parse(&e.frame)?.body {
+            mpcp::Body::Register { flag, .. } => RegisterFlag::from_u8(flag),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn an_ignored_request_is_left_unanswered_and_counted() {
+        let mut peer = faulted_peer("discovery-ignore 2");
+        // Passed over as ever; then two faulted; then admitted.
+        assert!(request(&mut peer, 1).is_empty());
+        assert_eq!(peer.counters.register_req_window_passed, 1);
+        assert!(request(&mut peer, 10).is_empty());
+        assert!(request(&mut peer, 20).is_empty());
+        assert_eq!(peer.counters.register_req_fault_ignored, 2);
+        assert_eq!(peer.mpcp_state(), MpcpState::Idle);
+        let answer = request(&mut peer, 30);
+        assert_eq!(answer.iter().map(register_flag).collect::<Vec<_>>(), vec![Some(RegisterFlag::Ack)]);
+        assert!(peer.counters.register_requests_accounted_for());
+    }
+
+    #[test]
+    fn a_refused_request_gets_a_nack_and_grants_nothing() {
+        let mut peer = faulted_peer("discovery-nack 1");
+        request(&mut peer, 1);
+        let answer = request(&mut peer, 10);
+        assert_eq!(answer.iter().map(register_flag).collect::<Vec<_>>(), vec![Some(RegisterFlag::Nack)]);
+        assert_eq!(peer.counters.register_req_nacked, 1);
+        assert_eq!(peer.mpcp_state(), MpcpState::Idle);
+        assert_eq!(peer.take_llid_assignment(), None, "a refusal publishes no LLID");
+        // An acknowledgement of the refused grant is not expected.
+        peer.deliver(&register_ack(ONU, peer.assigned_llid()), at(20));
+        assert_eq!(peer.counters.register_ack_unexpected, 1);
+        // The next request is admitted.
+        let answer = request(&mut peer, 30);
+        assert_eq!(answer.iter().map(register_flag).collect::<Vec<_>>(), vec![Some(RegisterFlag::Ack)]);
+        assert!(peer.counters.register_requests_accounted_for());
+    }
+
+    #[test]
+    fn a_lost_register_never_reaches_the_line_and_the_handshake_times_out() {
+        let mut peer = faulted_peer("discovery-drop-register 1");
+        request(&mut peer, 1);
+        assert!(request(&mut peer, 10).is_empty(), "nothing went on the line");
+        assert_eq!(peer.counters.registers_lost, 1);
+        assert_eq!(peer.counters.register_req_accepted, 1);
+        assert_eq!(peer.mpcp_state(), MpcpState::WaitAck);
+        assert_eq!(peer.take_llid_assignment(), None);
+        // But the peer did send it, and says so.
+        assert!(peer.rx_log().iter().any(|f| f.description == "REGISTER (lost)"));
+        // The far end asks again; the handshake is still in flight.
+        assert!(request(&mut peer, 500).is_empty());
+        assert_eq!(peer.counters.register_req_in_flight, 1);
+        peer.advance_to(at(10 + PROCESSING_DELAY.as_ms() + REGISTER_ACK_TIMEOUT.as_ms()));
+        assert_eq!(peer.counters.register_ack_timeouts, 1);
+        let answer = request(&mut peer, 1500);
+        assert_eq!(answer.iter().map(register_flag).collect::<Vec<_>>(), vec![Some(RegisterFlag::Ack)]);
+        peer.deliver(&register_ack(ONU, peer.assigned_llid()), at(1510));
+        assert_eq!(peer.mpcp_state(), MpcpState::Registered);
+        assert!(peer.counters.register_requests_accounted_for());
+    }
+
+    #[test]
+    fn faults_apply_in_the_order_written_and_then_stop() {
+        let mut peer = faulted_peer("discovery-nack 1\ndiscovery-ignore 1");
+        request(&mut peer, 1);
+        assert_eq!(request(&mut peer, 10).iter().map(register_flag).collect::<Vec<_>>(), vec![Some(RegisterFlag::Nack)]);
+        assert!(request(&mut peer, 20).is_empty());
+        assert_eq!(request(&mut peer, 30).iter().map(register_flag).collect::<Vec<_>>(), vec![Some(RegisterFlag::Ack)]);
+        assert_eq!((peer.counters.register_req_nacked, peer.counters.register_req_fault_ignored), (1, 1));
+    }
+
+    #[test]
+    fn synthesized_requests_do_not_spend_the_faults() {
+        let mut peer = faulted_peer("discovery-ignore 1");
+        request(&mut peer, 1);
+        request(&mut peer, 10);
+        assert_eq!(peer.counters.register_req_fault_ignored, 1);
+        peer.rewind_handshake();
+        request(&mut peer, 20);
+        assert!(request(&mut peer, 30).is_empty(), "the fault applies to the first real request");
+        assert_eq!(peer.counters.register_req_fault_ignored, 2);
     }
 
     #[test]

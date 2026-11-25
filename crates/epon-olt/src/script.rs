@@ -59,6 +59,22 @@
 //!   or every registration would end at the same step. A script that cuts
 //!   the fibre twice therefore cuts it once per registration, in order.
 //!
+//! - `discovery-ignore <n>`, `discovery-nack <n>`, `discovery-drop-register
+//!   <n>` are faults of the discovery handshake, which comes before anything
+//!   the script plays and so cannot be a step. Each takes the next `n`
+//!   registration requests the peer would otherwise have admitted, in the
+//!   order the lines are written, over the whole run:
+//!   - `discovery-ignore` leaves them unanswered, as after a collision;
+//!   - `discovery-nack` answers them with a REGISTER whose flag refuses
+//!     (Nack), granting nothing;
+//!   - `discovery-drop-register` admits them, and the REGISTER that grants
+//!     the LLID is lost on the line, so no REGISTER_ACK closes the
+//!     handshake and the peer abandons it at its deadline.
+//!
+//!   The peer passing over the first window of each discovery cycle comes
+//!   before them and is not a fault: a request it passes over does not count
+//!   against `n`.
+//!
 //! A reaction is `continue`, `stop`, or `deregister-after <ms>`. Every
 //! duration is link time, in milliseconds.
 //!
@@ -153,6 +169,18 @@ pub enum Reregistration {
     Once,
 }
 
+/// A fault of the discovery handshake, applied to one registration request
+/// the peer would otherwise have admitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiscoveryFault {
+    /// No answer at all.
+    Ignore,
+    /// A REGISTER that refuses.
+    Nack,
+    /// A REGISTER that grants, lost on the line.
+    DropRegister,
+}
+
 /// One line of the script, with where it came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
@@ -169,6 +197,8 @@ pub struct Script {
     /// slow-protocol group address. `None` leaves the peer as configured.
     pub multicast_oam: Option<bool>,
     pub reregistration: Reregistration,
+    /// One entry per request to fault, in the order they apply.
+    pub discovery_faults: Vec<DiscoveryFault>,
 }
 
 /// A line that could not be read.
@@ -218,6 +248,21 @@ impl Script {
                         ["once"] => Reregistration::Once,
                         _ => return Err(err("reregistration is `replay` or `once`".into())),
                     };
+                    continue;
+                }
+                "discovery-ignore" | "discovery-nack" | "discovery-drop-register" => {
+                    let fault = match keyword {
+                        "discovery-ignore" => DiscoveryFault::Ignore,
+                        "discovery-nack" => DiscoveryFault::Nack,
+                        _ => DiscoveryFault::DropRegister,
+                    };
+                    let [n] = rest[..] else {
+                        return Err(err(format!("{keyword} takes a number of requests")));
+                    };
+                    let n: usize = n
+                        .parse()
+                        .map_err(|_| err(format!("`{n}` is not a number of requests")))?;
+                    script.discovery_faults.extend(std::iter::repeat_n(fault, n));
                     continue;
                 }
                 "send" => {
@@ -469,6 +514,11 @@ impl Player {
 
     pub fn steps(&self) -> &[Step] {
         &self.script.steps
+    }
+
+    /// The discovery faults the script asks for, in the order they apply.
+    pub fn discovery_faults(&self) -> &[DiscoveryFault] {
+        &self.script.discovery_faults
     }
 
     /// What a registration that follows a teardown does to the script.
@@ -922,6 +972,18 @@ mod tests {
             ]
         );
         assert!(p.finished());
+    }
+
+    #[test]
+    fn discovery_faults_queue_up_in_the_order_they_are_written() {
+        let s = script("discovery-ignore 2\ndiscovery-drop-register 1\ndiscovery-nack 1\nwait 1\n");
+        use DiscoveryFault::*;
+        assert_eq!(s.discovery_faults, vec![Ignore, Ignore, DropRegister, Nack]);
+        assert!(script("wait 1\n").discovery_faults.is_empty());
+        assert!(script("discovery-nack 0\n").discovery_faults.is_empty());
+        for bad in ["discovery-ignore\n", "discovery-nack two\n", "discovery-ignore 1 2\n"] {
+            assert_eq!(Script::parse(bad).unwrap_err().line, 1, "{bad:?}");
+        }
     }
 
     #[test]

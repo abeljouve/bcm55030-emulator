@@ -256,6 +256,24 @@ mod tests {
         assert!(peer.counters.upstream_mpcpdus_accounted_for());
     }
 
+    /// Refused once, its grant lost once: an end that keeps asking gets in.
+    #[test]
+    fn an_end_that_keeps_asking_registers_through_discovery_faults() {
+        let mut link = Link::default();
+        let mut onu = OnuResponder::new(ONU);
+        link.peer.set_script(
+            crate::script::Script::parse("discovery-nack 1\ndiscovery-drop-register 1\nwait 1\n")
+                .expect("parses"),
+        );
+        link.set_link(true, at(0));
+        co_simulate(&mut link, &mut onu, at(15_000), WireDuration::from_ms(1));
+        let c = link.peer.counters;
+        assert_eq!((c.register_req_nacked, c.registers_lost, c.register_ack_timeouts), (1, 1, 1));
+        assert_eq!(c.registrations, 1);
+        assert_eq!(onu.llid(), Some(link.peer.assigned_llid()));
+        assert!(c.register_requests_accounted_for(), "{c:?}");
+    }
+
     /// A cut shorter than the watchdog loses frames and nothing else.
     #[test]
     fn a_cut_shorter_than_the_watchdog_leaves_the_registration_up() {
