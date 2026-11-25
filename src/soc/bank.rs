@@ -513,8 +513,11 @@ impl PeripheralBank {
         // clear). Without a usable downstream it is set again on every
         // tick, as on a unit without fibre; once the peer has broadcast a
         // GATE on an established link nothing sets it, and the firmware's
-        // clear holds, as on a receiving unit.
-        if !(self.olt.link_up && self.olt.has_broadcast_gate()) {
+        // clear holds, as on a receiving unit. A cut fibre is a unit without
+        // fibre for as long as it lasts: the latch is set again on every tick
+        // of the cut, and a clear holds again once the light is back.
+        let lit = self.olt.downstream_lit();
+        if !(self.olt.link_up && self.olt.has_broadcast_gate() && lit) {
             self.epon_mac.latch_link_loss();
             self.pending_cache_inv.push(
                 DatapathOp::CacheInvalidate { addr: 0x0100_0E04 },
@@ -547,7 +550,15 @@ impl PeripheralBank {
             // has broadcast >=1 downstream GATE — models the HW timestamp
             // lock off the recovered downstream. DO-NOT-FAKE: never set
             // from a firmware write to 0x01000300.
-            self.mpcp_tssync.set_hw_lock(self.olt.has_broadcast_gate());
+            //
+            // INFERRED: a cut takes the lock away. Nothing measured says how
+            // fast the bit falls or comes back; this follows the definition
+            // above (no recovered downstream, nothing to lock to). The
+            // timestamp drive above is left running through a cut: with no
+            // drift modelled, a free-running local clock reads the same as
+            // the far end's, and what the silicon shows there without light
+            // is not measured.
+            self.mpcp_tssync.set_hw_lock(self.olt.has_broadcast_gate() && lit);
             for &addr in &[0x0100_00B4u32, 0x0100_0304, 0x0100_0320, 0x0100_0D8C] {
                 self.pending_cache_inv.push(
                     DatapathOp::CacheInvalidate { addr },

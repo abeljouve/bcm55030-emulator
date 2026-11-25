@@ -39,13 +39,20 @@ impl Link {
     ///
     /// Arrivals first, then the peer's own events, then what it decided goes
     /// on the line — in that order, so a frame that lands can still be
-    /// answered within the same step rather than the next one.
+    /// answered within the same step rather than the next one. The peer is
+    /// brought up to each arrival before the frame is taken, so a cut it
+    /// decided on the way is already on the line when the frame is judged.
     pub fn advance_to(&mut self, now: WireInstant) {
-        while let Some(landed) = self.upstream.pop_arrived(now) {
-            self.peer.advance_to(landed.arrives_at);
-            self.peer.deliver(&landed.frame, landed.arrives_at);
+        while let Some(due) = self.upstream.next_arrival().filter(|t| *t <= now) {
+            self.peer.advance_to(due);
+            self.collect_cuts();
+            if let Some(landed) = self.upstream.pop_arrived(due) {
+                self.peer.deliver(&landed.frame, landed.arrives_at);
+                self.collect_cuts();
+            }
         }
         self.peer.advance_to(now);
+        self.collect_cuts();
         for out in self.peer.take_downstream() {
             self.downstream.send(out.frame, out.at);
         }
@@ -59,7 +66,34 @@ impl Link {
 
     /// Take the next frame that has reached the ONU end by `now`.
     pub fn poll_downstream(&mut self, now: WireInstant) -> Option<InFlight> {
+        self.collect_cuts();
         self.downstream.pop_arrived(now)
+    }
+
+    /// Cut the fibre from `from` until `until`, in both directions.
+    ///
+    /// The peer is not told: nothing on the line says it was cut, and the
+    /// peer finds out the way an OLT does, by what stops arriving.
+    pub fn cut(&mut self, from: WireInstant, until: WireInstant) {
+        self.downstream.cut(from, until);
+        self.upstream.cut(from, until);
+    }
+
+    /// Put on the line the cuts the peer's script asked for.
+    pub fn collect_cuts(&mut self) {
+        for cut in self.peer.take_fibre_cuts() {
+            self.cut(cut.from, cut.until);
+        }
+    }
+
+    /// True while light crosses the fibre at `at`.
+    pub fn lit_at(&self, at: WireInstant) -> bool {
+        self.downstream.lit_at(at)
+    }
+
+    /// Frames lost because their crossing met a cut, both directions.
+    pub fn lost_dark(&self) -> u64 {
+        self.downstream.lost_dark + self.upstream.lost_dark
     }
 
     /// Bring the link up or down. Down empties both directions: a frame on a
@@ -184,6 +218,56 @@ mod tests {
         assert!(link.peer.counters.frames_sent > link.downstream.config.depth as u64);
         assert!(link.downstream.dropped_full > 0, "an undrained queue must lose frames");
         assert!(link.downstream.in_flight() <= link.downstream.config.depth);
+    }
+
+    /// The whole chain a cut sets off, with an end that keeps its own
+    /// watchdog: the peer's grants go unanswered and it tears the link down,
+    /// its REGISTER is lost on the dark fibre, the far end gives its LLID up
+    /// when GATEs stop, and once the light is back it registers again and
+    /// the script is played again without cutting a second time.
+    #[test]
+    fn a_cut_tears_the_link_down_and_the_light_coming_back_brings_it_up_again() {
+        let mut link = Link::default();
+        let mut onu = OnuResponder::new(ONU);
+        link.peer.set_script(crate::script::Script::parse("wait 500\ncut 3000\nwait 10\n").expect("parses"));
+        link.set_link(true, at(0));
+        co_simulate(&mut link, &mut onu, at(30_000), WireDuration::from_ms(1));
+
+        let peer = &link.peer;
+        assert_eq!(peer.counters.registrations, 2, "{:?}", peer.counters);
+        assert_eq!(peer.counters.mpcp_timeouts, 1);
+        assert_eq!(onu.counters.watchdog_expiries, 1);
+        assert_eq!(onu.counters.deregisters_seen, 0, "the peer's teardown was lost on the line");
+        assert!(link.downstream.lost_dark > 0 && link.upstream.lost_dark > 0);
+        assert_eq!(link.downstream.cuts().len(), 1, "cut once, not on every registration");
+        let player = peer.script().expect("scripted");
+        assert_eq!(player.registration(), 2);
+        assert!(player.finished());
+        use crate::script::Verdict;
+        let verdicts: Vec<Verdict> = player.outcomes().iter().map(|o| o.verdict.clone()).collect();
+        assert_eq!(
+            verdicts,
+            vec![
+                Verdict::Waited, Verdict::Cut, Verdict::Interrupted,
+                Verdict::Waited, Verdict::Skipped, Verdict::Waited,
+            ]
+        );
+        assert!(peer.counters.register_requests_accounted_for());
+        assert!(peer.counters.upstream_mpcpdus_accounted_for());
+    }
+
+    /// A cut shorter than the watchdog loses frames and nothing else.
+    #[test]
+    fn a_cut_shorter_than_the_watchdog_leaves_the_registration_up() {
+        let mut link = Link::default();
+        let mut onu = OnuResponder::new(ONU);
+        link.peer.set_script(crate::script::Script::parse("cut 300\n").expect("parses"));
+        link.set_link(true, at(0));
+        co_simulate(&mut link, &mut onu, at(20_000), WireDuration::from_ms(1));
+        assert_eq!(link.peer.counters.registrations, 1);
+        assert_eq!(link.peer.counters.mpcp_timeouts, 0);
+        assert_eq!(onu.counters.watchdog_expiries, 0);
+        assert!(link.lost_dark() > 0);
     }
 
     #[test]

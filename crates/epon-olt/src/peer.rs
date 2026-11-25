@@ -18,6 +18,26 @@
 //! decision it takes is stamped with the instant it was due — not with the
 //! instant the host got round to it. A host that calls `advance_to` once per
 //! second and one that calls it a million times a second see the same peer.
+//!
+//! ## Watchdog
+//!
+//! Clause 64 has the OLT restart its `mpcp_timer` on every REPORT and tear
+//! the registration down when `mpcp_timeout` (1 s by default) passes without
+//! one. It also has the OLT grant every registered ONU at least every 50 ms,
+//! which is what makes a 1 s bound safe. This peer grants once a second
+//! ([`NORMAL_GATE_INTERVAL`], INFERRED), so a timer counted from the last
+//! REPORT would run out between two ordinary grants.
+//!
+//! DIVERGENCE from the clause, deliberate: the silence is measured in grants.
+//! When a grant falls due and every grant issued over more than
+//! `mpcp_timeout` has gone unanswered, the peer tears the registration down
+//! instead of granting. With grants every 50 ms that is the clause's own
+//! bound to within a grant; with this peer's cadence it means two grants in a
+//! row ignored, a teardown two grant intervals after the first one ignored
+//! (about three seconds after the last REPORT rather than one), and a silence
+//! shorter than `mpcp_timeout` never tears a link down. The watchdog is armed
+//! only once the registered end has reported at all: an end whose MAC never
+//! reports is left alone, as before.
 
 use std::collections::VecDeque;
 
@@ -66,6 +86,9 @@ pub const PROCESSING_DELAY: WireDuration = WireDuration::from_ms(1);
 /// measured from. The MPCP timeout, the clause's own bound on silence, takes
 /// its place.
 pub const REGISTER_ACK_TIMEOUT: WireDuration = WireDuration::from_ms(1000);
+
+/// The MPCP watchdog, clause 64's `mpcp_timeout` default.
+pub const MPCP_TIMEOUT: WireDuration = WireDuration::from_ms(1000);
 
 /// Requests ignored before one is answered. The peer lets the first discovery
 /// window pass and registers on the second.
@@ -171,6 +194,9 @@ pub struct PeerConfig {
     /// How long a REGISTER waits for its acknowledgement before the
     /// handshake is abandoned and the next request may be admitted.
     pub register_ack_timeout: WireDuration,
+    /// How long grants may go unanswered by a REPORT before the registration
+    /// is torn down, at the next grant due. `None` disarms the watchdog.
+    pub mpcp_timeout: Option<WireDuration>,
     pub ignored_register_requests: u32,
     /// Interval between normal GATEs while registered.
     pub normal_gate_interval: WireDuration,
@@ -201,6 +227,7 @@ impl Default for PeerConfig {
             rediscovery_delay: REDISCOVERY_DELAY,
             processing_delay: PROCESSING_DELAY,
             register_ack_timeout: REGISTER_ACK_TIMEOUT,
+            mpcp_timeout: Some(MPCP_TIMEOUT),
             ignored_register_requests: IGNORED_REGISTER_REQUESTS,
             normal_gate_interval: NORMAL_GATE_INTERVAL,
             polled_attributes: default_polled_attributes(),
@@ -277,6 +304,8 @@ pub struct Counters {
     pub extended_opaque_bodies_seen: u64,
     pub registrations: u64,
     pub deregistrations: u64,
+    /// Registrations torn down by the watchdog.
+    pub mpcp_timeouts: u64,
 }
 
 impl Counters {
@@ -388,6 +417,14 @@ pub struct Peer {
     /// A registration completed and the host has not been told yet.
     registration_complete: bool,
 
+    /// The registered end has reported at least once, which is what arms
+    /// the watchdog.
+    reported: bool,
+    /// First grant of this registration no REPORT has answered yet.
+    unanswered_grant: Option<WireInstant>,
+    /// Cuts the script asked for, for the host to put on the line.
+    fibre_cuts: Vec<crate::fibre::Cut>,
+
     /// The exchange to play once discovery has converged, in place of the
     /// attribute rotation and of the registration's fixed lifetime.
     script: Option<Player>,
@@ -427,6 +464,9 @@ impl Peer {
             counters: Counters::default(),
             llid_assignment: None,
             registration_complete: false,
+            reported: false,
+            unanswered_grant: None,
+            fibre_cuts: Vec::new(),
             script: None,
             upstream_tap: None,
         }
@@ -486,11 +526,27 @@ impl Peer {
             Timer::NormalGate => {
                 // Only while registered: the window is addressed to an LLID.
                 if self.mpcp_state == MpcpState::Registered {
+                    if let (Some(timeout), Some(first)) =
+                        (self.config.mpcp_timeout, self.unanswered_grant)
+                    {
+                        if self.now - first > timeout {
+                            self.counters.mpcp_timeouts += 1;
+                            self.log(format!(
+                                "watchdog: no REPORT since the grant of {first}, {} ago — tearing down",
+                                self.now - first
+                            ));
+                            self.tear_down_registration();
+                            return;
+                        }
+                    }
                     let frame = self.build_normal_gate();
                     self.emit(frame, "GATE (normal)");
                     self.counters.gates_sent += 1;
                     self.counters.gates_normal_sent += 1;
                     self.sched.arm_in(Timer::NormalGate, self.now, self.config.normal_gate_interval);
+                    if self.reported && self.unanswered_grant.is_none() {
+                        self.unanswered_grant = Some(self.now);
+                    }
                 }
             }
             Timer::Keepalive => {
@@ -577,8 +633,18 @@ impl Peer {
                     }
                 }
                 script::Command::WakeAt(at) => self.sched.arm_at(Timer::Script, at),
+                script::Command::Cut { until } => {
+                    self.log(format!("fibre cut until {until}"));
+                    self.fibre_cuts.push(crate::fibre::Cut { from: self.now, until });
+                }
             }
         }
+    }
+
+    /// Take the cuts the script asked for. The fibre is the host's: the peer
+    /// only says when.
+    pub fn take_fibre_cuts(&mut self) -> Vec<crate::fibre::Cut> {
+        std::mem::take(&mut self.fibre_cuts)
     }
 
     /// Keep every upstream frame for the host to take, from now on.
@@ -625,6 +691,8 @@ impl Peer {
             self.sched.clear();
             self.mpcp_state = MpcpState::Idle;
             self.registered_at = None;
+            self.reported = false;
+            self.unanswered_grant = None;
             self.settling = false;
             self.register_requests_seen = 0;
             self.discovery.reset();
@@ -730,6 +798,10 @@ impl Peer {
             }
             mpcp::Opcode::Report => {
                 self.counters.reports_seen += 1;
+                if self.mpcp_state == MpcpState::Registered {
+                    self.reported = true;
+                    self.unanswered_grant = None;
+                }
                 format!("REPORT ({} bytes)", frame.len())
             }
             opcode if opcode.is_downstream_only() => {
@@ -896,6 +968,8 @@ impl Peer {
         // No LLID, no window to grant. The timer is re-armed by the next
         // registration rather than left firing into nothing.
         self.sched.cancel(Timer::NormalGate);
+        self.reported = false;
+        self.unanswered_grant = None;
         let was = self.discovery.state();
         self.discovery.reset();
         self.note_discovery_change(was);
@@ -1074,6 +1148,8 @@ impl Peer {
         self.sched.cancel(Timer::RegisterResponse);
         self.sched.cancel(Timer::AckTimeout);
         self.sched.cancel(Timer::Lifetime);
+        self.reported = false;
+        self.unanswered_grant = None;
     }
 
     // ── Downlink builders ───────────────────────────────────────────
@@ -2003,6 +2079,127 @@ mod tests {
         converge(&mut peer, acked + 1);
         assert_eq!(scripted_requests(&peer), vec![0x01]);
         assert_eq!(peer.script().expect("scripted").registration(), 1);
+    }
+
+    /// Grants the peer has put on the line since the last call, as instants.
+    fn grants(peer: &mut Peer) -> Vec<WireInstant> {
+        peer.take_downstream()
+            .into_iter()
+            .filter(|e| e.description == "GATE (normal)")
+            .map(|e| e.at)
+            .collect()
+    }
+
+    #[test]
+    fn an_end_that_answers_every_grant_is_never_torn_down() {
+        let mut peer = live_peer();
+        peer.advance_to(at(0));
+        let acked = register(&mut peer, 1);
+        peer.take_downstream();
+        // Each grant answered a millisecond after it went out, for a minute
+        // and a half of a peer whose own lifetime timer is off.
+        peer.set_script(Script::parse("wait 1\n").expect("parses"));
+        let mut t = acked;
+        while t < acked + 90_000 {
+            t += 1;
+            peer.advance_to(at(t));
+            if !grants(&mut peer).is_empty() {
+                peer.deliver(&report_frame(), at(t + 1));
+            }
+        }
+        assert!(peer.counters.reports_seen > 80);
+        assert_eq!(peer.counters.mpcp_timeouts, 0);
+        assert_eq!(peer.mpcp_state(), MpcpState::Registered);
+    }
+
+    #[test]
+    fn an_end_that_stops_reporting_is_torn_down_when_its_silence_outlasts_the_timeout() {
+        let mut peer = live_peer();
+        peer.set_script(Script::parse("wait 1\n").expect("parses"));
+        peer.advance_to(at(0));
+        let acked = register(&mut peer, 1);
+        peer.take_downstream();
+        // One grant answered, then silence.
+        let first = acked + NORMAL_GATE_INTERVAL.as_ms();
+        peer.advance_to(at(first));
+        assert_eq!(grants(&mut peer), vec![at(first)]);
+        peer.deliver(&report_frame(), at(first + 1));
+        let ignored = first + NORMAL_GATE_INTERVAL.as_ms();
+        // One grant ignored is a silence of one grant interval, no longer
+        // than the timeout: the next grant goes out.
+        let next = ignored + NORMAL_GATE_INTERVAL.as_ms();
+        peer.advance_to(at(next));
+        assert_eq!(grants(&mut peer), vec![at(ignored), at(next)]);
+        assert_eq!(peer.counters.mpcp_timeouts, 0);
+        // Two in a row: when the third falls due, the first ignored is more
+        // than the timeout old, and the peer tears down instead of granting.
+        let due = next + NORMAL_GATE_INTERVAL.as_ms();
+        peer.advance_to(at(due - 1));
+        assert_eq!(peer.counters.mpcp_timeouts, 0, "not a millisecond early");
+        peer.advance_to(at(due));
+        assert_eq!(peer.counters.mpcp_timeouts, 1);
+        assert_eq!(peer.counters.deregistrations, 1);
+        assert_eq!(peer.mpcp_state(), MpcpState::Idle);
+        assert!(grants(&mut peer).is_empty(), "torn down instead of granting");
+        let teardown = peer.rx_log().iter().rev().find(|f| f.description == "REGISTER deregister");
+        assert_eq!(teardown.map(|f| f.at), Some(at(due)));
+    }
+
+    #[test]
+    fn a_report_after_one_ignored_grant_keeps_the_link_up() {
+        let mut peer = live_peer();
+        peer.set_script(Script::parse("wait 1\n").expect("parses"));
+        peer.advance_to(at(0));
+        let acked = register(&mut peer, 1);
+        let mut t = acked;
+        let mut n = 0;
+        while t < acked + 20_000 {
+            t += 1;
+            peer.advance_to(at(t));
+            // Every other grant is answered.
+            for _ in grants(&mut peer) {
+                n += 1;
+                if n % 2 == 1 {
+                    peer.deliver(&report_frame(), at(t + 1));
+                }
+            }
+        }
+        assert!(n > 15);
+        assert_eq!(peer.counters.mpcp_timeouts, 0);
+    }
+
+    #[test]
+    fn an_end_that_never_reported_is_left_alone() {
+        let mut peer = live_peer();
+        peer.set_script(Script::parse("wait 1\n").expect("parses"));
+        peer.advance_to(at(0));
+        register(&mut peer, 1);
+        peer.advance_to(at(30_000));
+        assert_eq!(peer.counters.mpcp_timeouts, 0);
+        assert_eq!(peer.mpcp_state(), MpcpState::Registered);
+        // And a disarmed watchdog leaves a silent end alone too.
+        let mut peer = Peer::new(PeerConfig { mpcp_timeout: None, ..PeerConfig::default() });
+        peer.set_link(true, at(0));
+        peer.set_script(Script::parse("wait 1\n").expect("parses"));
+        peer.advance_to(at(0));
+        let acked = register(&mut peer, 1);
+        peer.advance_to(at(acked + 1000));
+        peer.deliver(&report_frame(), at(acked + 1001));
+        peer.advance_to(at(acked + 30_000));
+        assert_eq!(peer.counters.mpcp_timeouts, 0);
+    }
+
+    #[test]
+    fn a_cut_is_handed_to_the_host_with_its_span() {
+        let (mut peer, started) = scripted_peer_playing("cut 3000\nsend AABBCC/10 01\n");
+        assert_eq!(
+            peer.take_fibre_cuts(),
+            vec![crate::fibre::Cut { from: at(started), until: at(started + 3000) }]
+        );
+        assert!(peer.take_fibre_cuts().is_empty(), "taking them clears them");
+        assert!(scripted_requests(&peer).is_empty());
+        peer.advance_to(at(started + 3000));
+        assert_eq!(scripted_requests(&peer), vec![0x01], "the step ends when the light is back");
     }
 
     #[test]

@@ -309,6 +309,27 @@ impl Olt {
         self.link.upstream.dropped_full
     }
 
+    /// Frames lost because the fibre was cut while they crossed it:
+    /// downstream, upstream.
+    pub fn lost_in_the_dark(&self) -> (u64, u64) {
+        (self.link.downstream.lost_dark, self.link.upstream.lost_dark)
+    }
+
+    /// True while light reaches this end. False during a cut, whether the
+    /// peer's script or the host asked for it.
+    pub fn downstream_lit(&self) -> bool {
+        self.link.lit_at(self.wire_now)
+    }
+
+    /// Cut the fibre for `span` of link time, from now, in both directions.
+    ///
+    /// Unlike [`Self::set_link_up`], this is not something either end does:
+    /// the peer keeps its state and its timers, and finds out the way an OLT
+    /// does, by what stops arriving.
+    pub fn cut_fibre(&mut self, span: WireDuration) {
+        self.link.cut(self.wire_now, self.wire_now + span);
+    }
+
     /// True once a frame has been reassembled from the transmit port.
     pub fn real_tx_seen(&self) -> bool {
         self.real_tx_seen
@@ -457,6 +478,7 @@ impl Olt {
     /// Move what the peer just decided to send onto the fibre, so a frame
     /// built outside a tick does not wait for the next one to start crossing.
     fn carry_downstream(&mut self) {
+        self.link.collect_cuts();
         for out in self.link.peer.take_downstream() {
             self.link.downstream.send(out.frame, out.at);
         }

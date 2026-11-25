@@ -14,6 +14,10 @@
 //! - **Depth is finite.** What does not fit is dropped and counted. A queue
 //!   that never loses anything turns a burst into a backlog that is delivered
 //!   late but delivered, which is the one thing a real downstream never does.
+//!
+//! A fibre can also be cut for a span of time. A frame whose crossing
+//! overlaps a cut does not arrive, late or otherwise: it is counted as lost
+//! when it would have landed.
 
 use std::collections::VecDeque;
 
@@ -82,8 +86,29 @@ pub const DEFAULT_DEPTH: usize = 32;
 /// A frame in flight, with the instant it lands.
 #[derive(Clone, Debug)]
 pub struct InFlight {
+    /// Instant it was handed to the line.
+    pub sent_at: WireInstant,
     pub arrives_at: WireInstant,
     pub frame: Vec<u8>,
+}
+
+/// A span during which no light crosses: from `from`, up to but not
+/// including `until`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cut {
+    pub from: WireInstant,
+    pub until: WireInstant,
+}
+
+impl Cut {
+    fn covers(&self, at: WireInstant) -> bool {
+        self.from <= at && at < self.until
+    }
+
+    /// True when a crossing from `sent` to `landed` met the cut.
+    fn severs(&self, sent: WireInstant, landed: WireInstant) -> bool {
+        self.from <= landed && sent < self.until
+    }
 }
 
 /// One direction of the link.
@@ -99,6 +124,9 @@ pub struct Fibre {
     pub delivered: u64,
     /// Frames refused because the direction was full.
     pub dropped_full: u64,
+    /// Frames whose crossing met a cut.
+    pub lost_dark: u64,
+    cuts: Vec<Cut>,
 }
 
 impl Fibre {
@@ -111,7 +139,26 @@ impl Fibre {
             sent: 0,
             delivered: 0,
             dropped_full: 0,
+            lost_dark: 0,
+            cuts: Vec::new(),
         }
+    }
+
+    /// Take the light off the line from `from` until `until`.
+    pub fn cut(&mut self, from: WireInstant, until: WireInstant) {
+        if from < until {
+            self.cuts.push(Cut { from, until });
+        }
+    }
+
+    /// True unless a cut covers `at`.
+    pub fn lit_at(&self, at: WireInstant) -> bool {
+        !self.cuts.iter().any(|c| c.covers(at))
+    }
+
+    /// Every cut the line has had, in the order it was given.
+    pub fn cuts(&self) -> &[Cut] {
+        &self.cuts
     }
 
     /// How long `len` bytes occupy the line.
@@ -138,18 +185,25 @@ impl Fibre {
         // sent ahead of it, whatever the jitter drew.
         let arrives_at = earliest.max(self.last_arrival);
         self.last_arrival = arrives_at;
-        self.queue.push_back(InFlight { arrives_at, frame });
+        self.queue.push_back(InFlight { sent_at: at, arrives_at, frame });
         true
     }
 
     /// Take the next frame that has landed by `now`, with the instant it did.
+    ///
+    /// A frame whose crossing met a cut is taken off the line and counted
+    /// instead, at the instant it would have landed.
     pub fn pop_arrived(&mut self, now: WireInstant) -> Option<InFlight> {
-        let arrived = self.queue.front().is_some_and(|f| f.arrives_at <= now);
-        if !arrived {
-            return None;
+        while self.queue.front().is_some_and(|f| f.arrives_at <= now) {
+            let landed = self.queue.pop_front().expect("checked above");
+            if self.cuts.iter().any(|c| c.severs(landed.sent_at, landed.arrives_at)) {
+                self.lost_dark += 1;
+                continue;
+            }
+            self.delivered += 1;
+            return Some(landed);
         }
-        self.delivered += 1;
-        self.queue.pop_front()
+        None
     }
 
     /// Frames on the line, neither delivered nor dropped.
@@ -291,6 +345,38 @@ mod tests {
         // And a different seed draws differently, or the jitter is not doing
         // anything.
         assert_ne!(arrivals(config), arrivals(FibreConfig { seed: 7, ..config }));
+    }
+
+    #[test]
+    fn a_crossing_that_meets_a_cut_is_lost_and_counted() {
+        let mut f = Fibre::new(FibreConfig::downstream());
+        f.cut(at(1_000), at(2_000));
+        assert!(f.lit_at(at(999)) && !f.lit_at(at(1_000)) && !f.lit_at(at(1_999)));
+        assert!(f.lit_at(at(2_000)), "the light is back at the end of the cut");
+        // Sent before and landed before; landing inside; sent inside; sent
+        // inside, landing after; sent after.
+        for sent in [0, 950, 1_500, 1_950, 2_000] {
+            f.send(frame(60), at(sent));
+        }
+        let mut landed = Vec::new();
+        while let Some(l) = f.pop_arrived(at(10_000)) {
+            landed.push(l.sent_at);
+        }
+        assert_eq!(landed, vec![at(0), at(2_000)]);
+        assert_eq!((f.delivered, f.lost_dark), (2, 3));
+    }
+
+    #[test]
+    fn a_lost_frame_does_not_hold_back_the_ones_behind_it() {
+        let mut f = Fibre::new(FibreConfig::downstream());
+        f.cut(at(0), at(1));
+        f.send(frame(60), at(0));
+        f.send(frame(60), at(500));
+        // The first was sent inside the cut and lands after it; the second
+        // is clear of it.
+        assert!(f.pop_arrived(at(200)).is_none());
+        assert_eq!(f.lost_dark, 1);
+        assert!(f.pop_arrived(at(1_000)).is_some());
     }
 
     #[test]

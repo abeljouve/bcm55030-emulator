@@ -2,8 +2,9 @@
 //!
 //! This is not a model of any particular equipment and must never be used as
 //! one: it does the smallest thing that keeps a link alive — slave to the
-//! discovery window, ask to register, acknowledge the grant, answer OAM — so
-//! that the peer can be exercised end to end with nothing else present.
+//! discovery window, ask to register, acknowledge the grant, answer a grant
+//! with a REPORT, answer OAM, and give its LLID up when GATEs stop arriving —
+//! so that the peer can be exercised end to end with nothing else present.
 //!
 //! Its value is as a control. When the peer misbehaves against real firmware,
 //! running the same peer against this tells you whether the fault is in the
@@ -16,6 +17,9 @@ use crate::types::{EtherType, Llid, MacAddr};
 
 /// How often the responder sends its own Information OAMPDU.
 pub const KEEPALIVE_INTERVAL: WireDuration = WireDuration::from_ms(1000);
+/// Silence after which the responder gives its LLID up: clause 64's
+/// `mpcp_timeout`, restarted on every GATE.
+pub const WATCHDOG: WireDuration = WireDuration::from_ms(1000);
 /// Windows this responder can use, as bits of the discovery information
 /// field. Whatever a GATE offers is narrowed to this before being echoed.
 pub const WINDOWS_SUPPORTED: u16 = 0x0011;
@@ -42,6 +46,9 @@ pub struct OnuCounters {
     pub extended_seen: u64,
     pub requests_sent: u64,
     pub acks_sent: u64,
+    pub reports_sent: u64,
+    /// LLIDs given up because no GATE arrived in time.
+    pub watchdog_expiries: u64,
 }
 
 /// A responder that keeps a link alive and nothing more.
@@ -60,6 +67,8 @@ pub struct OnuResponder {
     pub registered_at: Option<WireInstant>,
     /// Instant the teardown landed.
     pub deregistered_at: Option<WireInstant>,
+    /// Instant the last GATE landed, for the watchdog.
+    last_gate: Option<WireInstant>,
     /// How long each completed registration lasted, as measured here — grant
     /// landing to teardown landing. This is the figure to compare against the
     /// peer's own timer; the difference is what the exchange cost.
@@ -78,6 +87,7 @@ impl OnuResponder {
             counters: OnuCounters::default(),
             registered_at: None,
             deregistered_at: None,
+            last_gate: None,
             registration_lives: Vec::new(),
         }
     }
@@ -93,6 +103,11 @@ impl OnuResponder {
 
     /// Run the responder's own timers up to `now`.
     pub fn advance_to(&mut self, now: WireInstant) {
+        if self.llid.is_some() && self.last_gate.is_some_and(|g| now - g > WATCHDOG) {
+            self.counters.watchdog_expiries += 1;
+            self.llid = None;
+            self.discovery.reset();
+        }
         while let Some(due) = self.next_keepalive.filter(|d| *d <= now) {
             let frame = self.build_info(due);
             self.out.push((due, frame));
@@ -112,9 +127,24 @@ impl OnuResponder {
 
     fn on_mpcp(&mut self, frame: &[u8], at: WireInstant) {
         let Some(pdu) = mpcp::Pdu::parse(frame) else { return };
+        if matches!(pdu.body, mpcp::Body::Gate { .. }) {
+            self.last_gate = Some(at);
+        }
         match pdu.body {
             mpcp::Body::Gate { flags, .. } if !flags.discovery => {
                 self.counters.gates_normal_seen += 1;
+                // A grant is answered with a REPORT, which is what keeps the
+                // far end's watchdog fed. Its body is not modelled.
+                if self.llid.is_some() {
+                    let report = mpcp::bare(mpcp::Header {
+                        dst: pdu.header.src,
+                        src: self.mac,
+                        opcode: mpcp::Opcode::Report,
+                        timestamp: pdu.header.timestamp,
+                    });
+                    self.out.push((at, report));
+                    self.counters.reports_sent += 1;
+                }
             }
             mpcp::Body::Gate { flags, .. } if flags.discovery => {
                 self.counters.gates_seen += 1;

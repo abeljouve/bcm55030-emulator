@@ -33,6 +33,12 @@
 //!   default to `stop`.
 //! - `wait <ms>` lets link time pass.
 //! - `deregister` tears the registration down.
+//! - `cut <ms>` takes the light off the fibre for that long, both ways: what
+//!   the peer sends does not reach the far end, and what the far end sends
+//!   does not reach the peer. The step ends when the light comes back. The
+//!   peer is not told; it finds out by what stops arriving, and its own
+//!   watchdog (see [`crate::peer`]) tears down a registration whose grants go
+//!   unanswered — with a REGISTER the cut fibre loses.
 //! - `ignore <oui>/<code|*>` names messages the far end sends on its own
 //!   initiative. They are counted and never judged.
 //! - `oam-destination multicast|unicast` says where the peer addresses its
@@ -48,9 +54,10 @@
 //!   - `once`: the script is played on the first registration only, and a
 //!     teardown neither stops nor restarts it.
 //!
-//!   A `deregister` step is a fault injected into the run, not provisioning:
-//!   a replay skips one that an earlier pass already played, or every
-//!   registration would end at the same step.
+//!   `deregister` and `cut` steps are faults injected into the run, not
+//!   provisioning: a replay skips one that an earlier pass already played,
+//!   or every registration would end at the same step. A script that cuts
+//!   the fibre twice therefore cuts it once per registration, in order.
 //!
 //! A reaction is `continue`, `stop`, or `deregister-after <ms>`. Every
 //! duration is link time, in milliseconds.
@@ -124,13 +131,15 @@ pub enum Action {
     },
     Wait(WireDuration),
     Deregister,
+    /// Take the light off the fibre for this long.
+    Cut(WireDuration),
 }
 
 impl Action {
     /// A fault injected into the run rather than an exchange: played on the
     /// first pass that reaches it, skipped by the replays after it.
     pub fn once_per_run(&self) -> bool {
-        matches!(self, Self::Deregister)
+        matches!(self, Self::Deregister | Self::Cut(_))
     }
 }
 
@@ -235,6 +244,16 @@ impl Script {
                     Action::Wait(parse_ms(ms).map_err(err)?)
                 }
                 "deregister" if rest.is_empty() => Action::Deregister,
+                "cut" => {
+                    let [ms] = rest[..] else {
+                        return Err(err("cut takes a duration in milliseconds".into()));
+                    };
+                    let span = parse_ms(ms).map_err(err)?;
+                    if span == WireDuration::ZERO {
+                        return Err(err("a cut lasts at least a millisecond".into()));
+                    }
+                    Action::Cut(span)
+                }
                 other => return Err(err(format!("unknown step `{other}`"))),
             };
             script.steps.push(Step { line, action });
@@ -332,6 +351,8 @@ pub enum Verdict {
     TimedOut,
     /// The registration was torn down, by a step or by a reaction.
     Deregistered,
+    /// The light went off; the step ends when it comes back.
+    Cut,
     /// The registration was torn down while the step was under way, by
     /// something other than the step itself.
     Interrupted,
@@ -348,6 +369,7 @@ impl fmt::Display for Verdict {
             Self::Mismatched { oui, code } => write!(f, "mismatched ({oui}/{code:02X})"),
             Self::TimedOut => f.write_str("timed out"),
             Self::Deregistered => f.write_str("deregistered"),
+            Self::Cut => f.write_str("fibre cut"),
             Self::Interrupted => f.write_str("interrupted by a teardown"),
             Self::Skipped => f.write_str("skipped (played on an earlier registration)"),
         }
@@ -373,6 +395,8 @@ pub struct Outcome {
 pub enum Command {
     Send { oui: Oui, code: u8, body: Vec<u8> },
     Deregister,
+    /// Take the light off the fibre from now until `until`.
+    Cut { until: WireInstant },
     /// Call [`Player::resume`] again at this instant.
     WakeAt(WireInstant),
 }
@@ -384,6 +408,8 @@ enum State {
     /// The step at the cursor is to be started.
     Ready,
     Waiting { until: WireInstant },
+    /// The fibre is cut until this instant.
+    Dark { until: WireInstant },
     Expecting { deadline: WireInstant },
     /// A reaction asked for a teardown at this instant.
     Leaving { at: WireInstant },
@@ -478,7 +504,7 @@ impl Player {
             return;
         }
         match self.state {
-            State::Waiting { .. } | State::Expecting { .. } => {
+            State::Waiting { .. } | State::Dark { .. } | State::Expecting { .. } => {
                 self.record(now, Verdict::Interrupted);
             }
             State::Leaving { .. } => {
@@ -536,6 +562,14 @@ impl Player {
                     self.cursor += 1;
                     self.state = State::Ready;
                 }
+                State::Dark { until } => {
+                    if now < until {
+                        commands.push(Command::WakeAt(until));
+                        return commands;
+                    }
+                    self.cursor += 1;
+                    self.state = State::Ready;
+                }
                 State::Expecting { deadline } => {
                     if now < deadline {
                         commands.push(Command::WakeAt(deadline));
@@ -580,6 +614,12 @@ impl Player {
                             self.cursor += 1;
                         }
                         Action::Wait(span) => self.state = State::Waiting { until: now + span },
+                        Action::Cut(span) => {
+                            let until = now + span;
+                            self.record(now, Verdict::Cut);
+                            commands.push(Command::Cut { until });
+                            self.state = State::Dark { until };
+                        }
                         Action::Expect { within, .. } => {
                             self.state = State::Expecting { deadline: now + within };
                         }
@@ -833,6 +873,55 @@ mod tests {
         assert!(p.finished());
         // And a registration after it plays nothing.
         assert!(p.start(at(10)).is_empty());
+    }
+
+    #[test]
+    fn a_cut_takes_the_light_off_and_the_step_ends_when_it_comes_back() {
+        let s = script("cut 3000\nsend AABBCC/10 01\n");
+        assert_eq!(s.steps[0].action, Action::Cut(WireDuration::from_ms(3000)));
+        for bad in ["cut\n", "cut 0\n", "cut 3 s\n"] {
+            assert_eq!(Script::parse(bad).unwrap_err().line, 1, "{bad:?}");
+        }
+        let mut p = Player::new(s);
+        assert_eq!(
+            p.start(at(10)),
+            vec![Command::Cut { until: at(3010) }, Command::WakeAt(at(3010))]
+        );
+        assert!(p.resume(at(3009)).contains(&Command::WakeAt(at(3010))));
+        assert_eq!(p.resume(at(3010)), vec![Command::Send { oui: OUI, code: REQUEST, body: vec![1] }]);
+        assert_eq!(verdicts(&p), vec![Verdict::Cut, Verdict::Sent]);
+        assert_eq!(p.outcomes()[0].at, at(10));
+    }
+
+    #[test]
+    fn a_replay_cuts_the_fibre_once_per_registration_in_order() {
+        let mut p = Player::new(script("send AABBCC/10 01\ncut 3000\ncut 120000\n"));
+        p.start(at(0));
+        // The cut takes the registration down before the light is back.
+        p.on_teardown(at(2000));
+        let second = p.start(at(5000));
+        assert_eq!(
+            second,
+            vec![
+                Command::Send { oui: OUI, code: REQUEST, body: vec![1] },
+                Command::Cut { until: at(125_000) },
+                Command::WakeAt(at(125_000)),
+            ]
+        );
+        p.on_teardown(at(6000));
+        assert_eq!(
+            p.start(at(130_000)),
+            vec![Command::Send { oui: OUI, code: REQUEST, body: vec![1] }]
+        );
+        assert_eq!(
+            verdicts(&p),
+            vec![
+                Verdict::Sent, Verdict::Cut, Verdict::Interrupted,
+                Verdict::Sent, Verdict::Skipped, Verdict::Cut, Verdict::Interrupted,
+                Verdict::Sent, Verdict::Skipped, Verdict::Skipped,
+            ]
+        );
+        assert!(p.finished());
     }
 
     #[test]
