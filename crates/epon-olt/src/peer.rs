@@ -58,6 +58,15 @@ pub const REDISCOVERY_DELAY: WireDuration = WireDuration::from_ms(693);
 /// plausible order of magnitude, not a measurement.
 pub const PROCESSING_DELAY: WireDuration = WireDuration::from_ms(1);
 
+/// How long the peer waits for the REGISTER_ACK that closes a handshake.
+///
+/// INFERRED stand-in. Clause 64 gives the acknowledgement until the end of the
+/// grant the OLT issues for it, plus the round trip; this peer issues no such
+/// grant (the far end answers without one), so that deadline has nothing to be
+/// measured from. The MPCP timeout, the clause's own bound on silence, takes
+/// its place.
+pub const REGISTER_ACK_TIMEOUT: WireDuration = WireDuration::from_ms(1000);
+
 /// Requests ignored before one is answered. The peer lets the first discovery
 /// window pass and registers on the second.
 pub const IGNORED_REGISTER_REQUESTS: u32 = 1;
@@ -142,6 +151,8 @@ pub enum Timer {
     /// Issue the next normal GATE. Only armed while registered — a grant
     /// window means nothing to an ONU that has no LLID.
     NormalGate,
+    /// Give up on a REGISTER that no REGISTER_ACK closed.
+    AckTimeout,
     /// Carry on with the script: a wait, a deadline or a teardown is due.
     Script,
 }
@@ -157,6 +168,9 @@ pub struct PeerConfig {
     pub registration_lifetime: WireDuration,
     pub rediscovery_delay: WireDuration,
     pub processing_delay: WireDuration,
+    /// How long a REGISTER waits for its acknowledgement before the
+    /// handshake is abandoned and the next request may be admitted.
+    pub register_ack_timeout: WireDuration,
     pub ignored_register_requests: u32,
     /// Interval between normal GATEs while registered.
     pub normal_gate_interval: WireDuration,
@@ -186,6 +200,7 @@ impl Default for PeerConfig {
             registration_lifetime: REGISTRATION_LIFETIME,
             rediscovery_delay: REDISCOVERY_DELAY,
             processing_delay: PROCESSING_DELAY,
+            register_ack_timeout: REGISTER_ACK_TIMEOUT,
             ignored_register_requests: IGNORED_REGISTER_REQUESTS,
             normal_gate_interval: NORMAL_GATE_INTERVAL,
             polled_attributes: default_polled_attributes(),
@@ -227,6 +242,8 @@ pub struct Counters {
     pub register_ack_unexpected: u64,
     /// The acknowledgement did not echo back what was granted, or refused it.
     pub register_ack_rejected: u64,
+    /// Handshakes abandoned because no acknowledgement came in time.
+    pub register_ack_timeouts: u64,
 
     /// Upstream MPCPDUs, by what they were.
     ///
@@ -490,6 +507,16 @@ impl Peer {
                 self.sched.arm_in(Timer::AttributePoll, self.now, self.config.attribute_interval);
             }
             Timer::RegisterResponse => self.answer_registration(),
+            Timer::AckTimeout => {
+                if self.mpcp_state == MpcpState::WaitAck {
+                    self.counters.register_ack_timeouts += 1;
+                    self.mpcp_state = MpcpState::Idle;
+                    self.log(format!(
+                        "no REGISTER_ACK within {} — handshake with {} abandoned",
+                        self.config.register_ack_timeout, self.onu_mac
+                    ));
+                }
+            }
             Timer::Lifetime => self.tear_down_registration(),
             Timer::Rediscovery => {
                 self.settling = false;
@@ -517,7 +544,7 @@ impl Peer {
         self.script = Some(Player::new(script));
         self.sched.cancel(Timer::AttributePoll);
         self.sched.cancel(Timer::Lifetime);
-        if self.discovery.converged() {
+        if self.discovery.converged() && self.mpcp_state == MpcpState::Registered {
             self.start_script();
         }
     }
@@ -540,7 +567,15 @@ impl Peer {
                 script::Command::Send { oui, code, body } => {
                     self.send_extended(oui, code, &body);
                 }
-                script::Command::Deregister => self.tear_down_registration(),
+                script::Command::Deregister => {
+                    if self.registered_at.is_some() {
+                        self.tear_down_registration();
+                    } else {
+                        // Nothing to tear down, so no teardown reaches the
+                        // script: let it carry on by itself.
+                        self.sched.arm_at(Timer::Script, self.now);
+                    }
+                }
                 script::Command::WakeAt(at) => self.sched.arm_at(Timer::Script, at),
             }
         }
@@ -581,6 +616,12 @@ impl Peer {
             self.sched.arm_at(Timer::Keepalive, self.now);
         } else {
             self.log("link down".to_string());
+            if self.registered_at.is_some() {
+                let now = self.now;
+                if let Some(player) = self.script.as_mut() {
+                    player.on_teardown(now);
+                }
+            }
             self.sched.clear();
             self.mpcp_state = MpcpState::Idle;
             self.registered_at = None;
@@ -709,9 +750,30 @@ impl Peer {
             self.counters.register_ack_unexpected += 1;
             return;
         }
+        self.sched.cancel(Timer::AckTimeout);
         self.mpcp_state = MpcpState::Registered;
         self.registration_complete = true;
         self.registered_at = Some(self.now);
+        let restart_discovery = match self.script.as_ref().map(Player::reregistration) {
+            None => false,
+            Some(script::Reregistration::Replay) => {
+                self.counters.registrations > 0 || self.discovery.converged()
+            }
+            Some(script::Reregistration::Once) => {
+                self.counters.registrations == 0 && self.discovery.converged()
+            }
+        };
+        if restart_discovery {
+            // A new registration starts OAM discovery over: whatever it
+            // converged on before belonged to a link that held no LLID or was
+            // torn down, and a replayed script provisions this one once
+            // discovery on this one has converged. Kept to scripts that
+            // replay: an unscripted peer rotates its reads as before, and a
+            // script played once leaves later registrations as they were.
+            let was = self.discovery.state();
+            self.discovery.reset();
+            self.note_discovery_change(was);
+        }
         self.counters.registrations += 1;
         if self.script.is_none() {
             self.sched.arm_in(Timer::Lifetime, self.now, self.config.registration_lifetime);
@@ -817,6 +879,7 @@ impl Peer {
         self.emit(frame, "REGISTER");
         self.llid_assignment = Some(self.assigned_llid.as_u16());
         self.mpcp_state = MpcpState::WaitAck;
+        self.sched.arm_in(Timer::AckTimeout, self.now, self.config.register_ack_timeout);
     }
 
     fn tear_down_registration(&mut self) {
@@ -839,6 +902,10 @@ impl Peer {
         self.sched.cancel(Timer::AttributePoll);
         self.settling = true;
         self.sched.arm_in(Timer::Rediscovery, self.now, self.config.rediscovery_delay);
+        let now = self.now;
+        if let Some(player) = self.script.as_mut() {
+            player.on_teardown(now);
+        }
     }
 
     fn note_discovery_change(&mut self, was: oam::DiscoveryState) {
@@ -856,7 +923,11 @@ impl Peer {
     fn on_discovery_entered(&mut self, state: oam::DiscoveryState) {
         if state == oam::DiscoveryState::Converged {
             if self.script.is_some() {
-                self.start_script();
+                // A script provisions a registered link: discovery converging
+                // with an end that holds no LLID is not a link to provision.
+                if self.mpcp_state == MpcpState::Registered {
+                    self.start_script();
+                }
             } else {
                 self.sched.arm_at(Timer::AttributePoll, self.now);
             }
@@ -1001,6 +1072,7 @@ impl Peer {
         // synthesized traffic used up.
         self.register_requests_seen = 0;
         self.sched.cancel(Timer::RegisterResponse);
+        self.sched.cancel(Timer::AckTimeout);
         self.sched.cancel(Timer::Lifetime);
     }
 
@@ -1796,6 +1868,141 @@ mod tests {
         assert_eq!(deregisters_sent(&peer), 0);
         peer.advance_to(at(started + 2_500));
         assert_eq!(deregisters_sent(&peer), 1);
+    }
+
+    /// A stable far end describing itself, which is what converges discovery.
+    fn stable_information() -> Vec<u8> {
+        oam::information(
+            DEFAULT_OLT_MAC,
+            ONU,
+            oam::Flags::local_stable(),
+            oam::InfoTlv {
+                is_local: true,
+                oam_version: 1,
+                revision: 0,
+                state: 0,
+                configuration: 0x14,
+                max_pdu_size: 0x0600,
+                oui: oam::Oui::DPOE,
+                vendor_specific: [0; 4],
+            },
+        )
+    }
+
+    /// Converge discovery from wherever it is, starting at `t`: the far end
+    /// describes itself, the peer advertises long enough to settle, and the
+    /// far end confirms. Returns the instant it converged at.
+    fn converge(peer: &mut Peer, t: u64) -> u64 {
+        peer.deliver(&stable_information(), at(t));
+        let settled = t + 6 * OAM_KEEPALIVE_INTERVAL.as_ms() + 1;
+        peer.advance_to(at(settled));
+        peer.deliver(&stable_information(), at(settled + 1));
+        assert!(peer.discovery().converged(), "{:?}", peer.discovery().state());
+        settled + 1
+    }
+
+    #[test]
+    fn a_torn_down_registration_is_admitted_again() {
+        let mut peer = live_peer();
+        peer.advance_to(at(0));
+        let acked = register(&mut peer, 1);
+        let torn = acked + REGISTRATION_LIFETIME.as_ms();
+        peer.advance_to(at(torn));
+        assert_eq!(peer.mpcp_state(), MpcpState::Idle);
+        let rediscovered = torn + REDISCOVERY_DELAY.as_ms();
+        peer.advance_to(at(rediscovered));
+        register(&mut peer, rediscovered);
+        assert_eq!(peer.mpcp_state(), MpcpState::Registered);
+        assert_eq!(peer.counters.registrations, 2);
+        // The second discovery cycle passed over its first window too.
+        assert_eq!(peer.counters.register_req_window_passed, 2);
+        assert!(peer.counters.register_requests_accounted_for());
+    }
+
+    #[test]
+    fn a_register_nobody_acknowledges_is_abandoned() {
+        let mut peer = live_peer();
+        peer.advance_to(at(0));
+        for _ in 0..=IGNORED_REGISTER_REQUESTS {
+            peer.deliver(&register_req(ONU), at(1));
+        }
+        peer.advance_to(at(1 + PROCESSING_DELAY.as_ms()));
+        assert_eq!(peer.mpcp_state(), MpcpState::WaitAck);
+        let sent = 1 + PROCESSING_DELAY.as_ms();
+        // Until the deadline, a new request is a handshake already in flight.
+        peer.deliver(&register_req(ONU), at(sent + 500));
+        assert_eq!(peer.counters.register_req_in_flight, 1);
+        peer.advance_to(at(sent + REGISTER_ACK_TIMEOUT.as_ms() - 1));
+        assert_eq!(peer.mpcp_state(), MpcpState::WaitAck);
+        peer.advance_to(at(sent + REGISTER_ACK_TIMEOUT.as_ms()));
+        assert_eq!(peer.mpcp_state(), MpcpState::Idle);
+        assert_eq!(peer.counters.register_ack_timeouts, 1);
+        // The next request is admitted: the window was already passed over.
+        let retry = sent + REGISTER_ACK_TIMEOUT.as_ms() + 10;
+        peer.deliver(&register_req(ONU), at(retry));
+        assert_eq!(peer.counters.register_req_accepted, 2);
+        peer.advance_to(at(retry + PROCESSING_DELAY.as_ms()));
+        peer.deliver(&register_ack(ONU, peer.assigned_llid()), at(retry + 5));
+        assert_eq!(peer.mpcp_state(), MpcpState::Registered);
+        // An acknowledgement in time cancels the deadline.
+        peer.advance_to(at(retry + 10 * REGISTER_ACK_TIMEOUT.as_ms()));
+        assert_eq!(peer.counters.register_ack_timeouts, 1);
+        assert!(peer.counters.register_requests_accounted_for());
+    }
+
+    #[test]
+    fn a_script_waits_for_a_registered_link() {
+        let mut peer = live_peer();
+        peer.set_script(Script::parse(SCRIPT).expect("the fixture parses"));
+        peer.advance_to(at(0));
+        // Discovery converges with an end that holds no LLID.
+        let converged = converge(&mut peer, 1);
+        assert!(scripted_requests(&peer).is_empty(), "nothing to provision without an LLID");
+        // Registering on an already converged link starts discovery over: the
+        // script waits for discovery to converge on it.
+        let acked = register(&mut peer, converged + 1);
+        assert!(scripted_requests(&peer).is_empty());
+        converge(&mut peer, acked + 1);
+        assert_eq!(scripted_requests(&peer), vec![0x01]);
+    }
+
+    #[test]
+    fn a_new_registration_replays_the_script() {
+        let (mut peer, started) = scripted_peer_playing(
+            "send AABBCC/10 01\nexpect AABBCC/11 80 within 500\nderegister\nsend AABBCC/10 02\n",
+        );
+        peer.deliver(&scripted_answer(SCRIPT_ANSWER, &[0x80]), at(started + 1));
+        assert_eq!(deregisters_sent(&peer), 1);
+        assert_eq!(scripted_requests(&peer), vec![0x01], "the teardown ends the pass");
+
+        let rediscovered = started + 1 + REDISCOVERY_DELAY.as_ms();
+        peer.advance_to(at(rediscovered));
+        let acked = register(&mut peer, rediscovered);
+        assert_eq!(peer.counters.registrations, 2);
+        let converged = converge(&mut peer, acked + 1);
+        assert_eq!(scripted_requests(&peer), vec![0x01, 0x01], "played again from the top");
+        peer.deliver(&scripted_answer(SCRIPT_ANSWER, &[0x80]), at(converged + 1));
+        // The teardown the first pass injected is not injected again.
+        assert_eq!(deregisters_sent(&peer), 1);
+        assert_eq!(scripted_requests(&peer), vec![0x01, 0x01, 0x02]);
+        let player = peer.script().expect("scripted");
+        assert!(player.finished());
+        assert_eq!(player.registration(), 2);
+    }
+
+    #[test]
+    fn a_script_played_once_is_left_alone_by_a_new_registration() {
+        let (mut peer, started) = scripted_peer_playing(
+            "reregistration once\nsend AABBCC/10 01\nexpect AABBCC/11 80 within 500\nderegister\n",
+        );
+        peer.deliver(&scripted_answer(SCRIPT_ANSWER, &[0x80]), at(started + 1));
+        let rediscovered = started + 1 + REDISCOVERY_DELAY.as_ms();
+        peer.advance_to(at(rediscovered));
+        let acked = register(&mut peer, rediscovered);
+        assert_eq!(peer.counters.registrations, 2);
+        converge(&mut peer, acked + 1);
+        assert_eq!(scripted_requests(&peer), vec![0x01]);
+        assert_eq!(peer.script().expect("scripted").registration(), 1);
     }
 
     #[test]

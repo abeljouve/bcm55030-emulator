@@ -39,9 +39,26 @@
 //!   OAMPDUs, for the whole run: the slow-protocol group address, or the
 //!   ONU's own once it is known. Equipment differs on this, and an answer
 //!   built from the request carries the choice back.
+//! - `reregistration replay|once` says what a registration that follows a
+//!   teardown does to the script, whatever tore the first one down.
+//!   - `replay`, the default: the script is played again from its first
+//!     step, once OAM has converged on the new registration. A new
+//!     registration is a new link to provision. A script that a reaction
+//!     ended (`stop`, `deregister-after`) stays ended.
+//!   - `once`: the script is played on the first registration only, and a
+//!     teardown neither stops nor restarts it.
+//!
+//!   A `deregister` step is a fault injected into the run, not provisioning:
+//!   a replay skips one that an earlier pass already played, or every
+//!   registration would end at the same step.
 //!
 //! A reaction is `continue`, `stop`, or `deregister-after <ms>`. Every
 //! duration is link time, in milliseconds.
+//!
+//! The script only starts once the link is registered and OAM discovery has
+//! converged. A teardown in the middle of a replayed script ends that pass:
+//! the step under way is recorded as interrupted, and the next registration
+//! starts from the top.
 
 use std::fmt;
 
@@ -109,6 +126,24 @@ pub enum Action {
     Deregister,
 }
 
+impl Action {
+    /// A fault injected into the run rather than an exchange: played on the
+    /// first pass that reaches it, skipped by the replays after it.
+    pub fn once_per_run(&self) -> bool {
+        matches!(self, Self::Deregister)
+    }
+}
+
+/// What a registration that follows a teardown does to the script.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Reregistration {
+    /// Play the script again from its first step.
+    #[default]
+    Replay,
+    /// Leave the script as the teardown found it.
+    Once,
+}
+
 /// One line of the script, with where it came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
@@ -124,6 +159,7 @@ pub struct Script {
     /// Where OAMPDUs are addressed, when the script says: `true` for the
     /// slow-protocol group address. `None` leaves the peer as configured.
     pub multicast_oam: Option<bool>,
+    pub reregistration: Reregistration,
 }
 
 /// A line that could not be read.
@@ -165,6 +201,14 @@ impl Script {
                         ["unicast"] => false,
                         _ => return Err(err("oam-destination is `multicast` or `unicast`".into())),
                     });
+                    continue;
+                }
+                "reregistration" => {
+                    script.reregistration = match rest[..] {
+                        ["replay"] => Reregistration::Replay,
+                        ["once"] => Reregistration::Once,
+                        _ => return Err(err("reregistration is `replay` or `once`".into())),
+                    };
                     continue;
                 }
                 "send" => {
@@ -288,6 +332,11 @@ pub enum Verdict {
     TimedOut,
     /// The registration was torn down, by a step or by a reaction.
     Deregistered,
+    /// The registration was torn down while the step was under way, by
+    /// something other than the step itself.
+    Interrupted,
+    /// A fault an earlier pass already injected.
+    Skipped,
 }
 
 impl fmt::Display for Verdict {
@@ -299,6 +348,8 @@ impl fmt::Display for Verdict {
             Self::Mismatched { oui, code } => write!(f, "mismatched ({oui}/{code:02X})"),
             Self::TimedOut => f.write_str("timed out"),
             Self::Deregistered => f.write_str("deregistered"),
+            Self::Interrupted => f.write_str("interrupted by a teardown"),
+            Self::Skipped => f.write_str("skipped (played on an earlier registration)"),
         }
     }
 }
@@ -312,6 +363,9 @@ pub struct Outcome {
     pub line: usize,
     pub at: WireInstant,
     pub verdict: Verdict,
+    /// Which pass over the script this was: one more for every registration
+    /// the script was replayed on.
+    pub registration: u32,
 }
 
 /// What the player asks of the peer that hosts it.
@@ -347,6 +401,12 @@ pub struct Player {
     cursor: usize,
     state: State,
     outcomes: Vec<Outcome>,
+    /// Passes started so far.
+    registration: u32,
+    /// A reaction ended the script. Nothing replays it.
+    halted: bool,
+    /// Steps already played, for the ones played once per run.
+    played: Vec<bool>,
     /// Frames the script was told to ignore.
     pub ignored_seen: u64,
     /// Extended frames that arrived while no step was waiting for one, or
@@ -357,10 +417,13 @@ pub struct Player {
 impl Player {
     pub fn new(script: Script) -> Self {
         Self {
+            played: vec![false; script.steps.len()],
             script,
             cursor: 0,
             state: State::Idle,
             outcomes: Vec::new(),
+            registration: 0,
+            halted: false,
             ignored_seen: 0,
             unsolicited_seen: 0,
         }
@@ -382,18 +445,60 @@ impl Player {
         &self.script.steps
     }
 
-    /// Start playing. Later calls change nothing: a script is played once.
+    /// What a registration that follows a teardown does to the script.
+    pub fn reregistration(&self) -> Reregistration {
+        self.script.reregistration
+    }
+
+    /// Passes started so far: 1 on the first registration, one more for
+    /// every registration the script was replayed on.
+    pub fn registration(&self) -> u32 {
+        self.registration
+    }
+
+    /// Start a pass. A call while a pass is under way, or after the last one
+    /// ended, changes nothing.
     pub fn start(&mut self, now: WireInstant) -> Vec<Command> {
         if self.state != State::Idle {
             return Vec::new();
         }
+        self.registration += 1;
         self.state = State::Ready;
         self.resume(now)
     }
 
+    /// The registration the script was playing on was torn down at `now`.
+    ///
+    /// Replayed, the pass ends here: a step waiting on the link is recorded
+    /// as interrupted, and the next [`Self::start`] plays from the top. A
+    /// teardown a reaction had asked for, or one that arrives while such a
+    /// teardown is pending, ends the script for good.
+    pub fn on_teardown(&mut self, now: WireInstant) {
+        if self.script.reregistration == Reregistration::Once || self.state == State::Idle {
+            return;
+        }
+        match self.state {
+            State::Waiting { .. } | State::Expecting { .. } => {
+                self.record(now, Verdict::Interrupted);
+            }
+            State::Leaving { .. } => {
+                self.record(now, Verdict::Interrupted);
+                self.halted = true;
+            }
+            State::Idle | State::Ready | State::Done => {}
+        }
+        if self.halted {
+            self.state = State::Done;
+            return;
+        }
+        self.cursor = 0;
+        self.state = State::Idle;
+    }
+
     fn record(&mut self, at: WireInstant, verdict: Verdict) {
         let line = self.script.steps[self.cursor].line;
-        self.outcomes.push(Outcome { step: self.cursor, line, at, verdict });
+        let registration = self.registration;
+        self.outcomes.push(Outcome { step: self.cursor, line, at, verdict, registration });
     }
 
     fn react(&mut self, reaction: Reaction, now: WireInstant) -> Vec<Command> {
@@ -405,6 +510,7 @@ impl Player {
             }
             Reaction::Stop => {
                 self.state = State::Done;
+                self.halted = true;
                 Vec::new()
             }
             Reaction::Deregister { after } => {
@@ -450,6 +556,7 @@ impl Player {
                     }
                     self.record(at, Verdict::Deregistered);
                     self.state = State::Done;
+                    self.halted = true;
                     commands.push(Command::Deregister);
                     return commands;
                 }
@@ -458,6 +565,14 @@ impl Player {
                         self.state = State::Done;
                         return commands;
                     };
+                    if step.action.once_per_run() {
+                        if self.played[self.cursor] {
+                            self.record(now, Verdict::Skipped);
+                            self.cursor += 1;
+                            continue;
+                        }
+                        self.played[self.cursor] = true;
+                    }
                     match step.action.clone() {
                         Action::Send { oui, code, body } => {
                             self.record(now, Verdict::Sent);
@@ -472,6 +587,11 @@ impl Player {
                             self.record(now, Verdict::Deregistered);
                             commands.push(Command::Deregister);
                             self.cursor += 1;
+                            // Replayed, the teardown ends this pass: nothing
+                            // after it is played on the registration it ended.
+                            if self.script.reregistration == Reregistration::Replay {
+                                return commands;
+                            }
                         }
                     }
                 }
@@ -660,7 +780,10 @@ mod tests {
         p.start(at(0));
         // The host comes back late; the timeout is still stamped where it fell.
         assert_eq!(p.resume(at(180)), vec![Command::WakeAt(at(2100))]);
-        assert_eq!(p.outcomes()[1], Outcome { step: 1, line: 2, at: at(100), verdict: Verdict::TimedOut });
+        assert_eq!(
+            p.outcomes()[1],
+            Outcome { step: 1, line: 2, at: at(100), verdict: Verdict::TimedOut, registration: 1 }
+        );
         assert_eq!(p.resume(at(2100)), vec![Command::Deregister]);
     }
 
@@ -701,10 +824,111 @@ mod tests {
     }
 
     #[test]
-    fn a_deregister_step_tears_down_and_the_script_goes_on() {
-        let mut p = Player::new(script("deregister\nwait 5\n"));
+    fn a_deregister_step_played_once_tears_down_and_the_script_goes_on() {
+        let mut p = Player::new(script("reregistration once\nderegister\nwait 5\n"));
         assert_eq!(p.start(at(0)), vec![Command::Deregister, Command::WakeAt(at(5))]);
+        p.on_teardown(at(0));
         p.resume(at(5));
         assert_eq!(verdicts(&p), vec![Verdict::Deregistered, Verdict::Waited]);
+        assert!(p.finished());
+        // And a registration after it plays nothing.
+        assert!(p.start(at(10)).is_empty());
+    }
+
+    #[test]
+    fn what_a_reregistration_does_is_read_from_the_header() {
+        assert_eq!(script("wait 1\n").reregistration, Reregistration::Replay);
+        assert_eq!(script("reregistration once\n").reregistration, Reregistration::Once);
+        assert_eq!(script("reregistration replay\n").reregistration, Reregistration::Replay);
+        assert_eq!(Script::parse("reregistration twice\n").unwrap_err().line, 1);
+    }
+
+    #[test]
+    fn a_new_registration_replays_the_script_from_the_top() {
+        let mut p = Player::new(script(REQUEST_AND_ANSWER));
+        p.start(at(0));
+        p.on_upstream(OUI, ANSWER, &[0x80, 0x00], at(3));
+        assert!(p.finished());
+        p.on_teardown(at(50));
+        assert!(!p.finished() && !p.started(), "waiting for the next registration");
+        assert_eq!(
+            p.start(at(1000)),
+            vec![
+                Command::Send { oui: OUI, code: REQUEST, body: vec![1, 2] },
+                Command::WakeAt(at(1100)),
+            ]
+        );
+        assert_eq!(p.registration(), 2);
+        let passes: Vec<u32> = p.outcomes().iter().map(|o| o.registration).collect();
+        assert_eq!(passes, vec![1, 1, 1, 2]);
+    }
+
+    #[test]
+    fn a_teardown_under_a_step_interrupts_it_and_the_next_pass_starts_over() {
+        let mut p = Player::new(script(REQUEST_AND_ANSWER));
+        p.start(at(0));
+        p.on_teardown(at(40));
+        assert_eq!(p.outcomes()[1].verdict, Verdict::Interrupted);
+        assert_eq!(p.outcomes()[1].at, at(40));
+        // The deadline of the interrupted step fires into nothing.
+        assert!(p.resume(at(100)).is_empty());
+        assert_eq!(p.outcomes().len(), 2);
+        p.start(at(500));
+        assert_eq!(p.outcomes()[2], Outcome {
+            step: 0,
+            line: 1,
+            at: at(500),
+            verdict: Verdict::Sent,
+            registration: 2,
+        });
+    }
+
+    #[test]
+    fn a_script_a_reaction_ended_is_not_replayed() {
+        // Stopped by a mismatch.
+        let mut p = Player::new(script("send AABBCC/10 01\nexpect AABBCC/11 80 within 100\n"));
+        p.start(at(0));
+        p.on_upstream(OUI, ANSWER, &[0x00], at(3));
+        p.on_teardown(at(10));
+        assert!(p.start(at(1000)).is_empty());
+        assert!(p.finished());
+        // Torn down by its own reaction.
+        let mut p = Player::new(script(REQUEST_AND_ANSWER));
+        p.start(at(0));
+        p.on_upstream(OUI, ANSWER, &[0x00, 0x00], at(3));
+        assert_eq!(p.resume(at(13)), vec![Command::Deregister]);
+        p.on_teardown(at(13));
+        assert!(p.start(at(1000)).is_empty());
+        // Torn down by something else while that teardown was pending.
+        let mut p = Player::new(script(REQUEST_AND_ANSWER));
+        p.start(at(0));
+        p.on_upstream(OUI, ANSWER, &[0x00, 0x00], at(3));
+        p.on_teardown(at(5));
+        assert_eq!(p.outcomes().last().map(|o| o.verdict.clone()), Some(Verdict::Interrupted));
+        assert!(p.start(at(1000)).is_empty());
+        assert!(p.resume(at(13)).is_empty(), "the pending teardown is not sent any more");
+    }
+
+    #[test]
+    fn a_replay_skips_the_teardown_an_earlier_pass_injected() {
+        let mut p = Player::new(script("send AABBCC/10 01\nderegister\nsend AABBCC/10 02\n"));
+        assert_eq!(
+            p.start(at(0)),
+            vec![Command::Send { oui: OUI, code: REQUEST, body: vec![1] }, Command::Deregister]
+        );
+        // Nothing after the teardown is played on the registration it ended.
+        p.on_teardown(at(0));
+        assert_eq!(
+            p.start(at(1000)),
+            vec![
+                Command::Send { oui: OUI, code: REQUEST, body: vec![1] },
+                Command::Send { oui: OUI, code: REQUEST, body: vec![2] },
+            ]
+        );
+        assert_eq!(
+            verdicts(&p),
+            vec![Verdict::Sent, Verdict::Deregistered, Verdict::Sent, Verdict::Skipped, Verdict::Sent]
+        );
+        assert!(p.finished());
     }
 }
