@@ -613,6 +613,13 @@ impl Uni {
         self.rx_pending.drain(..).collect()
     }
 
+    /// Take the oldest accepted frame, for a datapath that can only take
+    /// one when it has room: what it does not take stays here, in a queue
+    /// that is finite and counts what it refuses.
+    pub fn pop_rx_frame(&mut self) -> Option<Vec<u8>> {
+        self.rx_pending.pop_front()
+    }
+
     fn stat_cmd_word(&self) -> u32 {
         let stored = self.store[Self::idx(REG_STAT_CMD)] & !BUSY_BIT;
         if self.port_busy {

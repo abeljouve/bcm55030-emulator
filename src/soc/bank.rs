@@ -453,8 +453,12 @@ impl PeripheralBank {
         // mailbox, but through their own classifier binding: the two
         // directions do not share a rule table. They are classified
         // whether or not the fibre's gate is open — that gate guards the
-        // fibre's EtherType fallback, and this port has none.
-        for frame in self.uni.take_rx_frames() {
+        // fibre's EtherType fallback, and this port has none. Like the
+        // fibre's, a frame the mailbox has no room for waits where it is,
+        // in the port's own finite queue, instead of being thrown away by
+        // a depth this model shares between queues that silicon does not.
+        while self.olt.mailbox_has_room() {
+            let Some(frame) = self.uni.pop_rx_frame() else { break };
             self.olt.deliver_port_frame((&self.lue, self.uni_classifier_binding), &frame);
         }
         // The MAC holds the counters software latches; the OLT is where a

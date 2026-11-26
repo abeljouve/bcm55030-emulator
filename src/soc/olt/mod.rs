@@ -579,7 +579,7 @@ impl Olt {
         (lue, binding): (&Lue, ClassifierBinding),
         frame: &[u8],
     ) -> Option<Slot> {
-        if self.total_pending_count() >= MAILBOX_DEPTH {
+        if !self.mailbox_has_room() {
             self.port_ingress.mailbox_full += 1;
             return None;
         }
@@ -715,6 +715,11 @@ impl Olt {
 
     pub fn has_any_pending(&self) -> bool {
         self.mailbox_pending.values().any(|q| !q.is_empty())
+    }
+
+    /// True while the mailbox can take another frame.
+    pub fn mailbox_has_room(&self) -> bool {
+        self.total_pending_count() < MAILBOX_DEPTH
     }
 
     pub fn total_pending_count(&self) -> usize {

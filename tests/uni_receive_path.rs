@@ -232,6 +232,35 @@ fn a_rule_naming_an_upstream_queue_does_not_hand_the_frame_to_the_cpu() {
     assert!(c.accounted_for());
 }
 
+/// A frame the mailbox has no room for waits in the port and lands once
+/// software has taken one: it is not dropped by a depth the fibre's
+/// frames share.
+#[test]
+fn a_frame_the_mailbox_cannot_take_yet_waits_in_the_port() {
+    let mut bank = bank_with_live_port();
+    let ClassifierBinding { instance, table } = bank.uni_classifier_binding;
+    let queue = Slot(0x0F);
+    program_queue_rule(&mut bank, instance, table, 0x20, 0x88B5, queue.0 as u16);
+
+    while bank.olt.mailbox_has_room() {
+        offer(&mut bank, ethertype_frame(0x88B5));
+        bank.tick(1);
+    }
+    let held = bank.olt.total_pending_count();
+    offer(&mut bank, ethertype_frame(0x88B5));
+    bank.tick(1);
+    assert_eq!(bank.olt.total_pending_count(), held, "no room: it does not land");
+    assert_eq!(bank.uni.rx_queued(), 1, "it waits in the port");
+    assert_eq!(bank.olt.port_ingress.mailbox_full, 0, "and is not counted lost");
+
+    // Software takes one frame from the queue; the waiting one lands.
+    bank.olt.mailbox_pending.get_mut(&queue.0).unwrap().pop_front();
+    bank.tick(1);
+    assert_eq!(bank.olt.total_pending_count(), held);
+    assert_eq!(bank.uni.rx_queued(), 0);
+    assert!(bank.olt.port_ingress.accounted_for());
+}
+
 /// A frame offered to a port that is not up never becomes the
 /// datapath's problem.
 #[test]
