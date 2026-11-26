@@ -127,8 +127,8 @@ const REG_SPECIAL_0064: u32 = 0x0100_0064;
 /// but the offset is not documented in `hwregs`.
 // MPCP CMD LATCH moved to LaneBus mpcp_bus (lane 8) in bank.rs.
 /// EPON discovery status. Bit 2 = OLT discovery detected, bit 1 =
-/// discovery change. W1C for bits[2:1]. `mpcp_epon_get_status` returns
-/// true when `(val & 6) == 4` (bit 2 set, bit 1 clear).
+/// discovery change. W1C for bits[2:1]. Firmware reads discovery as
+/// present when `(val & 6) == 4` (bit 2 set, bit 1 clear).
 const REG_DISCOVERY_STATUS: u32 = 0x0100_1040;
 
 /// Address carveouts inside the table / LLID windows that belong to

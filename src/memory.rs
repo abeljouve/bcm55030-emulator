@@ -427,7 +427,7 @@ impl Memory {
     // `write_word` back the debug and introspection views (MCP `read_memory` /
     // `write_memory`, the UI memory panel, offline analysis tools).
     //
-    // They deliberately do NOT apply the §6.2 align-down that the CPU data port
+    // They deliberately do NOT apply the misaligned-access align-down that the CPU data port
     // applies in `data_effective_addr`. This asymmetry is intentional: a
     // debugger asked for the bytes at address N must report the bytes at
     // address N. Do not "fix" the misaligned branches below to match the CPU —
@@ -833,7 +833,7 @@ impl Memory {
     /// Effective address of a CPU data access — the address the core actually
     /// drives on the memory port.
     ///
-    /// OBSERVED (verified against real hardware, §6.2 "Misaligned accesses"):
+    /// OBSERVED (verified against real hardware, misaligned accesses):
     /// this ARC700 integration neither traps nor performs a byte-wise fixup on
     /// a misaligned word / half-word access. The core silently clears the low
     /// address bits before performing the transfer:
@@ -853,7 +853,7 @@ impl Memory {
     /// MMIO accesses. Hence it is applied here, at the single entry point of
     /// the data port, ahead of the `cache_bypass || is_mmio || !dcache_enabled`
     /// dispatch — a peripheral therefore only ever sees an already-masked
-    /// address. (INFERRED for the `.di` and MMIO legs: §6.2's probes used an
+    /// address. (INFERRED for the `.di` and MMIO legs: the silicon probes used an
     /// SRAM base, so neither leg is directly measured. `.DI` is defined purely
     /// in terms of cache participation — "the cache is bypassed and the data is
     /// loaded directly from or stored directly to the memory" — and says
@@ -925,7 +925,7 @@ impl Memory {
     }
 
     pub fn read_half_data(&mut self, addr: u32, cache_bypass: bool) -> Result<u16, Exception> {
-        // §6.2: half-word effective address = address & ~1.
+        // Measured: half-word effective address = address & ~1.
         let addr = self.data_effective_addr(addr, 2, false);
         let r = self.read_half_data_inner(addr, cache_bypass);
         if self.read_trace.is_some() {
@@ -939,7 +939,7 @@ impl Memory {
     }
 
     fn read_half_data_inner(&mut self, addr: u32, cache_bypass: bool) -> Result<u16, Exception> {
-        debug_assert_eq!(addr & 1, 0, "caller must pass a §6.2 effective address");
+        debug_assert_eq!(addr & 1, 0, "caller must pass an aligned effective address");
         if cache_bypass || self.is_mmio(addr) || !self.dcache_enabled() {
             if self.sram_offset(addr).is_none() {
                 if let Some(ref bank) = self.bank {
@@ -959,7 +959,7 @@ impl Memory {
     }
 
     pub fn read_word_data(&mut self, addr: u32, cache_bypass: bool) -> Result<u32, Exception> {
-        // §6.2: word effective address = address & ~3.
+        // Measured: word effective address = address & ~3.
         let addr = self.data_effective_addr(addr, 4, false);
         let r = self.read_word_data_inner(addr, cache_bypass);
         if self.read_trace.is_some() {
@@ -981,13 +981,13 @@ impl Memory {
     // trap.
     //
     // Verified against real hardware: there is no exception, but the low address
-    // bits are silently *cleared* (§6.2, align-down) — the transfer lands
+    // bits are silently *cleared* (align-down) — the transfer lands
     // elsewhere, it is not byte-wise fixed up. The byte-wise model was "more
     // correct" than the hardware, which made the resulting silent corruption
     // invisible here. The mask now lives in `data_effective_addr`, so by the
     // time control reaches this function the address is aligned.
     fn read_word_data_inner(&mut self, addr: u32, cache_bypass: bool) -> Result<u32, Exception> {
-        debug_assert_eq!(addr & 3, 0, "caller must pass a §6.2 effective address");
+        debug_assert_eq!(addr & 3, 0, "caller must pass an aligned effective address");
         if cache_bypass || self.is_mmio(addr) || !self.dcache_enabled() {
             if self.sram_offset(addr).is_none() {
                 if let Some(ref bank) = self.bank {
@@ -1026,7 +1026,7 @@ impl Memory {
     }
 
     pub fn write_half_data(&mut self, addr: u32, val: u16, cache_bypass: bool) -> Result<(), Exception> {
-        // §6.2: half-word effective address = address & ~1. Masked before the
+        // Measured: half-word effective address = address & ~1. Masked before the
         // watchpoint check and the NCO mirror so both see the address the core
         // actually drove.
         let addr = self.data_effective_addr(addr, 2, true);
@@ -1047,7 +1047,7 @@ impl Memory {
     }
 
     pub fn write_word_data(&mut self, addr: u32, val: u32, cache_bypass: bool) -> Result<(), Exception> {
-        // §6.2: word effective address = address & ~3. Note this also repairs a
+        // Measured: word effective address = address & ~3. Note this also repairs a
         // fabrication on the MMIO leg: a misaligned MMIO store used to fall
         // into `write_word`'s unaligned branch, find no SRAM backing, and
         // return `Ok(())` — silently dropped, never reaching the peripheral nor
@@ -1084,9 +1084,8 @@ impl Memory {
         // the bypass path — reads the stale SRAM word. Software that means to
         // keep what it wrote must issue a write-back invalidate (`DC_IVDC`
         // with `IM=1`) *before* disabling; a well-behaved boot loader does
-        // exactly that. -- OBSERVED, DATASHEET §5.3 (and §5.3.1, §10.7), which calls
-        // out compiler-saved frame pointers held across a disable window as
-        // the case this bites.
+        // exactly that. -- OBSERVED on silicon; compiler-saved frame pointers held across a
+        // disable window are the case this bites.
         //
         // WRONG per silicon characterization: this used to flush every dirty
         // line on the enabled->disabled transition.
@@ -1099,7 +1098,7 @@ impl Memory {
         // does not write back. Flushing here made the model more forgiving than
         // the hardware, which is the one direction a model must never err. In the
         // shipping configuration both boot loaders disable the D-cache and never
-        // re-enable it (§7 step 3), so at runtime the cache is empty and there is
+        // re-enable it (boot step 3), so at runtime the cache is empty and there is
         // nothing to lose on such a store anyway.
         if let Some(ref mut dc) = self.dcache {
             dc.write_dc_ctrl(val);
@@ -1316,7 +1315,7 @@ mod tests {
     // mode, not the ARC700 misalignment rule. Flat mode has no peripheral bank
     // and takes `read_word`'s strict path, which rejects a misaligned request
     // rather than inventing a value. The CPU data port behaves completely
-    // differently (§6.2 align-down) — see `misaligned_*_data_*` below.
+    // differently (align-down) — see `misaligned_*_data_*` below.
     #[test]
     fn test_misaligned_word() {
         let mem = Memory::new(16);
@@ -1438,9 +1437,9 @@ mod tests {
         assert_eq!(mem.read_word(0x300).unwrap(), 0x12345678);
     }
 
-    // DATASHEET §5.3: disabling the D-cache does NOT write dirty lines back.
+    // Measured on silicon: disabling the D-cache does NOT write dirty lines back.
     // The enable flag clears, the dirty lines are lost, and the next access —
-    // bypassing the cache now — reads the stale SRAM word. §5.3 names this
+    // bypassing the cache now — reads the stale SRAM word. Measurement names this
     // exact case: "compiler-saved frame pointers held on the stack across a
     // cache-disable window".
     //
@@ -1464,7 +1463,7 @@ mod tests {
         assert_eq!(mem.read_word_data(slot, false).unwrap(), 0x0000_0000);
     }
 
-    // The other half of §5.3: the write-back invalidate (`DC_IVDC` with IM=1)
+    // The other half of the measurement: the write-back invalidate (`DC_IVDC` with IM=1)
     // is what makes SRAM coherent, and software must issue it *before* the
     // disable. A well-behaved boot loader does (flush-invalidate then
     // `sr 0xC3,[DC_CTRL]`), which is why its hand-off survives.
@@ -1517,9 +1516,9 @@ mod tests {
     }
 
     // ===================================================================
-    // ISA characterization §6.2 "Misaligned accesses"
+    // Misaligned accesses, measured on silicon
     //
-    // Test vector and result table for §6.2. Bytes
+    // Test vector and result table. Bytes
     // `80 FF 00 AA 11 22 33 44` at an aligned base:
     //
     //   | Request                  | Observed result/effect              |

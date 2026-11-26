@@ -1,6 +1,6 @@
 //! `AUX_IENABLE` (aux `0x40C`) is not implemented on the BCM55030.
 //!
-//! DATASHEET §6.1, measured on silicon: a read of `0x40C` returns the
+//! Measured on silicon: a read of `0x40C` returns the
 //! `IDENTITY` value that every unimplemented auxiliary address returns, a
 //! write is discarded (writing back the read value with bit 7 set and
 //! re-reading returns the original), and there is **no per-line interrupt
@@ -9,7 +9,7 @@
 //! individual sources are masked at the peripheral.
 //!
 //! The evidence that settles it: Timer 1 / IRQ 7 was delivered 19 001 times
-//! during the §4.1.4 hardware-loop characterization, in a run whose own
+//! during a hardware-loop characterization run on silicon, whose own
 //! `0x40C` readback showed bit 7 clear.
 //!
 //! The emulator used to `&`-mask delivery with an `aux_ienable` field
@@ -35,7 +35,7 @@ fn reading_aux_40c_returns_identity() {
 fn writing_aux_40c_has_no_observable_effect() {
     let mut state = CpuState::new();
 
-    // The datasheet's own probe: write back the read value with bit 7 set.
+    // The probe used on silicon: write back the read value with bit 7 set.
     state.write_aux_reg(AUX_IENABLE, IDENTITY_VALUE | 0x80).unwrap();
     assert_eq!(state.read_aux_reg(AUX_IENABLE).unwrap(), IDENTITY_VALUE);
 

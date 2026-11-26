@@ -19,11 +19,11 @@
 //!
 //! OBSERVED silicon:
 //!
-//! - **Cache geometry** (DATASHEET §5.2/§5.3/§5.4: 4 KB 1-way direct-mapped
+//! - **Cache geometry** (measured on silicon: 4 KB 1-way direct-mapped
 //!   I-cache, set = addr[11:5], 32 B line; MMIO bypass).
-//! - **The uncached SRAM load latency, 10 clocks exactly** (§5.5.1: a 64-load
+//! - **The uncached SRAM load latency, 10 clocks exactly** (a 64-load
 //!   dependent chain spans 632 ticks = `1 + 63 × 10 + 1`).
-//! - **The MMIO read latency, ≈ 40 clocks** (§5.5.6, differential measurement;
+//! - **The MMIO read latency, ≈ 40 clocks** (differential measurement;
 //!   the absolute is accurate to a few clocks, the differential is solid).
 //!
 //! Still INFERRED — and this is where the model's weight sits:
@@ -61,7 +61,7 @@
 //!    line-fill.
 //!
 //!    ⚠ That collapse is **not a mitigation available on a shipping device**.
-//!    Per §5.3.1 the D-cache is *disabled* in the shipping configuration — the
+//!    Measured: the D-cache is *disabled* in the shipping configuration — the
 //!    boot loader turns it off at boot step 3 and nothing re-enables it — so
 //!    every data load is an uncached bus transaction and both surfaces (SRAM
 //!    sweep and MMIO poll) are live at all times. An earlier revision of this
@@ -105,7 +105,7 @@ pub const DEFAULT_FETCH_LATENCY: u32 = 8;
 /// Uncached MMIO load latency `M` (cycles). `M >> F`: an MMIO poll keeps its
 /// load window open far longer than a line fill, which is what lets a fetch
 /// miss stream overlap and starve it.
-/// -- OBSERVED, DATASHEET §5.5.6: an MMIO word read costs ≈ 40 clocks, about
+/// -- OBSERVED on silicon: an MMIO word read costs ≈ 40 clocks, about
 /// four times an SRAM word load, measured differentially against the same
 /// trampoline on an SRAM address (2783 − 854 ticks over 64 accesses). The
 /// absolute is accurate to a few clocks; the differential is solid. Was 32
@@ -113,8 +113,8 @@ pub const DEFAULT_FETCH_LATENCY: u32 = 8;
 /// `{16, 32, 64}`, so no verdict moved.
 pub const DEFAULT_MMIO_LOAD_LATENCY: u32 = 40;
 /// Uncached SRAM load latency (cycles). Every data load is one of these on a
-/// shipping device: the D-cache is disabled there (§5.3.1).
-/// -- OBSERVED, DATASHEET §5.5.1: the load-use recurrence is **10 clocks
+/// shipping device: the D-cache is disabled there.
+/// -- OBSERVED on silicon: the load-use recurrence is **10 clocks
 /// exactly** — a 64-load dependent chain spans 632 ticks, decomposing as
 /// `1 (instrument) + 63 × 10 + 1`. (The ≈ 9.88 figure once published divided
 /// by 64 instead of the 63 dependency edges a 64-load chain actually has.)
@@ -125,8 +125,8 @@ pub const DEFAULT_SRAM_LOAD_LATENCY: u32 = 10;
 /// the sweep's sensitivity table) it is a **switch that gates whether the hang
 /// exists at all**: the deadlock requires `fetch_runahead_lines >=` the hot
 /// loop's line footprint so the engine observes the far-side set collision
-/// (`runahead=1 -> 0 hangs`, `>= footprint -> hangs`). The datasheet does not
-/// specify a fetch-buffer / prefetch depth; this value is assumed.
+/// (`runahead=1 -> 0 hangs`, `>= footprint -> hangs`). Nothing measured
+/// gives a fetch-buffer / prefetch depth; this value is assumed.
 pub const DEFAULT_FETCH_RUNAHEAD_LINES: u32 = 8;
 /// Consecutive cycles a load may be pending-but-ungranted before the model
 /// declares a bus deadlock. Sized well above any legitimate fill burst.
@@ -153,7 +153,7 @@ pub struct TimingConfig {
     /// a loop resident in a decode/loop buffer would feed the stalled backend
     /// without re-fetching, breaking the ping-pong. This "no loop buffer +
     /// re-read every iteration" assumption is what *sustains* the starvation
-    /// (the datasheet describes no such buffer for this reduced-config core, so
+    /// (nothing measured shows such a buffer on this reduced-config core, so
     /// it is assumed). Consequence: the model can over-declare hangs for a
     /// small self-evicting loop that a buffered machine would survive. When
     /// `false`, the fetch engine quiesces once the backend stalls, so the same
@@ -196,8 +196,8 @@ struct BusTxn {
 /// A blocking, single-outstanding-transaction bus with a fixed-priority
 /// (fetch > load) arbiter.
 ///
-/// INFERRED — a working hypothesis, NOT datasheet-backed. The BCM55030
-/// datasheet documents no bus arbiter, no single-outstanding constraint and no
+/// INFERRED — a working hypothesis, NOT measured. Nothing measured on
+/// the BCM55030 shows a bus arbiter, a single-outstanding constraint or a
 /// fetch-over-load priority; this structure is the simplest interconnect that
 /// reproduces the observed layout-dependent hang. It is the load-bearing
 /// assumption of the whole model — treat it as a hypothesis under test, not
@@ -779,8 +779,8 @@ pub struct TimingShadow {
     pub cycle: u64,
     /// Drives DEBUG.LD (aux 0x05 bit 31): true while a load is outstanding in
     /// the model. This is a MODEL-produced diagnostic populated only under this
-    /// timing shadow — the functional ISS never sets it, and the datasheet aux
-    /// table documents no bit-31 for DEBUG. It exists so a future JTAG/OCD
+    /// timing shadow — the functional ISS never sets it, and no measurement
+    /// shows a bit-31 for DEBUG. It exists so a future JTAG/OCD
     /// `DEBUG.LD` sample at a real silicon hang can be cross-checked against the
     /// model's "load starved" state; it is NOT an independent silicon readback.
     /// On a deadlock it stays true, so an aux-0x05 read returns bit31=1.

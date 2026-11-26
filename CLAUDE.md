@@ -138,4 +138,4 @@ what explains a choice, a constraint, or a mechanism that is not visible from
 the signature. A short note beats a paragraph.
 
 Keep comments to what the emulator itself needs. Findings, measurements and
-external context live in the workshop repository, not in this one.
+external context do not belong in this repository.

@@ -47,7 +47,7 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x00FC1017, RegInfo {
         block_id: 47, block_name: "Clock Divider / NCO Config",
         reg_name: "CLK_READY_FLAG", access: "R",
-        desc: "1 = clock stable (`serdes_hw_ready_flag`)",
+        desc: "1 = clock stable",
     }),
     (0x00FC1018, RegInfo {
         block_id: 47, block_name: "Clock Divider / NCO Config",
@@ -133,12 +133,12 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01000050, RegInfo {
         block_id: 45, block_name: "SerDes Speed Control",
         reg_name: "CHIP_ID_LOW16", access: "R",
-        desc: "16-bit chip ID/revision -- `serdes_read_chip_id_low16`",
+        desc: "16-bit chip ID/revision",
     }),
     (0x01000054, RegInfo {
         block_id: 45, block_name: "SerDes Speed Control",
         reg_name: "SPEED_CTRL_PARAM", access: "W",
-        desc: "Parametre additionnel -- `serdes_set_speed_ctrl_reg_0x54`",
+        desc: "Parametre additionnel",
     }),
     (0x01000060, RegInfo {
         block_id: 73, block_name: "MDIO Clause 45 Controller",
@@ -173,7 +173,7 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01000090, RegInfo {
         block_id: 90040, block_name: "IRQ Configuration Shadow Copy",
         reg_name: "IRQ_CONFIG_SHADOW", access: "W",
-        desc: "IRQ configuration shadow copy. Written in parallel with DAT_2000e9fc for synchro",
+        desc: "IRQ configuration shadow copy. Written in parallel with an SRAM copy",
     }),
     (0x01000092, RegInfo {
         block_id: 90040, block_name: "IRQ Configuration Shadow Copy",
@@ -210,12 +210,12 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
                The block name here still says MPCP slot config.",
     }),
     (0x01000140, RegInfo {
-        block_id: 90001, block_name: "Lane State Table (DAT_ram_20032cc8)",
+        block_id: 90001, block_name: "Lane State Table",
         reg_name: "LANE_CMD_CONFIG", access: "RW",
         desc: "Config command (busy-wait pattern)",
     }),
     (0x01000150, RegInfo {
-        block_id: 90001, block_name: "Lane State Table (DAT_ram_20032cc8)",
+        block_id: 90001, block_name: "Lane State Table",
         reg_name: "LANE_CMD_WRITE", access: "RW",
         desc: "Write command, bit 31=busy",
     }),
@@ -267,7 +267,7 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x010001C0, RegInfo {
         block_id: 5, block_name: "SerDes Lane Configuration",
         reg_name: "UNI_LANE_INDEX", access: "RMW",
-        desc: "UNI lane index (bits 21:20). Also used by serdes_lane2_init_pon_rx which clears ",
+        desc: "UNI lane index (bits 21:20). Also cleared by the PON RX lane 2 init",
     }),
     (0x010001D4, RegInfo {
         block_id: 44, block_name: "SerDes Link Status MMIO",
@@ -317,17 +317,17 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x0100021C, RegInfo {
         block_id: 10, block_name: "SPI Flash FIFO Controller",
         reg_name: "SPI_FIFO_READ_DATA", access: "R",
-        desc: "Donnees lues (compare a `DAT_20011cf8` = JEDEC ID attendu)",
+        desc: "Donnees lues (comparees au JEDEC ID attendu)",
     }),
     (0x01000224, RegInfo {
         block_id: 9, block_name: "Peripheral Bus Controller (SPI + MDIO)",
         reg_name: "SPI_CONFIG", access: "W",
-        desc: "Registre configuration SPI (ecrit depuis DAT_20011b00)",
+        desc: "Registre configuration SPI (ecrit depuis une valeur en SRAM)",
     }),
     (0x01000228, RegInfo {
         block_id: 9, block_name: "Peripheral Bus Controller (SPI + MDIO)",
         reg_name: "MDIO_BUSY", access: "R",
-        desc: "Bit 0 = MDIO busy (attente dans `hw_mdio_wait_busy`)",
+        desc: "Bit 0 = MDIO busy (attendu a 0 avant chaque commande)",
     }),
     (0x0100022C, RegInfo {
         block_id: 9, block_name: "Peripheral Bus Controller (SPI + MDIO)",
@@ -357,7 +357,7 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01000408, RegInfo {
         block_id: 3, block_name: "PHY 1G (Gigabit Ethernet PHY)",
         reg_name: "UNI_PHY_CONFIG_C", access: "W",
-        desc: "PHY 1G config register C. Written with value 0x07 during serdes_init_auto_rx. Lo",
+        desc: "PHY 1G config register C. Written with value 0x07 during RX auto init. Lo",
     }),
     (0x0100040C, RegInfo {
         block_id: 3, block_name: "PHY 1G (Gigabit Ethernet PHY)",
@@ -372,7 +372,7 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01000420, RegInfo {
         block_id: 12, block_name: "MACsec Key Engine",
         reg_name: "KEY_ENGINE_BUSY", access: "RMW",
-        desc: "Bit 31 = busy (`macsec_hw_wait_key_engine_ready` loop)",
+        desc: "Bit 31 = busy (polled until clear)",
     }),
     (0x01000424, RegInfo {
         block_id: 12, block_name: "MACsec Key Engine",
@@ -382,7 +382,7 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x0100043C, RegInfo {
         block_id: 24, block_name: "PON TX Config Table",
         reg_name: "LLID_TX_CONFIG", access: "RW",
-        desc: "Config TX par LLID (32 entries, stride 4 bytes, 16 bits useful). Read by hw_pon_",
+        desc: "Config TX par LLID (32 entries, stride 4 bytes, 16 bits useful).",
     }),
     (0x010004D0, RegInfo {
         block_id: 26, block_name: "SerDes Auto RX Block",
@@ -472,77 +472,77 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01000D40, RegInfo {
         block_id: 90070, block_name: "PON LLID RX Config",
         reg_name: "LLID_RX_CONFIG_16", access: "W",
-        desc: "LLID 16 RX config (cleared to 0 by hw_pon_clear_llid_rx_config). Array: base + (",
+        desc: "LLID 16 RX config (cleared to 0 on LLID teardown). Array: base + (",
     }),
     (0x01000D44, RegInfo {
         block_id: 90070, block_name: "PON LLID RX Config",
         reg_name: "LLID_RX_CONFIG_17", access: "W",
-        desc: "LLID 17 RX config (cleared to 0 by hw_pon_clear_llid_rx_config)",
+        desc: "LLID 17 RX config (cleared to 0 on LLID teardown)",
     }),
     (0x01000D48, RegInfo {
         block_id: 90070, block_name: "PON LLID RX Config",
         reg_name: "LLID_RX_CONFIG_18", access: "W",
-        desc: "LLID 18 RX config (cleared to 0 by hw_pon_clear_llid_rx_config)",
+        desc: "LLID 18 RX config (cleared to 0 on LLID teardown)",
     }),
     (0x01000D4C, RegInfo {
         block_id: 90070, block_name: "PON LLID RX Config",
         reg_name: "LLID_RX_CONFIG_19", access: "W",
-        desc: "LLID 19 RX config (cleared to 0 by hw_pon_clear_llid_rx_config)",
+        desc: "LLID 19 RX config (cleared to 0 on LLID teardown)",
     }),
     (0x01000D50, RegInfo {
         block_id: 90070, block_name: "PON LLID RX Config",
         reg_name: "LLID_RX_CONFIG_20", access: "W",
-        desc: "LLID 20 RX config (cleared to 0 by hw_pon_clear_llid_rx_config)",
+        desc: "LLID 20 RX config (cleared to 0 on LLID teardown)",
     }),
     (0x01000D54, RegInfo {
         block_id: 90070, block_name: "PON LLID RX Config",
         reg_name: "LLID_RX_CONFIG_21", access: "W",
-        desc: "LLID 21 RX config (cleared to 0 by hw_pon_clear_llid_rx_config)",
+        desc: "LLID 21 RX config (cleared to 0 on LLID teardown)",
     }),
     (0x01000D58, RegInfo {
         block_id: 90070, block_name: "PON LLID RX Config",
         reg_name: "LLID_RX_CONFIG_22", access: "W",
-        desc: "LLID 22 RX config (cleared to 0 by hw_pon_clear_llid_rx_config)",
+        desc: "LLID 22 RX config (cleared to 0 on LLID teardown)",
     }),
     (0x01000D5C, RegInfo {
         block_id: 90070, block_name: "PON LLID RX Config",
         reg_name: "LLID_RX_CONFIG_23", access: "W",
-        desc: "LLID 23 RX config (cleared to 0 by hw_pon_clear_llid_rx_config)",
+        desc: "LLID 23 RX config (cleared to 0 on LLID teardown)",
     }),
     (0x01000D60, RegInfo {
         block_id: 90070, block_name: "PON LLID RX Config",
         reg_name: "LLID_RX_CONFIG_24", access: "W",
-        desc: "LLID 24 RX config (cleared to 0 by hw_pon_clear_llid_rx_config)",
+        desc: "LLID 24 RX config (cleared to 0 on LLID teardown)",
     }),
     (0x01000D64, RegInfo {
         block_id: 90070, block_name: "PON LLID RX Config",
         reg_name: "LLID_RX_CONFIG_25", access: "W",
-        desc: "LLID 25 RX config (cleared to 0 by hw_pon_clear_llid_rx_config)",
+        desc: "LLID 25 RX config (cleared to 0 on LLID teardown)",
     }),
     (0x01000D68, RegInfo {
         block_id: 90070, block_name: "PON LLID RX Config",
         reg_name: "LLID_RX_CONFIG_26", access: "W",
-        desc: "LLID 26 RX config (cleared to 0 by hw_pon_clear_llid_rx_config)",
+        desc: "LLID 26 RX config (cleared to 0 on LLID teardown)",
     }),
     (0x01000D6C, RegInfo {
         block_id: 90070, block_name: "PON LLID RX Config",
         reg_name: "LLID_RX_CONFIG_27", access: "W",
-        desc: "LLID 27 RX config (cleared to 0 by hw_pon_clear_llid_rx_config)",
+        desc: "LLID 27 RX config (cleared to 0 on LLID teardown)",
     }),
     (0x01000D70, RegInfo {
         block_id: 90070, block_name: "PON LLID RX Config",
         reg_name: "LLID_RX_CONFIG_28", access: "W",
-        desc: "LLID 28 RX config (cleared to 0 by hw_pon_clear_llid_rx_config)",
+        desc: "LLID 28 RX config (cleared to 0 on LLID teardown)",
     }),
     (0x01000D74, RegInfo {
         block_id: 90070, block_name: "PON LLID RX Config",
         reg_name: "LLID_RX_CONFIG_29", access: "W",
-        desc: "LLID 29 RX config (cleared to 0 by hw_pon_clear_llid_rx_config)",
+        desc: "LLID 29 RX config (cleared to 0 on LLID teardown)",
     }),
     (0x01000D78, RegInfo {
         block_id: 90070, block_name: "PON LLID RX Config",
         reg_name: "LLID_RX_CONFIG_30", access: "W",
-        desc: "LLID 30 RX config (cleared to 0 by hw_pon_clear_llid_rx_config)",
+        desc: "LLID 30 RX config (cleared to 0 on LLID teardown)",
     }),
     (0x01000D94, RegInfo {
         block_id: 25, block_name: "SerDes 10G TX Block",
@@ -571,7 +571,7 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01000E0C, RegInfo {
         block_id: 7, block_name: "PON Lane Enable / Speed",
         reg_name: "PON_ENABLE_BIT2", access: "RMW",
-        desc: "Bit 2 du registre base -- set par `hw_pon_set_enable_bit2`",
+        desc: "Bit 2 du registre base -- enable",
     }),
     (0x01000E40, RegInfo {
         block_id: 7, block_name: "PON Lane Enable / Speed",
@@ -596,7 +596,7 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01000F80, RegInfo {
         block_id: 15, block_name: "MACsec SA Programming 10G",
         reg_name: "MACSEC_CHANNEL_ENABLE", access: "RMW",
-        desc: "Toggle enable channel -- `macsec_hw_10g_set_llid_mask`. \
+        desc: "Toggle enable channel. \
                ⛔ three blocks claim this one word in the register DB and no \
                measurement separates them: block 15 MACSEC_CHANNEL_ENABLE, \
                block 23 NCO_TX_MODE_SECONDARY (bit 9) and block 25 \
@@ -631,7 +631,7 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01001000, RegInfo {
         block_id: 1, block_name: "EPON MAC -- Bloc principal",
         reg_name: "CHIP_REV", access: "R",
-        desc: "Chip revision / bond options -- 0xB2110816. Lu via `reg 1`. \
+        desc: "Chip revision / bond options -- 0xB2110816. \
                ⛔ contradicted by the register DB: two other blocks read this \
                word instead — RX_MODE_CTRL (block 2, bit 18 auto mode) and \
                GRANT_MODE_CTRL (block 16). Block 1 no longer holds a revision \
@@ -645,37 +645,37 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01001008, RegInfo {
         block_id: 1, block_name: "EPON MAC -- Bloc principal",
         reg_name: "LLID_CAPTURE_MASK", access: "RMW",
-        desc: "Masque capture LLID -- `hw_counter_set/clear_llid_capture_mask`",
+        desc: "Masque capture LLID (set/clear par bit)",
     }),
     (0x01001014, RegInfo {
         block_id: 1, block_name: "EPON MAC -- Bloc principal",
         reg_name: "LLID_ACTIVE_BITMAP", access: "RMW",
-        desc: "Bitmap des LLIDs actifs -- `hw_counter_clear_active_llid_bit` clear un bit",
+        desc: "Bitmap des LLIDs actifs (clear par bit)",
     }),
     (0x0100101C, RegInfo {
         block_id: 1, block_name: "EPON MAC -- Bloc principal",
         reg_name: "LLID_MASK_CONTROL", access: "W",
-        desc: "Masque LLID control -- `epon_hw_set_llid_mask_control`",
+        desc: "Masque LLID control",
     }),
     (0x01001020, RegInfo {
         block_id: 1, block_name: "EPON MAC -- Bloc principal",
         reg_name: "LLID_COUNTER_MASK", access: "RMW",
-        desc: "Masque compteurs LLID -- set/clear par `hw_counter_set/clear_active_llid_mask`",
+        desc: "Masque compteurs LLID (set/clear par bit)",
     }),
     (0x01001024, RegInfo {
         block_id: 1, block_name: "EPON MAC -- Bloc principal",
         reg_name: "TX_GRANT_MASK", access: "RMW",
-        desc: "Masque grants TX -- set par `hw_grant_set_tx_mask`, clear par `hw_grant_clear_tx",
+        desc: "Masque grants TX (set/clear par bit)",
     }),
     (0x0100102C, RegInfo {
         block_id: 1, block_name: "EPON MAC -- Bloc principal",
         reg_name: "RX_GRANT_MASK", access: "RMW",
-        desc: "Masque grants RX -- set par `hw_grant_set_rx_mask`, clear par `hw_grant_clear_rx",
+        desc: "Masque grants RX (set/clear par bit)",
     }),
     (0x01001030, RegInfo {
         block_id: 1, block_name: "EPON MAC -- Bloc principal",
         reg_name: "IRQ_MASK", access: "RMW",
-        desc: "Masque d'interruption EPON -- `epon_hw_set_interrupt_mask_bits` set bits",
+        desc: "Masque d'interruption EPON (set bits)",
     }),
     (0x0100103C, RegInfo {
         block_id: 16, block_name: "EPON Grant Timing",
@@ -690,7 +690,7 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01001050, RegInfo {
         block_id: 1, block_name: "EPON MAC -- Bloc principal",
         reg_name: "ACTIVE_FLAGS", access: "RW",
-        desc: "Registre flags actifs -- `hw_epon_read_active_flags_reg`",
+        desc: "Registre flags actifs",
     }),
     (0x010010C4, RegInfo {
         block_id: 2, block_name: "EPON RX Configuration",
@@ -745,7 +745,7 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01001284, RegInfo {
         block_id: 34, block_name: "EPON Counter Engine",
         reg_name: "CTR_REGISTER_INDEX", access: "W",
-        desc: "Index du compteur a lire (calcule par `hw_counter_compute_register_index`)",
+        desc: "Index du compteur a lire",
     }),
     (0x01001288, RegInfo {
         block_id: 34, block_name: "EPON Counter Engine",
@@ -940,7 +940,7 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
         desc: "Donnees evenement (mot 4)",
     }),
     (0x01002500, RegInfo {
-        block_id: 90004, block_name: "SerDes Lane Speed Mode HW (DAT_ram_20035b68)",
+        block_id: 90004, block_name: "SerDes Lane Speed Mode HW",
         reg_name: "SPEED_MODE_HW", access: "W",
         desc: "Speed mode hardware (2-bit)",
     }),
@@ -950,7 +950,7 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
         desc: "Niveau FIFO RX (12-bit, 0-4095)",
     }),
     (0x01002640, RegInfo {
-        block_id: 90005, block_name: "Lane Config Write (DAT_ram_20035db4)",
+        block_id: 90005, block_name: "Lane Config Write",
         reg_name: "LANE_CONFIG_REG", access: "W",
         desc: "Configuration register par lane",
     }),
@@ -983,7 +983,7 @@ pub const MMIO_REGISTERS: &[(u32, RegInfo)] = &[
     (0x01002C00, RegInfo {
         block_id: 11, block_name: "MACsec Control",
         reg_name: "MACSEC_CTRL", access: "RMW",
-        desc: "Bit 15 : clear par `macsec_hw_clear_ctrl_bit15` (mask 0xffff7fff)",
+        desc: "Bit 15 : clear (mask 0xffff7fff)",
     }),
     (0x01002D00, RegInfo {
         block_id: 65, block_name: "SerDes Lane Mode Controller",

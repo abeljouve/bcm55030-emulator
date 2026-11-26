@@ -3,7 +3,7 @@
 //! mutations (cpu_run, set_breakpoint, write_register, ...)
 //! land in phase 5b.
 //!
-//! Tools follow the the design spec §MCP Server §Tools categories:
+//! Tools fall into these categories:
 //! firmware / cpu / memory / disassembly / peripherals / flash /
 //! annotations / breakpoints.
 //!
@@ -1425,7 +1425,7 @@ impl EmulatorHandler {
                 out.insert("blink".into(), HexValue(snap.cpu.core_regs[31]));
                 out.insert("lp_count".into(), HexValue(snap.cpu.core_regs[60]));
                 out.insert("status32".into(), HexValue(snap.cpu.flags.status32));
-                // No "ienable": aux 0x40C is unimplemented (DATASHEET §6.1).
+                // No "ienable": aux 0x40C is unimplemented on silicon.
                 out.insert("ipending".into(), HexValue(snap.cpu.aux.ipending));
             }
         }
@@ -4077,7 +4077,7 @@ fn reg_by_name(cpu: &crate::emu::snapshot::CpuSnapshot, name: &str) -> Option<u3
         "ilink1" => Some(cpu.core_regs[29]),
         "ilink2" => Some(cpu.core_regs[30]),
         // "ienable" resolves to the absent-register value, not to a mask:
-        // aux 0x40C is unimplemented and reads back IDENTITY (§6.1).
+        // aux 0x40C is unimplemented and reads back IDENTITY (measured).
         "ienable" => Some(crate::cpu::registers::IDENTITY_VALUE),
         "ipending" => Some(cpu.aux.ipending),
         "identity" => Some(cpu.aux.identity),

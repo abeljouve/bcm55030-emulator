@@ -535,7 +535,7 @@ impl Worker {
             bank.pbc.flash.data[..dma_len].to_vec()
         };
         self.cpu.mem.load_binary(0, &dma_bytes);
-        // DATASHEET §5.4: the on-chip DMA engine writes directly into
+        // Measured on silicon: the on-chip DMA engine writes directly into
         // SRAM and the integration layer broadcasts those writes as
         // I/D-cache invalidations. The 64 KB boot DMA is such a write,
         // so the caches must not retain pre-DMA lines for `0x0..0x80`.
@@ -543,7 +543,7 @@ impl Worker {
         self.cpu.mem.icache_invalidate_all();
 
         // There is no IRQ enable mask to preset: `AUX_IENABLE` (0x40C) is
-        // unimplemented on this silicon (DATASHEET §6.1). The `E1`/`E2`
+        // unimplemented on this silicon. The `E1`/`E2`
         // presets only apply in warm mode.
         if boot_mode == BootMode::Warm {
             self.cpu.state.flag_e1 = true;

@@ -252,7 +252,7 @@ impl DCache {
 
     // There is deliberately no standalone "write back every dirty line without
     // invalidating" operation. `DC_FLSH` has no observable effect on this
-    // silicon (§5.3), and disabling the cache does not drain anything either —
+    // silicon, and disabling the cache does not drain anything either —
     // the only mechanism that makes SRAM coherent is `DC_IVDC` with `IM=1`,
     // which is `invalidate_all` above. A `flush_dirty` used to exist, called
     // from the DC_CTRL disable path; see `Memory::dcache_sync_ctrl` for why it

@@ -294,8 +294,7 @@ pub struct ScenarioEngine {
     /// G4: SerDes cold-cal convergence as a SCENARIO INPUT, default
     /// `false` (= cal NOT converged, IND lane2/lane3 `0xBB`/`0xDB` bit7
     /// reads 0). The emulator does NOT model the analog VCO/CDR
-    /// convergence physics (DO-NOT-FAKE — see project memories
-    /// `project_lane2_pon_core_coldcal_is_blocker`). A scenario / test
+    /// convergence physics (DO-NOT-FAKE). A scenario / test
     /// can opt into a converged analog state by setting this true; the
     /// bank then seeds the cal-done bit7 for lanes 2/3. Defaulting to
     /// not-converged stops the emulator from silently papering over the

@@ -9,7 +9,7 @@
 //! diverging from silicon (and from the CLI, which uses a fresh `Cpu`).
 //!
 //! Silicon has no "previous life" across a power-on / watchdog reset:
-//! the caches are invalid after reset, and DATASHEET §5.4 mandates the
+//! the caches are invalid after reset, and silicon requires the
 //! boot DMA broadcast cache invalidations. This test pins that.
 
 use bcm55030_emulator::cpu::Cpu;
@@ -53,7 +53,7 @@ fn reset_soc_in_place_invalidates_stale_icache_for_ivt_region() {
 /// then fetches/executes the slot — so that slot must decode as a
 /// jump whose target is the absolute `<hi:lo>`, and executing it must
 /// land PC there. Live-silicon anchor: slot0 = `2020 0f80 0000 0150`
-/// = `j @0x150` (`project_dma_256k_chunk_rootcause`).
+/// = `j @0x150`.
 #[test]
 fn ivt_slot_j_limm_decodes_and_executes_to_absolute_target() {
     let mut cpu = Cpu::new_bcm55030(BootMode::Warm);
@@ -87,8 +87,8 @@ fn ivt_slot_j_limm_decodes_and_executes_to_absolute_target() {
 }
 
 /// Bug points (b)+(c) end-to-end: a `.di` store sequence into the
-/// low-memory aperture (exactly what `nco_write_channel` /
-/// `hw_install_irq_vector_2` emit) programs the NCO/IVT channel, and
+/// low-memory aperture (exactly what firmware emits to install an IRQ
+/// vector) programs the NCO/IVT channel, and
 /// the ARC interrupt unit then vectors that IRQ to the channel's
 /// `j @<absolute>` target — NOT to the SRAM IVT slot. Pre-fix the
 /// emulator had no NCO aperture and vectored through SRAM only.
@@ -126,9 +126,9 @@ fn di_programmed_nco_slot_is_used_for_interrupt_vectoring() {
 
 /// Bug point (d): I-cache coherence between code fetched from the
 /// `0x0..0x80` IVT alias and a later `.di` (cache-bypass) rewrite.
-/// DATASHEET §5.4: a `.di` store updates SRAM only and does NOT
+/// Measured on silicon: a `.di` store updates SRAM only and does NOT
 /// invalidate the I-cache — execution keeps using the stale line
-/// until an explicit `IC_IVIC` (the reference `nco_commit_fence`). This
+/// until an explicit `IC_IVIC`. This
 /// pins both halves: stale-until-IVIC, then fresh-after-IVIC.
 #[test]
 fn di_store_to_ivt_is_stale_until_ic_ivic() {

@@ -2,7 +2,7 @@
 //! and re-checks (a) dirty-line preservation through the *real* PBC
 //! MMIO path (not just `apply_datapath_op` directly).
 //!
-//! Drives the exact register sequence `hw_mdio_read_command` emits:
+//! Drives the exact register sequence a firmware MDIO read command emits:
 //!   *0x0100022C (REG_DMA_ADDR,      base+0x3C) = src  (flash addr)
 //!   *0x01000230 (REG_DMA_DATA_ADDR, base+0x40) = dst  (RAM addr)
 //!   *0x01000228 (REG_DMA_CTRL,      base+0x38) = (len<<4)|1   "go"
@@ -34,7 +34,7 @@ fn pbc_mdio_read_delivers_exact_len_to_exact_dst() {
     cpu.mem.write_word_data(dst - 4, 0xA1A1_A1A1, true).unwrap();
     cpu.mem.write_word_data(dst + 4, 0xB2B2_B2B2, true).unwrap();
 
-    // hw_mdio_read_command(dst, src=0x90000, len=4)
+    // MDIO read command: dst, src=0x90000, len=4
     cpu.mem.write_word(REG_DMA_ADDR, 0x9_0000).unwrap();
     cpu.mem.write_word(REG_DMA_DATA_ADDR, dst).unwrap();
     cpu.mem.write_word(REG_DMA_CTRL, (4 << 4) | 1).unwrap();

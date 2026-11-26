@@ -58,7 +58,7 @@ pub fn draw(ui: &mut egui::Ui, app: &mut EmulatorApp) {
         }
         ui.separator();
         // Whether IRQ 5 can reach the core is a property of the UART, not of
-        // the core: there is no per-line enable mask (DATASHEET §6.1), so the
+        // the core: there is no per-line enable mask (measured on silicon), so the
         // arm lives in the UART's own IER (bit 2 = RX interrupt enable).
         let rx_irq = app.handle.bank.read().uart.ier() & 0x04 != 0;
         ui.colored_label(

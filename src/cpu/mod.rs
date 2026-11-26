@@ -95,7 +95,7 @@ pub struct Cpu {
     /// Once it reaches [`TIGHT_LOOP_THRESHOLD`], the emulator treats
     /// the spin as a watchdog-triggered warm reset — modelling the
     /// BCM55030's Timer 1 watchdog that fires after the firmware
-    /// enters `system_reboot_infinite_loop`.
+    /// enters its reboot spin loop.
     tight_loop_count: u32,
     tight_loop_last_pc: u32,
 
@@ -857,7 +857,7 @@ aliasing_fetch_line={:?} set_index={:?} starve={} cyc={} \
         // the peripheral asserting (which is what set the pending bit), the
         // line's level from `AUX_IRQ_LEV` (0x200), and the matching `E1`/`E2`
         // bit of `STATUS32`, all applied below.
-        // -- OBSERVED, DATASHEET §6.1: Timer 1 / IRQ 7 was delivered 19 001
+        // -- OBSERVED on silicon: Timer 1 / IRQ 7 was delivered 19 001
         // times in a run whose own `0x40C` readback showed bit 7 clear.
         let pending = self.state.aux_irq_pending;
         if pending == 0 {

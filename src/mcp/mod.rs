@@ -8,7 +8,7 @@
 //!
 //! - `handler` — `EmulatorHandler` struct + `#[tool_router]` +
 //!   `#[tool_handler]` implementations. Phase 4 ships the
-//!   read-only subset of the design spec §MCP Server §Tools. Mutations
+//!   read-only subset of the tools. Mutations
 //!   land in phase 5.
 //! - `server` — `spawn_server(handle, port)` starts a dedicated
 //!   tokio runtime on a new OS thread, wires `StreamableHttpService`

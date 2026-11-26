@@ -2,7 +2,7 @@
 //!
 //! Owns the single-register `EPON_FREE_COUNTER` at `0x01000050`.
 //! The counter advances by 1 on each word-level read so that firmware
-//! exact-match busy-waits (`serdes_busy_wait_epon_timer_ticks`) see
+//! exact-match busy-waits on it see
 //! every consecutive value and never skip a target. Sub-word reads
 //! (byte/half) peek without advancing — only the firmware's `ld.di`
 //! word reads trigger progression.

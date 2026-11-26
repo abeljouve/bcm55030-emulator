@@ -57,7 +57,7 @@ pub const AUX_ICAUSE2: u32 = 0x40B;
 /// so the absence is documented where a reader looks for the register. There is
 /// deliberately no `aux_ienable` field and no read/write arm: the address falls
 /// through to the generic absent-aux handling (read = `IDENTITY_VALUE`, write
-/// discarded). -- OBSERVED, DATASHEET §6.1.
+/// discarded). -- OBSERVED on silicon.
 pub const AUX_IENABLE: u32 = 0x40C;
 pub const AUX_ITRIGGER: u32 = 0x40D;
 pub const AUX_XPU: u32 = 0x410;
@@ -71,8 +71,8 @@ pub const AUX_IRQ_PENDING: u32 = 0x416;
 /// ARCVER=0x24, build=0xB4. Non-existent aux regs also return this value.
 pub const IDENTITY_VALUE: u32 = 0x00B40124;
 
-// NOTE: a disassembler label `Auxregs0028` = STATUS32 (AUX 0x0A * 4 = byte
-// offset 0x28). There is NO BCM55030-custom AUX at number 0x28.
+// NOTE: a tool that labels AUX registers by byte offset shows STATUS32
+// (AUX 0x0A * 4) as 0x28. There is NO BCM55030-custom AUX at number 0x28.
 
 // BCR addresses
 pub const AUX_BCR_VER: u32 = 0x60;

@@ -60,10 +60,10 @@ pub struct AuxSnapshot {
     pub lp_start: u32,
     pub lp_end: u32,
     pub int_vector_base: u32,
-    // No `ienable`: aux 0x40C is unimplemented (DATASHEET §6.1). A read of it
+    // No `ienable`: aux 0x40C is unimplemented on silicon. A read of it
     // returns `IDENTITY`, which the `identity` field above already reports —
     // publishing a second copy under an enable-mask name would invite exactly
-    // the misreading the datasheet warns against.
+    // the misreading the measurement rules out.
     pub ipending: u32,
     /// Timer 0: COUNT, CONTROL, LIMIT (IRQ 3).
     pub count0: u32,

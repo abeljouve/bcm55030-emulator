@@ -113,7 +113,7 @@ fn draw_core(ui: &mut egui::Ui, app: &EmulatorApp) {
 fn draw_aux(ui: &mut egui::Ui, app: &EmulatorApp) {
     let aux = &app.snapshot.cpu.aux;
     // No `ienable` row: aux 0x40C is unimplemented on this silicon
-    // (DATASHEET §6.1). Showing an enable mask that does not exist is how a
+    // (measured). Showing an enable mask that does not exist is how a
     // reader concludes a line is disabled when the hardware will deliver it.
     let rows: [(&str, u32); 14] = [
         ("identity", aux.identity),

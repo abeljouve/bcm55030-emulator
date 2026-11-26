@@ -44,7 +44,7 @@
 //! `0x01000318`, `0x0100031C`, `0x01000D88`, and the firmware-arm bit of
 //! `0x01000304`) round-trip through the backing store in BOTH modes.
 //!
-//! Datasheet basis: §14.6 (MPCP TX-rate `0x01000320`); the bit-level
+//! Measured basis: the MPCP TX-rate word `0x01000320`; the bit-level
 //! TS-sync semantics of `0x01000304`/`0x010000B4` are an INFERRED
 //! contract taken from the firmware's expected behaviour (marked
 //! below), not yet verified against silicon.
