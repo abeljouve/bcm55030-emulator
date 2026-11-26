@@ -191,9 +191,40 @@ impl ClassifierRouting {
     }
 }
 
+/// What became of the frames another port handed the mailbox.
+///
+/// Kept apart from [`ClassifierRouting`] on the fibre's frames: the two
+/// ingresses read different rule sets, and one tally of both would let a
+/// verdict on one hide the other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PortIngress {
+    /// The classifier's verdicts on these frames.
+    pub routing: ClassifierRouting,
+    /// Of the matched frames, the ones whose queue belongs to the CPU
+    /// channel and landed in the mailbox.
+    pub delivered: u64,
+    /// Of the matched frames, the ones whose queue belongs to another
+    /// channel. That is forwarding — up the link or out of a port — and
+    /// this mailbox, which is what the CPU reads, does not carry it.
+    pub matched_a_queue_off_the_cpu_channel: u64,
+    /// Refused before classification: the mailbox was full.
+    pub mailbox_full: u64,
+}
+
+impl PortIngress {
+    /// Every frame offered left exactly one tally, and every match was
+    /// either delivered or set aside as forwarding.
+    pub fn accounted_for(&self) -> bool {
+        self.routing.decisions_accounted_for()
+            && self.routing.matched == self.delivered + self.matched_a_queue_off_the_cpu_channel
+    }
+}
+
 #[derive(Clone)]
 pub struct Olt {
     pub classifier_counters: ClassifierRouting,
+    /// Frames from the subscriber port, accounted for on their own.
+    pub port_ingress: PortIngress,
     /// Frames landed per queue since the last drain, for the datapath to
     /// hand to the MAC's counter port. Kept here because this is where a
     /// frame is known to have landed, and drained rather than read so a
@@ -251,6 +282,7 @@ impl Olt {
         let config = OltConfig::default();
         Self {
             classifier_counters: ClassifierRouting::default(),
+            port_ingress: PortIngress::default(),
             arrivals: HashMap::new(),
             link: Link::new(
                 peer_config(&config),
@@ -530,46 +562,61 @@ impl Olt {
     /// the EtherType fallback is what the model did before a classifier
     /// existed. A frame from another port has no such history, so there
     /// is nothing to fall back *to*: with no rule naming a queue, it is
-    /// dropped and the refusal is returned rather than routed by guess.
+    /// dropped and the refusal is counted rather than routed by guess.
+    ///
+    /// The rule set is always consulted. The gate that keeps it off the
+    /// fibre's frames protects that fallback; this path has none to
+    /// protect, and without the rules it could only drop.
+    ///
+    /// Only a queue of the CPU channel lands here. A rule naming one of
+    /// another channel forwards the frame, which is counted and not
+    /// carried: put in this mailbox it would sit in a queue nothing in
+    /// the model drains, and show up to software as received.
     ///
     /// Returns the slot it reached, or `None` for every way it did not.
     pub fn deliver_port_frame(
         &mut self,
-        classifier: Option<(&Lue, ClassifierBinding)>,
+        (lue, binding): (&Lue, ClassifierBinding),
         frame: &[u8],
     ) -> Option<Slot> {
         if self.total_pending_count() >= MAILBOX_DEPTH {
+            self.port_ingress.mailbox_full += 1;
             return None;
         }
-        let (lue, binding) = classifier?;
-        self.classifier_counters.classified += 1;
+        let c = &mut self.port_ingress;
+        c.routing.classified += 1;
         let (verdict, refusals) = lue.classify(binding, frame);
-        self.classifier_counters.refusals.add(&refusals);
+        c.routing.refusals.add(&refusals);
         let queue = match verdict {
             Verdict::Match { actions, .. } => {
                 match actions.iter().find_map(|a| a.destination_queue()) {
                     Some(q) => q,
                     None => {
-                        self.classifier_counters.match_without_a_queue += 1;
+                        c.routing.match_without_a_queue += 1;
                         return None;
                     }
                 }
             }
             Verdict::NoMatch => {
-                self.classifier_counters.no_match += 1;
+                c.routing.no_match += 1;
                 return None;
             }
             Verdict::Undecidable { .. } => {
-                self.classifier_counters.undecidable += 1;
+                c.routing.undecidable += 1;
                 return None;
             }
         };
         let Ok(q) = u8::try_from(queue) else {
-            self.classifier_counters.matched_queue_outside_the_slot_space += 1;
+            c.routing.matched_queue_outside_the_slot_space += 1;
             return None;
         };
-        self.classifier_counters.matched += 1;
+        c.routing.matched += 1;
         let slot = Slot(q);
+        if !slot.is_cpu_queue() {
+            c.matched_a_queue_off_the_cpu_channel += 1;
+            return None;
+        }
+        c.delivered += 1;
         let words = mailbox::encode_frame(frame);
         self.mailbox_pending.entry(slot.0).or_default().push_back(words);
         *self.arrivals.entry(slot.0).or_insert(0) += 1;

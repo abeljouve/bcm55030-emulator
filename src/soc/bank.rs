@@ -451,16 +451,11 @@ impl PeripheralBank {
         self.olt.load_frames_into_mailbox(classifier);
         // Frames the subscriber port accepted go through the same
         // mailbox, but through their own classifier binding: the two
-        // directions do not share a rule table, and routing UNI ingress
-        // with the downstream binding would answer a question nobody
-        // measured. With the classifier gate shut there is no binding at
-        // all and the frames are dropped — the EtherType fallback is the
-        // fibre's history, not this port's.
-        let uni_classifier = self
-            .use_classifier
-            .then_some((&self.lue, self.uni_classifier_binding));
+        // directions do not share a rule table. They are classified
+        // whether or not the fibre's gate is open — that gate guards the
+        // fibre's EtherType fallback, and this port has none.
         for frame in self.uni.take_rx_frames() {
-            self.olt.deliver_port_frame(uni_classifier, &frame);
+            self.olt.deliver_port_frame((&self.lue, self.uni_classifier_binding), &frame);
         }
         // The MAC holds the counters software latches; the OLT is where a
         // frame is known to have landed. Carrying the number across is the

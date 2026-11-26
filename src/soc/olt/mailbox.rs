@@ -17,6 +17,9 @@ pub const STRIDE: u32 = 0x200;
 /// Number of addressable channel blocks.
 pub const BLOCK_COUNT: u32 = 8;
 
+/// The channel whose queues software dequeues.
+pub const CPU_CHANNEL: u8 = 0;
+
 /// Status bit 9: a word is waiting on the data port.
 pub const STATUS_DATA_READY: u32 = 0x200;
 
@@ -69,6 +72,20 @@ impl Slot {
             Some(EtherType::Mpcp | EtherType::SlowProtocol | EtherType::Eapol) => Self::CONTROL,
             _ => Self::DATA,
         }
+    }
+
+    /// The channel the queue belongs to: the top three bits.
+    pub fn channel(self) -> u8 {
+        self.0 >> 5
+    }
+
+    /// True for a queue of the channel the CPU dequeues from.
+    ///
+    /// -- OBSERVED: channel 0 holds the queues software pops, channel 1
+    /// the ones the link's upstream MAC drains, channel 2 those that leave
+    /// on the subscriber port.
+    pub fn is_cpu_queue(self) -> bool {
+        self.channel() == CPU_CHANNEL
     }
 
     /// Index and bit position of this slot in the LLID bitmap.

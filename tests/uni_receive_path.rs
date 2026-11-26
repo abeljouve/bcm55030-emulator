@@ -28,6 +28,7 @@ use bcm55030_emulator::soc::lue::{
 use bcm55030_emulator::soc::peripheral::PeripheralEvent;
 use bcm55030_emulator::soc::uni::{UniEvent, UniRxSignal};
 use bcm55030_emulator::soc::bank::BootMode;
+use bcm55030_emulator::soc::olt::mailbox::Slot;
 
 /// The queue the firmware polls for frames it terminates itself.
 const CPU_QUEUE: u16 = 0x10;
@@ -168,24 +169,67 @@ fn a_rule_in_another_table_of_the_bound_instance_is_not_seen() {
     assert_eq!(bank.olt.total_pending_count(), before);
 }
 
-/// With the classifier gate shut there is no rule set to consult, and
-/// the frame is dropped rather than routed by the EtherType fallback —
-/// that fallback is the fibre's history, and this port has none.
+/// The fibre's classifier gate guards the fibre's fallback; this port
+/// has none, so its rules are read with the gate shut too. Without them
+/// the frame could only be dropped.
 #[test]
-fn a_shut_classifier_gate_drops_the_frame_instead_of_guessing() {
+fn the_fibre_gate_does_not_stand_between_the_port_and_its_rules() {
     let mut bank = bank_with_live_port();
     assert!(!bank.use_classifier, "the gate is shut by default");
-    let before = bank.olt.total_pending_count();
+    let ClassifierBinding { instance, table } = bank.uni_classifier_binding;
+    program_queue_rule(&mut bank, instance, table, 0x20, 0x8809, CPU_QUEUE);
 
+    let before = bank.olt.total_pending_count();
     offer(&mut bank, ethertype_frame(0x8809));
     bank.tick(1);
 
+    assert_eq!(bank.olt.total_pending_count(), before + 1);
+    let c = bank.olt.port_ingress;
+    assert_eq!((c.routing.classified, c.delivered), (1, 1));
+    assert!(c.accounted_for());
     assert_eq!(
-        bank.olt.total_pending_count(),
-        before,
-        "with no rule set, there is nothing to route by"
+        bank.olt.classifier_counters.classified, 0,
+        "the fibre's tally is not where this port's verdicts go"
     );
-    assert_eq!(bank.uni.counters.rx_accepted, 1, "the port still took it");
+}
+
+/// Any queue of the CPU channel is one software can pop, not only the
+/// control-plane one: the frame lands in the queue the rule names.
+#[test]
+fn a_frame_lands_in_the_cpu_queue_the_rule_names() {
+    let mut bank = bank_with_live_port();
+    let ClassifierBinding { instance, table } = bank.uni_classifier_binding;
+    let queue = Slot(0x0F);
+    assert!(queue.is_cpu_queue());
+    program_queue_rule(&mut bank, instance, table, 0x20, 0x88B5, queue.0 as u16);
+
+    offer(&mut bank, ethertype_frame(0x88B5));
+    bank.tick(1);
+
+    let (word, bit) = queue.bitmap_position();
+    assert_ne!(bank.olt.mailbox_bitmap[word] & (1 << bit), 0, "the queue's bitmap bit is up");
+    assert_eq!(bank.olt.mailbox_pending.get(&queue.0).map(|q| q.len()), Some(1));
+}
+
+/// A rule naming a queue of another channel forwards the frame. The CPU's
+/// mailbox does not carry that, so the frame is counted and not landed:
+/// left there it would sit in a queue nothing drains and read as received.
+#[test]
+fn a_rule_naming_an_upstream_queue_does_not_hand_the_frame_to_the_cpu() {
+    let mut bank = bank_with_live_port();
+    let ClassifierBinding { instance, table } = bank.uni_classifier_binding;
+    let upstream = Slot(0x22);
+    assert!(!upstream.is_cpu_queue());
+    program_queue_rule(&mut bank, instance, table, 0x20, 0x8809, upstream.0 as u16);
+
+    let before = bank.olt.total_pending_count();
+    offer(&mut bank, ethertype_frame(0x8809));
+    bank.tick(1);
+
+    assert_eq!(bank.olt.total_pending_count(), before);
+    let c = bank.olt.port_ingress;
+    assert_eq!((c.routing.matched, c.matched_a_queue_off_the_cpu_channel, c.delivered), (1, 1, 0));
+    assert!(c.accounted_for());
 }
 
 /// A frame offered to a port that is not up never becomes the
