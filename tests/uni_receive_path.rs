@@ -7,11 +7,11 @@
 //! for a reason it can name, and says "yes" the moment a rule names a
 //! queue.
 //!
-//! The default binding sends this ingress to the instance whose rules
-//! name no queue, so the first test below is what silicon measured:
-//! frames go in, nothing comes out, and every one of them is counted.
-//! ⛔ Which instance really sees this ingress is not established — the
-//! second test is what a device that routed it would look like.
+//! The ingress reads instance 0 table 1, the pair a rule naming a CPU
+//! queue was measured to work in. With no such rule there, the first
+//! test below is what silicon measured: frames go in, nothing comes
+//! out, and every one of them is counted. The second is the same port
+//! once a rule names the queue the firmware polls.
 //!
 //! ⚠ One thing this file must not be read as saying. A frame that stops
 //! here stops because **no verdict named a queue**, and against the rule
@@ -32,8 +32,6 @@ use bcm55030_emulator::soc::bank::BootMode;
 /// The queue the firmware polls for frames it terminates itself.
 const CPU_QUEUE: u16 = 0x10;
 
-const TABLE: u8 = 8;
-
 fn ethertype_frame(et: u16) -> Vec<u8> {
     let mut f = vec![0u8; 64];
     f[12] = (et >> 8) as u8;
@@ -43,7 +41,7 @@ fn ethertype_frame(et: u16) -> Vec<u8> {
 
 /// A rule that matches one EtherType and names a queue for it, written
 /// through the port the way software writes it.
-fn program_queue_rule(bank: &mut PeripheralBank, instance: usize, index: u16, et: u16, queue: u16) {
+fn program_queue_rule(bank: &mut PeripheralBank, instance: usize, table: u8, index: u16, et: u16, queue: u16) {
     let entry = Entry::Clause {
         clause: Clause {
             field: Field::EtherType,
@@ -61,7 +59,7 @@ fn program_queue_rule(bank: &mut PeripheralBank, instance: usize, index: u16, et
     for (i, w) in entry.encode().to_regs().iter().enumerate() {
         port.write_data(i, *w);
     }
-    port.write_cmd(CMD_GO | CMD_WRITE | ((TABLE as u32) << 12) | index as u32);
+    port.write_cmd(CMD_GO | CMD_WRITE | ((table as u32) << 12) | index as u32);
 }
 
 fn bank_with_live_port() -> PeripheralBank {
@@ -113,8 +111,8 @@ fn with_no_rule_naming_a_queue_the_frames_stop_at_the_classifier() {
 fn a_rule_naming_the_cpu_queue_carries_the_frame_to_the_mailbox() {
     let mut bank = bank_with_live_port();
     bank.use_classifier = true;
-    let instance = bank.uni_classifier_binding.instance;
-    program_queue_rule(&mut bank, instance, 0x20, 0x8809, CPU_QUEUE);
+    let ClassifierBinding { instance, table } = bank.uni_classifier_binding;
+    program_queue_rule(&mut bank, instance, table, 0x20, 0x8809, CPU_QUEUE);
 
     let before = bank.olt.total_pending_count();
     offer(&mut bank, ethertype_frame(0x8809));
@@ -135,8 +133,8 @@ fn the_binding_decides_which_rule_set_the_ingress_meets() {
     let mut bank = bank_with_live_port();
     bank.use_classifier = true;
     // Put the rule in one instance and read the ingress with the other.
-    let bound = bank.uni_classifier_binding.instance;
-    program_queue_rule(&mut bank, 1 - bound, 0x20, 0x8809, CPU_QUEUE);
+    let ClassifierBinding { instance: bound, table } = bank.uni_classifier_binding;
+    program_queue_rule(&mut bank, 1 - bound, table, 0x20, 0x8809, CPU_QUEUE);
 
     let before = bank.olt.total_pending_count();
     offer(&mut bank, ethertype_frame(0x8809));
@@ -148,10 +146,26 @@ fn the_binding_decides_which_rule_set_the_ingress_meets() {
     );
 
     // Move the binding and the same frame lands.
-    bank.uni_classifier_binding = ClassifierBinding { instance: 1 - bound, table: TABLE };
+    bank.uni_classifier_binding = ClassifierBinding { instance: 1 - bound, table };
     offer(&mut bank, ethertype_frame(0x8809));
     bank.tick(1);
     assert_eq!(bank.olt.total_pending_count(), before + 1);
+}
+
+/// The table is part of the binding too: the same rule one table over is
+/// not one this ingress meets.
+#[test]
+fn a_rule_in_another_table_of_the_bound_instance_is_not_seen() {
+    let mut bank = bank_with_live_port();
+    bank.use_classifier = true;
+    let ClassifierBinding { instance, table } = bank.uni_classifier_binding;
+    assert_eq!((instance, table), (0, 1), "the pair measured to carry a CPU rule");
+    program_queue_rule(&mut bank, instance, 8, 0x20, 0x8809, CPU_QUEUE);
+
+    let before = bank.olt.total_pending_count();
+    offer(&mut bank, ethertype_frame(0x8809));
+    bank.tick(1);
+    assert_eq!(bank.olt.total_pending_count(), before);
 }
 
 /// With the classifier gate shut there is no rule set to consult, and
@@ -180,8 +194,8 @@ fn a_shut_classifier_gate_drops_the_frame_instead_of_guessing() {
 fn an_unarmed_port_hands_the_datapath_nothing() {
     let mut bank = PeripheralBank::new(BootMode::Cold);
     bank.use_classifier = true;
-    let instance = bank.uni_classifier_binding.instance;
-    program_queue_rule(&mut bank, instance, 0x20, 0x8809, CPU_QUEUE);
+    let ClassifierBinding { instance, table } = bank.uni_classifier_binding;
+    program_queue_rule(&mut bank, instance, table, 0x20, 0x8809, CPU_QUEUE);
 
     let before = bank.olt.total_pending_count();
     offer(&mut bank, ethertype_frame(0x8809));

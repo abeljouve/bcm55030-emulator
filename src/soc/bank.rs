@@ -200,20 +200,26 @@ pub struct PeripheralBank {
     /// only path every downstream frame takes.
     pub use_classifier: bool,
     pub classifier_binding: crate::soc::lue::ClassifierBinding,
-    /// Which classifier instance sees frames arriving on the UNI port.
+    /// Which classifier instance and table see frames arriving on the UNI
+    /// port.
     ///
-    /// ⛔ **Not established.** The firmware calls one direction
-    /// "Upstream" and the other "Dnstream", but that selector belongs to
-    /// a statistics read and nothing ties it to the instance numbering
-    /// here, which is positional in the address map. Instance 0 is the
-    /// default because it is the one whose rules name no queue, so this
-    /// model predicts what was measured on silicon: a frame pushed into that
-    /// port reaches no queue and the firmware never sees it.
+    /// -- OBSERVED on silicon, both ways round: a rule written into
+    /// instance 0 **table 1** alone, matching one EtherType and naming a
+    /// CPU queue, carries every frame of that EtherType entering this port
+    /// to that queue, without a gap; and the per-port rules software
+    /// writes into the same table, naming upstream queues, are what send
+    /// tagged traffic from this port up the link. So this ingress reads
+    /// that pair.
     ///
-    /// That is a prediction, not a fact, and it is the useful shape for
-    /// one: set this to the other instance and the model says the frame
-    /// arrives. Falsifier: which command register the "Upstream" path
-    /// writes.
+    /// The older reading of "frames pushed into this port never reach the
+    /// firmware" still holds for a rule set with no CPU queue in that
+    /// table — which is what that measurement had — and needs no other
+    /// binding to say so.
+    ///
+    /// ⛔ Whether the hardware consults **other** tables of the instance as
+    /// well is not established: only table 1 was ever tested alone. A pair
+    /// cannot express "several tables", so a rule placed elsewhere is not
+    /// seen here.
     pub uni_classifier_binding: crate::soc::lue::ClassifierBinding,
     pub serdes: SerDes,
     /// The UNI-side Ethernet port. Its block sits inside what the SerDes
@@ -353,10 +359,7 @@ impl PeripheralBank {
             lue: Lue::new(),
             use_classifier: false,
             classifier_binding: Default::default(),
-            uni_classifier_binding: crate::soc::lue::ClassifierBinding {
-                instance: 0,
-                table: 8,
-            },
+            uni_classifier_binding: crate::soc::lue::ClassifierBinding::UNI_INGRESS,
             efuse_udr: EfuseUdr::new(),
             fatal_filter: FatalFilter::new(),
             mpcp: Mpcp::new(),

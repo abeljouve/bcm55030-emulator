@@ -117,6 +117,12 @@ pub struct ClassifierBinding {
     pub table: u8,
 }
 
+impl ClassifierBinding {
+    /// The pair frames entering on the subscriber port are read with. See
+    /// `PeripheralBank::uni_classifier_binding` for what establishes it.
+    pub const UNI_INGRESS: Self = Self { instance: 0, table: 1 };
+}
+
 impl Default for ClassifierBinding {
     fn default() -> Self {
         Self { instance: 1, table: 8 }

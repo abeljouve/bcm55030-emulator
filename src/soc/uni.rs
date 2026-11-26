@@ -81,13 +81,13 @@
 //! What happens after that is **not** this block's decision. The frame
 //! goes to the classifier, and only a rule that names a queue sends it
 //! anywhere. That is the whole point of routing it rather than
-//! delivering it: on hardware, frames pushed into this port were never
-//! seen by the firmware, and a model that delivered them anyway would
-//! be contradicting silicon to make the emulator look livelier.
+//! delivering it: on hardware, frames pushed into this port reach the
+//! firmware when, and only when, a rule names a CPU queue for them, and
+//! a model that delivered them anyway would contradict both readings.
 //!
-//! ⛔ Which classifier instance sees this ingress is **not established**
-//! — see `Bank::uni_classifier_binding`, which carries the default and
-//! the falsifier.
+//! Which classifier instance and table see this ingress — see
+//! `PeripheralBank::uni_classifier_binding`, which says what is measured
+//! and what is not.
 //!
 //! **No firmware hook.** What arms the port and what arrives on the
 //! receive pair are inputs ([`UniEvent`]), not something this module
