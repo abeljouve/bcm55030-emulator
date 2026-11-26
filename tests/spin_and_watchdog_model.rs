@@ -4,7 +4,7 @@
 //! unconditionally. That is wrong twice over:
 //!
 //! 1. **Unconditional.** Real silicon resets on a spin only if a watchdog was
-//!    armed. `docs/isa/05-registers.md` Figure 66 gives the ARC timer control
+//!    armed. Figure 66 of the ARCompact ISA Programmer's Reference gives the ARC timer control
 //!    layout — bit 0 `IE`, bit 1 `NH`, bit 2 `W` ("enable watchdog reset
 //!    signal"), bit 3 `IP` — and the emulator implemented every bit of it
 //!    EXCEPT `W`, then compensated with a detector that rebooted whether or
@@ -113,7 +113,7 @@ fn the_watchdog_bit_is_what_resets_not_the_spin_detector() {
     assert_ne!(
         cpu.mem.read_word(0x0003_0000).unwrap(),
         0xDEAD_BEEF,
-        "CONTROL.W (docs/isa/05-registers.md Fig. 66) must reset the chip on limit"
+        "CONTROL.W (ARCompact PRM Fig. 66) must reset the chip on limit"
     );
 }
 

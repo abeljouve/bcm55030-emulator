@@ -37,7 +37,7 @@ const UART_PRESCALER: u64 = 256;
 const TIGHT_LOOP_THRESHOLD: u32 = 64;
 
 /// ARC timer `CONTROL` bit 0 — IE, interrupt enable.
-/// (`docs/isa/05-registers.md`, Figure 66.)
+/// (ARCompact ISA Programmer's Reference, Figure 66.)
 const TIMER_CTRL_IE: u32 = 1 << 0;
 /// ARC timer `CONTROL` bit 2 — W, "enable watchdog reset signal".
 const TIMER_CTRL_W: u32 = 1 << 2;
@@ -526,8 +526,8 @@ aliasing_fetch_line={:?} set_index={:?} starve={} cyc={} \
         // spins forever), and it did so ~64 instructions in rather than at the
         // ~15.6 M instructions a 100 ms watchdog takes at 156.25 MHz — a
         // reboot cadence ~250 000x too fast. That fabricated reboot loop is
-        // divergence D1 of `docs/bugs/emu-reboot-halt-and-transfer-model-divergences.md`,
-        // and it is the same failure shape as the D4 icache zero-fill: an
+        // a divergence from silicon, with the same failure shape as an
+        // earlier icache zero-fill: an
         // emulator-invented reboot standing where the real symptom was, wiping
         // the SRAM an investigator needed to read.
         //
@@ -799,7 +799,7 @@ aliasing_fetch_line={:?} set_index={:?} starve={} cyc={} \
                 self.state.aux_irq_pending |= 1 << 3;
             }
             // W (bit 2): "enable watchdog reset signal"
-            // (`docs/isa/05-registers.md` Figure 66). Modelled here rather
+            // (ARCompact ISA Programmer's Reference, Figure 66). Modelled here rather
             // than faked by the spin detector, so a watchdog resets the chip
             // when the firmware armed one — and ONLY then.
             if self.state.aux_control0 & TIMER_CTRL_W != 0 {
