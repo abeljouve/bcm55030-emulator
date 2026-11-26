@@ -78,15 +78,22 @@ fn submission_words(frame: &[u8]) -> Vec<u32> {
 
 /// Drive a frame through the transmit port exactly as the firmware does.
 fn submit(olt: &mut Olt, frame: &[u8]) {
-    let cmd_addr = CMD_STATUS_BASE + TX_BLOCK * STRIDE;
-    let data_addr = DATA_BASE + TX_BLOCK * STRIDE;
+    assert_eq!(submit_on(olt, TX_BLOCK, frame), None, "the fibre's channel hands nothing back");
+}
+
+/// The same, on any channel; returns what the model hands back.
+fn submit_on(olt: &mut Olt, block: u32, frame: &[u8]) -> Option<Vec<u8>> {
+    let cmd_addr = CMD_STATUS_BASE + block * STRIDE;
+    let data_addr = DATA_BASE + block * STRIDE;
     olt.observe_write(
         cmd_addr,
         mailbox::Command::Write { channel: 0, len: frame.len(), mpcp: true }.encode(),
     );
+    let mut out = None;
     for word in submission_words(frame) {
-        olt.observe_write(data_addr, word);
+        out = out.or(olt.observe_write(data_addr, word));
     }
+    out
 }
 
 fn frame_with_ethertype(ethertype: EtherType) -> Vec<u8> {
@@ -411,4 +418,18 @@ fn what_a_script_says_about_addressing_outlasts_a_tick() {
     olt.set_script(script::Script::parse("oam-destination multicast\n").expect("the fixture parses"));
     run(&mut olt, 3);
     assert!(!olt.link.peer.config.unicast_oam);
+}
+
+/// A frame submitted on the subscriber port's channel is that port's, not
+/// the fibre's: it is handed back whole and the peer never sees it.
+#[test]
+fn a_submission_on_the_subscriber_port_channel_does_not_reach_the_fibre() {
+    let mut olt = live_olt();
+    let frame = frame_with_ethertype(EtherType::Other(0x88B5));
+    let handed_back = submit_on(&mut olt, mailbox::UNI_PORT_CHANNEL, &frame);
+    cross(&mut olt);
+
+    assert_eq!(handed_back.as_deref(), Some(&frame[..]));
+    assert!(olt.tx_log().is_empty(), "nothing went up the fibre");
+    assert!(!olt.real_tx_seen(), "and the peer's handshake was not disturbed");
 }

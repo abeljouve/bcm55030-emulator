@@ -1238,7 +1238,9 @@ impl PeripheralBank {
         // changes no read-back, so the write still reaches whichever
         // peripheral claims it below.
         if crate::soc::olt::Olt::claims_mailbox(addr) {
-            self.olt.observe_write(addr, val);
+            if let Some(frame) = self.olt.observe_write(addr, val) {
+                self.uni.transmit(frame);
+            }
         }
         // OLT CMD write intercept — must be before epon_mac.
         if crate::soc::olt::Olt::claims_mailbox(addr) && self.olt.write_cmd(addr, val) {

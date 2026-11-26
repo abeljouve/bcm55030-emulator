@@ -20,6 +20,11 @@ pub const BLOCK_COUNT: u32 = 8;
 /// The channel whose queues software dequeues.
 pub const CPU_CHANNEL: u8 = 0;
 
+/// The channel whose submissions leave on the subscriber port, not on the
+/// fibre. -- OBSERVED: a frame submitted through this channel's command
+/// and data ports arrives at the far end of the subscriber port.
+pub const UNI_PORT_CHANNEL: u32 = 2;
+
 /// Status bit 9: a word is waiting on the data port.
 pub const STATUS_DATA_READY: u32 = 0x200;
 

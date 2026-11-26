@@ -833,16 +833,25 @@ impl Olt {
         Some(frame)
     }
 
-    pub fn observe_write(&mut self, addr: u32, val: u32) {
+    /// Follow a write to the mailbox ports and assemble what software
+    /// submits.
+    ///
+    /// A frame submitted on the subscriber port's channel is not the
+    /// fibre's: it is handed back for the datapath to put on that port,
+    /// and the peer never sees it.
+    pub fn observe_write(&mut self, addr: u32, val: u32) -> Option<Vec<u8>> {
         if mailbox::block_index(addr, mailbox::CMD_STATUS_BASE).is_some() {
             if let Some(Command::Write { len, .. }) = Command::decode(val) {
                 self.tx_assembler.begin(addr, len);
             }
-            return;
+            return None;
         }
-        if let Some(frame) = self.tx_assembler.push_word(addr, val) {
-            self.on_captured_tx(frame);
+        let frame = self.tx_assembler.push_word(addr, val)?;
+        if mailbox::block_index(addr, mailbox::DATA_BASE) == Some(mailbox::UNI_PORT_CHANNEL) {
+            return Some(frame);
         }
+        self.on_captured_tx(frame);
+        None
     }
 
     fn on_captured_tx(&mut self, frame: Vec<u8>) {

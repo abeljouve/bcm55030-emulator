@@ -424,6 +424,11 @@ pub enum UniEvent {
 /// cannot be read as a link that received nothing.
 const RX_QUEUE_DEPTH: usize = 8;
 
+/// How many sent frames the port keeps for a harness to read. A log, not a
+/// queue the hardware has: it is bounded so that a run that never reads it
+/// does not grow without end, and what falls off is counted.
+const TX_LOG_DEPTH: usize = 1024;
+
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct UniCounters {
     /// Reads of [`REG_STAT_CMD`] that found bit 31 still set. The
@@ -464,6 +469,15 @@ pub struct UniCounters {
     pub rx_dropped_queue_full: u64,
     /// Taken past the port's own gates and handed to the datapath.
     pub rx_accepted: u64,
+
+    // The transmit side. Every frame software submits to this port lands
+    // in exactly one of the first two.
+    /// Submitted while the port was armed, and sent.
+    pub tx_sent: u64,
+    /// Submitted while the port was not armed: nothing leaves.
+    pub tx_dropped_unarmed: u64,
+    /// Sent, but no longer in the log the harness reads, which is finite.
+    pub tx_log_overflow: u64,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -504,6 +518,8 @@ pub struct Uni {
     stat_selected: Option<StatSelect>,
     /// Frames past the port's gates, waiting for the datapath.
     rx_pending: std::collections::VecDeque<Vec<u8>>,
+    /// Frames sent on the transmit pair, oldest first.
+    tx_log: std::collections::VecDeque<Vec<u8>>,
     pub counters: UniCounters,
 }
 
@@ -523,6 +539,7 @@ impl Uni {
             stat_counters: [0u32; STAT_COUNT],
             stat_selected: None,
             rx_pending: std::collections::VecDeque::new(),
+            tx_log: std::collections::VecDeque::new(),
             counters: UniCounters::default(),
         };
         uni.apply_silicon_power_on();
@@ -618,6 +635,29 @@ impl Uni {
     /// that is finite and counts what it refuses.
     pub fn pop_rx_frame(&mut self) -> Option<Vec<u8>> {
         self.rx_pending.pop_front()
+    }
+
+    /// A frame software submitted to this port's channel.
+    ///
+    /// The one gate is the port state, as on the receive side. INFERRED:
+    /// the channel's queue masks, which software sets once the link is up,
+    /// may hold a frame back on hardware; they are not modelled here.
+    pub fn transmit(&mut self, frame: Vec<u8>) {
+        if !self.armed {
+            self.counters.tx_dropped_unarmed += 1;
+            return;
+        }
+        self.counters.tx_sent += 1;
+        if self.tx_log.len() >= TX_LOG_DEPTH {
+            self.tx_log.pop_front();
+            self.counters.tx_log_overflow += 1;
+        }
+        self.tx_log.push_back(frame);
+    }
+
+    /// Take the frames sent since the last call, oldest first.
+    pub fn take_tx_frames(&mut self) -> Vec<Vec<u8>> {
+        self.tx_log.drain(..).collect()
     }
 
     fn stat_cmd_word(&self) -> u32 {
@@ -737,6 +777,7 @@ impl Peripheral for Uni {
         self.rx = UniRxSignal::None;
         self.armed = false;
         self.rx_pending.clear();
+        self.tx_log.clear();
         self.counters = UniCounters::default();
         self.apply_silicon_power_on();
     }
@@ -1116,6 +1157,35 @@ mod tests {
         assert_eq!(c.rx_dropped_queue_full, 3);
         assert_eq!(c.rx_dropped_no_signal, 1);
         assert_eq!(u.rx_queued(), RX_QUEUE_DEPTH);
+    }
+
+    /// What software submits leaves only from an armed port, and every
+    /// submission is counted one way or the other.
+    #[test]
+    fn a_submitted_frame_is_sent_only_from_an_armed_port() {
+        let mut u = Uni::new();
+        u.transmit(frame(60));
+        assert_eq!(u.counters.tx_dropped_unarmed, 1);
+        assert!(u.take_tx_frames().is_empty());
+
+        let mut u = armed_with(UniRxSignal::TenGigCoding);
+        u.transmit(frame(60));
+        u.transmit(frame(64));
+        assert_eq!(u.counters.tx_sent, 2);
+        assert_eq!(u.take_tx_frames(), vec![frame(60), frame(64)]);
+        assert!(u.take_tx_frames().is_empty(), "taken once");
+    }
+
+    /// The log is finite and says what it let go.
+    #[test]
+    fn the_transmit_log_is_bounded_and_counts_what_falls_off() {
+        let mut u = armed_with(UniRxSignal::TenGigCoding);
+        for _ in 0..TX_LOG_DEPTH + 2 {
+            u.transmit(frame(60));
+        }
+        assert_eq!(u.counters.tx_sent, TX_LOG_DEPTH as u64 + 2);
+        assert_eq!(u.counters.tx_log_overflow, 2);
+        assert_eq!(u.take_tx_frames().len(), TX_LOG_DEPTH);
     }
 
     /// A port taken out of service does not keep what it was holding.
