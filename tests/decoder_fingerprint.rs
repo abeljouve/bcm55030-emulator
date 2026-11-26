@@ -10,7 +10,7 @@ use bcm55030_emulator::decoder::decode_bytes;
 use bcm55030_emulator::decoder::format::format_instruction;
 
 const CASES: u32 = 1_000_000;
-const GOLDEN: u64 = 0x971b_fa29_0af7_53e4;
+const GOLDEN: u64 = 0x5d5f_8d8b_771c_fdad;
 
 struct XorShift64Star(u64);
 impl XorShift64Star {

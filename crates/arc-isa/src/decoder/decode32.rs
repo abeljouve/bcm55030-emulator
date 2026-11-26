@@ -1037,6 +1037,18 @@ fn decode_flag(
                 pc,
             })
         }
+        0b10 => {
+            // REG_S12IMM: the source is the sign-extended s12.
+            Ok(DecodedInstruction {
+                inst: Instruction::Flag {
+                    src: Operand::Imm(extract_s12(word) as u32),
+                    cc: None,
+                },
+                size: 4,
+                has_limm: false,
+                pc,
+            })
+        }
         0b11 => {
             let m = (word >> 5) & 1;
             let q = extract_condition_q(word);
@@ -1433,6 +1445,46 @@ fn decode_extension_ops(
 mod tests {
     use super::*;
     use crate::decoder::ByteSliceFetch;
+
+    /// FLAG (major 0x04, sub-opcode 0x29) with operand mode `p`; `low12`
+    /// fills Inst[11:0] (C/u6 in [11:6], the rest below).
+    fn flag_word(p: u32, low12: u32) -> u32 {
+        (0x04 << 27) | (p << 22) | (0x29 << 16) | (low12 & 0xFFF)
+    }
+
+    /// REG_S12IMM operand field: S[5:0] in [11:6], S[11:6] in [5:0].
+    fn s12_field(s: i32) -> u32 {
+        let s = s as u32 & 0xFFF;
+        ((s & 0x3F) << 6) | (s >> 6)
+    }
+
+    fn flag_src(word: u32, limm: u32) -> (Operand, bool) {
+        let mut bytes = [0u8; 8];
+        bytes[..4].copy_from_slice(&word.to_be_bytes());
+        bytes[4..].copy_from_slice(&limm.to_be_bytes());
+        let fetch = ByteSliceFetch::new(&bytes, 0);
+        let d = decode_32bit(word, 0, &fetch).expect("flag decodes");
+        match d.inst {
+            Instruction::Flag { src, cc: None } => (src, d.has_limm),
+            other => panic!("not an unconditional flag: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flag_s12_is_sign_extended() {
+        for s in [0, 1, 64, 2047, -1, -2048] {
+            let (src, limm) = flag_src(flag_word(0b10, s12_field(s)), 0);
+            assert_eq!(src, Operand::Imm(s as u32), "flag s12 {s}");
+            assert!(!limm);
+        }
+    }
+
+    #[test]
+    fn flag_limm_takes_the_following_word() {
+        let (src, limm) = flag_src(flag_word(0b00, 62 << 6), 0x1234_5678);
+        assert_eq!(src, Operand::Imm(0x1234_5678));
+        assert!(limm);
+    }
 
     #[test]
     fn mov_b62_u6_no_limm() {

@@ -277,7 +277,7 @@ pub(crate) fn fingerprint_steps(step: &dyn Fn(&mut Cpu) -> Result<(), Exception>
 
 const REGISTERS: u64 = 0xbe62_974d_92c4_42c3;
 const MEMORY: u64 = 0x00a4_ecc5_21e9_aba9;
-const STEPS: u64 = 0x1067_32c0_ab8a_6330;
+const STEPS: u64 = 0x4208_2411_9374_0efe;
 
 #[test]
 fn register_semantics_fingerprint() {
