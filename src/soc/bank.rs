@@ -457,6 +457,8 @@ impl PeripheralBank {
         // fibre's, a frame the mailbox has no room for waits where it is,
         // in the port's own finite queue, instead of being thrown away by
         // a depth this model shares between queues that silicon does not.
+        // INFERRED divergence: it is classified when it leaves that queue,
+        // against the rules in place then; silicon classifies at ingress.
         while self.olt.mailbox_has_room() {
             let Some(frame) = self.uni.pop_rx_frame() else { break };
             self.olt.deliver_port_frame((&self.lue, self.uni_classifier_binding), &frame);
